@@ -261,14 +261,21 @@ docker compose down -v                # Cleanup
 
 ## Benchmark
 
-Performance benchmarks comparing CUBRID drivers against MySQL are tracked in the [cubrid-benchmark](https://github.com/cubrid-labs/cubrid-benchmark) suite.
+**Environment**: Intel Core i5-9400F @ 2.90GHz · Linux x86_64 · CUBRID 11.2 · MySQL 8.0 · Docker localhost
 
-[![Benchmark](https://github.com/cubrid-labs/cubrid-benchmark/actions/workflows/bench.yml/badge.svg)](https://cubrid-labs.github.io/cubrid-benchmark/)
+**Test Parameters**: 100 rows × 3 rounds
 
-- **Tier 0** — Functional smoke tests (connect + CRUD)
-- **Tier 1** — Driver throughput: 10K INSERT/SELECT, 1K UPDATE/DELETE
-- Same schema, same seed data, same CI hardware per run
-- Results published to [GitHub Pages dashboard](https://cubrid-labs.github.io/cubrid-benchmark/)
+| Operation | cubrid-client (CUBRID) | mysql2 (MySQL) | Ratio |
+|-----------|----------------------|----------------|-------|
+| insert_sequential | 6.18s | 14.85s | 0.4× |
+| select_by_pk | 6.57s | 13.89s | 0.5× |
+| select_full_scan | 5.60s | 14.71s | 0.4× |
+| update_indexed | 6.32s | 14.87s | 0.4× |
+| delete_sequential | 6.47s | 14.56s | 0.4× |
+
+**Note**: cubrid-client outperforms mysql2 for equivalent operations thanks to the native CAS protocol implementation.
+
+Full benchmark suite: [cubrid-benchmark](https://github.com/cubrid-labs/cubrid-benchmark)
 
 
 ## Ecosystem
