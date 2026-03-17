@@ -90,28 +90,46 @@ try {
 
 Non-transaction queries (`db.query()`) share a single connection. The connection is created on the first call and reused for all subsequent queries:
 
-```
-createClient() ─┐
-                │  (no connection yet)
-db.query()  ────┤  ← Connection #1 created
-db.query()  ────┤  ← Connection #1 reused
-db.query()  ────┤  ← Connection #1 reused
-db.close()  ────┘  ← Connection #1 closed
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant Client as cubrid-client
+    participant Conn1 as Shared Connection #1
+
+    App->>Client: createClient()
+    Note over Client: No connection yet (lazy)
+    App->>Client: query()
+    Client->>Conn1: Create and open Connection #1
+    App->>Client: query()
+    Client->>Conn1: Reuse Connection #1
+    App->>Client: query()
+    Client->>Conn1: Reuse Connection #1
+    App->>Client: close()
+    Client->>Conn1: Close Connection #1
 ```
 
 ### Transaction Connection
 
 Each `db.transaction()` call creates an **isolated connection** that is independent of the shared connection. The isolated connection is automatically closed when the transaction completes:
 
-```
-db.transaction(async (tx) => {
-  // Connection #2 created (isolated)
-  await tx.query("INSERT ...");
-  await tx.query("UPDATE ...");
-  // Auto-commit on success
-}); // Connection #2 auto-closed
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant Client as cubrid-client
+    participant Conn2 as Isolated Connection #2
+    participant Conn1 as Shared Connection #1
 
-db.query("SELECT ..."); // Still uses Connection #1
+    App->>Client: transaction(async tx => ...)
+    Client->>Conn2: Create isolated connection
+    Client->>Conn2: beginTransaction()
+    App->>Client: tx.query("INSERT ...")
+    Client->>Conn2: Execute on Connection #2
+    App->>Client: tx.query("UPDATE ...")
+    Client->>Conn2: Execute on Connection #2
+    Client->>Conn2: commit() on success
+    Client->>Conn2: close() always
+    App->>Client: query("SELECT ...")
+    Client->>Conn1: Continue using shared Connection #1
 ```
 
 ### Manual Transaction on Shared Connection

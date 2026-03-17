@@ -166,19 +166,17 @@ await db.transaction(async (tx) => {
 
 Suggested project structure:
 
-```text
-src
-  client.ts
-  connection.ts
-  query.ts
-  transaction.ts
-  types.ts
-
-tests
-
-examples
-
-docs
+```mermaid
+graph TD
+    Root[cubrid-client] --> Src[src]
+    Root --> Tests[tests]
+    Root --> Examples[examples]
+    Root --> Docs[docs]
+    Src --> ClientTs[client.ts]
+    Src --> ConnectionTs[connection.ts]
+    Src --> QueryTs[query.ts]
+    Src --> TransactionTs[transaction.ts]
+    Src --> TypesTs[types.ts]
 ```
 
 ## Packaging

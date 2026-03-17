@@ -317,11 +317,11 @@ All errors extend the native `Error` class and use the standard [`ErrorOptions.c
 
 ### Error Hierarchy
 
-```
-Error
-├── ConnectionError   — connection lifecycle failures
-├── QueryError        — SQL execution failures
-└── TransactionError  — transaction lifecycle failures
+```mermaid
+graph TD
+    E[Error] --> C[ConnectionError - connection lifecycle failures]
+    E --> Q[QueryError - SQL execution failures]
+    E --> T[TransactionError - transaction lifecycle failures]
 ```
 
 ### Common Pattern

@@ -202,15 +202,40 @@ Closes the shared connection. Safe to call multiple times.
 
 `cubrid-client` implements the CUBRID CAS binary protocol directly over TCP sockets:
 
+```mermaid
+flowchart TD
+    App[Application] --> Client[cubrid-client]
+    Client --> CAS[CAS Protocol over TCP]
+    CAS --> Broker[CUBRID Broker]
+    Broker --> Server[CUBRID Server]
 ```
-createClient(options)
-  └── CubridClient(config, connectionFactory)
-       └── NativeCubridAdapter (implements ConnectionLike)
-            └── CASConnection (TCP socket, framed binary I/O)
-                 ├── PacketWriter  — binary request encoding
-                 ├── PacketReader  — binary response decoding
-                 ├── Protocol      — CAS command builders/parsers
-                 └── Constants     — function codes, data types
+
+```mermaid
+graph TD
+    A[createClient options] --> B[CubridClient config connectionFactory]
+    B --> C[NativeCubridAdapter implements ConnectionLike]
+    C --> D[CASConnection TCP socket framed binary IO]
+    D --> E[PacketWriter binary request encoding]
+    D --> F[PacketReader binary response decoding]
+    D --> G[Protocol CAS command builders and parsers]
+    D --> H[Constants function codes and data types]
+```
+
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant Client as cubrid-client
+    participant Broker as CUBRID Broker
+    participant Server as CUBRID Server
+
+    App->>Client: createClient(config)
+    Note over Client: Lazy connection (no network I/O)
+    App->>Client: query(sql, params)
+    Client->>Broker: CAS connect/query over TCP
+    Broker->>Server: Execute SQL
+    Server-->>Broker: Result set / status
+    Broker-->>Client: CAS response packets
+    Client-->>App: Typed rows / [] for DDL-DML
 ```
 
 No external protocol drivers needed — the entire CAS handshake, query execution, and result parsing is implemented in TypeScript.
@@ -226,16 +251,17 @@ No external protocol drivers needed — the entire CAS handshake, query executio
 
 ## Project Layout
 
-```text
-src/
-  protocol/        # CAS binary protocol (connection, packet I/O, wire format)
-  client/          # CubridClient, CubridTransaction, createClient
-  adapters/        # ConnectionLike interface + NativeCubridAdapter
-  errors/          # ConnectionError, QueryError, TransactionError
-  internals/       # mapError, mapResult, normalizeConfig
-  types/           # TypeScript interfaces and type aliases
-tests/             # node:test suite (99%+ statement coverage)
-docs/              # Detailed documentation
+```mermaid
+graph TD
+    Root[cubrid-client] --> Src[src]
+    Root --> Tests[tests]
+    Root --> Docs[docs]
+    Src --> Protocol[protocol - CAS binary protocol]
+    Src --> ClientModule[client - CubridClient CubridTransaction createClient]
+    Src --> Adapters[adapters - ConnectionLike and NativeCubridAdapter]
+    Src --> Errors[errors - ConnectionError QueryError TransactionError]
+    Src --> Internals[internals - mapError mapResult normalizeConfig]
+    Src --> Types[types - TypeScript interfaces and aliases]
 ```
 
 ## Development
