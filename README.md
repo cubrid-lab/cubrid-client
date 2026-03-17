@@ -289,7 +289,9 @@ Full benchmark suite: [cubrid-benchmark](https://github.com/cubrid-labs/cubrid-b
 | [pycubrid](https://github.com/cubrid-labs/pycubrid) | Python DB-API 2.0 driver |
 | [sqlalchemy-cubrid](https://github.com/cubrid-labs/sqlalchemy-cubrid) | SQLAlchemy 2.0 dialect |
 | [cubrid-go](https://github.com/cubrid-labs/cubrid-go) | Go database/sql driver + GORM |
+| [gorm-cubrid](https://github.com/cubrid-labs/gorm-cubrid) | GORM dialect for CUBRID |
 | [cubrid-rs](https://github.com/cubrid-labs/cubrid-rs) | Native Rust database driver for CUBRID (sync + async, pure Rust) |
+| [sea-orm-cubrid](https://github.com/cubrid-labs/sea-orm-cubrid) | SeaORM backend for CUBRID |
 | [cubrid-cookbook](https://github.com/cubrid-labs/cubrid-cookbook) | Framework integration examples |
 
 ## License
