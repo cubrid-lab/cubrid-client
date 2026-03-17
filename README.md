@@ -10,7 +10,6 @@
 [![license](https://img.shields.io/github/license/cubrid-labs/cubrid-client)](https://github.com/cubrid-labs/cubrid-client/blob/main/LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/cubrid-labs/cubrid-client)](https://github.com/cubrid-labs/cubrid-client)
 <!-- BADGES:END -->
-<!-- BADGES:END -->
 
 ## Why cubrid-client?
 
