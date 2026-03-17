@@ -12,6 +12,7 @@
 
 import { Socket } from "node:net";
 import { SIZE_CAS_INFO, SIZE_DATA_LENGTH } from "./constants.js";
+import { parseConnectionString } from "../utils/connection-string.js";
 import {
   writeClientInfoExchange,
   parseClientInfoExchange,
@@ -42,7 +43,11 @@ export class CASConnection {
   private _sessionId = 0;
   private receiveBuffer: Buffer = Buffer.alloc(0);
 
-  constructor(private readonly config: CASConnectionConfig) {}
+  private readonly config: CASConnectionConfig;
+
+  constructor(config: CASConnectionConfig | string) {
+    this.config = typeof config === "string" ? parseConnectionString(config) : config;
+  }
 
   /** Perform broker handshake and open database. */
   async connect(): Promise<void> {

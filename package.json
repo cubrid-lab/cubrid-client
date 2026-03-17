@@ -24,10 +24,10 @@
   },
   "scripts": {
     "build": "tsup src/index.ts --format esm,cjs --dts",
-    "test": "node --import tsx --test 'tests/client.test.ts' 'tests/protocol.test.ts' 'tests/native-adapter.test.ts' 'tests/connection.test.ts'",
+    "test": "node --import tsx --test 'tests/client.test.ts' 'tests/protocol.test.ts' 'tests/native-adapter.test.ts' 'tests/connection.test.ts' 'tests/connection-string.test.ts' 'tests/query-utils.test.ts'",
     "test:integration": "node --import tsx --test 'tests/integration.test.ts'",
     "test:all": "node --import tsx --test 'tests/*.test.ts'",
-    "test:coverage": "c8 --reporter=text --reporter=lcov node --import tsx --test 'tests/client.test.ts' 'tests/protocol.test.ts' 'tests/native-adapter.test.ts' 'tests/connection.test.ts'",
+    "test:coverage": "c8 --reporter=text --reporter=lcov node --import tsx --test 'tests/client.test.ts' 'tests/protocol.test.ts' 'tests/native-adapter.test.ts' 'tests/connection.test.ts' 'tests/connection-string.test.ts' 'tests/query-utils.test.ts'",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm run test:coverage"
   },

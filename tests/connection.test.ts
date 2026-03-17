@@ -123,6 +123,32 @@ test("CASConnection connect — reuse broker socket (newPort=0)", async () => {
   }
 });
 
+test("CASConnection accepts connection URL string", async () => {
+  const { server, port } = await createMockBroker((socket) => {
+    socket.once("data", () => {
+      const portBuf = Buffer.alloc(4);
+      portBuf.writeInt32BE(0, 0);
+      socket.write(portBuf);
+
+      socket.once("data", () => {
+        socket.write(frameResponse(buildOpenDbResponse(77)));
+      });
+    });
+  });
+
+  try {
+    const cas = new CASConnection(`cubrid://dba:%40pw@127.0.0.1:${port}/testdb`);
+    await cas.connect();
+
+    assert.equal(cas.isConnected, true);
+    assert.equal(cas.sessionId, 77);
+
+    await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});
+
 test("CASConnection connect — redirect to new port (newPort > 0)", async () => {
   // Create the CAS server that will receive the redirected connection
   const { server: casServer, port: casPort } = await createMockBroker((socket) => {
