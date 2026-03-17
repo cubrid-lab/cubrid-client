@@ -97,7 +97,10 @@ export class CubridClient implements Queryable {
     if (!this.sharedConnectionPromise) {
       this.sharedConnectionPromise = Promise.resolve(
         this.connectionFactory(this.config),
-      );
+      ).catch((error) => {
+        this.sharedConnectionPromise = undefined;
+        throw error;
+      });
     }
 
     return this.sharedConnectionPromise;

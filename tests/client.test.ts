@@ -263,6 +263,30 @@ test("client query maps connection errors to QueryError", async () => {
   );
 });
 
+test("client retries connection after initial factory failure", async () => {
+  let attempts = 0;
+  const connection = new FakeConnection();
+  const client = createClient(
+    baseOptions({
+      connectionFactory: () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error("first connect failed");
+        return connection;
+      },
+    }),
+  );
+
+  await assert.rejects(
+    client.query("SELECT 1"),
+    (error: unknown) => error instanceof QueryError,
+  );
+
+  connection.nextRows = [{ id: 1 }];
+  const rows = await client.query("SELECT 1");
+  assert.deepEqual(rows, [{ id: 1 }]);
+  assert.equal(attempts, 2);
+});
+
 test("transaction commits on success and closes the dedicated connection", async () => {
   const transactional = new FakeConnection();
   const client = createClient(
