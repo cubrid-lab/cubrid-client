@@ -21,18 +21,17 @@
 - `npm run build`
 - `npm run check`
 
-## Competition Context (공모전 — Performance Loop System)
+## Project Context — Performance Loop System
 
-> This repo is a **supporting track** (nice-to-have) for the competition.
-> Timeline: 2026-03-25 ~ 2026-11-04
+> This repo is a **supporting track** (nice-to-have) for the Performance Loop.
 > Board: [CUBRID Ecosystem Roadmap](https://github.com/orgs/cubrid-labs/projects/2)
 
-### Competition Role
+### Role
 
 cubrid-client already benchmarks **faster than MySQL** in TypeScript.
-The competition narrative is "already fast, now production-ready" — resilience, not speed.
+The narrative is "already fast, now production-ready" — resilience, not speed.
 
-### Competition Issues on This Repo
+### Related Issues
 
 | Issue | Phase | Priority |
 |-------|-------|----------|
