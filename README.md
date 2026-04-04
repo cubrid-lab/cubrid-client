@@ -284,40 +284,12 @@ npm run test:integration              # Run against live DB
 docker compose down -v                # Cleanup
 ```
 
-## Benchmark
-
-**Environment**: Intel Core i5-9400F @ 2.90GHz · Linux x86_64 · CUBRID 11.2 · MySQL 8.0 · Docker localhost
-
-**Test Parameters**: 100 rows × 3 rounds
-
-| Operation | cubrid-client (CUBRID) | mysql2 (MySQL) | Ratio |
-|-----------|----------------------|----------------|-------|
-| insert_sequential | 6.18s | 14.85s | 0.4× |
-| select_by_pk | 6.57s | 13.89s | 0.5× |
-| select_full_scan | 5.60s | 14.71s | 0.4× |
-| update_indexed | 6.32s | 14.87s | 0.4× |
-| delete_sequential | 6.47s | 14.56s | 0.4× |
-
-**Note**: cubrid-client outperforms mysql2 for equivalent operations thanks to the native CAS protocol implementation.
-
-Full benchmark suite: [cubrid-benchmark](https://github.com/cubrid-labs/cubrid-benchmark)
-
-
 ## Ecosystem
-
-`cubrid-client` is part of the CUBRID open-source ecosystem:
 
 | Package | Description |
 |---------|-------------|
 | [cubrid-client](https://github.com/cubrid-labs/cubrid-client) | TypeScript client (this package) |
 | [drizzle-cubrid](https://github.com/cubrid-labs/drizzle-cubrid) | Drizzle ORM dialect for CUBRID |
-| [pycubrid](https://github.com/cubrid-labs/pycubrid) | Python DB-API 2.0 driver |
-| [sqlalchemy-cubrid](https://github.com/cubrid-labs/sqlalchemy-cubrid) | SQLAlchemy 2.0 dialect |
-| [cubrid-go](https://github.com/cubrid-labs/cubrid-go) | Go database/sql driver + GORM |
-| [gorm-cubrid](https://github.com/cubrid-labs/gorm-cubrid) | GORM dialect for CUBRID |
-| [cubrid-rs](https://github.com/cubrid-labs/cubrid-rs) | Native Rust database driver for CUBRID (sync + async, pure Rust) |
-| [sea-orm-cubrid](https://github.com/cubrid-labs/sea-orm-cubrid) | SeaORM backend for CUBRID |
-| [cubrid-cookbook](https://github.com/cubrid-labs/cubrid-cookbook) | Framework integration examples |
 
 ## Roadmap
 
