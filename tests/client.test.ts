@@ -34,6 +34,7 @@ class FakeConnection implements ConnectionLike {
   commitError?: Error;
   rollbackError?: Error;
   closeError?: Error;
+  ping?: () => Promise<string>;
 
   async connect(): Promise<void> {}
 
@@ -781,4 +782,56 @@ test("node-cubrid adapter close is a no-op when no connection was created", asyn
 
   // close without ever connecting - should not throw
   await adapter.close();
+});
+
+// ---------------------------------------------------------------------------
+// CubridClient.ping()
+// ---------------------------------------------------------------------------
+
+test("client ping delegates to connection.ping", async () => {
+  const connection = new FakeConnection();
+  connection.ping = async () => "11.2.9.0866";
+  const client = createClient(
+    baseOptions({
+      connectionFactory: () => connection,
+    }),
+  );
+
+  const version = await client.ping();
+  assert.equal(version, "11.2.9.0866");
+});
+
+test("client ping wraps error as ConnectionError", async () => {
+  const connection = new FakeConnection();
+  connection.ping = async () => {
+    throw new Error("ping failed");
+  };
+  const client = createClient(
+    baseOptions({
+      connectionFactory: () => connection,
+    }),
+  );
+
+  await assert.rejects(
+    client.ping(),
+    (error: unknown) =>
+      error instanceof ConnectionError &&
+      error.message === "Health check failed.",
+  );
+});
+
+test("client ping throws when connection has no ping method", async () => {
+  const connection = new FakeConnection();
+  const client = createClient(
+    baseOptions({
+      connectionFactory: () => connection,
+    }),
+  );
+
+  await assert.rejects(
+    client.ping(),
+    (error: unknown) =>
+      error instanceof ConnectionError &&
+      error.message === "Health check failed.",
+  );
 });

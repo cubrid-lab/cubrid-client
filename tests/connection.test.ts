@@ -454,6 +454,79 @@ test("CASConnection close destroys socket and resets state", async () => {
   }
 });
 
+test("CASConnection send rejects when remote side closed socket", async () => {
+  const { server, port } = await createMockBroker((socket) => {
+    socket.once("data", () => {
+      const portBuf = Buffer.alloc(4);
+      portBuf.writeInt32BE(0, 0);
+      socket.write(portBuf);
+
+      socket.once("data", () => {
+        const body = buildOpenDbResponse(1);
+        socket.write(frameResponse(body));
+
+        // Simulate broker closing socket after handshake (KEEP_CONNECTION=AUTO)
+        setTimeout(() => socket.destroy(), 20);
+      });
+    });
+  });
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+    await cas.connect();
+    assert.equal(cas.isConnected, true);
+
+    // Wait for server to close the socket
+    await new Promise((r) => setTimeout(r, 100));
+
+    // send() should reject because socket is dead
+    await assert.rejects(
+      () => cas.send(Buffer.alloc(8), Buffer.from([0x01])),
+      (err: Error) => {
+        assert.match(err.message, /closed by the remote side/);
+        return true;
+      },
+    );
+
+    // close() should not throw
+    await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("CASConnection close does not crash when socket already dead", async () => {
+  const { server, port } = await createMockBroker((socket) => {
+    socket.once("data", () => {
+      const portBuf = Buffer.alloc(4);
+      portBuf.writeInt32BE(0, 0);
+      socket.write(portBuf);
+
+      socket.once("data", () => {
+        const body = buildOpenDbResponse(1);
+        socket.write(frameResponse(body));
+
+        // Broker closes socket immediately
+        setTimeout(() => socket.destroy(), 10);
+      });
+    });
+  });
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+    await cas.connect();
+
+    // Wait for broker to kill socket
+    await new Promise((r) => setTimeout(r, 80));
+
+    // close() must not throw even though socket is dead
+    await cas.close();
+    assert.equal(cas.isConnected, false);
+  } finally {
+    await closeServer(server);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // recvExact — buffered data path
 // ---------------------------------------------------------------------------

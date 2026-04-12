@@ -16,7 +16,6 @@ import {
   writeEndTran,
   writeConClose,
   interpolateParams,
-  type ColumnMeta,
   type PrepareAndExecuteResult,
 } from "../protocol/protocol.js";
 import { EndTranType, StatementType } from "../protocol/constants.js";
@@ -49,45 +48,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     params?: QueryParams,
   ): Promise<T[]> {
     try {
-      const cas = this.getOrCreateCAS();
-
-      if (!cas.isConnected) {
-        await cas.connect();
-      }
-
-      // Client-side parameter interpolation (CUBRID CAS doesn't reliably support bind params)
-      const resolvedSql = params && params.length > 0 ? interpolateParams(sql, params) : sql;
-
-      // Send PrepareAndExecute (FC=41)
-      const { header, payload } = writePrepareAndExecute(
-        resolvedSql,
-        this.autoCommit,
-        cas.casInfo,
-      );
-      const responsePayload = await cas.sendAndRecv(header, payload);
-
-      const result: PrepareAndExecuteResult = parsePrepareAndExecute(
-        responsePayload,
-        cas.protoVersion,
-      );
-
-      // For non-SELECT statements, close handle and return empty array
-      if (result.statementType !== StatementType.SELECT) {
-        await this.closeQueryHandle(cas, result.queryHandle);
-        return [] as unknown as T[];
-      }
-
-      // For SELECT: collect all rows via inline fetch + additional fetches
-      const allRows = [...result.rows];
-
-      if (result.totalTupleCount > allRows.length) {
-        await this.fetchRemaining(cas, result, allRows);
-      }
-
-      // Close the query handle
-      await this.closeQueryHandle(cas, result.queryHandle);
-
-      return allRows as T[];
+      return await this.executeQuery<T>(sql, params);
     } catch (error) {
       throw mapError("query", error, "Failed to execute CUBRID query.");
     }
@@ -153,7 +114,6 @@ export class NativeCubridAdapter implements DriverAdapter {
 
     try {
       if (cas.isConnected) {
-        // Best-effort: send CON_CLOSE before destroying socket
         try {
           const { header, payload } = writeConClose(cas.casInfo);
           await cas.send(header, payload);
@@ -168,9 +128,63 @@ export class NativeCubridAdapter implements DriverAdapter {
     }
   }
 
+  async ping(): Promise<string> {
+    try {
+      const cas = this.getOrCreateCAS();
+
+      if (!cas.isConnected) {
+        await cas.connect();
+      }
+
+      return await cas.ping();
+    } catch (error) {
+      throw mapError("connection", error, "Health check failed.");
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Internal helpers
   // ---------------------------------------------------------------------------
+
+  private async executeQuery<T extends QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<T[]> {
+    const cas = this.getOrCreateCAS();
+
+    if (!cas.isConnected) {
+      await cas.connect();
+    }
+
+    const resolvedSql = params && params.length > 0 ? interpolateParams(sql, params) : sql;
+
+    const { header, payload } = writePrepareAndExecute(
+      resolvedSql,
+      this.autoCommit,
+      cas.casInfo,
+    );
+    const responsePayload = await cas.sendAndRecv(header, payload);
+
+    const result: PrepareAndExecuteResult = parsePrepareAndExecute(
+      responsePayload,
+      cas.protoVersion,
+    );
+
+    if (result.statementType !== StatementType.SELECT) {
+      await this.closeQueryHandle(cas, result.queryHandle);
+      return [] as unknown as T[];
+    }
+
+    const allRows = [...result.rows];
+
+    if (result.totalTupleCount > allRows.length) {
+      await this.fetchRemaining(cas, result, allRows);
+    }
+
+    await this.closeQueryHandle(cas, result.queryHandle);
+
+    return allRows as T[];
+  }
 
   private getOrCreateCAS(): CASConnection {
     if (!this.cas) {

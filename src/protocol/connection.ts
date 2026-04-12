@@ -18,6 +18,8 @@ import {
   parseClientInfoExchange,
   writeOpenDatabase,
   parseOpenDatabase,
+  writeGetDbVersion,
+  parseGetDbVersion,
   type OpenDatabaseResult,
 } from "./protocol.js";
 
@@ -38,6 +40,7 @@ export interface CASConnectionConfig {
 export class CASConnection {
   private socket: Socket | null = null;
   private connected = false;
+  private socketDead = false;
   private _casInfo: Buffer = Buffer.alloc(SIZE_CAS_INFO);
   private _protoVersion = 1;
   private _sessionId = 0;
@@ -54,6 +57,8 @@ export class CASConnection {
     if (this.connected) {
       return;
     }
+
+    this.socketDead = false;
 
     // Step 1: Connect to broker and send ClientInfoExchange
     const brokerSocket = await this.createSocket(this.config.host, this.config.port);
@@ -113,6 +118,10 @@ export class CASConnection {
       throw new Error("CASConnection is not connected");
     }
 
+    if (this.socketDead) {
+      throw new Error("Socket has been closed by the remote side");
+    }
+
     const combined = Buffer.concat([header, payload]);
     await this.socketWrite(this.socket, combined);
   }
@@ -158,9 +167,21 @@ export class CASConnection {
     const socket = this.socket;
     this.socket = null;
     this.connected = false;
+    this.socketDead = false;
     this.receiveBuffer = Buffer.alloc(0);
 
+    socket.removeAllListeners();
     socket.destroy();
+  }
+
+  /**
+   * Send GET_DB_VERSION to verify the connection is alive.
+   * Returns the server version string on success, throws on failure.
+   */
+  async ping(): Promise<string> {
+    const { header, payload } = writeGetDbVersion(true, this._casInfo);
+    const response = await this.sendAndRecv(header, payload);
+    return parseGetDbVersion(response);
   }
 
   /** Current CAS_INFO bytes (echoed back to server on each request). */
@@ -210,6 +231,23 @@ export class CASConnection {
         socket.removeAllListeners("error");
         socket.removeAllListeners("timeout");
         socket.setTimeout(0); // Disable timeout after successful connect
+
+        // Track remote socket closure (broker may close after auto-commit)
+        socket.on("end", () => {
+          this.socketDead = true;
+        });
+
+        socket.on("close", () => {
+          this.socketDead = true;
+        });
+
+        // Absorb EPIPE / ECONNRESET from late writes to a dead socket.
+        // Without this handler Node.js treats the error event as unhandled
+        // and crashes the process.
+        socket.on("error", () => {
+          this.socketDead = true;
+        });
+
         resolve(socket);
       });
     });
