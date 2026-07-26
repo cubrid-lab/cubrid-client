@@ -146,8 +146,13 @@ export class CASConnection {
   /**
    * Send request and receive response in one call.
    * Strips the CAS_INFO from the response (first 4 bytes) and returns the payload.
+   *
+   * Before sending, checks CAS_INFO status and reconnects if the broker
+   * has released the CAS process — matching the official CUBRID JDBC
+   * driver's `UClientSideConnection.checkReconnect()`.
    */
   async sendAndRecv(header: Buffer, payload: Buffer): Promise<Buffer> {
+    await this.checkReconnect();
     await this.send(header, payload);
     const response = await this.recv();
 
@@ -175,6 +180,30 @@ export class CASConnection {
   }
 
   /**
+   * Reconnect to the broker when the CAS has been released.
+   *
+   * The CUBRID broker sets `CAS_INFO[0]` to `INACTIVE` (0) when the CAS
+   * process is no longer reserved for this client (`KEEP_CONNECTION=AUTO`).
+   * The official JDBC driver checks this before every request and
+   * transparently reconnects.
+   */
+  private async checkReconnect(): Promise<void> {
+    if (!this.connected || !this.socket) {
+      return;
+    }
+
+    if (this._casInfo[0] === CASConnection.CAS_INFO_STATUS_INACTIVE) {
+      this.socket.destroy();
+      this.socket = null;
+      this.connected = false;
+      this.receiveBuffer = Buffer.alloc(0);
+      await this.connect();
+    }
+  }
+
+  private static readonly CAS_INFO_STATUS_INACTIVE = 0;
+
+  /**
    * Send GET_DB_VERSION to verify the connection is alive.
    * Returns the server version string on success, throws on failure.
    */
@@ -183,7 +212,6 @@ export class CASConnection {
     const response = await this.sendAndRecv(header, payload);
     return parseGetDbVersion(response);
   }
-
   /** Current CAS_INFO bytes (echoed back to server on each request). */
   get casInfo(): Buffer {
     return this._casInfo;
