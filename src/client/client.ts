@@ -93,6 +93,18 @@ export class CubridClient implements Queryable {
     }
   }
 
+  async ping(): Promise<string> {
+    try {
+      const connection = await this.getSharedConnection();
+      if (connection.ping) {
+        return await connection.ping();
+      }
+      throw new Error("Underlying connection does not support ping.");
+    } catch (error) {
+      throw mapError("connection", error, "Health check failed.");
+    }
+  }
+
   private getSharedConnection(): Promise<ConnectionLike> {
     if (!this.sharedConnectionPromise) {
       this.sharedConnectionPromise = Promise.resolve(

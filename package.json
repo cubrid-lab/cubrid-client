@@ -3,6 +3,11 @@
   "version": "1.1.0",
   "description": "Modern TypeScript-first client for CUBRID.",
   "license": "MIT",
+  "author": "Gyeongjun Paik <paikend@gmail.com>",
+  "contributors": [
+    { "name": "Gyeongjun Paik", "email": "paikend@gmail.com" },
+    { "name": "Yeongseon Choe", "email": "yeongseon.choe@gmail.com" }
+  ],
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -47,10 +52,10 @@
     "url": "https://github.com/cubrid-labs/cubrid-client/issues"
   },
   "devDependencies": {
-    "@types/node": "^25.5.0",
+    "@types/node": "^26.0.0",
     "c8": "^11.0.0",
     "tsup": "^8.3.5",
     "tsx": "^4.20.3",
-    "typescript": "^5.8.2"
+    "typescript": "^6.0.3"
   }
 }

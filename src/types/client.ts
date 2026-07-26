@@ -48,6 +48,7 @@ export interface ConnectionLike {
   commit(): Promise<void>;
   rollback(): Promise<void>;
   close(): Promise<void>;
+  ping?(): Promise<string>;
 }
 
 export type ConnectionFactory = (

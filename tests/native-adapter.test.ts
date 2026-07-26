@@ -993,3 +993,51 @@ test("NativeCubridAdapter query wraps connect failure as QueryError", async () =
     },
   );
 });
+
+// ---------------------------------------------------------------------------
+// ping()
+// ---------------------------------------------------------------------------
+
+test("NativeCubridAdapter ping delegates to CAS.ping", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+
+  let pingCalled = false;
+  (fakeCAS as FakeCASConnection & { ping: () => Promise<string> }).ping = async () => {
+    pingCalled = true;
+    return "11.2.9.0866";
+  };
+
+  const version = await adapter.ping();
+  assert.equal(version, "11.2.9.0866");
+  assert.ok(pingCalled);
+});
+
+test("NativeCubridAdapter ping auto-connects if not connected", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS._isConnected = false;
+
+  (fakeCAS as FakeCASConnection & { ping: () => Promise<string> }).ping = async () => {
+    return "11.2";
+  };
+
+  const version = await adapter.ping();
+  assert.equal(version, "11.2");
+  assert.equal(fakeCAS.connectCalls, 1);
+});
+
+test("NativeCubridAdapter ping wraps error as ConnectionError", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+
+  (fakeCAS as FakeCASConnection & { ping: () => Promise<string> }).ping = async () => {
+    throw new Error("ping failed");
+  };
+
+  await assert.rejects(
+    () => adapter.ping(),
+    (err: Error) => {
+      assert.ok(err instanceof ConnectionError);
+      assert.match(err.message, /Health check failed/);
+      return true;
+    },
+  );
+});
