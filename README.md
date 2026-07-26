@@ -5,10 +5,10 @@
 <!-- BADGES:START -->
 [![npm version](https://img.shields.io/npm/v/cubrid-client)](https://www.npmjs.com/package/cubrid-client)
 [![node version](https://img.shields.io/node/v/cubrid-client)](https://nodejs.org)
-[![ci workflow](https://github.com/cubrid-labs/cubrid-client/actions/workflows/ci.yml/badge.svg)](https://github.com/cubrid-labs/cubrid-client/actions/workflows/ci.yml)
-[![coverage](https://codecov.io/gh/cubrid-labs/cubrid-client/branch/main/graph/badge.svg)](https://codecov.io/gh/cubrid-labs/cubrid-client)
-[![license](https://img.shields.io/github/license/cubrid-labs/cubrid-client)](https://github.com/cubrid-labs/cubrid-client/blob/main/LICENSE)
-[![GitHub stars](https://img.shields.io/github/stars/cubrid-labs/cubrid-client)](https://github.com/cubrid-labs/cubrid-client)
+[![ci workflow](https://github.com/cubrid-lab/cubrid-client/actions/workflows/ci.yml/badge.svg)](https://github.com/cubrid-lab/cubrid-client/actions/workflows/ci.yml)
+[![coverage](https://codecov.io/gh/cubrid-lab/cubrid-client/branch/main/graph/badge.svg)](https://codecov.io/gh/cubrid-lab/cubrid-client)
+[![license](https://img.shields.io/github/license/cubrid-lab/cubrid-client)](https://github.com/cubrid-lab/cubrid-client/blob/main/LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/cubrid-lab/cubrid-client)](https://github.com/cubrid-lab/cubrid-client)
 <!-- BADGES:END -->
 
 ## Why cubrid-client?
