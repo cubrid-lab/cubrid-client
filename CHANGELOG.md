@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **Data corruption in parameterized queries** (P0): string parameters were always escaped using MySQL-style backslash rules (`\` → `\\`, `\n` → `\\n`, etc.), which corrupts data on CUBRID servers where `no_backslash_escapes=yes` (the CUBRID default) — a backslash there is a literal character, so it was being wrongly doubled. The client now probes the server (`SELECT CHAR_LENGTH('\')`) once per physical connection and pins the correct escaping mode, re-negotiating after reconnect. In literal mode only the single quote is doubled; in escape mode backslashes and CR/LF are escaped as well. String parameters containing NUL (`0x00`) or Ctrl-Z (`0x1A`) are now rejected with a `QueryError` (use a `Buffer` for binary data).
 
+### Changed
+- CI now runs the integration test file (`tests/integration.test.ts`) and emits a visible warning annotation when no live CUBRID server is available, instead of silently omitting integration coverage. Documented the real `npm run test:integration` workflow (no `docker compose` file is shipped).
+
 ## [0.3.0] - 2026-03-13
 
 ### Added
