@@ -9,6 +9,11 @@ updates:
     labels:
       - "dependencies"
     open-pull-requests-limit: 10
+    # TypeScript 6.x breaks @types/node global resolution with this tsconfig
+    # (moduleResolution: bundler). Hold on 5.x until TS6/TS7 tooling is verified.
+    ignore:
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
