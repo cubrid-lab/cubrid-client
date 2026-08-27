@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **TLS/SSL support** (P1): opt-in client-side TLS for connecting to SSL-enabled CUBRID brokers (`SSL=ON`). Set `ssl: true` on `createClient` for default certificate verification, or pass a `ClientSSLOptions` object (`rejectUnauthorized`, `ca`, `servername`) for self-signed / private-CA certificates. The client performs a STARTTLS-style upgrade on the same broker port: it sends the SSL client magic (`CUBRS`), reads the CAS `NO_ERROR` acknowledgement, then upgrades the socket to TLS (minimum TLS 1.2, `rejectUnauthorized: true` by default) before the database login. The plaintext path is unchanged when `ssl` is omitted. Live `SSL=ON` broker validation is the deferred release gate.
+
+
 ### Fixed
 - **Data corruption in parameterized queries** (P0): string parameters were always escaped using MySQL-style backslash rules (`\` → `\\`, `\n` → `\\n`, etc.), which corrupts data on CUBRID servers where `no_backslash_escapes=yes` (the CUBRID default) — a backslash there is a literal character, so it was being wrongly doubled. The client now probes the server (`SELECT CHAR_LENGTH('\')`) once per physical connection and pins the correct escaping mode, re-negotiating after reconnect. In literal mode only the single quote is doubled; in escape mode backslashes and CR/LF are escaped as well. String parameters containing NUL (`0x00`) or Ctrl-Z (`0x1A`) are now rejected with a `QueryError` (use a `Buffer` for binary data).
 
