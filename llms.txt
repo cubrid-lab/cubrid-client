@@ -16,24 +16,24 @@ Key facts:
 
 ## Docs
 
-- [README](https://github.com/cubrid-labs/cubrid-client/blob/main/README.md): Full API documentation, quick start, typed queries, transactions
-- [Product Requirements](https://github.com/cubrid-labs/cubrid-client/blob/main/PRD.md): Product requirements document with Example-first Design Philosophy
+- [README](https://github.com/cubrid-lab/cubrid-client/blob/main/README.md): Full API documentation, quick start, typed queries, transactions
+- [Product Requirements](https://github.com/cubrid-lab/cubrid-client/blob/main/PRD.md): Product requirements document with Example-first Design Philosophy
 
 ## Examples
 
-- [Quick Start](https://github.com/cubrid-labs/cubrid-client/blob/main/README.md#quick-start): Basic connection and query
-- [Typed Queries](https://github.com/cubrid-labs/cubrid-client/blob/main/README.md#typed-queries): Generic type parameter for query results
-- [Transactions](https://github.com/cubrid-labs/cubrid-client/blob/main/README.md#transactions): Isolated transactional connections with auto-rollback
-- [CUBRID Cookbook — cubrid-client](https://github.com/cubrid-labs/cubrid-cookbook/tree/main/node/cubrid): Production-ready examples — connect, CRUD, transactions
+- [Quick Start](https://github.com/cubrid-lab/cubrid-client/blob/main/README.md#quick-start): Basic connection and query
+- [Typed Queries](https://github.com/cubrid-lab/cubrid-client/blob/main/README.md#typed-queries): Generic type parameter for query results
+- [Transactions](https://github.com/cubrid-lab/cubrid-client/blob/main/README.md#transactions): Isolated transactional connections with auto-rollback
+- [CUBRID Cookbook — cubrid-client](https://github.com/cubrid-lab/cubrid-cookbook/tree/main/node/cubrid): Production-ready examples — connect, CRUD, transactions
 
 ## API Reference
 
-- [Source — create-client.ts](https://github.com/cubrid-labs/cubrid-client/blob/main/src/client/create-client.ts): Client factory function
-- [Source — client.ts](https://github.com/cubrid-labs/cubrid-client/blob/main/src/client/client.ts): Client class with query and close methods
-- [Source — transaction.ts](https://github.com/cubrid-labs/cubrid-client/blob/main/src/client/transaction.ts): Transaction implementation
+- [Source — create-client.ts](https://github.com/cubrid-lab/cubrid-client/blob/main/src/client/create-client.ts): Client factory function
+- [Source — client.ts](https://github.com/cubrid-lab/cubrid-client/blob/main/src/client/client.ts): Client class with query and close methods
+- [Source — transaction.ts](https://github.com/cubrid-lab/cubrid-client/blob/main/src/client/transaction.ts): Transaction implementation
 
 ## Ecosystem
 
-- [drizzle-cubrid](https://github.com/cubrid-labs/drizzle-cubrid): Drizzle ORM dialect for CUBRID (uses cubrid-client as driver)
-- [cubrid-cookbook](https://github.com/cubrid-labs/cubrid-cookbook): Production-ready examples across Python, Node.js, and Go
+- [drizzle-cubrid](https://github.com/cubrid-lab/drizzle-cubrid): Drizzle ORM dialect for CUBRID (uses cubrid-client as driver)
+- [cubrid-cookbook](https://github.com/cubrid-lab/cubrid-cookbook): Production-ready examples across Python, Node.js, and Go
 - [CUBRID](https://www.cubrid.org/): The CUBRID database
