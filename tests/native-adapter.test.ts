@@ -33,6 +33,10 @@ function createAdapterWithFakeCAS(
   // Inject fake CAS into the private field
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (adapter as any).cas = fakeCAS;
+  // Pre-set the negotiated backslash mode so param tests skip the probe query.
+  // Dedicated tests below exercise negotiation explicitly.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (adapter as any).noBackslashEscapes = true;
 
   return { adapter, fakeCAS };
 }
@@ -517,6 +521,61 @@ test("NativeCubridAdapter query SELECT with NULL values", async () => {
   const rows = await adapter.query("SELECT val FROM t");
   assert.equal(rows.length, 1);
   assert.equal(rows[0]!.val, null);
+});
+
+// ---------------------------------------------------------------------------
+// Backslash-escape mode negotiation (P0)
+// ---------------------------------------------------------------------------
+
+function queueProbeResponse(fakeCAS: FakeCASConnection, charLength: string): void {
+  fakeCAS.queueResponse(
+    buildSelectResponse([{ name: "char_length", type: 2 }], [[charLength]]),
+  );
+  fakeCAS.queueResponse(buildSimpleResponse(0)); // CloseReqHandle after probe
+}
+
+test("negotiateBackslashEscapes: probe result 2 -> literal mode (true)", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  queueProbeResponse(fakeCAS, "2");
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const mode = await (adapter as any).negotiateBackslashEscapes(fakeCAS);
+  assert.equal(mode, true);
+});
+
+test("negotiateBackslashEscapes: probe result 1 -> escape mode (false)", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  queueProbeResponse(fakeCAS, "1");
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const mode = await (adapter as any).negotiateBackslashEscapes(fakeCAS);
+  assert.equal(mode, false);
+});
+
+test("negotiateBackslashEscapes: unexpected probe result is rejected, not guessed", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  queueProbeResponse(fakeCAS, "3");
+  await assert.rejects(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    () => (adapter as any).negotiateBackslashEscapes(fakeCAS),
+    /backslash-escaping mode/,
+  );
+});
+
+test("ensureBackslashMode negotiates once and caches the result", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (adapter as any).noBackslashEscapes = null; // undo harness pre-set
+  queueProbeResponse(fakeCAS, "2");
+  const before = fakeCAS.sendAndRecvCalls;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const first = await (adapter as any).ensureBackslashMode(fakeCAS);
+  const afterFirst = fakeCAS.sendAndRecvCalls;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const second = await (adapter as any).ensureBackslashMode(fakeCAS);
+  const afterSecond = fakeCAS.sendAndRecvCalls;
+  assert.equal(first, true);
+  assert.equal(second, true);
+  assert.ok(afterFirst > before, "probe should run on first call");
+  assert.equal(afterSecond, afterFirst, "probe should not run again (cached)");
 });
 
 // ---------------------------------------------------------------------------

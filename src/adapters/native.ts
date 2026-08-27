@@ -30,6 +30,13 @@ const DEFAULT_FETCH_SIZE = 100;
 export class NativeCubridAdapter implements DriverAdapter {
   private cas: CASConnection | null = null;
   private autoCommit = true;
+  /**
+   * Server backslash-escaping mode, negotiated once per physical connection via
+   * `SELECT CHAR_LENGTH('\\')`. `null` until negotiated. `true` means the CUBRID
+   * default `no_backslash_escapes=yes` (backslash is a literal char); `false`
+   * means backslash-escape processing is active. See `negotiateBackslashEscapes`.
+   */
+  private noBackslashEscapes: boolean | null = null;
 
   constructor(private readonly config: ClientConfig) {}
 
@@ -111,6 +118,7 @@ export class NativeCubridAdapter implements DriverAdapter {
 
     const cas = this.cas;
     this.cas = null;
+    this.noBackslashEscapes = null;
 
     try {
       if (cas.isConnected) {
@@ -156,7 +164,10 @@ export class NativeCubridAdapter implements DriverAdapter {
       await cas.connect();
     }
 
-    const resolvedSql = params && params.length > 0 ? interpolateParams(sql, params) : sql;
+    const resolvedSql =
+      params && params.length > 0
+        ? interpolateParams(sql, params, await this.ensureBackslashMode(cas))
+        : sql;
 
     const { header, payload } = writePrepareAndExecute(
       resolvedSql,
@@ -202,6 +213,58 @@ export class NativeCubridAdapter implements DriverAdapter {
     }
 
     return this.cas;
+  }
+
+  /**
+   * Return the negotiated backslash-escaping mode for the current connection,
+   * running the one-time probe on first use.
+   */
+  private async ensureBackslashMode(cas: CASConnection): Promise<boolean> {
+    if (this.noBackslashEscapes === null) {
+      this.noBackslashEscapes = await this.negotiateBackslashEscapes(cas);
+    }
+    return this.noBackslashEscapes;
+  }
+
+  /**
+   * Probe the live server to determine whether backslash-escape processing is
+   * active, mirroring the CUBRID JDBC/pycubrid strategy.
+   *
+   * Sends `SELECT CHAR_LENGTH('\\')` (a literal two-backslash string):
+   *   - result `2` -> backslash is a literal character
+   *     (`no_backslash_escapes=yes`, the CUBRID default) -> returns `true`.
+   *   - result `1` -> backslash-escape processing is on -> returns `false`.
+   *
+   * Any other result is treated as unknown and rejected rather than guessed,
+   * because guessing wrong silently corrupts every string parameter.
+   */
+  private async negotiateBackslashEscapes(cas: CASConnection): Promise<boolean> {
+    const { header, payload } = writePrepareAndExecute(
+      "SELECT CHAR_LENGTH('\\\\')",
+      this.autoCommit,
+      cas.casInfo,
+    );
+    const responsePayload = await cas.sendAndRecv(header, payload);
+    const result = parsePrepareAndExecute(responsePayload, cas.protoVersion);
+
+    try {
+      const firstRow = result.rows[0];
+      const length = firstRow ? Number(Object.values(firstRow)[0]) : NaN;
+
+      if (length === 2) {
+        return true;
+      }
+      if (length === 1) {
+        return false;
+      }
+      throw new Error(
+        `Unable to determine CUBRID backslash-escaping mode: CHAR_LENGTH probe ` +
+          `returned ${String(length)} (expected 1 or 2). Refusing to guess, as an ` +
+          `incorrect mode silently corrupts string parameters.`,
+      );
+    } finally {
+      await this.closeQueryHandle(cas, result.queryHandle);
+    }
   }
 
   private async fetchRemaining(

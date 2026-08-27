@@ -815,71 +815,88 @@ test("encodeBindParams encodes multiple params sequentially", () => {
 // ---------------------------------------------------------------------------
 
 test("interpolateParams replaces ? with formatted values", () => {
-  const result = interpolateParams("SELECT * FROM t WHERE id = ? AND name = ?", [42, "Alice"]);
+  const result = interpolateParams(
+    "SELECT * FROM t WHERE id = ? AND name = ?",
+    [42, "Alice"],
+    true,
+  );
   assert.equal(result, "SELECT * FROM t WHERE id = 42 AND name = 'Alice'");
 });
 
 test("interpolateParams handles null", () => {
-  const result = interpolateParams("INSERT INTO t (v) VALUES (?)", [null]);
+  const result = interpolateParams("INSERT INTO t (v) VALUES (?)", [null], true);
   assert.equal(result, "INSERT INTO t (v) VALUES (NULL)");
 });
 
 test("interpolateParams handles boolean", () => {
-  const result = interpolateParams("SELECT ? AS val", [true]);
+  const result = interpolateParams("SELECT ? AS val", [true], true);
   assert.equal(result, "SELECT 1 AS val");
 });
 
 test("interpolateParams handles bigint", () => {
-  const result = interpolateParams("SELECT ?", [9876543210n]);
+  const result = interpolateParams("SELECT ?", [9876543210n], true);
   assert.equal(result, "SELECT 9876543210");
 });
 
 test("interpolateParams handles Date", () => {
   const d = new Date(Date.UTC(2025, 2, 14, 10, 30, 45, 123));
-  const result = interpolateParams("SELECT ?", [d]);
+  const result = interpolateParams("SELECT ?", [d], true);
   assert.ok(result.includes("DATETIME'2025-03-14 10:30:45.123'"));
 });
 
 test("interpolateParams handles Buffer", () => {
-  const result = interpolateParams("SELECT ?", [Buffer.from([0xAA, 0xBB])]);
+  const result = interpolateParams("SELECT ?", [Buffer.from([0xAA, 0xBB])], true);
   assert.equal(result, "SELECT X'aabb'");
 });
 
 test("interpolateParams preserves strings inside single quotes", () => {
-  const result = interpolateParams("SELECT * FROM t WHERE name = '?' AND id = ?", [42]);
+  const result = interpolateParams("SELECT * FROM t WHERE name = '?' AND id = ?", [42], true);
   assert.equal(result, "SELECT * FROM t WHERE name = '?' AND id = 42");
 });
 
 test("interpolateParams skips ? inside block comments", () => {
-  const result = interpolateParams("SELECT 1 /* ? */ WHERE id = ?", [7]);
+  const result = interpolateParams("SELECT 1 /* ? */ WHERE id = ?", [7], true);
   assert.equal(result, "SELECT 1 /* ? */ WHERE id = 7");
 });
 
 test("interpolateParams skips ? inside line comments", () => {
-  const result = interpolateParams("SELECT 1 -- ?\nWHERE id = ?", [7]);
+  const result = interpolateParams("SELECT 1 -- ?\nWHERE id = ?", [7], true);
   assert.equal(result, "SELECT 1 -- ?\nWHERE id = 7");
 });
 
 test("interpolateParams preserves strings inside double quotes", () => {
-  const result = interpolateParams('SELECT * FROM t WHERE "col?" = ?', [42]);
+  const result = interpolateParams('SELECT * FROM t WHERE "col?" = ?', [42], true);
   assert.equal(result, 'SELECT * FROM t WHERE "col?" = 42');
 });
 
 test("interpolateParams handles escaped quotes", () => {
-  const result = interpolateParams("SELECT * FROM t WHERE name = 'O''Brien' AND id = ?", [1]);
+  const result = interpolateParams("SELECT * FROM t WHERE name = 'O''Brien' AND id = ?", [1], true);
   assert.equal(result, "SELECT * FROM t WHERE name = 'O''Brien' AND id = 1");
 });
 
 test("interpolateParams throws on insufficient params", () => {
   assert.throws(
-    () => interpolateParams("SELECT ?, ?", [1]),
+    () => interpolateParams("SELECT ?, ?", [1], true),
     (err: Error) => err.message.includes("Not enough parameters"),
   );
 });
 
 test("interpolateParams handles no params in SQL", () => {
-  const result = interpolateParams("SELECT 1", []);
+  const result = interpolateParams("SELECT 1", [], true);
   assert.equal(result, "SELECT 1");
+});
+
+test("interpolateParams is backslash-mode aware for string params", () => {
+  // Literal mode (CUBRID default): backslash preserved verbatim.
+  assert.equal(
+    interpolateParams("SELECT ?", ["C:\\temp"], true),
+    "SELECT 'C:\\temp'",
+  );
+  // Escape mode: backslash doubled.
+  assert.equal(
+    interpolateParams("SELECT ?", ["C:\\temp"], false),
+    "SELECT 'C:\\\\temp'",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -887,36 +904,52 @@ test("interpolateParams handles no params in SQL", () => {
 // ---------------------------------------------------------------------------
 
 test("formatValue formats null and undefined", () => {
-  assert.equal(formatValue(null), "NULL");
-  assert.equal(formatValue(undefined), "NULL");
+  assert.equal(formatValue(null, true), "NULL");
+  assert.equal(formatValue(undefined, true), "NULL");
 });
 
 test("formatValue formats boolean", () => {
-  assert.equal(formatValue(true), "1");
-  assert.equal(formatValue(false), "0");
+  assert.equal(formatValue(true, true), "1");
+  assert.equal(formatValue(false, true), "0");
 });
 
 test("formatValue formats number", () => {
-  assert.equal(formatValue(42), "42");
-  assert.equal(formatValue(3.14), "3.14");
+  assert.equal(formatValue(42, true), "42");
+  assert.equal(formatValue(3.14, true), "3.14");
 });
 
 test("formatValue formats bigint", () => {
-  assert.equal(formatValue(9876543210n), "9876543210");
+  assert.equal(formatValue(9876543210n, true), "9876543210");
 });
 
-test("formatValue escapes string", () => {
-  assert.equal(formatValue("hello"), "'hello'");
-  assert.equal(formatValue("it's"), "'it''s'");
-  assert.equal(formatValue("back\\slash"), "'back\\\\slash'");
-  assert.equal(formatValue("new\nline"), "'new\\nline'");
-  assert.equal(formatValue("return\rcar"), "'return\\rcar'");
-  assert.equal(formatValue("null\0byte"), "'null\\0byte'");
+test("formatValue escapes string in literal mode (no_backslash_escapes=yes)", () => {
+  // CUBRID default: only the single quote is special; backslash is literal.
+  assert.equal(formatValue("hello", true), "'hello'");
+  assert.equal(formatValue("it's", true), "'it''s'");
+  assert.equal(formatValue("back\\slash", true), "'back\\slash'");
+  assert.equal(formatValue("new\nline", true), "'new\nline'");
+  assert.equal(formatValue("return\rcar", true), "'return\rcar'");
+});
+
+test("formatValue escapes string in escape mode (no_backslash_escapes=no)", () => {
+  assert.equal(formatValue("hello", false), "'hello'");
+  assert.equal(formatValue("it's", false), "'it''s'");
+  assert.equal(formatValue("back\\slash", false), "'back\\\\slash'");
+  // Backslash prepended before the literal newline / carriage return.
+  assert.equal(formatValue("new\nline", false), "'new\\\nline'");
+  assert.equal(formatValue("return\rcar", false), "'return\\\rcar'");
+});
+
+test("formatValue rejects NUL and Ctrl-Z bytes in both modes", () => {
+  for (const mode of [true, false]) {
+    assert.throws(() => formatValue("null\0byte", mode), /null byte/);
+    assert.throws(() => formatValue("ctrlz\x1abyte", mode), /Ctrl-Z/);
+  }
 });
 
 test("formatValue formats Date", () => {
   const d = new Date(Date.UTC(2025, 0, 1, 0, 0, 0, 0));
-  assert.equal(formatValue(d), "DATETIME'2025-01-01 00:00:00.000'");
+  assert.equal(formatValue(d, true), "DATETIME'2025-01-01 00:00:00.000'");
 });
 
 test("formatValue formats Date using UTC getters", () => {
@@ -979,15 +1012,15 @@ test("formatValue formats Date using UTC getters", () => {
   }
 
   const d = new FakeDate("2025-03-14T10:30:45.123Z");
-  assert.equal(formatValue(d), "DATETIME'2025-03-14 10:30:45.123'");
+  assert.equal(formatValue(d, true), "DATETIME'2025-03-14 10:30:45.123'");
 });
 
 test("formatValue formats Buffer", () => {
-  assert.equal(formatValue(Buffer.from([0xDE, 0xAD])), "X'dead'");
+  assert.equal(formatValue(Buffer.from([0xDE, 0xAD]), true), "X'dead'");
 });
 
 test("formatValue stringifies unknown types", () => {
-  assert.equal(formatValue({ toString: () => "custom" }), "'custom'");
+  assert.equal(formatValue({ toString: () => "custom" }, true), "'custom'");
 });
 
 // ---------------------------------------------------------------------------
