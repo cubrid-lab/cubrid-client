@@ -12,6 +12,14 @@
 /** Magic string sent during broker handshake. */
 export const CAS_MAGIC = "CUBRK";
 
+/**
+ * Magic string sent during broker handshake when TLS is requested.
+ * The server detects SSL clients via `IS_SSL_CLIENT` (strncmp == "CUBRS").
+ * Verified against CUBRID source: src/broker/cas_protocol.h
+ *   SRV_CON_CLIENT_MAGIC_STR_SSL "CUBRS".
+ */
+export const CAS_MAGIC_SSL = "CUBRS";
+
 /** Client type identifier — JDBC-compatible client. */
 export const CLIENT_JDBC = 3;
 

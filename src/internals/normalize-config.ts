@@ -9,6 +9,7 @@ export function normalizeConfig(options: ClientOptions): ClientConfig {
     password: options.password ?? "",
     connectionTimeout: options.connectionTimeout,
     maxConnectionRetryCount: options.maxConnectionRetryCount,
+    ssl: options.ssl,
     logger: options.logger,
   };
 }

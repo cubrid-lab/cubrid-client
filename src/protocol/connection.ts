@@ -11,6 +11,7 @@
  */
 
 import { Socket } from "node:net";
+import { connect as tlsConnect, type TLSSocket } from "node:tls";
 import { SIZE_CAS_INFO, SIZE_DATA_LENGTH } from "./constants.js";
 import { parseConnectionString } from "../utils/connection-string.js";
 import {
@@ -30,6 +31,26 @@ export interface CASConnectionConfig {
   user: string;
   password: string;
   connectionTimeout?: number;
+  /**
+   * Enable TLS/SSL for the connection. Requires the CUBRID broker to be
+   * configured with `SSL=ON` in `cubrid_broker.conf`. When enabled the client
+   * sends the SSL magic ("CUBRS") and upgrades the CAS socket to TLS
+   * (STARTTLS-style) after the broker redirect, before OpenDatabase.
+   * Default: false.
+   */
+  ssl?: boolean;
+  /**
+   * Reject connections whose server certificate cannot be verified against the
+   * trusted CA set. Default: true (secure by default). CUBRID ships a
+   * self-signed server certificate by default, so verification will fail unless
+   * you supply `ca`. Setting this to false disables verification and is
+   * intended for development/testing only.
+   */
+  rejectUnauthorized?: boolean;
+  /** PEM CA certificate(s) used to verify the server certificate. */
+  ca?: string | Buffer;
+  /** Server name for SNI and certificate hostname verification. */
+  servername?: string;
 }
 
 /**
@@ -38,7 +59,7 @@ export interface CASConnectionConfig {
  * Manages socket lifecycle, the two-step handshake, and framed binary I/O.
  */
 export class CASConnection {
-  private socket: Socket | null = null;
+  private socket: Socket | TLSSocket | null = null;
   private connected = false;
   private socketDead = false;
   private _casInfo: Buffer = Buffer.alloc(SIZE_CAS_INFO);
@@ -64,7 +85,7 @@ export class CASConnection {
     const brokerSocket = await this.createSocket(this.config.host, this.config.port);
 
     try {
-      await this.socketWrite(brokerSocket, writeClientInfoExchange());
+      await this.socketWrite(brokerSocket, writeClientInfoExchange(this.config.ssl));
 
       // Step 2: Receive redirect port (4 bytes)
       const portData = await this.recvExact(brokerSocket, SIZE_DATA_LENGTH);
@@ -81,6 +102,15 @@ export class CASConnection {
         this.socket = await this.createSocket(this.config.host, newPort);
       } else {
         this.socket = brokerSocket;
+      }
+
+      // Step 3.5 (SSL only): STARTTLS-style upgrade on the resolved CAS socket.
+      // Per CUBRID source (src/broker/cas_common_main.c) the CAS sends a
+      // plaintext 4-byte NO_ERROR int, then runs SSL_accept, then reads the
+      // OpenDatabase credentials over TLS. This step is SSL-only; the non-SSL
+      // path is intentionally left byte-for-byte unchanged.
+      if (this.config.ssl) {
+        this.socket = await this.upgradeToTls(this.socket);
       }
 
       // Step 4: Send OpenDatabase (628 bytes, unframed)
@@ -280,6 +310,85 @@ export class CASConnection {
       });
     });
   }
+
+  /**
+   * Upgrade a plaintext CAS socket to TLS (STARTTLS-style), used only when
+   * `config.ssl` is enabled.
+   *
+   * Ordering is dictated by the CUBRID CAS server
+   * (src/broker/cas_common_main.c, non-Windows path):
+   *   1. server sends a plaintext 4-byte NO_ERROR int  (net_write_int(fd, 0))
+   *   2. server runs SSL_accept                          (cas_init_ssl)
+   *   3. server reads the OpenDatabase credentials over TLS
+   *
+   * So the client reads exactly the 4-byte NO_ERROR on the plaintext socket,
+   * then performs the TLS handshake, then sends OpenDatabase over TLS.
+   *
+   * NOTE (live-validation gate): the exact plaintext->TLS byte boundary must be
+   * verified against a live `SSL=ON` broker. The non-SSL path does not read this
+   * int, so it is read here only in SSL mode.
+   */
+  private async upgradeToTls(rawSocket: Socket): Promise<TLSSocket> {
+    // Step A: consume exactly the 4-byte plaintext NO_ERROR response.
+    const noErrorBuf = await this.recvExact(rawSocket, SIZE_DATA_LENGTH);
+    const code = noErrorBuf.readInt32BE(0);
+    if (code !== 0) {
+      rawSocket.destroy();
+      throw new Error(
+        `CUBRID broker rejected TLS handshake (code: ${code}). ` +
+          `Verify the broker is configured with SSL=ON.`,
+      );
+    }
+
+    // Step B: guarantee a clean boundary before wrapping with TLS. Any bytes
+    // buffered past the 4-byte NO_ERROR must be pushed back onto the raw socket
+    // so tls.connect() sees them as the start of the TLS stream. Over-read is
+    // unlikely (the server cannot send ServerHello before our ClientHello) but
+    // is guarded defensively.
+    if (this.receiveBuffer.length > 0) {
+      const leftover = this.receiveBuffer;
+      this.receiveBuffer = Buffer.alloc(0);
+      rawSocket.unshift(leftover);
+    }
+
+    // Step C: wrap the raw socket in TLS and wait for the handshake.
+    return new Promise<TLSSocket>((resolve, reject) => {
+      const tlsSocket = tlsConnect({
+        socket: rawSocket,
+        rejectUnauthorized: this.config.rejectUnauthorized ?? true,
+        ca: this.config.ca,
+        servername: this.config.servername,
+        minVersion: "TLSv1.2",
+      });
+
+      const onError = (err: Error): void => {
+        tlsSocket.removeListener("secureConnect", onSecure);
+        tlsSocket.destroy();
+        reject(new Error(`TLS handshake failed: ${err.message}`));
+      };
+
+      const onSecure = (): void => {
+        tlsSocket.removeListener("error", onError);
+
+        // Re-wire dead-socket tracking onto the TLS socket.
+        tlsSocket.on("end", () => {
+          this.socketDead = true;
+        });
+        tlsSocket.on("close", () => {
+          this.socketDead = true;
+        });
+        tlsSocket.on("error", () => {
+          this.socketDead = true;
+        });
+
+        resolve(tlsSocket);
+      };
+
+      tlsSocket.once("error", onError);
+      tlsSocket.once("secureConnect", onSecure);
+    });
+  }
+
 
   private socketWrite(socket: Socket, data: Buffer): Promise<void> {
     return new Promise<void>((resolve, reject) => {

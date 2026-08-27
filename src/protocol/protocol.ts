@@ -14,6 +14,7 @@ import { PacketWriter } from "./packet-writer.js";
 import {
   CASFunctionCode,
   CAS_MAGIC,
+  CAS_MAGIC_SSL,
   CAS_PROTOCOL_VERSION,
   CAS_VERSION,
   CLIENT_JDBC,
@@ -60,10 +61,13 @@ export interface ColumnMeta {
 /**
  * Build ClientInfoExchange packet (10 bytes, unframed).
  * Sent to broker to initiate connection.
+ *
+ * When `useSsl` is true the SSL magic ("CUBRS") is emitted instead of the
+ * normal magic ("CUBRK"), signaling the broker/CAS to expect a TLS upgrade.
  */
-export function writeClientInfoExchange(): Buffer {
+export function writeClientInfoExchange(useSsl = false): Buffer {
   const w = new PacketWriter(10);
-  const magic = Buffer.from(CAS_MAGIC, "ascii");
+  const magic = Buffer.from(useSsl ? CAS_MAGIC_SSL : CAS_MAGIC, "ascii");
   w.writeBytes(magic);
   w.writeByte(CLIENT_JDBC);
   w.writeByte(CAS_VERSION);

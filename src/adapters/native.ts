@@ -208,12 +208,37 @@ export class NativeCubridAdapter implements DriverAdapter {
         ...(this.config.connectionTimeout !== undefined && {
           connectionTimeout: this.config.connectionTimeout,
         }),
+        ...this.resolveSslConfig(),
       };
       this.cas = new CASConnection(casConfig);
     }
 
     return this.cas;
   }
+
+  /**
+   * Translate the public `ssl` option (boolean | ClientSSLOptions) into the flat
+   * TLS fields understood by CASConnectionConfig. Returns an empty object when
+   * SSL is disabled so the non-SSL path is untouched.
+   */
+  private resolveSslConfig(): Partial<CASConnectionConfig> {
+    const ssl = this.config.ssl;
+    if (!ssl) {
+      return {};
+    }
+    if (ssl === true) {
+      return { ssl: true };
+    }
+    return {
+      ssl: true,
+      ...(ssl.rejectUnauthorized !== undefined && {
+        rejectUnauthorized: ssl.rejectUnauthorized,
+      }),
+      ...(ssl.ca !== undefined && { ca: ssl.ca }),
+      ...(ssl.servername !== undefined && { servername: ssl.servername }),
+    };
+  }
+
 
   /**
    * Return the negotiated backslash-escaping mode for the current connection,
