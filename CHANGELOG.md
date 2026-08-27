@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - CI now runs the integration test file (`tests/integration.test.ts`) and emits a visible warning annotation when no live CUBRID server is available, instead of silently omitting integration coverage. Documented the real `npm run test:integration` workflow (no `docker compose` file is shipped).
+- Updated all repository references from the old `cubrid-labs` GitHub org to the canonical `cubrid-lab` org (`package.json` URLs, README, docs, workflows, issue templates).
+- Pinned `@types/node` to `^18.19.0` to match the declared `engines.node >= 18` floor (previously `^26.0.0`, which typed APIs unavailable on the minimum supported runtime).
+
+### Documentation
+- Documented that `Date` parameters are serialized in **UTC** (`DATETIME'...'` with millisecond precision), since CUBRID's `DATETIME` type is timezone-less.
 
 ## [0.3.0] - 2026-03-13
 

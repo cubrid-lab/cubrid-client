@@ -307,7 +307,7 @@ process.on("SIGTERM", async () => {
 
 ## Getting Help
 
-- [GitHub Issues](https://github.com/cubrid-labs/cubrid-client/issues) — Bug reports and feature requests
+- [GitHub Issues](https://github.com/cubrid-lab/cubrid-client/issues) — Bug reports and feature requests
 - [API Reference](./API_REFERENCE.md) — Full method signatures and types
 - [Connection Guide](./CONNECTION.md) — Connection configuration details
 - [CUBRID Documentation](https://www.cubrid.org/manual/) — Official CUBRID documentation
