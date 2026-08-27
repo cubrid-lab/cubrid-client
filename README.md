@@ -100,6 +100,26 @@ await db.query("INSERT INTO data (a, b, c, d, e, f, g) VALUES (?, ?, ?, ?, ?, ?,
 ]);
 ```
 
+### How parameters are escaped
+
+Parameters are rendered into the SQL text client-side, with escaping that is
+aware of the server's `no_backslash_escapes` setting. On first use, the client
+probes the server (`SELECT CHAR_LENGTH('\\')`) and pins the correct mode for
+the connection:
+
+- **`no_backslash_escapes=yes`** (the CUBRID default): the backslash is an
+  ordinary character. Only the single quote is doubled (`'` → `''`); backslashes,
+  newlines, and carriage returns are preserved verbatim. This means a Windows
+  path like `C:\temp\file.txt` round-trips unchanged.
+- **`no_backslash_escapes=no`**: backslash-escape processing is active, so
+  backslashes are doubled and `\r` / `\n` are backslash-escaped in addition to
+  doubling the single quote.
+
+> **Rejected bytes:** string parameters containing a NUL (`0x00`) or Ctrl-Z
+> (`0x1A`) byte are rejected with a `QueryError`, because CUBRID cannot store a
+> NUL in a string literal and defines no safe literal escape for `0x1A`. Encode
+> such values as binary using a `Buffer` parameter (rendered as `X'..'`) instead.
+
 ## Transactions
 
 ### Automatic (Recommended)

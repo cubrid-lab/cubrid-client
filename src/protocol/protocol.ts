@@ -503,7 +503,11 @@ function encodeOneParam(w: PacketWriter, value: unknown): void {
  * parameters for all drivers, so we use client-side interpolation
  * (same approach as cubrid-go and node-cubrid).
  */
-export function interpolateParams(sql: string, params: readonly unknown[]): string {
+export function interpolateParams(
+  sql: string,
+  params: readonly unknown[],
+  noBackslashEscapes: boolean,
+): string {
   let paramIndex = 0;
   let result = "";
   let inSingleQuotedString = false;
@@ -609,7 +613,7 @@ export function interpolateParams(sql: string, params: readonly unknown[]): stri
           `Not enough parameters: expected at least ${paramIndex + 1}, got ${params.length}`,
         );
       }
-      result += formatValue(params[paramIndex]!);
+      result += formatValue(params[paramIndex]!, noBackslashEscapes);
       paramIndex++;
       continue;
     }
@@ -623,7 +627,7 @@ export function interpolateParams(sql: string, params: readonly unknown[]): stri
 /**
  * Format a JavaScript value as a SQL literal.
  */
-export function formatValue(value: unknown): string {
+export function formatValue(value: unknown, noBackslashEscapes: boolean): string {
   if (value === null || value === undefined) {
     return "NULL";
   }
@@ -641,7 +645,7 @@ export function formatValue(value: unknown): string {
   }
 
   if (typeof value === "string") {
-    return `'${escapeString(value)}'`;
+    return escapeString(value, noBackslashEscapes);
   }
 
   if (value instanceof Date) {
@@ -652,17 +656,51 @@ export function formatValue(value: unknown): string {
     return `X'${value.toString("hex")}'`;
   }
 
-  return `'${escapeString(String(value))}'`;
+  return escapeString(String(value), noBackslashEscapes);
 }
 
-function escapeString(value: string): string {
-  return value
+/**
+ * Escape a string as a complete CUBRID SQL literal (including the surrounding
+ * single quotes).
+ *
+ * CUBRID's escaping is MODE-DEPENDENT, governed by the server system parameter
+ * `no_backslash_escapes` (default `yes`). The caller MUST pass the negotiated
+ * mode (see `NativeCubridAdapter` / `SELECT CHAR_LENGTH('\\')` probe):
+ *
+ *   - `noBackslashEscapes = true`  (literal mode, the CUBRID default): the
+ *     backslash is an ordinary character. Only the single quote is special and
+ *     is doubled (`'` -> `''`). Backslashes, newlines, and carriage returns are
+ *     preserved verbatim. This is the ANSI-SQL behaviour.
+ *   - `noBackslashEscapes = false` (escape mode): backslash introduces escape
+ *     sequences, so `\` is doubled and `\r` / `\n` are backslash-escaped, in
+ *     addition to doubling `'`.
+ *
+ * NUL (`\x00`) and Ctrl-Z (`\x1a`) are ALWAYS rejected: CUBRID does not accept
+ * a NUL inside a string literal, and its SQL grammar defines no safe literal
+ * escape for `0x1A` (there is no MySQL-style `\Z`), so emitting either as a
+ * raw control byte would corrupt the statement. Callers should use binary
+ * (`X'..'`) encoding for values that may contain these bytes.
+ */
+function escapeString(value: string, noBackslashEscapes: boolean): string {
+  if (value.includes("\0")) {
+    throw new Error("string parameter contains a null byte (0x00), which CUBRID cannot store in a string literal");
+  }
+  if (value.includes("\x1a")) {
+    throw new Error("string parameter contains a Ctrl-Z byte (0x1A), which has no safe CUBRID string-literal escape");
+  }
+
+  if (noBackslashEscapes) {
+    // Literal mode (CUBRID default): only the single quote is special.
+    return `'${value.replace(/'/g, "''")}'`;
+  }
+
+  // Escape mode: backslash is an escape introducer.
+  const escaped = value
     .replace(/\\/g, "\\\\")
     .replace(/'/g, "''")
-    .replace(/\0/g, "\\0")
-    .replace(/\n/g, "\\n")
-    .replace(/\r/g, "\\r")
-    .replace(/\x1a/g, "\\Z");
+    .replace(/\r/g, "\\\r")
+    .replace(/\n/g, "\\\n");
+  return `'${escaped}'`;
 }
 
 function formatDatetime(date: Date): string {

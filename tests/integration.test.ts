@@ -142,6 +142,76 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
   });
 
   // -------------------------------------------------------------------------
+  // P0 regression: mode-aware string escaping (no silent corruption)
+  // -------------------------------------------------------------------------
+
+  test("P0: backslash/quote/newline string params round-trip without corruption", async () => {
+    const client = createClient(TEST_CONFIG);
+
+    try {
+      try {
+        await client.query("DROP TABLE IF EXISTS p0_escape_native");
+      } catch {
+        // Table might not exist
+      }
+      await client.query(
+        "CREATE TABLE p0_escape_native (id INT AUTO_INCREMENT PRIMARY KEY, val VARCHAR(200))",
+      );
+
+      const samples = [
+        "C:\\temp\\file.txt", // Windows path — backslashes must NOT be doubled
+        "back\\slash",
+        "O'Brien", // embedded single quote
+        "line1\nline2", // newline
+        "carriage\rreturn", // carriage return
+        "mixed \\ ' end",
+        "100%_plain",
+      ];
+
+      for (const s of samples) {
+        await client.query("INSERT INTO p0_escape_native (val) VALUES (?)", [s]);
+      }
+
+      const rows = await client.query<{ val: string }>(
+        "SELECT val FROM p0_escape_native ORDER BY id",
+      );
+      assert.equal(rows.length, samples.length);
+      rows.forEach((row, i) => {
+        assert.equal(row.val, samples[i], `round-trip mismatch for sample #${i}`);
+      });
+
+      await client.query("DROP TABLE p0_escape_native");
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("P0: NUL and Ctrl-Z string params are rejected, not silently mutated", async () => {
+    const client = createClient(TEST_CONFIG);
+
+    try {
+      await assert.rejects(
+        () => client.query("SELECT ? AS v", ["a\0b"]),
+        (err: Error) => {
+          assert.ok(err instanceof QueryError);
+          assert.match((err.cause as Error).message, /null byte/);
+          return true;
+        },
+      );
+      await assert.rejects(
+        () => client.query("SELECT ? AS v", ["a\x1ab"]),
+        (err: Error) => {
+          assert.ok(err instanceof QueryError);
+          assert.match((err.cause as Error).message, /Ctrl-Z/);
+          return true;
+        },
+      );
+    } finally {
+      await client.close();
+    }
+  });
+
+  // -------------------------------------------------------------------------
   // Data types
   // -------------------------------------------------------------------------
 
