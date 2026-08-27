@@ -196,6 +196,7 @@ test("normalizeConfig applies default values", () => {
     password: "",
     connectionTimeout: undefined,
     maxConnectionRetryCount: undefined,
+    ssl: undefined,
     logger: undefined,
   });
 });

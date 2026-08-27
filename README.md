@@ -163,6 +163,54 @@ try {
 }
 ```
 
+## TLS/SSL
+
+Connect to an SSL-enabled CUBRID broker (`SSL=ON` in `cubrid_broker.conf`) by
+setting the `ssl` option. Certificates are verified against the system trust
+store by default (`rejectUnauthorized: true`), and the minimum negotiated
+protocol is TLS 1.2.
+
+```ts
+// Simplest form: enable TLS with default certificate verification
+const db = createClient({
+  host: "localhost",
+  database: "demodb",
+  user: "dba",
+  ssl: true,
+});
+```
+
+For self-signed or private-CA broker certificates, pass an options object:
+
+```ts
+import { readFileSync } from "node:fs";
+
+const db = createClient({
+  host: "db.internal",
+  database: "demodb",
+  user: "dba",
+  ssl: {
+    ca: readFileSync("broker-ca.pem", "utf8"), // trust a private CA
+    servername: "db.internal",                 // override SNI / cert hostname
+    // rejectUnauthorized: false,               // opt out of verification (NOT recommended)
+  },
+});
+```
+
+`ClientSSLOptions` fields:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `rejectUnauthorized` | `boolean` | `true` | Reject connections whose certificate cannot be verified |
+| `ca` | `string \| Buffer \| Array` | *(system store)* | Trusted CA certificate(s) for verification |
+| `servername` | `string` | `host` | Server name for SNI and certificate hostname checks |
+
+> The client uses a STARTTLS-style upgrade on the same broker port (`33000`):
+> it negotiates the CAS handshake, then upgrades the socket to TLS before the
+> database login. The plaintext (non-SSL) path is unaffected when `ssl` is
+> omitted or `false`.
+
+
 ## Error Handling
 
 Every error includes the original driver error as `.cause`:
@@ -200,6 +248,7 @@ Creates a client instance. Connection is established lazily on first query.
 | `user` | `string` | *(required)* | Database user |
 | `password` | `string` | `""` | Password |
 | `connectionTimeout` | `number` | — | Connection timeout (ms) |
+| `ssl` | `boolean \| ClientSSLOptions` | `false` | Enable TLS. `true` for defaults, or an object for cert/verification control (see [TLS/SSL](#tlsssl)) |
 
 ### `client.query<T>(sql, params?): Promise<T[]>`
 
