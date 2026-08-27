@@ -31,5 +31,10 @@ jobs:
       - name: Test with coverage
         run: npm run test:coverage
 
+      - name: Integration tests (self-skipping without live CUBRID)
+        run: |
+          echo "::warning title=Integration tests not run against a live CUBRID::tests/integration.test.ts self-skips its database-dependent cases because no CUBRID server is provisioned in this workflow. Only offline cases run here. Run 'npm run test:integration' against a live CUBRID (127.0.0.1:33000, database 'testdb', user 'dba') to exercise the full suite."
+          npm run test:integration
+
       - name: Build
         run: npm run build

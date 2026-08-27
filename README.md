@@ -298,11 +298,18 @@ npm run typecheck    # tsc --noEmit
 
 ### Integration Tests
 
+Integration tests run against a live CUBRID server. They self-skip their
+database-dependent cases when no server is reachable, so they are safe to run
+anywhere. Point them at a running CUBRID broker on `127.0.0.1:33000` with a
+database named `testdb` and user `dba` (empty password):
+
 ```bash
-docker compose up -d                  # Start CUBRID
-npm run test:integration              # Run against live DB
-docker compose down -v                # Cleanup
+npm run test:integration              # DB-dependent cases self-skip if unreachable
 ```
+
+> CI runs this step too, but no CUBRID server is provisioned there, so only the
+> offline cases execute and a warning annotation is emitted. To exercise the full
+> suite, run the command above against your own CUBRID instance.
 
 ## Ecosystem
 

@@ -1,9 +1,11 @@
 /**
- * Integration tests — real TCP against Docker CUBRID.
+ * Integration tests — real TCP against a live CUBRID server.
  *
- * Requires: docker container `cubrid-test` on localhost:33000 with database `testdb`.
- * Run:  docker compose up -d
- *       node --import tsx --test tests/integration.test.ts
+ * Requires: a CUBRID broker on 127.0.0.1:33000 with database `testdb`
+ * (user `dba`, empty password). Database-dependent cases self-skip when no
+ * server is reachable.
+ *
+ * Run:  npm run test:integration
  */
 import test, { describe, after } from "node:test";
 import assert from "node:assert/strict";
