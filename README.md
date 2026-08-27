@@ -100,6 +100,15 @@ await db.query("INSERT INTO data (a, b, c, d, e, f, g) VALUES (?, ?, ?, ?, ?, ?,
 ]);
 ```
 
+### Date parameters are serialized in UTC
+
+`Date` parameters are rendered as a `DATETIME'YYYY-MM-DD HH:MM:SS.mmm'`
+literal using the date's **UTC** components (millisecond precision). CUBRID's
+`DATETIME` type has no timezone, so the stored value reflects UTC wall-clock
+time, not the client's local time. If you need local-time semantics, convert
+the value yourself before passing it, or store an explicit UTC offset alongside
+it.
+
 ### How parameters are escaped
 
 Parameters are rendered into the SQL text client-side, with escaping that is
@@ -287,7 +296,7 @@ graph TD
 ## Development
 
 ```bash
-git clone https://github.com/cubrid-labs/cubrid-client.git
+git clone https://github.com/cubrid-lab/cubrid-client.git
 cd cubrid-client
 npm install
 npm run build        # TypeScript compilation (tsup)
@@ -315,14 +324,14 @@ npm run test:integration              # DB-dependent cases self-skip if unreacha
 
 | Package | Description |
 |---------|-------------|
-| [cubrid-client](https://github.com/cubrid-labs/cubrid-client) | TypeScript client (this package) |
-| [drizzle-cubrid](https://github.com/cubrid-labs/drizzle-cubrid) | Drizzle ORM dialect for CUBRID |
+| [cubrid-client](https://github.com/cubrid-lab/cubrid-client) | TypeScript client (this package) |
+| [drizzle-cubrid](https://github.com/cubrid-lab/drizzle-cubrid) | Drizzle ORM dialect for CUBRID |
 
 ## Roadmap
 
 See [`ROADMAP.md`](ROADMAP.md) for this project's direction and next milestones.
 
-For the ecosystem-wide view, see the [CUBRID Labs Ecosystem Roadmap](https://github.com/cubrid-labs/.github/blob/main/ROADMAP.md) and [Project Board](https://github.com/orgs/cubrid-labs/projects/2).
+For the ecosystem-wide view, see the [CUBRID Labs Ecosystem Roadmap](https://github.com/cubrid-lab/.github/blob/main/ROADMAP.md) and [Project Board](https://github.com/orgs/cubrid-lab/projects/2).
 
 ## Disclaimer
 

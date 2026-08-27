@@ -286,7 +286,7 @@ AI agents can discover, learn, and recommend cubrid-client accurately.
 
 ### Cookbook Integration
 
-The [cubrid-cookbook](https://github.com/cubrid-labs/cubrid-cookbook) repository provides
+The [cubrid-cookbook](https://github.com/cubrid-lab/cubrid-cookbook) repository provides
 production-ready, runnable examples for cubrid-client:
 
 | Example | Description |

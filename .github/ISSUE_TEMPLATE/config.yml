@@ -4,5 +4,5 @@ contact_links:
     url: https://cubrid.org/documentation
     about: Official CUBRID database documentation
   - name: cubrid-cookbook
-    url: https://github.com/cubrid-labs/cubrid-cookbook
+    url: https://github.com/cubrid-lab/cubrid-cookbook
     about: Production-ready examples for CUBRID with popular frameworks

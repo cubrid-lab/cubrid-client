@@ -15,9 +15,9 @@
 - Prefer compatibility-safe changes because this repo is library code.
 - Add or update tests for any protocol or public client behavior change.
 
-## Development Workflow (cubrid-labs org standard)
+## Development Workflow (cubrid-lab org standard)
 
-All non-trivial work across cubrid-labs repositories MUST follow this 4-phase cycle:
+All non-trivial work across cubrid-lab repositories MUST follow this 4-phase cycle:
 
 1. **Oracle Design Review** — Consult Oracle before implementation to validate architecture, API surface, and approach. Raise concerns early.
 2. **Implementation** — Build the feature/fix with tests. Follow existing codebase patterns.
@@ -35,7 +35,7 @@ Skipping any phase requires explicit justification. Trivial changes (typos, sing
 ## Project Context — Performance Loop System
 
 > This repo is a **supporting track** (nice-to-have) for the Performance Loop.
-> Board: [CUBRID Ecosystem Roadmap](https://github.com/orgs/cubrid-labs/projects/2)
+> Board: [CUBRID Ecosystem Roadmap](https://github.com/orgs/cubrid-lab/projects/2)
 
 ### Role
 

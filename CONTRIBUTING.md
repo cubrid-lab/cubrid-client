@@ -25,7 +25,7 @@ and instructions for contributing to the project.
 
 ```bash
 # Clone the repository
-git clone https://github.com/cubrid-labs/cubrid-client.git
+git clone https://github.com/cubrid-lab/cubrid-client.git
 cd cubrid-client
 
 # Install dependencies
@@ -139,5 +139,5 @@ For feature requests, describe the use case and expected behavior.
 
 ## Questions?
 
-Open a [GitHub Discussion](https://github.com/cubrid-labs/cubrid-client/discussions)
-or file an [issue](https://github.com/cubrid-labs/cubrid-client/issues).
+Open a [GitHub Discussion](https://github.com/cubrid-lab/cubrid-client/discussions)
+or file an [issue](https://github.com/cubrid-lab/cubrid-client/issues).

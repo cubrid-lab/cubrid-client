@@ -25,7 +25,7 @@ flowchart TD
 
 ## Benchmark Results
 
-Source: [cubrid-benchmark](https://github.com/cubrid-labs/cubrid-benchmark)
+Source: [cubrid-benchmark](https://github.com/cubrid-lab/cubrid-benchmark)
 
 Environment: Intel Core i5-9400F @ 2.90GHz, 6 cores, Linux x86_64, Docker containers.
 
@@ -67,7 +67,7 @@ flowchart TD
 
 ## Running Benchmarks
 
-1. Clone `https://github.com/cubrid-labs/cubrid-benchmark`.
+1. Clone `https://github.com/cubrid-lab/cubrid-benchmark`.
 2. Start Docker-based benchmark databases as described in the repo.
 3. Run the TypeScript suite for `cubrid-client` and `mysql2`.
 4. Use 100 rows x 3 rounds for parity with the published results.
