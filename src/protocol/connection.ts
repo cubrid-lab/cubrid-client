@@ -371,34 +371,23 @@ export class CASConnection {
    * Upgrade a plaintext CAS socket to TLS (STARTTLS-style), used only when
    * `config.ssl` is enabled.
    *
-   * Ordering is dictated by the CUBRID CAS server
-   * (src/broker/cas_common_main.c, non-Windows path):
-   *   1. server sends a plaintext 4-byte NO_ERROR int  (net_write_int(fd, 0))
-   *   2. server runs SSL_accept                          (cas_init_ssl)
-   *   3. server reads the OpenDatabase credentials over TLS
+   * Ordering is dictated by the CUBRID CAS server. After the client sends the
+   * "CUBRS" SSL magic, the broker replies with a single 4-byte int (the CAS
+   * redirect port / status) — the SAME int the non-SSL path reads in step 2 of
+   * connectUnlocked — and then immediately runs SSL_accept, blocking on the
+   * client's TLS ClientHello. There is NO separate second "NO_ERROR" int.
    *
-   * So the client reads exactly the 4-byte NO_ERROR on the plaintext socket,
-   * then performs the TLS handshake, then sends OpenDatabase over TLS.
-   *
-   * NOTE (live-validation gate): the exact plaintext->TLS byte boundary must be
-   * verified against a live `SSL=ON` broker. The non-SSL path does not read this
-   * int, so it is read here only in SSL mode.
+   * Verified against a live SSL=ON broker (CUBRID 11.2): after the magic the
+   * broker sends exactly one 4-byte int and then waits in SSL_accept; issuing
+   * the TLS handshake immediately after consuming that int completes (TLSv1.3).
+   * Therefore this method must NOT read another int — the int is already
+   * consumed by connectUnlocked — it only flushes any buffered bytes and
+   * performs the TLS handshake.
    */
   private async upgradeToTls(rawSocket: Socket): Promise<TLSSocket> {
-    // Step A: consume exactly the 4-byte plaintext NO_ERROR response.
-    const noErrorBuf = await this.recvExact(rawSocket, SIZE_DATA_LENGTH);
-    const code = noErrorBuf.readInt32BE(0);
-    if (code !== 0) {
-      rawSocket.destroy();
-      throw new Error(
-        `CUBRID broker rejected TLS handshake (code: ${code}). ` +
-          `Verify the broker is configured with SSL=ON.`,
-      );
-    }
-
-    // Step B: guarantee a clean boundary before wrapping with TLS. Any bytes
-    // buffered past the 4-byte NO_ERROR must be pushed back onto the raw socket
-    // so tls.connect() sees them as the start of the TLS stream. Over-read is
+    // Guarantee a clean boundary before wrapping with TLS. Any bytes buffered
+    // past the redirect-port int must be pushed back onto the raw socket so
+    // tls.connect() sees them as the start of the TLS stream. Over-read is
     // unlikely (the server cannot send ServerHello before our ClientHello) but
     // is guarded defensively.
     if (this.receiveBuffer.length > 0) {
@@ -407,7 +396,7 @@ export class CASConnection {
       rawSocket.unshift(leftover);
     }
 
-    // Step C: wrap the raw socket in TLS and wait for the handshake.
+    // Wrap the raw socket in TLS and wait for the handshake.
     return new Promise<TLSSocket>((resolve, reject) => {
       const tlsSocket = tlsConnect({
         socket: rawSocket,

@@ -106,29 +106,26 @@ function int32(value: number): Buffer {
 }
 
 /**
- * Mock SSL-enabled CUBRID broker mimicking the confirmed CAS ordering:
+ * Mock SSL-enabled CUBRID broker mimicking the confirmed CAS ordering
+ * (verified against a live SSL=ON CUBRID 11.2 broker):
  *   1. read 10-byte client-info (asserts "CUBRS" magic)
- *   2. write plaintext redirect port = 0 (reuse socket)
- *   3. write plaintext 4-byte NO_ERROR (or the supplied error code)
- *   4. TLS-accept (SSL_accept) on the same socket
- *   5. read OpenDatabase over TLS, write framed response over TLS
+ *   2. write EXACTLY ONE plaintext 4-byte int (redirect port = 0, reuse socket)
+ *   3. immediately TLS-accept (SSL_accept) on the same socket
+ *   4. read OpenDatabase over TLS, write framed response over TLS
+ *
+ * There is NO separate second plaintext "NO_ERROR" int: the single int in
+ * step 2 is the only pre-TLS int the client reads.
  */
 function createMockSslBroker(opts: {
   sessionId?: number;
-  noErrorCode?: number;
 }): Promise<{ server: Server; port: number; sawMagic: () => string }> {
   let magicSeen = "";
   return new Promise((resolve) => {
     const server = createServer((socket: NetSocket) => {
       socket.once("data", (clientInfo: Buffer) => {
         magicSeen = clientInfo.subarray(0, 5).toString("ascii");
+        // Exactly one plaintext int (redirect/status), then SSL_accept.
         socket.write(int32(0)); // redirect: reuse this socket
-        socket.write(int32(opts.noErrorCode ?? 0)); // NO_ERROR (plaintext)
-
-        if ((opts.noErrorCode ?? 0) !== 0) {
-          // Error path: client should reject before TLS; just linger.
-          return;
-        }
 
         // SSL_accept on the same socket.
         const tls = new TLSSocket(socket, {
@@ -230,8 +227,17 @@ test("CASConnection connect over TLS — rejects self-signed cert by default", a
   }
 });
 
-test("CASConnection connect over TLS — rejects non-zero NO_ERROR (mode mismatch)", async () => {
-  const { server, port } = await createMockSslBroker({ noErrorCode: -1 });
+test("CASConnection connect over TLS — rejects negative redirect/status code", async () => {
+  // The broker signals rejection with a negative redirect/status int in the
+  // single pre-TLS read; the client must reject before attempting TLS.
+  const server = createServer((socket: NetSocket) => {
+    socket.once("data", () => {
+      socket.write(int32(-1));
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const addr = server.address();
+  const port = typeof addr === "object" && addr !== null ? addr.port : 0;
   try {
     const cas = new CASConnection({
       ...DEFAULT_CONFIG,
@@ -242,7 +248,7 @@ test("CASConnection connect over TLS — rejects non-zero NO_ERROR (mode mismatc
     await assert.rejects(
       () => cas.connect(),
       (err: Error) => {
-        assert.match(err.message, /rejected TLS handshake|SSL=ON/i);
+        assert.match(err.message, /rejected connection/i);
         return true;
       },
     );
