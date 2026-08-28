@@ -598,3 +598,225 @@ test("CASConnection default getter values before connect", () => {
   assert.equal(cas.protoVersion, 1);
   assert.equal(cas.casInfo.length, SIZE_CAS_INFO);
 });
+
+// ---------------------------------------------------------------------------
+// Concurrency serialization (issue #39)
+//
+// A single CASConnection is shared across concurrent queries. Without a
+// per-instance FIFO queue, overlapping sendAndRecv/connect/close calls race
+// on the shared socket / receiveBuffer / CAS_INFO state, corrupting the wire
+// protocol. These tests pin the serialization guarantees.
+// ---------------------------------------------------------------------------
+
+/** Frame a response whose payload is `text` and whose CAS_INFO stays ACTIVE. */
+function frameTextResponse(text: string): Buffer {
+  const casInfo = Buffer.from([0x01, 0x02, 0x03, 0x04]); // [0]!=0 => not INACTIVE
+  const payload = Buffer.from(`${text}\0`, "utf-8");
+  return frameResponse(Buffer.concat([casInfo, payload]));
+}
+
+test("CASConnection serializes concurrent sendAndRecv in FIFO order", async () => {
+  let arrival = 0;
+  const { server, port } = await createMockBroker((socket) => {
+    // Handshake
+    socket.once("data", () => {
+      const portBuf = Buffer.alloc(4);
+      portBuf.writeInt32BE(0, 0);
+      socket.write(portBuf);
+
+      socket.once("data", () => {
+        socket.write(frameResponse(buildOpenDbResponse(1)));
+
+        // Respond to each request with its server-side arrival index. The
+        // first response is delayed the most: if the client failed to
+        // serialize, requests 2 and 3 would be written before response 1
+        // was read and the responses would be consumed out of order.
+        socket.on("data", () => {
+          const n = ++arrival;
+          const delay = Math.max(0, 60 - n * 25);
+          setTimeout(() => socket.write(frameTextResponse(String(n))), delay);
+        });
+      });
+    });
+  });
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+    await cas.connect();
+
+    const results = await Promise.all([
+      cas.sendAndRecv(Buffer.alloc(8), Buffer.from([0x01])),
+      cas.sendAndRecv(Buffer.alloc(8), Buffer.from([0x02])),
+      cas.sendAndRecv(Buffer.alloc(8), Buffer.from([0x03])),
+    ]);
+
+    // Each launched op must receive the response for its own turn: op #i
+    // is the i-th request the server sees, and gets payload "i".
+    assert.deepEqual(
+      results.map((r) => r.toString("utf-8").replace(/\0$/, "")),
+      ["1", "2", "3"],
+    );
+
+    await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("CASConnection concurrent first-use connect() opens exactly one socket", async () => {
+  let connectionCount = 0;
+  const { server, port } = await createMockBroker((socket) => {
+    connectionCount += 1;
+    socket.once("data", () => {
+      const portBuf = Buffer.alloc(4);
+      portBuf.writeInt32BE(0, 0);
+      socket.write(portBuf);
+
+      socket.once("data", () => {
+        socket.write(frameResponse(buildOpenDbResponse(1)));
+      });
+    });
+  });
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+
+    // Fire concurrent first-use connects (the native adapter's first-query
+    // race). The FIFO queue plus idempotent connectUnlocked() must collapse
+    // these into a single physical broker connection.
+    await Promise.all([cas.connect(), cas.connect(), cas.connect()]);
+
+    assert.equal(cas.isConnected, true);
+    assert.equal(connectionCount, 1);
+
+    await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("CASConnection close() waits for an in-flight sendAndRecv", async () => {
+  const { server, port } = await createMockBroker((socket) => {
+    socket.once("data", () => {
+      const portBuf = Buffer.alloc(4);
+      portBuf.writeInt32BE(0, 0);
+      socket.write(portBuf);
+
+      socket.once("data", () => {
+        socket.write(frameResponse(buildOpenDbResponse(1)));
+
+        // Delay the request response so close() is enqueued while the
+        // sendAndRecv is still in flight.
+        socket.once("data", () => {
+          setTimeout(() => socket.write(frameTextResponse("INFLIGHT")), 60);
+        });
+      });
+    });
+  });
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+    await cas.connect();
+
+    // Launch the query, then request close() without awaiting the query.
+    const queryPromise = cas.sendAndRecv(Buffer.alloc(8), Buffer.from([0x01]));
+    const closePromise = cas.close();
+
+    // The in-flight query must complete cleanly (close did NOT tear down the
+    // socket mid-response); only afterwards does close take effect.
+    const result = await queryPromise;
+    assert.equal(result.toString("utf-8").replace(/\0$/, ""), "INFLIGHT");
+
+    await closePromise;
+    assert.equal(cas.isConnected, false);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("CASConnection close() runs its beforeClose hook after an in-flight request", async () => {
+  // The query response carries a distinctive CAS_INFO so we can prove, from the
+  // connection's own state, that the in-flight sendAndRecv fully applied its
+  // response (its final step copies the response CAS_INFO into _casInfo) BEFORE
+  // the beforeClose hook ran — i.e. the close frame can never be interleaved
+  // into the middle of the in-flight framed request.
+  const QUERY_CAS_INFO = [0x11, 0x22, 0x33, 0x44];
+  const queryResponse = frameResponse(
+    Buffer.concat([Buffer.from(QUERY_CAS_INFO), Buffer.from("DONE\0", "utf-8")]),
+  );
+  const { server, port } = await createMockBroker((socket) => {
+    socket.once("data", () => {
+      const portBuf = Buffer.alloc(4);
+      portBuf.writeInt32BE(0, 0);
+      socket.write(portBuf);
+
+      socket.once("data", () => {
+        socket.write(frameResponse(buildOpenDbResponse(1)));
+
+        // Respond to the query, delayed, so close() is enqueued while the
+        // query is still in flight.
+        socket.once("data", () => {
+          setTimeout(() => socket.write(queryResponse), 60);
+        });
+      });
+    });
+  });
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+    await cas.connect();
+
+    // The hook snapshots CAS_INFO at the moment it runs. (Assertions inside the
+    // hook are swallowed by close()'s best-effort catch, so we capture here and
+    // assert outside.)
+    let casInfoAtHook: number[] = [];
+    const queryPromise = cas.sendAndRecv(Buffer.alloc(8), Buffer.from([0x01]));
+    const closePromise = cas.close(async () => {
+      casInfoAtHook = [...cas.casInfo];
+    });
+
+    const result = await queryPromise;
+    assert.equal(result.toString("utf-8").replace(/\0$/, ""), "DONE");
+
+    await closePromise;
+    assert.equal(cas.isConnected, false);
+
+    // If the hook had run before the query completed, CAS_INFO would still hold
+    // the OpenDatabase value. Matching the query response proves ordering.
+    assert.deepEqual(casInfoAtHook, QUERY_CAS_INFO);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("CASConnection concurrent close() invokes the hook at most once", async () => {
+  let hookCalls = 0;
+  const { server, port } = await createMockBroker((socket) => {
+    socket.once("data", () => {
+      const portBuf = Buffer.alloc(4);
+      portBuf.writeInt32BE(0, 0);
+      socket.write(portBuf);
+
+      socket.once("data", () => {
+        socket.write(frameResponse(buildOpenDbResponse(1)));
+      });
+    });
+  });
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+    await cas.connect();
+
+    const hook = async (): Promise<void> => {
+      hookCalls += 1;
+    };
+    // The first queued close tears down the socket; the second sees no socket
+    // and returns before invoking the hook, so at most one close frame is sent.
+    await Promise.all([cas.close(hook), cas.close(hook)]);
+
+    assert.equal(cas.isConnected, false);
+    assert.equal(hookCalls, 1);
+  } finally {
+    await closeServer(server);
+  }
+});

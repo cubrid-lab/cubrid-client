@@ -99,8 +99,17 @@ class FakeCASConnection {
     return buildSimpleResponse(0);
   }
 
-  async close(): Promise<void> {
+  async close(beforeClose?: () => Promise<void>): Promise<void> {
     this.closeCalls += 1;
+    // Mirror CASConnection.close(): run the pre-close hook (e.g. CON_CLOSE)
+    // only while still connected, swallowing hook errors (best-effort).
+    if (this._isConnected && beforeClose) {
+      try {
+        await beforeClose();
+      } catch {
+        // Best-effort — ignore close-frame failures.
+      }
+    }
     this._isConnected = false;
   }
 
