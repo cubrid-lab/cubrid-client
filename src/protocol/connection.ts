@@ -67,14 +67,32 @@ export class CASConnection {
   private _sessionId = 0;
   private receiveBuffer: Buffer = Buffer.alloc(0);
 
+  /**
+   * Per-instance FIFO serialization queue. Public entry points that mutate
+   * shared socket / buffer / CAS_INFO state (connect, sendAndRecv, close) are
+   * chained through this tail promise so concurrent callers run strictly
+   * one-at-a-time. The chain must NEVER reject: a rejected op is swallowed
+   * here so it cannot poison subsequent queued operations.
+   */
+  private queue: Promise<unknown> = Promise.resolve();
+
   private readonly config: CASConnectionConfig;
 
   constructor(config: CASConnectionConfig | string) {
     this.config = typeof config === "string" ? parseConnectionString(config) : config;
   }
 
-  /** Perform broker handshake and open database. */
+  /**
+   * Perform broker handshake and open database.
+   *
+   * Queued: serialized against other public operations on this instance.
+   */
   async connect(): Promise<void> {
+    return this.enqueue(() => this.connectUnlocked());
+  }
+
+  /** Unlocked connect body. MUST only be called from within the queue. */
+  private async connectUnlocked(): Promise<void> {
     if (this.connected) {
       return;
     }
@@ -182,31 +200,52 @@ export class CASConnection {
    * driver's `UClientSideConnection.checkReconnect()`.
    */
   async sendAndRecv(header: Buffer, payload: Buffer): Promise<Buffer> {
-    await this.checkReconnect();
-    await this.send(header, payload);
-    const response = await this.recv();
+    return this.enqueue(async () => {
+      await this.checkReconnectUnlocked();
+      await this.send(header, payload);
+      const response = await this.recv();
 
-    // Update CAS_INFO from response
-    response.copy(this._casInfo, 0, 0, SIZE_CAS_INFO);
+      // Update CAS_INFO from response
+      response.copy(this._casInfo, 0, 0, SIZE_CAS_INFO);
 
-    // Return payload portion (after CAS_INFO)
-    return response.subarray(SIZE_CAS_INFO);
+      // Return payload portion (after CAS_INFO)
+      return response.subarray(SIZE_CAS_INFO);
+    });
   }
 
-  /** Best-effort close: send CON_CLOSE, then destroy socket. */
-  async close(): Promise<void> {
-    if (!this.socket) {
-      return;
-    }
+  /**
+   * Close the connection.
+   *
+   * Queued: serialized against connect()/sendAndRecv() so it never tears down
+   * the socket underneath an in-flight request. An optional `beforeClose` hook
+   * runs inside the same queued critical section, immediately before teardown,
+   * while the socket is still live — use it to emit a best-effort protocol-level
+   * close frame (e.g. CON_CLOSE) atomically with the teardown. The hook is only
+   * invoked when a live socket is present; its errors are swallowed.
+   */
+  async close(beforeClose?: () => Promise<void>): Promise<void> {
+    return this.enqueue(async () => {
+      if (!this.socket) {
+        return;
+      }
 
-    const socket = this.socket;
-    this.socket = null;
-    this.connected = false;
-    this.socketDead = false;
-    this.receiveBuffer = Buffer.alloc(0);
+      if (beforeClose) {
+        try {
+          await beforeClose();
+        } catch {
+          // Best-effort — ignore close-frame failures.
+        }
+      }
 
-    socket.removeAllListeners();
-    socket.destroy();
+      const socket = this.socket;
+      this.socket = null;
+      this.connected = false;
+      this.socketDead = false;
+      this.receiveBuffer = Buffer.alloc(0);
+
+      socket.removeAllListeners();
+      socket.destroy();
+    });
   }
 
   /**
@@ -217,7 +256,7 @@ export class CASConnection {
    * The official JDBC driver checks this before every request and
    * transparently reconnects.
    */
-  private async checkReconnect(): Promise<void> {
+  private async checkReconnectUnlocked(): Promise<void> {
     if (!this.connected || !this.socket) {
       return;
     }
@@ -227,7 +266,7 @@ export class CASConnection {
       this.socket = null;
       this.connected = false;
       this.receiveBuffer = Buffer.alloc(0);
-      await this.connect();
+      await this.connectUnlocked();
     }
   }
 
@@ -265,6 +304,23 @@ export class CASConnection {
   // ---------------------------------------------------------------------------
   // Internal helpers
   // ---------------------------------------------------------------------------
+
+  /**
+   * Chain `fn` onto the per-instance FIFO queue and return its result.
+   *
+   * `fn` runs only after all previously-queued operations settle. The
+   * caller receives the true result/rejection of `fn`, but the internal
+   * queue tail always resolves (rejections are swallowed) so one failing
+   * operation cannot deadlock or poison the queue.
+   */
+  private enqueue<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(() => fn(), () => fn());
+    this.queue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
 
   private createSocket(host: string, port: number): Promise<Socket> {
     return new Promise<Socket>((resolve, reject) => {

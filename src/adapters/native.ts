@@ -121,16 +121,13 @@ export class NativeCubridAdapter implements DriverAdapter {
     this.noBackslashEscapes = null;
 
     try {
-      if (cas.isConnected) {
-        try {
-          const { header, payload } = writeConClose(cas.casInfo);
-          await cas.send(header, payload);
-        } catch {
-          // Ignore — best effort
-        }
-      }
-
-      await cas.close();
+      // Send CON_CLOSE and tear down the socket as a single queued critical
+      // section, so the close frame never interleaves with an in-flight query
+      // (issue #39). The hook only runs while a live socket is present.
+      await cas.close(async () => {
+        const { header, payload } = writeConClose(cas.casInfo);
+        await cas.send(header, payload);
+      });
     } catch (error) {
       throw mapError("connection", error, "Failed to close CUBRID connection.");
     }
