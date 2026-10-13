@@ -1,5 +1,11 @@
 # cubrid-client
 
+<!-- CUBRID-LAB-DRIVER-ICON:START -->
+<a href="https://github.com/cubrid-lab/brand">
+  <img src="https://raw.githubusercontent.com/cubrid-lab/brand/d342189b49ac96d911e0f24a536ee7e9dd4a008a/dist/icons/cubrid-client.svg" alt="CUBRID Lab Driver icon (TypeScript)" width="80" />
+</a>
+<!-- CUBRID-LAB-DRIVER-ICON:END -->
+
 **Modern TypeScript-first Node.js client for the CUBRID database** — zero native dependencies, built-in CAS protocol driver, Promise-based API with full type safety.
 
 <!-- BADGES:START -->
