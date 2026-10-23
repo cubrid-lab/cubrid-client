@@ -17,14 +17,23 @@
 
 ## Development Workflow (cubrid-lab org standard)
 
-All non-trivial work across cubrid-lab repositories MUST follow this 4-phase cycle:
+Apply **identical PR review and merge criteria** regardless of whether
+code was written by a person, OpenCode, Codex, Claude Code, ChatGPT,
+Copilot or any other agent. No specific AI review is a prerequisite.
 
-1. **Oracle Design Review** — Consult Oracle before implementation to validate architecture, API surface, and approach. Raise concerns early.
-2. **Implementation** — Build the feature/fix with tests. Follow existing codebase patterns.
-3. **Documentation Update** — Update ALL affected docs (README, CHANGELOG, ROADMAP, API docs, SUPPORT_MATRIX, PRD, etc.) in the same PR or as an immediate follow-up. Code without doc updates is incomplete.
-4. **Oracle Post-Implementation Review** — Consult Oracle to review the completed work for correctness, edge cases, and consistency before merging.
+1. Implement a focused change with tests and affected documentation.
+2. Required GitHub Actions CI checks, appropriate to this repository,
+   are the authoritative verification at the final head. Local testing
+   is recommended but not an additional required gate.
+3. Review correctness, tests, security, API compatibility, maintainability,
+   and scope. Oracle, Copilot and `agent-review` findings are optional,
+   **advisory**, and never automatic approval or rejection.
+4. Disposition outstanding findings and let the responsible maintainer
+   decide on merge after checking required CI. Security, CI permissions,
+   release and publication changes need explicit independent review.
 
-Skipping any phase requires explicit justification. Trivial changes (typos, single-line fixes) may skip phases 1 and 4.
+Preserve existing branch protection, integration tests, compatibility and
+release safeguards. Do not create tool-dependent Oracle/Copilot routes.
 
 ## Validation
 - `npm run typecheck`
