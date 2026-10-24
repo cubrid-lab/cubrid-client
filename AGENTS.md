@@ -56,3 +56,26 @@ The narrative is "already fast, now production-ready" — resilience, not speed.
 | Issue | Phase | Priority |
 |-------|-------|----------|
 | #14 Implement reconnect, retry, and health check | R4 | Nice-to-Have |
+
+## Issue triage lifecycle
+
+New issues in this repository begin with `status: needs triage`. Any issue
+forms include the label; the `issues: opened` workflow covers external
+submissions. GitHub Actions using `GITHUB_TOKEN` must attach it when creating
+issues because their own events may not trigger this workflow.
+
+1. Confirm the problem and evidence, investigate unknowns, detect duplicate
+   issues and overlapping open PRs, and check local ownership, issue type,
+   scope/non-goals, dependencies and testable acceptance.
+2. Compare **all currently open issues in this repository** (including API
+   pagination) before deciding relative priority, considering user impact,
+   existing work and blockers rather than issue age.
+3. Assign one `priority: critical/high/medium/low` and one of the original
+   `size: XS/S/M/L/XL`; split oversized implementation work where useful,
+   retaining ownership and any parent completion contract.
+4. Re-fetch the saved GitHub labels and validate issue type, priority, size,
+   scope and duplicate disposition. Remove `status: needs triage` only when
+   the maintainer has completed that check. Otherwise retain it.
+
+This process never guesses issue urgency or creates another PR gate. Existing
+quality, security and release expectations still apply.
