@@ -55,11 +55,19 @@ npm run test:coverage
 npm run typecheck
 ```
 
-### Full Check
+### Offline check
 
 ```bash
 npm run check
 ```
+
+This executes type checking and offline unit tests with coverage. The PR CI
+also builds the package and invokes `npm run test:integration`, but it does
+**not** provision CUBRID: its database-dependent integration tests self-skip.
+A green CI run is not a live CAS round-trip verification. For a protocol,
+reconnection or transaction change, separately run `npm run test:integration`
+against a real CUBRID server and report the endpoint/version and executed test
+count; state clearly when that check was not run.
 
 ---
 
@@ -135,6 +143,23 @@ scrutiny. No existing repository CI or release safeguards are waived.
 - Maintain backward compatibility unless explicitly approved.
 
 ---
+
+## Local issue and agent handoff
+
+Before editing protocol, session or public API behavior, compare the latest
+`main`, local open issues and overlapping PRs. New issues begin with
+`status: needs triage`; maintainers verify validity, duplicates, type, scope
+and urgency against all open issues in this repository. Use exactly one
+`priority: critical/high/medium/low` and one `size: XS/S/M/L/XL`, then read
+back the actual GitHub labels before clearing triage. A priority estimate is
+not approval to merge.
+
+Human contributors may work on unclaimed issues without required AI tools or
+preapproval. Maintainer-operated autonomous agents must have authorization
+and a verified GitHub assignee before taking reserved work; coordinate with
+existing PR owners. Keep `database/sql`-equivalent transaction intent,
+parameter binding and wire parsing safe, use focused regression tests, and
+report offline versus real-database evidence separately.
 
 ## Reporting Issues
 
