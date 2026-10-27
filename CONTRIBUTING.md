@@ -1,5 +1,7 @@
 # Contributing to cubrid-client
 
+**Issue titles:** use a type-only prefix such as `feat:` or `bug:`, without a module scope. **PR and commit titles:** continue to use the existing Conventional Commits format and local validators. See the [shared policy](https://github.com/cubrid-lab/.github/blob/main/docs/ISSUE_PR_COMMIT_STANDARD.md) for evidence, acceptance criteria and triage responsibilities.
+
 Thank you for your interest in contributing! This document provides guidelines
 and instructions for contributing to the project.
 
