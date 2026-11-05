@@ -1069,3 +1069,49 @@ test("CASConnection connectionGeneration changes on a transparent reconnect", as
     await closeServer(server);
   }
 });
+
+test("CASConnection retries a failed connect without inheriting the old socket's death", async () => {
+  let connections = 0;
+  const { server, port } = await createMockBroker((socket) => {
+    const connection = ++connections;
+    socket.on("error", () => {});
+    socket.once("data", () => {
+      socket.write(Buffer.alloc(4));
+      socket.once("data", () => {
+        socket.write(connection === 1 ? frameHeader(-1) : frameResponse(buildOpenDbResponse(2)));
+        socket.on("data", () => socket.write(frameResponse(CAS_INFO)));
+      });
+    });
+  });
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+    await assert.rejects(cas.connect(), /Invalid CAS frame/);
+    await cas.connect();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const response = await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+    assert.equal(response.length, 0);
+    await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("CASConnection discardSession drops the socket and allows reconnecting", async () => {
+  const { server, port } = await brokerWith((socket) => socket.write(frameResponse(CAS_INFO)));
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+    await cas.connect();
+
+    await cas.discardSession();
+    assert.equal(cas.isConnected, false);
+
+    await cas.connect();
+    assert.equal(cas.connectionGeneration, 2);
+    await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});

@@ -72,12 +72,17 @@ export class NativeCubridAdapter implements DriverAdapter {
     try {
       const cas = this.getOrCreateCAS();
 
+      // Starting over here would hide that acknowledged statements are gone.
+      // rollback() acknowledges the loss and clears this state.
+      if (this.transactionGeneration !== null) {
+        this.assertTransactionSession(cas);
+      }
+
       if (!cas.isConnected) {
         await cas.connect();
       }
 
       this.autoCommit = false;
-      this.transactionGeneration = null;
     } catch (error) {
       throw mapError("transaction", error, "Failed to start transaction.");
     }
@@ -192,7 +197,7 @@ export class NativeCubridAdapter implements DriverAdapter {
       cas.casInfo,
     );
     const responsePayload = await cas.sendAndRecv(header, payload);
-    this.bindTransactionSession(cas);
+    await this.bindTransactionSession(cas);
 
     const result: PrepareAndExecuteResult = parsePrepareAndExecute(
       responsePayload,
@@ -234,12 +239,20 @@ export class NativeCubridAdapter implements DriverAdapter {
     }
   }
 
-  private bindTransactionSession(cas: CASConnection): void {
+  /**
+   * Called after a statement ran. If the session changed underneath it, that
+   * statement is open on the new session, so drop the session rather than
+   * let a later autocommit query persist work reported here as failed.
+   */
+  private async bindTransactionSession(cas: CASConnection): Promise<void> {
     if (!this.autoCommit && this.transactionGeneration === null) {
       this.transactionGeneration = cas.connectionGeneration;
     }
 
-    this.assertTransactionSession(cas);
+    if (this.isTransactionSessionLost(cas)) {
+      await cas.discardSession();
+      throw new Error("Connection lost during transaction");
+    }
   }
 
   private endTransaction(): void {

@@ -50,6 +50,7 @@ class FakeCASConnection {
   sendAndRecvCalls = 0;
   sendCalls = 0;
   closeCalls = 0;
+  discardCalls = 0;
   destroyed = false;
   _isConnected = true;
   _casInfo = Buffer.alloc(4);
@@ -80,6 +81,11 @@ class FakeCASConnection {
     }
     this._isConnected = true;
     this.connectionGeneration += 1;
+  }
+
+  async discardSession(): Promise<void> {
+    this.discardCalls += 1;
+    this._isConnected = false;
   }
 
   async send(_header: Buffer, _payload: Buffer): Promise<void> {
@@ -1232,4 +1238,29 @@ test("NativeCubridAdapter close ends an open transaction", async () => {
   fakeCAS.queueResponse(buildDMLResponse(20, 1));
   fakeCAS.queueResponse(buildSimpleResponse(0));
   await adapter.query("INSERT INTO t VALUES (1)");
+});
+
+test("NativeCubridAdapter discards a statement that ran on a replaced session", async () => {
+  const { adapter, fakeCAS } = await beginWithOneInsert();
+  fakeCAS.sendAndRecv = async () => {
+    fakeCAS.connectionGeneration += 1;
+    return buildDMLResponse(20, 1);
+  };
+
+  await assert.rejects(adapter.query("INSERT INTO t VALUES ('c')"), QueryError);
+
+  assert.equal(fakeCAS.discardCalls, 1);
+  assert.equal(fakeCAS.isConnected, false);
+});
+
+test("NativeCubridAdapter beginTransaction refuses to hide a lost transaction", async () => {
+  const { adapter, fakeCAS } = await beginWithOneInsert();
+  fakeCAS._isConnected = false;
+
+  await assert.rejects(adapter.beginTransaction(), TransactionError);
+  assert.equal(fakeCAS.connectCalls, 0);
+
+  await assert.rejects(adapter.rollback(), TransactionError);
+  await adapter.beginTransaction();
+  assert.equal(fakeCAS.connectCalls, 1);
 });

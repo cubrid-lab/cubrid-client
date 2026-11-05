@@ -151,10 +151,8 @@ export class CASConnection {
       this.connected = true;
     } catch (error) {
       brokerSocket.destroy();
-      if (this.socket && this.socket !== brokerSocket) {
-        this.socket.destroy();
-        this.socket = null;
-      }
+      this.socket?.destroy();
+      this.socket = null;
       this.receiveBuffer = Buffer.alloc(0);
       throw error;
     }
@@ -219,6 +217,14 @@ export class CASConnection {
       // Return payload portion (after CAS_INFO)
       return response.subarray(SIZE_CAS_INFO);
     });
+  }
+
+  /**
+   * Drop the current session so the server discards its uncommitted work.
+   * Queued: serialized against in-flight requests.
+   */
+  async discardSession(): Promise<void> {
+    return this.enqueue(async () => this.retireSocket());
   }
 
   /**
