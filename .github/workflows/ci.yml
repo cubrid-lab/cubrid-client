@@ -38,3 +38,9 @@ jobs:
 
       - name: Build
         run: npm run build
+
+      # Declarations come from the same pinned tsup/TypeScript on every lane;
+      # run the comparison once to avoid duplicate failures.
+      - name: Public API check
+        if: matrix.node-version == 22
+        run: npm run api:check
