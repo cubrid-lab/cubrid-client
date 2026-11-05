@@ -1,76 +1,131 @@
-name: Publish to npm
+name: Publish reviewed npm release
 
+# Manual only: release-please uses GITHUB_TOKEN and tag pushes from that
+# token will not automatically trigger separate GitHub Actions workflows.
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type PUBLISH after reviewing the release PR and live CUBRID evidence"
+        required: true
+        type: string
+      recovery_tag:
+        description: "Existing vX.Y.Z GitHub Release tag to retry npm publication; blank for new"
+        required: false
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
-  ci:
+  preflight:
+    if: ${{ inputs.confirmation == 'PUBLISH' }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
         node-version: [18, 20, 22]
-
     steps:
       - uses: actions/checkout@v7
-
       - name: Setup Node.js ${{ matrix.node-version }}
         uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
+      - run: npm ci
       - name: Typecheck
         run: npm run typecheck
-
-      - name: Test
+      - name: Offline tests
         run: npm test
-
       - name: Build
         run: npm run build
 
   publish:
-    needs: ci
+    needs: preflight
     runs-on: ubuntu-latest
+    environment: npm-publish
     permissions:
       contents: write
+      # release-please comments on the merged Release PR and swaps its
+      # autorelease labels right after creating the release. Without this the
+      # step fails post-release and the leftover pending label blocks new PRs.
+      pull-requests: write
       id-token: write
-
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v7
+      - name: Create GitHub Release only after explicit approval
+        if: ${{ inputs.recovery_tag == '' }}
+        id: release
+        uses: googleapis/release-please-action@v4
         with:
-          node-version: 20
-          registry-url: https://registry.npmjs.org
-          cache: npm
+          skip-github-pull-request: true
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build
-        run: npm run build
-
-      - name: Verify version matches tag
+      - name: Resolve immutable release tag
+        id: target
+        env:
+          RECOVERY_TAG: ${{ inputs.recovery_tag }}
+          GENERATED_TAG: ${{ steps.release.outputs.tag_name }}
+          RELEASE_CREATED: ${{ steps.release.outputs.release_created }}
         run: |
-          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
-          PKG_VERSION=$(node -p "require('./package.json').version")
-          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
-            echo "::error::Tag v$TAG_VERSION does not match package.json version $PKG_VERSION"
+          if [ -n "$RECOVERY_TAG" ]; then
+            tag="$RECOVERY_TAG"
+          else
+            if [ "$RELEASE_CREATED" != 'true' ]; then
+              echo "::error::No new release; merge a reviewed Release PR first."
+              exit 1
+            fi
+            tag="$GENERATED_TAG"
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Expected vX.Y.Z tag, got: $tag"
             exit 1
           fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.target.outputs.tag }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm ci
+      - name: Verify tagged package, lockfile and manifest versions
+        env:
+          RELEASE_TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          node -e '
+            const p = require("./package.json");
+            const lock = require("./package-lock.json");
+            const manifest = require("./.release-please-manifest.json");
+            const v = p.version;
+            if (process.env.RELEASE_TAG !== "v" + v ||
+                lock.version !== v || lock.packages[""].version !== v ||
+                manifest["."] !== v) {
+              console.error("Release tag, package, lockfile and manifest mismatch");
+              process.exit(1);
+            }
+          '
+      - name: Verify exact tagged contents
+        run: |
+          npm run typecheck
+          npm test
+          npm run build
+          npm pack --dry-run
+      - name: Check whether version is already published
+        id: registry
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if npm view "cubrid-client@$version" version > /dev/null 2>&1; then
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Version already published; skipping duplicate."
+          else
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Publish to npm
-        run: npm publish --access public
+        if: ${{ steps.registry.outputs.already_published == 'false' }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          generate_release_notes: true
+        run: npm publish --access public
