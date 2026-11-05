@@ -45,6 +45,10 @@ jobs:
     environment: npm-publish
     permissions:
       contents: write
+      # release-please comments on the merged Release PR and swaps its
+      # autorelease labels right after creating the release. Without this the
+      # step fails post-release and the leftover pending label blocks new PRs.
+      pull-requests: write
       id-token: write
     steps:
       - name: Create GitHub Release only after explicit approval
