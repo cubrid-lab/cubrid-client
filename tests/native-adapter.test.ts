@@ -1109,3 +1109,31 @@ test("NativeCubridAdapter ping wraps error as ConnectionError", async () => {
     },
   );
 });
+
+// ---------------------------------------------------------------------------
+// Connection loss during a transaction (#107)
+// ---------------------------------------------------------------------------
+
+test("NativeCubridAdapter query refuses to reconnect inside a transaction", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  await adapter.beginTransaction();
+  fakeCAS._isConnected = false;
+
+  await assert.rejects(adapter.query("SELECT 1"), (error: unknown) => {
+    assert.ok(error instanceof QueryError);
+    assert.match((error.cause as Error).message, /Connection lost during transaction/);
+    return true;
+  });
+  assert.equal(fakeCAS.connectCalls, 0);
+});
+
+for (const method of ["commit", "rollback"] as const) {
+  test(`NativeCubridAdapter ${method} on a lost connection allows later autocommit queries`, async () => {
+    const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+    await adapter.beginTransaction();
+    fakeCAS._isConnected = false;
+
+    await assert.rejects(adapter[method](), TransactionError);
+    assert.equal((adapter as unknown as { autoCommit: boolean }).autoCommit, true);
+  });
+}

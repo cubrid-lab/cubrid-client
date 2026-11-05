@@ -173,3 +173,10 @@ export const TYPE_NAMES: Record<number, string> = {
   [CUBRIDDataType.MULTISET]: "MULTISET",
   [CUBRIDDataType.SEQUENCE]: "SEQUENCE",
 };
+
+/**
+ * Largest CAS frame body accepted by default. This rejects corrupt or hostile
+ * lengths without capping real result batches; memory still grows only as
+ * bytes actually arrive, because frames are never preallocated.
+ */
+export const DEFAULT_MAX_FRAME_LENGTH = 1024 * 1024 * 1024;

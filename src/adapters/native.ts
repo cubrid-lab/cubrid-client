@@ -80,6 +80,8 @@ export class NativeCubridAdapter implements DriverAdapter {
       const cas = this.getOrCreateCAS();
 
       if (!cas.isConnected) {
+        // The server discarded any open transaction with the old session.
+        this.autoCommit = true;
         throw new Error("Not connected");
       }
 
@@ -98,6 +100,8 @@ export class NativeCubridAdapter implements DriverAdapter {
       const cas = this.getOrCreateCAS();
 
       if (!cas.isConnected) {
+        // The server discarded any open transaction with the old session.
+        this.autoCommit = true;
         throw new Error("Not connected");
       }
 
@@ -158,6 +162,12 @@ export class NativeCubridAdapter implements DriverAdapter {
     const cas = this.getOrCreateCAS();
 
     if (!cas.isConnected) {
+      // Reconnecting here would drop the earlier statements of this transaction
+      // and let a later commit() persist only the ones that follow.
+      if (!this.autoCommit) {
+        throw new Error("Connection lost during transaction");
+      }
+
       await cas.connect();
     }
 
