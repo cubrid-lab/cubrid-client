@@ -15,8 +15,10 @@ Python release strategy. The GitHub Release and npm publish steps are separate.
   review it, do not accept duplicate or misleading release notes.
 - This workflow is intentionally PR-only (skip-github-release: true).
   **Merging it does not create a GitHub Release or publish npm.**
-- Configure a least-privilege RELEASE_PLEASE_TOKEN GitHub App/PAT secret for
-  generated PRs to trigger CI. The default GITHUB_TOKEN fallback creates
+- Configure a narrowly scoped RELEASE_PLEASE_TOKEN PAT secret for generated
+  PRs to trigger CI, or modify this workflow to mint a short-lived GitHub App
+  installation token on each run. Do not store an expiring App token as a
+  long-lived secret. The default GITHUB_TOKEN fallback creates
   PRs but its events do not trigger pull_request Actions; maintainers must
   manually obtain and inspect CI checks on those generated PRs.
 - Ensure repository Actions settings permit workflow-created pull requests.
