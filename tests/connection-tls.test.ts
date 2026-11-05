@@ -118,6 +118,7 @@ function int32(value: number): Buffer {
  */
 function createMockSslBroker(opts: {
   sessionId?: number;
+  onRequest?: (tls: TLSSocket) => void;
 }): Promise<{ server: Server; port: number; sawMagic: () => string }> {
   let magicSeen = "";
   return new Promise((resolve) => {
@@ -136,7 +137,12 @@ function createMockSslBroker(opts: {
         tls.once("secure", () => {
           tls.once("data", () => {
             tls.write(frameResponse(buildOpenDbResponse(opts.sessionId ?? 55)));
+            if (opts.onRequest) {
+              const onRequest = opts.onRequest;
+              tls.on("data", () => onRequest(tls));
+            }
           });
+          tls.on("error", () => {});
         });
       });
     });
@@ -252,6 +258,32 @@ test("CASConnection connect over TLS — rejects negative redirect/status code",
         return true;
       },
     );
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("CASConnection over TLS reconnects when the CAS is released", async () => {
+  const released = Buffer.from([0x00, 0x02, 0x03, 0x04]);
+  const { server, port } = await createMockSslBroker({
+    onRequest: (tls) => tls.write(frameResponse(released)),
+  });
+
+  try {
+    const cas = new CASConnection({
+      ...DEFAULT_CONFIG,
+      port,
+      ssl: true,
+      rejectUnauthorized: false,
+    });
+    await cas.connect();
+    const request = Buffer.alloc(8);
+
+    await cas.sendAndRecv(request, Buffer.from([1]));
+    await cas.sendAndRecv(request, Buffer.from([1]));
+
+    assert.equal(cas.connectionGeneration, 2);
+    await cas.close();
   } finally {
     await closeServer(server);
   }

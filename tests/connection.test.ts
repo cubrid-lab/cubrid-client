@@ -1025,3 +1025,47 @@ test("CASConnection reconnects cleanly after retiring a socket", async () => {
     await closeServer(server);
   }
 });
+
+test("CASConnection sends requests after a broker redirect", async () => {
+  const { server: casServer, port: casPort } = await createMockBroker((socket) => {
+    socket.once("data", () => {
+      socket.write(frameResponse(buildOpenDbResponse(42)));
+      socket.on("data", () => socket.write(frameResponse(CAS_INFO)));
+    });
+  });
+  const { server: broker, port: brokerPort } = await createMockBroker((socket) => {
+    socket.once("data", () => socket.write(frameHeader(casPort)));
+  });
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port: brokerPort });
+    await cas.connect();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const response = await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+    assert.equal(response.length, 0);
+    await cas.close();
+  } finally {
+    await closeServer(broker);
+    await closeServer(casServer);
+  }
+});
+
+test("CASConnection connectionGeneration changes on a transparent reconnect", async () => {
+  const released = Buffer.from([0x00, 0x02, 0x03, 0x04]);
+  const { server, port } = await brokerWith((socket) => socket.write(frameResponse(released)));
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+    await cas.connect();
+    assert.equal(cas.connectionGeneration, 1);
+
+    await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+    await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+
+    assert.equal(cas.connectionGeneration, 2);
+    await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});

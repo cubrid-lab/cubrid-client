@@ -68,6 +68,7 @@ export class CASConnection {
   private _protoVersion = 1;
   private _sessionId = 0;
   private receiveBuffer: Buffer = Buffer.alloc(0);
+  private _connectionGeneration = 0;
 
   /**
    * Per-instance FIFO serialization queue. Public entry points that mutate
@@ -146,6 +147,7 @@ export class CASConnection {
       this._casInfo = result.casInfo;
       this._protoVersion = result.protoVersion;
       this._sessionId = result.sessionId;
+      this._connectionGeneration += 1;
       this.connected = true;
     } catch (error) {
       brokerSocket.destroy();
@@ -299,6 +301,11 @@ export class CASConnection {
     return this._sessionId;
   }
 
+  /** Changes on every new session, including transparent reconnects. */
+  get connectionGeneration(): number {
+    return this._connectionGeneration;
+  }
+
   /** Whether the connection is currently open. */
   get isConnected(): boolean {
     return this.connected;
@@ -350,21 +357,7 @@ export class CASConnection {
         socket.setTimeout(0); // Disable timeout after successful connect
 
         // Track remote socket closure (broker may close after auto-commit)
-        socket.on("end", () => {
-          this.socketDead = true;
-        });
-
-        socket.on("close", () => {
-          this.socketDead = true;
-        });
-
-        // Absorb EPIPE / ECONNRESET from late writes to a dead socket.
-        // Without this handler Node.js treats the error event as unhandled
-        // and crashes the process.
-        socket.on("error", () => {
-          this.socketDead = true;
-        });
-
+        this.trackSocketDeath(socket);
         resolve(socket);
       });
     });
@@ -419,16 +412,7 @@ export class CASConnection {
         tlsSocket.removeListener("error", onError);
 
         // Re-wire dead-socket tracking onto the TLS socket.
-        tlsSocket.on("end", () => {
-          this.socketDead = true;
-        });
-        tlsSocket.on("close", () => {
-          this.socketDead = true;
-        });
-        tlsSocket.on("error", () => {
-          this.socketDead = true;
-        });
-
+        this.trackSocketDeath(tlsSocket);
         resolve(tlsSocket);
       };
 
@@ -439,22 +423,35 @@ export class CASConnection {
 
 
   /**
+   * Mark the connection dead when `socket` goes away, unless `socket` has been
+   * replaced: a redirected broker socket or a retired socket closes after its
+   * successor exists, and that must not condemn the successor.
+   *
+   * The error listener also absorbs EPIPE / ECONNRESET from late writes, which
+   * Node.js would otherwise treat as unhandled and crash the process.
+   */
+  private trackSocketDeath(socket: Socket): void {
+    const markDead = (): void => {
+      if (this.socket === socket) {
+        this.socketDead = true;
+      }
+    };
+
+    socket.on("end", markDead);
+    socket.on("close", markDead);
+    socket.on("error", markDead);
+  }
+
+  /**
    * Drop the current socket and its buffered bytes. `isConnected` turns false,
    * so the next caller opens a fresh connection instead of reusing this one.
-   * Listeners go first: a late "close" from the old socket must not mark its
-   * replacement as dead.
    */
   private retireSocket(): void {
     const socket = this.socket;
     this.socket = null;
     this.connected = false;
     this.receiveBuffer = Buffer.alloc(0);
-
-    if (socket) {
-      socket.removeAllListeners();
-      socket.on("error", () => {});
-      socket.destroy();
-    }
+    socket?.destroy();
   }
 
   /**

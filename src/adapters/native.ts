@@ -38,6 +38,13 @@ export class NativeCubridAdapter implements DriverAdapter {
    */
   private noBackslashEscapes: boolean | null = null;
 
+  /**
+   * Session that holds the open transaction's statements. Set by the first
+   * statement rather than by beginTransaction(): a released CAS legitimately
+   * reconnects on that first statement, before there is any work to lose.
+   */
+  private transactionGeneration: number | null = null;
+
   constructor(private readonly config: ClientConfig) {}
 
   async connect(): Promise<void> {
@@ -70,38 +77,41 @@ export class NativeCubridAdapter implements DriverAdapter {
       }
 
       this.autoCommit = false;
+      this.transactionGeneration = null;
     } catch (error) {
       throw mapError("transaction", error, "Failed to start transaction.");
     }
   }
 
   async commit(): Promise<void> {
-    try {
-      const cas = this.getOrCreateCAS();
+    const cas = this.getOrCreateCAS();
 
+    try {
       if (!cas.isConnected) {
-        // The server discarded any open transaction with the old session.
-        this.autoCommit = true;
         throw new Error("Not connected");
       }
+
+      this.assertTransactionSession(cas);
 
       const { header, payload } = writeEndTran(EndTranType.COMMIT, cas.casInfo);
       const responsePayload = await cas.sendAndRecv(header, payload);
       parseSimpleResponse(responsePayload);
 
-      this.autoCommit = true;
+      // A transparent reconnect inside sendAndRecv() would have committed an
+      // empty session, so this success must still be checked.
+      this.assertTransactionSession(cas);
+      this.endTransaction();
     } catch (error) {
+      this.endTransactionIfSessionLost(cas);
       throw mapError("transaction", error, "Failed to commit transaction.");
     }
   }
 
   async rollback(): Promise<void> {
-    try {
-      const cas = this.getOrCreateCAS();
+    const cas = this.getOrCreateCAS();
 
+    try {
       if (!cas.isConnected) {
-        // The server discarded any open transaction with the old session.
-        this.autoCommit = true;
         throw new Error("Not connected");
       }
 
@@ -109,8 +119,9 @@ export class NativeCubridAdapter implements DriverAdapter {
       const responsePayload = await cas.sendAndRecv(header, payload);
       parseSimpleResponse(responsePayload);
 
-      this.autoCommit = true;
+      this.endTransaction();
     } catch (error) {
+      this.endTransactionIfSessionLost(cas);
       throw mapError("transaction", error, "Failed to roll back transaction.");
     }
   }
@@ -123,6 +134,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     const cas = this.cas;
     this.cas = null;
     this.noBackslashEscapes = null;
+    this.endTransaction();
 
     try {
       // Send CON_CLOSE and tear down the socket as a single queued critical
@@ -161,13 +173,11 @@ export class NativeCubridAdapter implements DriverAdapter {
   ): Promise<T[]> {
     const cas = this.getOrCreateCAS();
 
-    if (!cas.isConnected) {
-      // Reconnecting here would drop the earlier statements of this transaction
-      // and let a later commit() persist only the ones that follow.
-      if (!this.autoCommit) {
-        throw new Error("Connection lost during transaction");
-      }
+    // Reconnecting here would drop the earlier statements of this transaction
+    // and let a later commit() persist only the ones that follow.
+    this.assertTransactionSession(cas);
 
+    if (!cas.isConnected) {
       await cas.connect();
     }
 
@@ -182,6 +192,7 @@ export class NativeCubridAdapter implements DriverAdapter {
       cas.casInfo,
     );
     const responsePayload = await cas.sendAndRecv(header, payload);
+    this.bindTransactionSession(cas);
 
     const result: PrepareAndExecuteResult = parsePrepareAndExecute(
       responsePayload,
@@ -202,6 +213,45 @@ export class NativeCubridAdapter implements DriverAdapter {
     await this.closeQueryHandle(cas, result.queryHandle);
 
     return allRows as T[];
+  }
+
+  /** True when an open transaction's session no longer exists. */
+  private isTransactionSessionLost(cas: CASConnection): boolean {
+    if (this.autoCommit) {
+      return false;
+    }
+
+    return (
+      !cas.isConnected ||
+      (this.transactionGeneration !== null &&
+        cas.connectionGeneration !== this.transactionGeneration)
+    );
+  }
+
+  private assertTransactionSession(cas: CASConnection): void {
+    if (this.isTransactionSessionLost(cas)) {
+      throw new Error("Connection lost during transaction");
+    }
+  }
+
+  private bindTransactionSession(cas: CASConnection): void {
+    if (!this.autoCommit && this.transactionGeneration === null) {
+      this.transactionGeneration = cas.connectionGeneration;
+    }
+
+    this.assertTransactionSession(cas);
+  }
+
+  private endTransaction(): void {
+    this.autoCommit = true;
+    this.transactionGeneration = null;
+  }
+
+  /** The server discarded the work, so there is nothing left to end. */
+  private endTransactionIfSessionLost(cas: CASConnection): void {
+    if (this.isTransactionSessionLost(cas)) {
+      this.endTransaction();
+    }
   }
 
   private getOrCreateCAS(): CASConnection {

@@ -55,6 +55,7 @@ class FakeCASConnection {
   _casInfo = Buffer.alloc(4);
   _protoVersion = 1;
   _sessionId = 42;
+  connectionGeneration = 1;
 
   connectError?: Error;
   sendAndRecvError?: Error;
@@ -78,6 +79,7 @@ class FakeCASConnection {
       throw this.connectError;
     }
     this._isConnected = true;
+    this.connectionGeneration += 1;
   }
 
   async send(_header: Buffer, _payload: Buffer): Promise<void> {
@@ -1134,6 +1136,100 @@ for (const method of ["commit", "rollback"] as const) {
     fakeCAS._isConnected = false;
 
     await assert.rejects(adapter[method](), TransactionError);
-    assert.equal((adapter as unknown as { autoCommit: boolean }).autoCommit, true);
+
+    fakeCAS.queueResponse(buildDMLResponse(20, 1));
+    fakeCAS.queueResponse(buildSimpleResponse(0));
+    await adapter.query("INSERT INTO t VALUES (1)");
+    assert.equal(fakeCAS.connectCalls, 1);
+  });
+
+  test(`NativeCubridAdapter ${method} failing mid-exchange allows later autocommit queries`, async () => {
+    const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+    await adapter.beginTransaction();
+    fakeCAS.sendAndRecv = async () => {
+      fakeCAS._isConnected = false;
+      throw new Error("Invalid CAS frame length -1");
+    };
+
+    await assert.rejects(adapter[method](), TransactionError);
+
+    fakeCAS.sendAndRecv = FakeCASConnection.prototype.sendAndRecv;
+    fakeCAS.queueResponse(buildDMLResponse(20, 1));
+    fakeCAS.queueResponse(buildSimpleResponse(0));
+    await adapter.query("INSERT INTO t VALUES (1)");
+    assert.equal(fakeCAS.connectCalls, 1);
+  });
+
+  test(`NativeCubridAdapter ${method} rejected by a live server keeps the transaction open`, async () => {
+    const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+    await adapter.beginTransaction();
+    fakeCAS.queueResponse(buildErrorResponse(-1, "server refused"));
+
+    await assert.rejects(adapter[method](), TransactionError);
+
+    fakeCAS.queueResponse(buildSimpleResponse(0));
+    await adapter[method]();
   });
 }
+
+async function beginWithOneInsert() {
+  const created = createAdapterWithFakeCAS();
+  await created.adapter.beginTransaction();
+  created.fakeCAS.queueResponse(buildDMLResponse(20, 1));
+  created.fakeCAS.queueResponse(buildSimpleResponse(0));
+  await created.adapter.query("INSERT INTO t VALUES ('a')");
+  return created;
+}
+
+test("NativeCubridAdapter does not commit part of a transaction after ping reconnects", async () => {
+  const { adapter, fakeCAS } = await beginWithOneInsert();
+  fakeCAS._isConnected = false;
+  await fakeCAS.connect(); // what ping() does on a retired connection
+  const callsBefore = fakeCAS.sendAndRecvCalls;
+
+  await assert.rejects(adapter.query("INSERT INTO t VALUES ('c')"), QueryError);
+  await assert.rejects(adapter.commit(), (error: unknown) => {
+    assert.ok(error instanceof TransactionError);
+    assert.match((error.cause as Error).message, /Connection lost during transaction/);
+    return true;
+  });
+
+  assert.equal(fakeCAS.sendAndRecvCalls, callsBefore);
+});
+
+test("NativeCubridAdapter rejects commit when the server session changed during it", async () => {
+  const { adapter, fakeCAS } = await beginWithOneInsert();
+  fakeCAS.sendAndRecv = async () => {
+    fakeCAS.connectionGeneration += 1;
+    return buildSimpleResponse(0);
+  };
+
+  await assert.rejects(adapter.commit(), TransactionError);
+});
+
+test("NativeCubridAdapter allows a released CAS to reconnect on the first statement", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  await adapter.beginTransaction();
+
+  const responses = [buildDMLResponse(20, 1), buildSimpleResponse(0), buildSimpleResponse(0)];
+  fakeCAS.sendAndRecv = async () => {
+    if (responses.length === 3) {
+      fakeCAS.connectionGeneration += 1;
+    }
+    return responses.shift()!;
+  };
+
+  await adapter.query("INSERT INTO t VALUES ('a')");
+  await adapter.commit();
+});
+
+test("NativeCubridAdapter close ends an open transaction", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  await adapter.beginTransaction();
+  await adapter.close();
+
+  (adapter as unknown as { cas: FakeCASConnection }).cas = fakeCAS;
+  fakeCAS.queueResponse(buildDMLResponse(20, 1));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+  await adapter.query("INSERT INTO t VALUES (1)");
+});
