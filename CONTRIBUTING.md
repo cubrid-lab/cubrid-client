@@ -136,7 +136,7 @@ scrutiny. No existing repository CI or release safeguards are waived.
 - Write a clear title and description explaining _what_ and _why_.
 - Reference any related issues (e.g., `Fixes #42`).
 - Update documentation if your change affects the public API.
-- Update `CHANGELOG.md` with a summary of your change.
+- Use Conventional Commits and summarize user-facing changes in the PR. Release Please owns generated version/changelog entries; review the Release PR for accuracy.
 
 ### Review Process
 
@@ -162,6 +162,10 @@ and a verified GitHub assignee before taking reserved work; coordinate with
 existing PR owners. Keep `database/sql`-equivalent transaction intent,
 parameter binding and wire parsing safe, use focused regression tests, and
 report offline versus real-database evidence separately.
+
+## Release management
+
+This is a Node.js/TypeScript npm package. Release Please proposes version and changelog changes in a reviewed PR; it does not automatically publish. See [the release process](docs/RELEASE_PROCESS.md) for the v1.1.0 bootstrap, manual release approval, npm publication/recovery, live CUBRID evidence and token-related CI caveat.
 
 ## Reporting Issues
 
