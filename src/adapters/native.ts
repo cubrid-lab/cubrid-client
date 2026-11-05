@@ -64,6 +64,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     try {
       return await this.executeQuery<T>(sql, params);
     } catch (error) {
+      this.bindSessionLostByFirstStatement();
       throw mapError("query", error, "Failed to execute CUBRID query.");
     }
   }
@@ -255,6 +256,22 @@ export class NativeCubridAdapter implements DriverAdapter {
     }
   }
 
+  /**
+   * A first statement that took the session down never reached
+   * bindTransactionSession(). Binding to the dead session here keeps a later
+   * ping() reconnect from passing as the session of this transaction.
+   */
+  private bindSessionLostByFirstStatement(): void {
+    if (
+      !this.autoCommit &&
+      this.transactionGeneration === null &&
+      this.cas &&
+      !this.cas.isConnected
+    ) {
+      this.transactionGeneration = this.cas.connectionGeneration;
+    }
+  }
+
   private endTransaction(): void {
     this.autoCommit = true;
     this.transactionGeneration = null;
@@ -277,6 +294,9 @@ export class NativeCubridAdapter implements DriverAdapter {
         password: this.config.password,
         ...(this.config.connectionTimeout !== undefined && {
           connectionTimeout: this.config.connectionTimeout,
+        }),
+        ...(this.config.readTimeout !== undefined && {
+          readTimeout: this.config.readTimeout,
         }),
         ...this.resolveSslConfig(),
       };

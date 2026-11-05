@@ -13,6 +13,7 @@ Complete reference for every public export of `cubrid-client`.
   - [ConnectionError](#connectionerror)
   - [QueryError](#queryerror)
   - [TransactionError](#transactionerror)
+  - [ReadTimeoutError](#readtimeouterror)
 - [Types](#types)
   - [ClientOptions](#clientoptions)
   - [ClientConfig](#clientconfig)
@@ -162,7 +163,7 @@ async transaction<T>(callback: TransactionCallback<T>): Promise<T>
 2. `beginTransaction()` is called on that connection.
 3. The `callback` receives a [`CubridTransaction`](#cubridtransaction) instance scoped to that connection.
 4. If the callback resolves successfully, `commit()` is called.
-5. If the callback throws, `rollback()` is called, and the error is re-thrown as a `TransactionError`.
+5. If the callback throws, `rollback()` is called, and the error is re-thrown as a `TransactionError` (a [`ReadTimeoutError`](#readtimeouterror) is re-thrown as-is).
 6. The isolated connection is **always closed** in a `finally` block, regardless of outcome.
 
 ##### Examples
@@ -322,6 +323,7 @@ graph TD
     E[Error] --> C[ConnectionError - connection lifecycle failures]
     E --> Q[QueryError - SQL execution failures]
     E --> T[TransactionError - transaction lifecycle failures]
+    C --> R[ReadTimeoutError - server silent for readTimeout ms]
 ```
 
 ### Common Pattern
@@ -404,6 +406,31 @@ class TransactionError extends Error {
 | Query inside transaction fails | `"Transaction query failed."` |
 | Transaction callback throws | `"Transaction failed."` |
 
+### ReadTimeoutError
+
+Thrown when `readTimeout` is set and the server shows no activity for that many milliseconds while a response is awaited. It reaches the caller as-is from `query()`, `transaction()`, `commit()`, `rollback()` and `ping()`, instead of being wrapped in a `QueryError` or `TransactionError`.
+
+```ts
+class ReadTimeoutError extends ConnectionError {
+  name = "ReadTimeoutError";
+  readonly timeoutMs: number; // The readTimeout that expired
+}
+```
+
+The connection has been discarded. The outcome of the request on the server is unknown, so do not retry a write or a `COMMIT` blindly. See [Read timeout](CONNECTION.md#read-timeout).
+
+```ts
+import { ReadTimeoutError } from "cubrid-client";
+
+try {
+  await db.query("SELECT * FROM big_table");
+} catch (error) {
+  if (error instanceof ReadTimeoutError) {
+    console.error(`No response for ${error.timeoutMs}ms`);
+  }
+}
+```
+
 ### Accessing the Original Error
 
 All error classes preserve the original driver error via the standard `cause` property:
@@ -455,6 +482,7 @@ interface ClientOptions {
   user: string;
   password?: string;
   connectionTimeout?: number;
+  readTimeout?: number;
   maxConnectionRetryCount?: number;
   logger?: unknown;
   connectionFactory?: ConnectionFactory;
@@ -469,6 +497,7 @@ interface ClientOptions {
 | `user` | `string` | — | Database user (e.g., `"dba"`) |
 | `password` | `string` | `""` | Database password |
 | `connectionTimeout` | `number` | `undefined` | Connection timeout in milliseconds |
+| `readTimeout` | `number` | `undefined` | Milliseconds of server inactivity before a request fails with [`ReadTimeoutError`](#readtimeouterror) and the connection is discarded. `undefined` or `0` means no timeout. Other values must be between 1 and 2147483647, or `createClient()` throws a `RangeError`. See [Read timeout](CONNECTION.md#read-timeout) |
 | `maxConnectionRetryCount` | `number` | `undefined` | Maximum number of connection retry attempts |
 | `logger` | `unknown` | `undefined` | Logger instance (passed to the underlying driver) |
 | `connectionFactory` | [`ConnectionFactory`](#connectionfactory) | Built-in `NodeCubridAdapter` | Custom factory for creating connections |
@@ -485,6 +514,7 @@ interface ClientConfig {
   user: string;
   password: string;
   connectionTimeout?: number | undefined;
+  readTimeout?: number | undefined;
   maxConnectionRetryCount?: number | undefined;
   logger?: unknown;
 }

@@ -7,6 +7,7 @@ import { CubridTransaction } from "../src/client/transaction.js";
 import { NodeCubridAdapter } from "../src/adapters/node-cubrid.js";
 import { ConnectionError } from "../src/errors/connection-error.js";
 import { QueryError } from "../src/errors/query-error.js";
+import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { TransactionError } from "../src/errors/transaction-error.js";
 import { mapError } from "../src/internals/map-error.js";
 import { mapResult } from "../src/internals/map-result.js";
@@ -199,6 +200,28 @@ test("normalizeConfig applies default values", () => {
     ssl: undefined,
     logger: undefined,
   });
+});
+
+test("normalizeConfig keeps a valid readTimeout", () => {
+  assert.equal(normalizeConfig({ ...baseOptions(), readTimeout: 2500 }).readTimeout, 2500);
+  assert.equal(normalizeConfig({ ...baseOptions(), readTimeout: 0 }).readTimeout, 0);
+});
+
+for (const readTimeout of [-1, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31]) {
+  test(`createClient rejects readTimeout ${readTimeout}`, () => {
+    assert.throws(() => createClient({ ...baseOptions(), readTimeout }), RangeError);
+  });
+}
+
+test("ReadTimeoutError is a ConnectionError and survives every mapError kind", () => {
+  const timeout = new ReadTimeoutError(250);
+
+  assert.ok(timeout instanceof ConnectionError);
+  assert.equal(timeout.name, "ReadTimeoutError");
+  assert.equal(timeout.timeoutMs, 250);
+  for (const kind of ["connection", "query", "transaction"] as const) {
+    assert.equal(mapError(kind, timeout, "wrapped"), timeout);
+  }
 });
 
 test("mapResult maps driver column payloads to object rows", () => {

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createServer, type Server, type Socket as NetSocket } from "node:net";
 import { TLSSocket } from "node:tls";
 
+import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { CASConnection, type CASConnectionConfig } from "../src/protocol/connection.js";
 import { writeClientInfoExchange } from "../src/protocol/protocol.js";
 import {
@@ -283,6 +284,71 @@ test("CASConnection over TLS reconnects when the CAS is released", async () => {
     await cas.sendAndRecv(request, Buffer.from([1]));
 
     assert.equal(cas.connectionGeneration, 2);
+    await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Read timeout (#90)
+// ---------------------------------------------------------------------------
+
+const TLS_CONFIG = { ...DEFAULT_CONFIG, ssl: true, rejectUnauthorized: false, readTimeout: 300 };
+
+test("readTimeout bounds a TLS handshake the server never answers", { timeout: 5000 }, async () => {
+  const server = createServer((socket: NetSocket) => {
+    socket.on("error", () => {});
+    socket.once("data", () => socket.write(int32(0)));
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const addr = server.address();
+  const port = typeof addr === "object" && addr !== null ? addr.port : 0;
+
+  try {
+    const cas = new CASConnection({ ...TLS_CONFIG, port });
+
+    await assert.rejects(cas.connect(), ReadTimeoutError);
+    assert.equal(cas.isConnected, false);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("readTimeout retires a TLS connection that stalls mid-frame", { timeout: 5000 }, async () => {
+  const { server, port } = await createMockSslBroker({
+    onRequest: (tls) => tls.write(int32(100)),
+  });
+
+  try {
+    const cas = new CASConnection({ ...TLS_CONFIG, port });
+    await cas.connect();
+
+    await assert.rejects(cas.sendAndRecv(Buffer.alloc(8), Buffer.from([1])), ReadTimeoutError);
+    assert.equal(cas.isConnected, false);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("readTimeout over TLS spares a slow frame that keeps arriving", { timeout: 5000 }, async () => {
+  const framed = frameResponse(Buffer.concat([Buffer.from([1, 2, 3, 4]), Buffer.alloc(2, 0xab)]));
+  const { server, port } = await createMockSslBroker({
+    onRequest: async (tls) => {
+      for (const byte of framed) {
+        tls.write(Buffer.from([byte]));
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    },
+  });
+
+  try {
+    const cas = new CASConnection({ ...TLS_CONFIG, port });
+    await cas.connect();
+
+    const response = await cas.sendAndRecv(Buffer.alloc(8), Buffer.from([1]));
+
+    assert.deepEqual(response, Buffer.alloc(2, 0xab));
     await cas.close();
   } finally {
     await closeServer(server);

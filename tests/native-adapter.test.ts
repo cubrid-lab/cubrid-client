@@ -1,9 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createServer, type Server, type Socket as NetSocket } from "node:net";
 
 import { NativeCubridAdapter } from "../src/adapters/native.js";
+import { createClient } from "../src/client/create-client.js";
 import { ConnectionError } from "../src/errors/connection-error.js";
 import { QueryError } from "../src/errors/query-error.js";
+import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { TransactionError } from "../src/errors/transaction-error.js";
 import type { ClientConfig } from "../src/types/client.js";
 
@@ -1263,4 +1266,244 @@ test("NativeCubridAdapter beginTransaction refuses to hide a lost transaction", 
   await assert.rejects(adapter.rollback(), TransactionError);
   await adapter.beginTransaction();
   assert.equal(fakeCAS.connectCalls, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Read timeout through the public client, over a real socket (#90)
+// ---------------------------------------------------------------------------
+
+test("NativeCubridAdapter forwards readTimeout to CAS config", async () => {
+  const adapter = new NativeCubridAdapter({ ...DEFAULT_CONFIG, port: 19999, readTimeout: 1500 });
+  await adapter.connect().catch(() => {});
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  assert.equal((adapter as any).cas.config.readTimeout, 1500);
+});
+
+const CAS_INFO = Buffer.from([0x01, 0x02, 0x03, 0x04]);
+const STALL = Symbol("stall");
+const INSERT_OK = buildDMLResponse(20, 1);
+const CLOSE_OK = buildSimpleResponse(0);
+
+function frame(payload: Buffer): Buffer {
+  const header = Buffer.alloc(4);
+  header.writeInt32BE(payload.length, 0);
+  return Buffer.concat([header, CAS_INFO, payload]);
+}
+
+function openDatabaseFrame(): Buffer {
+  return frame(Buffer.alloc(16));
+}
+
+/**
+ * Stub CAS. `scripts[n]` answers the requests of the nth connection in order;
+ * STALL leaves that request unanswered and a missing entry answers success.
+ */
+async function createScriptedCas(
+  scripts: Array<Array<Buffer | typeof STALL>>,
+): Promise<{ server: Server; port: number; requests: number[] }> {
+  const requests: number[] = [];
+  const server = createServer((socket: NetSocket) => {
+    const connection = requests.push(0) - 1;
+    socket.on("error", () => {});
+    socket.once("data", () => {
+      socket.write(Buffer.alloc(4));
+      socket.once("data", () => {
+        socket.write(openDatabaseFrame());
+        socket.on("data", () => {
+          const index = requests[connection]!;
+          requests[connection] = index + 1;
+          const reply = scripts[connection]?.[index] ?? CLOSE_OK;
+          if (reply !== STALL) {
+            socket.write(frame(reply));
+          }
+        });
+      });
+    });
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address();
+  return { server, port: typeof address === "object" && address ? address.port : 0, requests };
+}
+
+function clientFor(port: number) {
+  return createClient({ host: "127.0.0.1", port, database: "testdb", user: "dba", readTimeout: 200 });
+}
+
+function closeStub(server: Server): Promise<void> {
+  return new Promise((resolve) => server.close(() => resolve()));
+}
+
+test("client.query rejects with ReadTimeoutError, and the next query reconnects", { timeout: 5000 }, async () => {
+  const { server, port, requests } = await createScriptedCas([[STALL], [INSERT_OK, CLOSE_OK]]);
+  const client = clientFor(port);
+
+  try {
+    await assert.rejects(client.query("INSERT INTO t VALUES (1)"), ReadTimeoutError);
+
+    assert.deepEqual(await client.query("INSERT INTO t VALUES (2)"), []);
+    assert.deepEqual(requests, [1, 2]);
+  } finally {
+    await client.close();
+    await closeStub(server);
+  }
+});
+
+test("a query queued behind a timeout fails fast, and later queries work", { timeout: 5000 }, async () => {
+  const { server, port, requests } = await createScriptedCas([
+    [INSERT_OK, CLOSE_OK, STALL],
+    [INSERT_OK, CLOSE_OK],
+  ]);
+  const client = clientFor(port);
+
+  try {
+    await client.query("INSERT INTO t VALUES (1)");
+
+    const stalled = client.query("INSERT INTO t VALUES (2)");
+    const queued = client.query("INSERT INTO t VALUES (3)");
+
+    await assert.rejects(stalled, ReadTimeoutError);
+    await assert.rejects(queued, (error: unknown) => {
+      assert.ok(error instanceof QueryError);
+      assert.match(((error.cause as Error).cause as Error).message, /not connected/);
+      return true;
+    });
+
+    await client.query("INSERT INTO t VALUES (4)");
+    assert.deepEqual(requests, [3, 2]);
+  } finally {
+    await client.close();
+    await closeStub(server);
+  }
+});
+
+test("client.ping rejects with ReadTimeoutError", { timeout: 5000 }, async () => {
+  const { server, port } = await createScriptedCas([[STALL]]);
+  const client = clientFor(port);
+
+  try {
+    await assert.rejects(client.ping(), ReadTimeoutError);
+  } finally {
+    await client.close();
+    await closeStub(server);
+  }
+});
+
+test("a timeout inside a transaction loses the session: query and commit fail loudly", { timeout: 5000 }, async () => {
+  const { server, port, requests } = await createScriptedCas([
+    [INSERT_OK, CLOSE_OK, STALL],
+    [INSERT_OK, CLOSE_OK],
+  ]);
+  const client = clientFor(port);
+
+  try {
+    await client.beginTransaction();
+    await client.query("INSERT INTO t VALUES (1)");
+    await assert.rejects(client.query("INSERT INTO t VALUES (2)"), ReadTimeoutError);
+
+    await assert.rejects(client.query("INSERT INTO t VALUES (3)"), (error: unknown) => {
+      assert.ok(error instanceof QueryError);
+      assert.match(((error.cause as Error).cause as Error).message, /Connection lost during transaction/);
+      return true;
+    });
+    await assert.rejects(client.commit(), TransactionError);
+
+    // Nothing reached a new session while the transaction was unresolved.
+    assert.deepEqual(requests, [3]);
+
+    // commit() acknowledged the loss, so autocommit work may resume.
+    await client.query("INSERT INTO t VALUES (4)");
+    assert.deepEqual(requests, [3, 2]);
+  } finally {
+    await client.close();
+    await closeStub(server);
+  }
+});
+
+test("a timeout on the first transaction statement cannot start a new session", { timeout: 5000 }, async () => {
+  const { server, port, requests } = await createScriptedCas([[STALL]]);
+  const client = clientFor(port);
+
+  try {
+    await client.beginTransaction();
+    await assert.rejects(client.query("INSERT INTO t VALUES (1)"), ReadTimeoutError);
+
+    await assert.rejects(client.query("INSERT INTO t VALUES (2)"), QueryError);
+    await assert.rejects(client.commit(), TransactionError);
+
+    assert.deepEqual(requests, [1]);
+  } finally {
+    await client.close();
+    await closeStub(server);
+  }
+});
+
+test("a statement whose handle cleanup times out still fails the commit", { timeout: 5000 }, async () => {
+  const { server, port } = await createScriptedCas([[INSERT_OK, STALL]]);
+  const client = clientFor(port);
+
+  try {
+    await client.beginTransaction();
+    await client.query("INSERT INTO t VALUES (1)");
+
+    await assert.rejects(client.commit(), TransactionError);
+  } finally {
+    await client.close();
+    await closeStub(server);
+  }
+});
+
+test("a timed-out COMMIT reports ReadTimeoutError and is not retried", { timeout: 5000 }, async () => {
+  const { server, port, requests } = await createScriptedCas([[INSERT_OK, CLOSE_OK, STALL]]);
+  const client = clientFor(port);
+
+  try {
+    await client.beginTransaction();
+    await client.query("INSERT INTO t VALUES (1)");
+
+    await assert.rejects(client.commit(), ReadTimeoutError);
+
+    assert.deepEqual(requests, [3]);
+  } finally {
+    await client.close();
+    await closeStub(server);
+  }
+});
+
+test("client.transaction surfaces a timeout and still closes", { timeout: 5000 }, async () => {
+  const { server, port } = await createScriptedCas([[STALL]]);
+  const client = clientFor(port);
+
+  await assert.rejects(
+    client.transaction((tx) => tx.query("INSERT INTO t VALUES (1)")),
+    ReadTimeoutError,
+  );
+
+  await closeStub(server);
+});
+
+test("ping after a first-statement timeout cannot give the transaction a new session", { timeout: 5000 }, async () => {
+  const version = Buffer.concat([buildSimpleResponse(0), Buffer.from("11.4.0\0")]);
+  const { server, port, requests } = await createScriptedCas([[STALL], [version]]);
+  const client = clientFor(port);
+
+  try {
+    await client.beginTransaction();
+    await assert.rejects(client.query("INSERT INTO t VALUES (1)"), ReadTimeoutError);
+    await client.ping();
+
+    await assert.rejects(client.query("INSERT INTO t VALUES (2)"), (error: unknown) => {
+      assert.ok(error instanceof QueryError);
+      assert.match(((error.cause as Error).cause as Error).message, /Connection lost during transaction/);
+      return true;
+    });
+    await assert.rejects(client.commit(), TransactionError);
+
+    // Only the ping reached the new session: no statement and no COMMIT.
+    assert.deepEqual(requests, [1, 1]);
+  } finally {
+    await client.close();
+    await closeStub(server);
+  }
 });

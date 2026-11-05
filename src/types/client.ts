@@ -25,6 +25,8 @@ export interface ClientConfig {
   user: string;
   password: string;
   connectionTimeout?: number | undefined;
+  /** See {@link ClientOptions.readTimeout}. */
+  readTimeout?: number | undefined;
   maxConnectionRetryCount?: number | undefined;
   ssl?: boolean | ClientSSLOptions | undefined;
   logger?: unknown;
@@ -37,6 +39,14 @@ export interface ClientOptions {
   user: string;
   password?: string;
   connectionTimeout?: number;
+  /**
+   * Discard the connection and reject with `ReadTimeoutError` when the server
+   * sends nothing for this many milliseconds while a response is awaited. This
+   * limits inactivity, not total query time, so it must exceed the longest time
+   * the server may spend executing a statement before its first response byte.
+   * Undefined or 0 means no timeout.
+   */
+  readTimeout?: number;
   maxConnectionRetryCount?: number;
   ssl?: boolean | ClientSSLOptions;
   logger?: unknown;

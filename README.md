@@ -254,6 +254,7 @@ Creates a client instance. Connection is established lazily on first query.
 | `user` | `string` | *(required)* | Database user |
 | `password` | `string` | `""` | Password |
 | `connectionTimeout` | `number` | — | Connection timeout (ms) |
+| `readTimeout` | `number` | — | Fail a query after this many ms with no activity from the server (see [Read timeout](docs/CONNECTION.md#read-timeout)). Unset means no timeout |
 | `ssl` | `boolean \| ClientSSLOptions` | `false` | Enable TLS. `true` for defaults, or an object for cert/verification control (see [TLS/SSL](#tlsssl)) |
 
 ### `client.query<T>(sql, params?): Promise<T[]>`
