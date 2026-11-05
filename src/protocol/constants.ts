@@ -93,6 +93,7 @@ export const EXECUTE_QUERY_ALL = 0x02;
 
 // ---------------------------------------------------------------------------
 // CUBRID data types (wire type codes)
+// Source: T_CCI_U_TYPE (CCI_U_TYPE_*) in CUBRID/cubrid src/broker/broker_cas_cci.h
 // ---------------------------------------------------------------------------
 
 export const enum CUBRIDDataType {
@@ -112,15 +113,17 @@ export const enum CUBRIDDataType {
   DATE = 13,
   TIME = 14,
   TIMESTAMP = 15,
+  SET = 16,
+  MULTISET = 17,
+  SEQUENCE = 18,
+  OBJECT = 19,
+  RESULTSET = 20,
+  BIGINT = 21,
   DATETIME = 22,
   BLOB = 23,
   CLOB = 24,
   ENUM = 25,
-  BIGINT = 26,
-  OBJECT = 32,
-  SET = 33,
-  MULTISET = 34,
-  SEQUENCE = 35,
+  JSON = 34,
 }
 
 // ---------------------------------------------------------------------------
@@ -172,4 +175,6 @@ export const TYPE_NAMES: Record<number, string> = {
   [CUBRIDDataType.SET]: "SET",
   [CUBRIDDataType.MULTISET]: "MULTISET",
   [CUBRIDDataType.SEQUENCE]: "SEQUENCE",
+  [CUBRIDDataType.RESULTSET]: "RESULTSET",
+  [CUBRIDDataType.JSON]: "JSON",
 };

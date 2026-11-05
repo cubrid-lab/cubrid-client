@@ -471,16 +471,63 @@ test("CLIENT_JDBC is 3", () => {
   assert.equal(CLIENT_JDBC, 3);
 });
 
-test("TYPE_NAMES maps all data types", () => {
-  assert.equal(TYPE_NAMES[CUBRIDDataType.INT], "INT");
-  assert.equal(TYPE_NAMES[CUBRIDDataType.STRING], "VARCHAR");
-  assert.equal(TYPE_NAMES[CUBRIDDataType.BIGINT], "BIGINT");
-  assert.equal(TYPE_NAMES[CUBRIDDataType.DATE], "DATE");
-  assert.equal(TYPE_NAMES[CUBRIDDataType.DATETIME], "DATETIME");
-  assert.equal(TYPE_NAMES[CUBRIDDataType.NULL], "NULL");
-  assert.equal(TYPE_NAMES[CUBRIDDataType.SET], "SET");
-  assert.equal(TYPE_NAMES[CUBRIDDataType.BLOB], "BLOB");
-  assert.equal(TYPE_NAMES[CUBRIDDataType.CLOB], "CLOB");
+// Literal wire codes from T_CCI_U_TYPE (CUBRID/cubrid src/broker/broker_cas_cci.h).
+// Deliberately not derived from CUBRIDDataType so a wrong constant cannot hide.
+// [name, enum value under test, literal wire code]
+const CCI_WIRE_CODES: Array<[string, number, number]> = [
+  ["NULL", CUBRIDDataType.NULL, 0],
+  ["CHAR", CUBRIDDataType.CHAR, 1],
+  ["STRING", CUBRIDDataType.STRING, 2],
+  ["NCHAR", CUBRIDDataType.NCHAR, 3],
+  ["VARNCHAR", CUBRIDDataType.VARNCHAR, 4],
+  ["BIT", CUBRIDDataType.BIT, 5],
+  ["VARBIT", CUBRIDDataType.VARBIT, 6],
+  ["NUMERIC", CUBRIDDataType.NUMERIC, 7],
+  ["INT", CUBRIDDataType.INT, 8],
+  ["SHORT", CUBRIDDataType.SHORT, 9],
+  ["MONETARY", CUBRIDDataType.MONETARY, 10],
+  ["FLOAT", CUBRIDDataType.FLOAT, 11],
+  ["DOUBLE", CUBRIDDataType.DOUBLE, 12],
+  ["DATE", CUBRIDDataType.DATE, 13],
+  ["TIME", CUBRIDDataType.TIME, 14],
+  ["TIMESTAMP", CUBRIDDataType.TIMESTAMP, 15],
+  ["SET", CUBRIDDataType.SET, 16],
+  ["MULTISET", CUBRIDDataType.MULTISET, 17],
+  ["SEQUENCE", CUBRIDDataType.SEQUENCE, 18],
+  ["OBJECT", CUBRIDDataType.OBJECT, 19],
+  ["RESULTSET", CUBRIDDataType.RESULTSET, 20],
+  ["BIGINT", CUBRIDDataType.BIGINT, 21],
+  ["DATETIME", CUBRIDDataType.DATETIME, 22],
+  ["BLOB", CUBRIDDataType.BLOB, 23],
+  ["CLOB", CUBRIDDataType.CLOB, 24],
+  ["ENUM", CUBRIDDataType.ENUM, 25],
+  ["JSON", CUBRIDDataType.JSON, 34],
+];
+
+test("CUBRIDDataType values match CCI wire codes", () => {
+  for (const [name, actual, expected] of CCI_WIRE_CODES) {
+    assert.equal(actual, expected, name);
+  }
+});
+
+test("TYPE_NAMES maps literal wire codes to type names", () => {
+  assert.equal(TYPE_NAMES[0], "NULL");
+  assert.equal(TYPE_NAMES[2], "VARCHAR");
+  assert.equal(TYPE_NAMES[8], "INT");
+  assert.equal(TYPE_NAMES[9], "SMALLINT");
+  assert.equal(TYPE_NAMES[13], "DATE");
+  assert.equal(TYPE_NAMES[16], "SET");
+  assert.equal(TYPE_NAMES[17], "MULTISET");
+  assert.equal(TYPE_NAMES[18], "SEQUENCE");
+  assert.equal(TYPE_NAMES[19], "OBJECT");
+  assert.equal(TYPE_NAMES[20], "RESULTSET");
+  assert.equal(TYPE_NAMES[21], "BIGINT");
+  assert.equal(TYPE_NAMES[22], "DATETIME");
+  assert.equal(TYPE_NAMES[23], "BLOB");
+  assert.equal(TYPE_NAMES[24], "CLOB");
+  assert.equal(TYPE_NAMES[34], "JSON");
+  // 26 is CCI_U_TYPE_USHORT, not BIGINT
+  assert.notEqual(TYPE_NAMES[26], "BIGINT");
 });
 
 test("OPEN_DB_TOTAL_SIZE is 628", () => {
@@ -752,7 +799,7 @@ test("encodeBindParams encodes large integer as BIGINT", () => {
   const large = 2147483648; // exceeds int32 max
   const buf = encodeBindParams([large]);
   assert.equal(buf.readInt32BE(0), 1 + 8); // type_byte + int64
-  assert.equal(buf[4], CUBRIDDataType.BIGINT);
+  assert.equal(buf[4], 21); // CCI_U_TYPE_BIGINT
   assert.equal(buf.readBigInt64BE(5), BigInt(large));
 });
 
@@ -765,7 +812,7 @@ test("encodeBindParams encodes floating point as DOUBLE", () => {
 
 test("encodeBindParams encodes bigint", () => {
   const buf = encodeBindParams([9876543210n]);
-  assert.equal(buf[4], CUBRIDDataType.BIGINT);
+  assert.equal(buf[4], 21); // CCI_U_TYPE_BIGINT
   assert.equal(buf.readBigInt64BE(5), 9876543210n);
 });
 
@@ -1227,12 +1274,23 @@ test("parsePrepareAndExecute SELECT with BIGINT column", () => {
   const data = Buffer.alloc(8);
   data.writeBigInt64BE(9876543210n, 0);
   const buf = buildSelectResponseForTypes(
-    [{ name: "val", type: CUBRIDDataType.BIGINT }],
-    [[{ type: CUBRIDDataType.BIGINT, data }]],
+    [{ name: "val", type: 21 }], // CCI_U_TYPE_BIGINT
+    [[{ type: 21, data }]],
   );
   const result = parsePrepareAndExecute(buf, 1);
   assert.equal(result.rows.length, 1);
   assert.equal(result.rows[0]!.val, 9876543210n);
+});
+
+test("parsePrepareAndExecute SELECT with negative BIGINT column (wire code 21)", () => {
+  const data = Buffer.alloc(8);
+  data.writeBigInt64BE(-9223372036854775808n, 0);
+  const buf = buildSelectResponseForTypes(
+    [{ name: "val", type: 21 }],
+    [[{ type: 21, data }]],
+  );
+  const result = parsePrepareAndExecute(buf, 1);
+  assert.equal(result.rows[0]!.val, -9223372036854775808n);
 });
 
 test("parsePrepareAndExecute SELECT with FLOAT column", () => {
