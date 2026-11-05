@@ -244,6 +244,20 @@ export function parsePrepareAndExecute(
   };
 }
 
+/**
+ * Read the query handle from a PREPARE_AND_EXECUTE response without decoding
+ * the rest of it, so the handle can still be released if decoding fails.
+ * Returns null when the response holds none: a server error, or too few bytes.
+ */
+export function readQueryHandle(data: Buffer): number | null {
+  if (data.length < SIZE_INT) {
+    return null;
+  }
+
+  const responseCode = data.readInt32BE(0);
+  return responseCode >= 0 ? responseCode : null;
+}
+
 // ---------------------------------------------------------------------------
 // Fetch (FC=8)
 // ---------------------------------------------------------------------------

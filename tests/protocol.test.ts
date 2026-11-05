@@ -26,6 +26,7 @@ import {
   parseOpenDatabase,
   writePrepareAndExecute,
   parsePrepareAndExecute,
+  readQueryHandle,
   writeFetch,
   parseFetch,
   writeCloseReqHandle,
@@ -1037,6 +1038,25 @@ test("parsePrepareAndExecute throws on error response", () => {
   assert.throws(() => parsePrepareAndExecute(buf, 1), (err: Error) => {
     return err.message.includes("-493") && err.message.includes("Syntax error");
   });
+});
+
+test("readQueryHandle returns the handle of a response that cannot be decoded", () => {
+  const buf = Buffer.alloc(6);
+  buf.writeInt32BE(7, 0);
+
+  assert.equal(readQueryHandle(buf), 7);
+  assert.throws(() => parsePrepareAndExecute(buf, 1));
+});
+
+test("readQueryHandle returns null for a server error", () => {
+  const buf = Buffer.alloc(8);
+  buf.writeInt32BE(-1, 0);
+
+  assert.equal(readQueryHandle(buf), null);
+});
+
+test("readQueryHandle returns null when the handle itself is cut off", () => {
+  assert.equal(readQueryHandle(Buffer.alloc(3)), null);
 });
 
 test("parsePrepareAndExecute parses non-SELECT result", () => {

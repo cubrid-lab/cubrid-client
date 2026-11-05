@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { NativeCubridAdapter } from "../src/adapters/native.js";
+import { CASFunctionCode } from "../src/protocol/constants.js";
 import { ConnectionError } from "../src/errors/connection-error.js";
 import { QueryError } from "../src/errors/query-error.js";
 import { TransactionError } from "../src/errors/transaction-error.js";
@@ -62,8 +63,11 @@ class FakeCASConnection {
   sendAndRecvError?: Error;
   sendError?: Error;
 
-  /** Responses to return from sendAndRecv, consumed in FIFO order */
-  private responses: Buffer[] = [];
+  /** Every payload passed to sendAndRecv, in order */
+  sentPayloads: Buffer[] = [];
+
+  /** Outcomes of sendAndRecv, consumed in FIFO order */
+  private responses: Array<Buffer | Error> = [];
 
   constructor(overrides: Partial<FakeCASConnection> = {}) {
     Object.assign(this, overrides);
@@ -72,6 +76,18 @@ class FakeCASConnection {
   /** Queue a sendAndRecv response */
   queueResponse(buf: Buffer): void {
     this.responses.push(buf);
+  }
+
+  /** Queue a failed exchange, which retires the socket like CASConnection. */
+  queueExchangeFailure(error: Error): void {
+    this.responses.push(error);
+  }
+
+  /** Handles released by CLOSE_REQ_HANDLE requests, in order */
+  get closedHandles(): number[] {
+    return this.sentPayloads
+      .filter((payload) => payload[0] === CASFunctionCode.CLOSE_REQ_HANDLE)
+      .map((payload) => payload.readInt32BE(5));
   }
 
   async connect(): Promise<void> {
@@ -95,16 +111,33 @@ class FakeCASConnection {
     }
   }
 
-  async sendAndRecv(_header: Buffer, _payload: Buffer): Promise<Buffer> {
+  async sendAndRecv(_header: Buffer, payload: Buffer): Promise<Buffer> {
     this.sendAndRecvCalls += 1;
+    this.sentPayloads.push(payload);
     if (this.sendAndRecvError) {
       throw this.sendAndRecvError;
     }
-    if (this.responses.length > 0) {
-      return this.responses.shift()!;
+    const next = this.responses.shift();
+    if (next instanceof Error) {
+      this._isConnected = false;
+      throw next;
+    }
+    if (next) {
+      return next;
     }
     // Default: return a "success" response (response_code = 0)
     return buildSimpleResponse(0);
+  }
+
+  async sendAndRecvOnSession(
+    generation: number,
+    header: Buffer,
+    payload: Buffer,
+  ): Promise<Buffer | null> {
+    if (!this._isConnected || this.connectionGeneration !== generation) {
+      return null;
+    }
+    return this.sendAndRecv(header, payload);
   }
 
   async close(beforeClose?: () => Promise<void>): Promise<void> {
@@ -1263,4 +1296,241 @@ test("NativeCubridAdapter beginTransaction refuses to hide a lost transaction", 
   await assert.rejects(adapter.rollback(), TransactionError);
   await adapter.beginTransaction();
   assert.equal(fakeCAS.connectCalls, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Query handle lifecycle (#108)
+// ---------------------------------------------------------------------------
+
+const QUERY_HANDLE = 7;
+
+/** A SELECT with one inline row and `total` rows on the server. */
+function buildPartialSelectResponse(total: number): Buffer {
+  const response = buildSelectResponse([{ name: "id", type: 2 }], [["1"]]);
+  const colMetaSize = 1 + 2 + 4 + 4 + 3 + 4 + 3 + 4 + 1 + 1 + 4 + 1 + 7;
+  response.writeInt32BE(QUERY_HANDLE, 0);
+  response.writeInt32BE(total, 4 + 4 + 1 + 4 + 1 + 4 + colMetaSize);
+  return response;
+}
+
+/** A FETCH response announcing a row whose bytes are cut off. */
+function buildTruncatedFetchResponse(): Buffer {
+  const response = Buffer.alloc(4 + 4 + 2);
+  response.writeInt32BE(0, 0);
+  response.writeInt32BE(1, 4);
+  return response;
+}
+
+/** A SELECT response that carries a handle but cuts off inside its inline row. */
+function buildTruncatedSelectResponse(handle = QUERY_HANDLE): Buffer {
+  const response = buildSelectResponse([{ name: "id", type: 2 }], [["a long value"]]);
+  response.writeInt32BE(handle, 0);
+  return response.subarray(0, response.length - 5);
+}
+
+async function assertQueryFails(
+  adapter: NativeCubridAdapter,
+  causePattern: RegExp,
+  sql = "SELECT id FROM t",
+): Promise<void> {
+  await assert.rejects(
+    () => adapter.query(sql),
+    (err: Error) => {
+      assert.ok(err instanceof QueryError);
+      assert.match((err.cause as Error).message, causePattern);
+      return true;
+    },
+  );
+}
+
+test("query handle: a successful SELECT closes it exactly once", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(buildPartialSelectResponse(1));
+
+  await adapter.query("SELECT id FROM t");
+
+  assert.deepEqual(fakeCAS.closedHandles, [QUERY_HANDLE]);
+});
+
+test("query handle: a successful DML closes it exactly once", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(buildDMLResponse(20, 1));
+
+  await adapter.query("INSERT INTO t VALUES (1)");
+
+  assert.deepEqual(fakeCAS.closedHandles, [1]);
+});
+
+test("query handle: a FETCH that ends early closes it exactly once", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(buildPartialSelectResponse(3));
+  fakeCAS.queueResponse(buildErrorResponse(-1, "no more data"));
+
+  const rows = await adapter.query("SELECT id FROM t");
+
+  assert.equal(rows.length, 1);
+  assert.deepEqual(fakeCAS.closedHandles, [QUERY_HANDLE]);
+});
+
+test("query handle: a FETCH rejected by the server still closes it", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(buildPartialSelectResponse(2));
+  const fetchError = buildErrorResponse(-495, "fetch rejected");
+  fetchError.writeInt32BE(-2, 0);
+  fakeCAS.queueResponse(fetchError);
+
+  await assertQueryFails(adapter, /CUBRID fetch failed/);
+
+  assert.deepEqual(fakeCAS.closedHandles, [QUERY_HANDLE]);
+  assert.equal(fakeCAS.isConnected, true);
+});
+
+test("query handle: a FETCH that cannot be decoded still closes it", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(buildPartialSelectResponse(2));
+  fakeCAS.queueResponse(buildTruncatedFetchResponse());
+
+  await assertQueryFails(adapter, /Malformed CAS packet|out of range/i);
+
+  assert.deepEqual(fakeCAS.closedHandles, [QUERY_HANDLE]);
+});
+
+test("query handle: inline rows that cannot be decoded still close it", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(buildTruncatedSelectResponse());
+
+  await assertQueryFails(adapter, /Malformed CAS packet|out of range/i);
+
+  assert.deepEqual(fakeCAS.closedHandles, [QUERY_HANDLE]);
+});
+
+test("query handle: column metadata that cannot be decoded still closes it", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(buildDMLResponse(20, 1).subarray(0, 12));
+
+  await assertQueryFails(adapter, /out of range|outside/i, "INSERT INTO t VALUES (1)");
+
+  assert.deepEqual(fakeCAS.closedHandles, [1]);
+});
+
+test("query handle: nothing is closed when the server returned no handle", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(buildErrorResponse(-493, "syntax error"));
+
+  await assertQueryFails(adapter, /CUBRID query failed/);
+
+  assert.deepEqual(fakeCAS.closedHandles, []);
+});
+
+test("query handle: nothing is closed on a socket the failed FETCH retired", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(buildPartialSelectResponse(2));
+  fakeCAS.queueExchangeFailure(new Error("socket reset"));
+
+  await assertQueryFails(adapter, /socket reset/);
+
+  assert.deepEqual(fakeCAS.closedHandles, []);
+  assert.equal(fakeCAS.sendAndRecvCalls, 2);
+
+  // The broken connection is not reused: the next query opens a new one.
+  fakeCAS.queueResponse(buildDMLResponse(20, 1));
+  await adapter.query("INSERT INTO t VALUES (1)");
+  assert.equal(fakeCAS.connectCalls, 1);
+});
+
+test("query handle: nothing is closed when decoding finds the socket retired", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  const original = fakeCAS.sendAndRecv.bind(fakeCAS);
+  fakeCAS.sendAndRecv = async (header: Buffer, payload: Buffer) => {
+    const response = await original(header, payload);
+    fakeCAS._isConnected = false;
+    return response;
+  };
+  fakeCAS.queueResponse(buildTruncatedSelectResponse());
+
+  await assertQueryFails(adapter, /Malformed CAS packet|out of range/i);
+
+  assert.deepEqual(fakeCAS.closedHandles, []);
+});
+
+test("query handle: nothing is closed on a session that replaced the handle's", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(buildPartialSelectResponse(2));
+
+  // Another caller retired the socket and reconnected while this FETCH was
+  // queued. The number now names nothing here, or that caller's own handle.
+  const original = fakeCAS.sendAndRecv.bind(fakeCAS);
+  fakeCAS.sendAndRecv = async (header: Buffer, payload: Buffer) => {
+    if (payload[0] === CASFunctionCode.FETCH) {
+      fakeCAS.connectionGeneration += 1;
+      throw new Error("fetched from a replaced session");
+    }
+    return original(header, payload);
+  };
+
+  await assertQueryFails(adapter, /replaced session/);
+
+  assert.deepEqual(fakeCAS.closedHandles, []);
+});
+
+test("query handle: a transaction that lost its session closes nothing", async () => {
+  const { adapter, fakeCAS } = await beginWithOneInsert();
+  fakeCAS.sentPayloads = [];
+  fakeCAS.queueResponse(buildDMLResponse(20, 1));
+
+  const original = fakeCAS.sendAndRecv.bind(fakeCAS);
+  fakeCAS.sendAndRecv = async (header: Buffer, payload: Buffer) => {
+    fakeCAS.connectionGeneration += 1;
+    return original(header, payload);
+  };
+
+  await assertQueryFails(adapter, /Connection lost during transaction/, "INSERT INTO t VALUES (2)");
+
+  assert.equal(fakeCAS.discardCalls, 1);
+  assert.deepEqual(fakeCAS.closedHandles, []);
+});
+
+test("query handle: a failed close does not mask the fetch failure", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(buildPartialSelectResponse(2));
+  fakeCAS.queueResponse(buildTruncatedFetchResponse());
+  fakeCAS.queueExchangeFailure(new Error("close failed"));
+
+  await assertQueryFails(adapter, /Malformed CAS packet|out of range/i);
+
+  assert.deepEqual(fakeCAS.closedHandles, [QUERY_HANDLE]);
+  assert.equal(fakeCAS.isConnected, false);
+});
+
+test("query handle: a close rejected by the server does not mask the failure", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(buildTruncatedSelectResponse());
+  fakeCAS.queueResponse(buildErrorResponse(-1006, "invalid handle"));
+
+  await assertQueryFails(adapter, /Malformed CAS packet|out of range/i);
+
+  assert.deepEqual(fakeCAS.closedHandles, [QUERY_HANDLE]);
+  assert.equal(fakeCAS.isConnected, true);
+});
+
+test("query handle: a successful query survives a failed close", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(buildPartialSelectResponse(1));
+  fakeCAS.queueExchangeFailure(new Error("close failed"));
+
+  const rows = await adapter.query("SELECT id FROM t");
+
+  assert.equal(rows.length, 1);
+  assert.deepEqual(fakeCAS.closedHandles, [QUERY_HANDLE]);
+});
+
+test("query handle: a backslash probe that cannot be decoded still closes it", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (adapter as any).noBackslashEscapes = null;
+  fakeCAS.queueResponse(buildTruncatedSelectResponse());
+
+  await assertQueryFails(adapter, /Malformed CAS packet|out of range/i, "SELECT ?");
+
+  assert.deepEqual(fakeCAS.closedHandles, [QUERY_HANDLE]);
 });

@@ -3,7 +3,7 @@
  *
  * Requires: a CUBRID broker on 127.0.0.1:33000 with database `testdb`
  * (user `dba`, empty password). Database-dependent cases self-skip when no
- * server is reachable.
+ * server is reachable. Set CUBRID_TEST_PORT to use another broker port.
  *
  * Run:  npm run test:integration
  */
@@ -14,10 +14,13 @@ import { createClient } from "../src/client/create-client.js";
 import { NativeCubridAdapter } from "../src/adapters/native.js";
 import { ConnectionError } from "../src/errors/connection-error.js";
 import { QueryError } from "../src/errors/query-error.js";
+import { CASFunctionCode } from "../src/protocol/constants.js";
+import type { CASConnection } from "../src/protocol/connection.js";
+import { writeFetch } from "../src/protocol/protocol.js";
 
 const TEST_CONFIG = {
   host: "127.0.0.1",
-  port: 33000,
+  port: Number(process.env.CUBRID_TEST_PORT ?? 33000),
   database: "testdb",
   user: "dba",
   password: "",
@@ -552,6 +555,192 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     } finally {
       await client.close();
     }
+  });
+
+  // -------------------------------------------------------------------------
+  // Query handle release (#108)
+  // -------------------------------------------------------------------------
+
+  describe("query handle release", () => {
+    const TABLE = "integration_test_handles";
+    const SELECT_ALL = `SELECT id, val FROM ${TABLE} ORDER BY id`;
+    const CAS_ER_SRV_HANDLE = -1006;
+
+    /** Enough rows that the first response cannot carry them all. */
+    const ROW_COUNT = 1000;
+
+    interface Trace {
+      adapter: NativeCubridAdapter;
+      cas: CASConnection;
+      sent: number[];
+      handle: () => number;
+    }
+
+    /** Observe every request and let `tamper` replace the response decoded by the adapter. */
+    async function open(tamper: (functionCode: number, response: Buffer) => Buffer): Promise<Trace> {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+      await adapter.connect();
+      const cas = (adapter as unknown as { cas: CASConnection }).cas;
+      const sent: number[] = [];
+      let handle = -1;
+
+      const sendAndRecv = cas.sendAndRecv.bind(cas);
+      cas.sendAndRecv = async (header, payload) => {
+        sent.push(payload[0]!);
+        const response = await sendAndRecv(header, payload);
+        if (payload[0] === CASFunctionCode.PREPARE_AND_EXECUTE) {
+          handle = response.readInt32BE(0);
+        }
+        return tamper(payload[0]!, response);
+      };
+
+      const sendAndRecvOnSession = cas.sendAndRecvOnSession.bind(cas);
+      cas.sendAndRecvOnSession = async (generation, header, payload) => {
+        const response = await sendAndRecvOnSession(generation, header, payload);
+        if (response) {
+          sent.push(payload[0]!);
+        }
+        return response;
+      };
+
+      return { adapter, cas, sent, handle: () => handle };
+    }
+
+    /** The server's verdict on `handle`, without the adapter or a reconnect in the way. */
+    async function fetchCode(trace: Trace): Promise<number> {
+      const { cas } = trace;
+      const { header, payload } = writeFetch(trace.handle(), 0, 1, cas.casInfo);
+      const response = await cas.sendAndRecvOnSession(cas.connectionGeneration, header, payload);
+      assert.ok(response, "the session is still open");
+      return response.readInt32BE(0) < 0 ? response.readInt32BE(4) : 0;
+    }
+
+    const count = (trace: Trace, functionCode: number): number =>
+      trace.sent.filter((code) => code === functionCode).length;
+
+    const truncateFetch = (functionCode: number, response: Buffer): Buffer =>
+      functionCode === CASFunctionCode.FETCH ? response.subarray(0, 10) : response;
+
+    const truncateExecute = (functionCode: number, response: Buffer): Buffer =>
+      functionCode === CASFunctionCode.PREPARE_AND_EXECUTE ? response.subarray(0, 12) : response;
+
+    test("creates a table large enough to need FETCH", async () => {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+
+      try {
+        await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await adapter.query(`CREATE TABLE ${TABLE} (id INT PRIMARY KEY, val VARCHAR(40))`);
+        await adapter.beginTransaction();
+        for (let id = 0; id < ROW_COUNT; id += 1) {
+          await adapter.query(`INSERT INTO ${TABLE} VALUES (${id}, 'row ${id}')`);
+        }
+        await adapter.commit();
+
+        const trace = await open((_code, response) => response);
+        const rows = await trace.adapter.query(SELECT_ALL);
+        assert.equal(rows.length, ROW_COUNT);
+        assert.ok(count(trace, CASFunctionCode.FETCH) > 0);
+        assert.equal(count(trace, CASFunctionCode.CLOSE_REQ_HANDLE), 1);
+        await trace.adapter.close();
+      } finally {
+        await adapter.close();
+      }
+    });
+
+    test("releases the handle after a FETCH decode failure inside a transaction", async () => {
+      const trace = await open(truncateFetch);
+
+      try {
+        await trace.adapter.beginTransaction();
+        const generation = trace.cas.connectionGeneration;
+
+        await assert.rejects(trace.adapter.query(SELECT_ALL), QueryError);
+
+        assert.equal(count(trace, CASFunctionCode.CLOSE_REQ_HANDLE), 1);
+        assert.equal(trace.cas.connectionGeneration, generation);
+        assert.equal(await fetchCode(trace), CAS_ER_SRV_HANDLE);
+        await trace.adapter.rollback();
+      } finally {
+        await trace.adapter.close();
+      }
+    });
+
+    test("releases the handle on its own session after an autocommit FETCH failure", async () => {
+      const trace = await open(truncateFetch);
+
+      try {
+        const generation = trace.cas.connectionGeneration;
+
+        await assert.rejects(trace.adapter.query(SELECT_ALL), QueryError);
+
+        // The broker has marked the CAS released by now, so anything that goes
+        // through sendAndRecv() would reconnect and close nothing.
+        assert.equal(count(trace, CASFunctionCode.CLOSE_REQ_HANDLE), 1);
+        assert.equal(trace.cas.connectionGeneration, generation);
+        assert.equal(await fetchCode(trace), CAS_ER_SRV_HANDLE);
+      } finally {
+        await trace.adapter.close();
+      }
+    });
+
+    test("releases the handle when the first response cannot be decoded", async () => {
+      const trace = await open(truncateExecute);
+
+      try {
+        await trace.adapter.beginTransaction();
+
+        await assert.rejects(trace.adapter.query(SELECT_ALL), QueryError);
+
+        assert.equal(count(trace, CASFunctionCode.CLOSE_REQ_HANDLE), 1);
+        assert.equal(await fetchCode(trace), CAS_ER_SRV_HANDLE);
+        await trace.adapter.rollback();
+      } finally {
+        await trace.adapter.close();
+      }
+    });
+
+    test("attempts no release on a socket lost during FETCH, then recovers", async () => {
+      const trace = await open((_code, response) => response);
+      const internals = trace.cas as unknown as { socket: { destroy(): void } };
+      const sendAndRecv = trace.cas.sendAndRecv;
+      trace.cas.sendAndRecv = async (header, payload) => {
+        if (payload[0] === CASFunctionCode.FETCH) {
+          internals.socket.destroy();
+        }
+        return sendAndRecv(header, payload);
+      };
+
+      try {
+        await assert.rejects(trace.adapter.query(SELECT_ALL), QueryError);
+
+        assert.equal(trace.cas.isConnected, false);
+        assert.equal(count(trace, CASFunctionCode.CLOSE_REQ_HANDLE), 0);
+
+        const rows = await trace.adapter.query("SELECT 1 + 1 AS result");
+        assert.equal(rows[0]!.result, 2);
+      } finally {
+        await trace.adapter.close();
+      }
+    });
+
+    test("does not open a session just to close a handle", async () => {
+      const trace = await open((_code, response) => response);
+
+      try {
+        const before = trace.cas.connectionGeneration;
+        await trace.adapter.query("SELECT 1 + 1 AS result");
+
+        assert.equal(trace.cas.connectionGeneration, before);
+      } finally {
+        await trace.adapter.close();
+      }
+    });
+
+    test("drops the table", async () => {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+      await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`);
+      await adapter.close();
+    });
   });
 
   // -------------------------------------------------------------------------
