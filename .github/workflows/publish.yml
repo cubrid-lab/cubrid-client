@@ -110,6 +110,7 @@ jobs:
           '
       - name: Verify exact tagged contents
         run: |
+          npm audit --audit-level=high
           npm run typecheck
           npm test
           npm run build
