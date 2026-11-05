@@ -1039,6 +1039,59 @@ test("parsePrepareAndExecute throws on error response", () => {
   });
 });
 
+test("StatementType values match the CUBRID CCI/CAS statement type ids", () => {
+  // Literal ids (CUBRID T_CCI_CUBRID_STMT; node-cubrid CUBRIDStatementType;
+  // pycubrid CUBRIDStatementType). Deliberately not derived from the enum so
+  // that any renumbering fails here.
+  assert.equal(StatementType.ALTER_CLASS, 0);
+  assert.equal(StatementType.ALTER_SERIAL, 1);
+  assert.equal(StatementType.COMMIT_WORK, 2);
+  assert.equal(StatementType.REGISTER_DATABASE, 3);
+  assert.equal(StatementType.CREATE_CLASS, 4);
+  assert.equal(StatementType.CREATE_INDEX, 5);
+  assert.equal(StatementType.CREATE_TRIGGER, 6);
+  assert.equal(StatementType.CREATE_SERIAL, 7);
+  assert.equal(StatementType.DROP_DATABASE, 8);
+  assert.equal(StatementType.DROP_CLASS, 9);
+  assert.equal(StatementType.DROP_INDEX, 10);
+  assert.equal(StatementType.DROP_LABEL, 11);
+  assert.equal(StatementType.DROP_TRIGGER, 12);
+  assert.equal(StatementType.DROP_SERIAL, 13);
+  assert.equal(StatementType.EVALUATE, 14);
+  assert.equal(StatementType.RENAME_CLASS, 15);
+  assert.equal(StatementType.ROLLBACK_WORK, 16);
+  assert.equal(StatementType.GRANT, 17);
+  assert.equal(StatementType.REVOKE, 18);
+  assert.equal(StatementType.UPDATE_STATS, 19);
+  assert.equal(StatementType.INSERT, 20);
+  assert.equal(StatementType.SELECT, 21);
+  assert.equal(StatementType.UPDATE, 22);
+  assert.equal(StatementType.DELETE, 23);
+  assert.equal(StatementType.CALL, 24);
+  assert.equal(StatementType.GET_STATS, 41);
+  assert.equal(StatementType.CALL_SP, 0x7e);
+  assert.equal(StatementType.UNKNOWN, 0x7f);
+});
+
+test("parsePrepareAndExecute reports literal statement codes from the wire", () => {
+  for (const code of [0, 4, 9, 17, 20, 22, 23, 24]) {
+    const buf = Buffer.alloc(64);
+    let offset = 0;
+    buf.writeInt32BE(1, offset); offset += 4; // queryHandle
+    buf.writeInt32BE(0, offset); offset += 4; // cache lifetime
+    buf.writeInt8(code, offset); offset += 1; // statement type
+    buf.writeInt32BE(0, offset); offset += 4; // bind count
+    buf.writeInt8(0, offset); offset += 1; // is_updatable
+    buf.writeInt32BE(0, offset); offset += 4; // column count
+    buf.writeInt32BE(0, offset); offset += 4; // total tuple count
+    buf.writeInt8(0, offset); offset += 1; // cache_reusable
+    buf.writeInt32BE(0, offset); offset += 4; // result count
+    const result = parsePrepareAndExecute(buf.subarray(0, offset), 1);
+    assert.equal(result.statementType, code);
+    assert.deepEqual(result.rows, []);
+  }
+});
+
 test("parsePrepareAndExecute parses non-SELECT result", () => {
   // Build a minimal successful PrepareAndExecute response for INSERT
   // responseCode(4) + cacheLifetime(4) + stmtType(1) + bindCount(4) + isUpdatable(1) + colCount(4)

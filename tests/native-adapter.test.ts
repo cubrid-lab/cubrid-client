@@ -489,6 +489,41 @@ test("NativeCubridAdapter query DELETE returns empty array", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// query() — DDL and CALL (statement codes as observed from CUBRID 10.2 / 11.4)
+// ---------------------------------------------------------------------------
+
+for (const [label, code] of [
+  ["ALTER_CLASS", 0],
+  ["CREATE_CLASS", 4],
+  ["CREATE_INDEX", 5],
+  ["DROP_CLASS", 9],
+  ["GRANT", 17],
+] as const) {
+  test(`NativeCubridAdapter query DDL statement code ${code} (${label}) returns empty array`, async () => {
+    const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+
+    fakeCAS.queueResponse(buildDMLResponse(code, 0));
+    fakeCAS.queueResponse(buildSimpleResponse(0)); // CloseReqHandle
+
+    const result = await adapter.query("DDL");
+    assert.deepEqual(result, []);
+  });
+}
+
+// CALL (code 24) is a non-SELECT statement. The broker reports a result column
+// for it, but query() does not read inline rows for it and returns []. Reading
+// CALL results is currently unsupported.
+test("NativeCubridAdapter query CALL statement code 24 returns empty array (results unsupported)", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+
+  fakeCAS.queueResponse(buildDMLResponse(24, 1));
+  fakeCAS.queueResponse(buildSimpleResponse(0)); // CloseReqHandle
+
+  const result = await adapter.query("CALL login('dba', '') ON CLASS db_user");
+  assert.deepEqual(result, []);
+});
+
+// ---------------------------------------------------------------------------
 // query() — SELECT
 // ---------------------------------------------------------------------------
 
