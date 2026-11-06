@@ -23,6 +23,11 @@ Python release strategy. The GitHub Release and npm publish steps are separate.
   manually obtain and inspect CI checks on those generated PRs.
 - Ensure repository Actions settings permit workflow-created pull requests.
 
+The [v1.2.0 release decision record](RELEASE_DECISION.md) lists the
+exact evidence, supported scope and unresolved **maintainer sign-off** needed
+before this candidate can be published. Its approval checklist is not
+automatically satisfied by a passing PR, version bump, or test count.
+
 ## Human-approved publication and recovery
 
 1. Review and merge the version/changelog Release PR.
