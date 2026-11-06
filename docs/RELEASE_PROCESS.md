@@ -38,36 +38,53 @@ exact evidence, supported scope and unresolved **maintainer sign-off** needed
 before this candidate can be published. Its approval checklist is not
 automatically satisfied by a passing PR, version bump, or test count.
 
-## Human-approved publication and recovery
+## Automated publication and recovery
 
-1. Review and merge the version/changelog Release PR.
-2. Record live CUBRID verification for advertised support versions and types,
-   TLS and transaction behavior before approving publication (#95/#120).
-   A successful offline test suite is not live protocol validation.
-3. Configure the npm-publish GitHub Environment with required reviewers and
-   suitable branch protections. Keep NPM_TOKEN restricted to npm publishing.
-4. Before publishing, run **Actions -> Reviewed release validation** as a
-   no-publish dry run on the exact candidate commit. Capture its run link.
-   This runs the four real CUBRID versions (10.2, 11.0, 11.2, 11.4), a
-   separately configured **SSL=ON** CUBRID 11.4 broker with verified CA and
-   hostname rejection tests, and packaged ESM/CJS consumer smoke on Node
-   18/20/22. A missing/skipped/failed job fails the gate. Review independent
-   protocol/type evidence and known limitations separately (#117/#120).
-5. Run Actions -> Publish reviewed npm release -> Run workflow and type PUBLISH.
-   Leave recovery_tag empty for a new release. Before tagging, it repeats
-   Node 18/20/22 typecheck, offline tests, build, API declaration check and
-   mandatory high/critical npm audit, then invokes that **same required
-   release validation** workflow for the exact commit. A failing live broker,
-   TLS job, packed npm consumer or incomplete check blocks tag creation.
-6. Only after both phases pass and the npm-publish environment approves does
-   release-please create an immutable GitHub Release/tag; it verifies
-   package.json, package-lock.json and manifest versions, repeats the security
-   and build checks on the tag, validates the curated notes and npm pack, then
-   publishes via NPM_TOKEN.
-7. If npm publishing fails after GitHub Release creation, rerun with
-   recovery_tag=vX.Y.Z; the workflow uses the existing immutable tag and
-   avoids republishing an already-present npm version. Investigate failures
-   before retries and verify GitHub/npm versions match after success.
+1. Release Please proposes a reviewable PR that bumps `package.json`,
+   `package-lock.json`, `.release-please-manifest.json`, and `CHANGELOG.md`.
+   A version is **not published** merely because the PR exists.
+2. Review the candidate notes and supported/unsupported behavior. The release
+   PR automatically runs the **full four-version CUBRID matrix**, real
+   CUBRID 11.4 SSL=ON certificate checks, Node 18/20/22 packed ESM/CJS
+   smoke, API declaration verification, offline tests and security scans.
+   Never merge while a required check has failed, been skipped or is absent.
+3. **Merging the reviewed Release Please PR into `main` automatically
+   triggers `Publish verified npm release`**. The workflow first verifies
+   the version, package lockfile and manifest match, the curated note exists,
+   a matching Release Please PR was merged, and no version tag or npm
+   artifact already exists. It is idempotent: an existing GitHub Release
+   is not generated twice.
+4. The same automatic job repeats Node 18/20/22 preflight checks, high
+   severity dependency audit and the complete four-version live database,
+   TLS and packed npm consumer validation on the **exact main commit**.
+   Any failure blocks tag creation and npm publication.
+5. After every gate succeeds, the protected `npm-publish` environment is
+   used for Release Please GitHub Release/tag creation and the npm
+   publication. Configure `NPM_TOKEN` appropriately. **If the environment
+   requires reviewers, GitHub will still request approval**: the release
+   trigger and checks are automatic, but repository approval rules are
+   respected rather than bypassed.
+6. The release job checks out the immutable tag and re-verifies the
+   versions, API declarations, tests, package and audited dependencies,
+   publishes the emoji-free curated Release notes under the title
+   `cubrid-client vX.Y.Z`, then publishes the package. Finally it verifies
+   that the exact version appears both in GitHub Releases and npm.
+7. If npm publication fails **after a tag was created**, investigate the
+   cause and use **Actions → Publish verified npm release → Run workflow**,
+   `confirmation=PUBLISH`, `recovery_tag=vX.Y.Z`. The workflow validates
+   that immutable tag instead of creating another release or changing tag
+   history. This manual path is for recovery, not the standard release.
+8. Release Please does **not** propose the following version until the
+   current `package.json` version has a matching GitHub Release. This
+   prevents a duplicate or premature version PR while a previous release
+   is still pending. The old v1.3.0 proposal generated before v1.2.0 was
+   tagged was closed without publishing.
+
+The [v1.2.0 decision record](RELEASE_DECISION.md) and issues
+[#106](https://github.com/cubrid-lab/cubrid-client/issues/106) and
+[#120](https://github.com/cubrid-lab/cubrid-client/issues/120) document the
+limited-scope release decision. Approval of a remediation release is
+**not** a claim of universal production readiness.
 
 The separate [release validation workflow](../.github/workflows/release-validation.yml)
 is safe to run without publishing. Production-ready certification remains a
@@ -83,7 +100,7 @@ production-ready based only on version number: support and stability claims
 must follow verified evidence, and limitations (#81/#82/#110/#116) must be
 disclosed. v1.2.0 is a scoped remediation release (#106) until full gates exist.
 
-PR #67 (tsup v9) requires Node >=22.18 for the **build tool**, while runtime
+The closed PR #67 (tsup v9) requires Node >=22.18 for the **build tool**, while runtime
 Node support and current CI Node 18/20/22 are separate decisions. Review it
 independently.
 
@@ -121,15 +138,14 @@ This file is the public GitHub Release body, not a second generated changelog:
 - **Validation and release scope:** distinguish offline CI from real broker
   execution, plus the review gate required for publishing.
 
-The manual publish workflow verifies the curated file exists, contains all
+The automated publish workflow verifies the curated file exists, contains all
 required sections, has no placeholder text, and that CHANGELOG has a matching
 generated version section with no duplicated [Unreleased] block. **Preflight
 runs before creation of a GitHub tag**; exact-tag verification repeats the check
 and applies the approved notes with `gh release edit` before npm publication.
 If publication fails after tag creation, use `recovery_tag` and investigate.
 
-For the current release candidate see `docs/releases/v1.2.0.md`. This file
-does not authorize publication by itself: unresolved correctness issues,
-live CUBRID tests, npm contents and the release-gate checklist must still be
-reviewed. A generated release PR with absent CI checks or an incomplete DB
-matrix is not evidence of a successful production-ready release.
+For release v1.2.0, see `docs/releases/v1.2.0.md`. The notes alone do
+not authorize publication: the automated gate checks actual release
+content, npm package exports and live database evidence, and fails closed
+on missing checks. Release scope remains bounded by documented tests.
