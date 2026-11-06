@@ -74,7 +74,6 @@ jobs:
           npm install --ignore-scripts --no-audit --no-fund "$GITHUB_WORKSPACE/$archive"
           node -e 'const p = require("cubrid-client"); if (typeof p.createClient !== "function" || typeof p.ReadTimeoutError !== "function") process.exit(1);'
           node --input-type=module -e 'import { createClient, ReadTimeoutError } from "cubrid-client"; if (typeof createClient !== "function" || typeof ReadTimeoutError !== "function") process.exit(1);'
-          node -e 'const p = require("cubrid-client/package.json"); if (!p) process.exit(1);' || true
       - name: Write verification summary
         if: always()
         shell: bash
