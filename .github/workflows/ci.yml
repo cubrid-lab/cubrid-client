@@ -39,6 +39,11 @@ jobs:
       - name: Build
         run: npm run build
 
+      # Also check archived release notes and the generated changelog for emoji.
+      - name: Validate release note format
+        if: matrix.node-version == 22
+        run: node scripts/verify-release-notes.mjs --candidate
+
       # Declarations come from the same pinned tsup/TypeScript on every lane;
       # run the comparison once to avoid duplicate failures.
       - name: Public API check
