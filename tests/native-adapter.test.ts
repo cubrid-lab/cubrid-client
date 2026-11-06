@@ -1048,7 +1048,7 @@ test("NativeCubridAdapter query SELECT fetches remaining rows", async () => {
   assert.equal(fakeCAS.sendAndRecvCalls, 3);
 });
 
-test("NativeCubridAdapter query SELECT fetchRemaining stops on zero tupleCount", async () => {
+test("NativeCubridAdapter rejects zero-tuple FETCH before the advertised total", async () => {
   const { adapter, fakeCAS } = createAdapterWithFakeCAS();
 
   // Build a SELECT response where totalTupleCount > inline rows
@@ -1071,10 +1071,8 @@ test("NativeCubridAdapter query SELECT fetchRemaining stops on zero tupleCount",
   // CloseReqHandle
   fakeCAS.queueResponse(buildSimpleResponse(0));
 
-  const rows = await adapter.query("SELECT id FROM t");
-  // Only 1 row (inline), fetchRemaining stopped because tupleCount = 0
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0]!.id, "1");
+  // A successful zero-row FETCH cannot complete a query that advertises 3 rows.
+  await assert.rejects(adapter.query("SELECT id FROM t"), QueryError);
 });
 
 // ---------------------------------------------------------------------------
