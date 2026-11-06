@@ -1,6 +1,12 @@
 name: Live CUBRID TLS integration
 
 on:
+  workflow_call:
+    inputs:
+      checkout_ref:
+        type: string
+        required: false
+        default: ""
   pull_request:
     branches: [main]
     paths:
@@ -29,6 +35,9 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-node@v7
         with:
           node-version: 22
