@@ -74,6 +74,31 @@ count; state clearly when that check was not run.
 
 ---
 
+## Protocol correctness review
+
+For a change to the native CAS decoder, frame parser or wire constants,
+reviewers must require independent protocol evidence rather than tests that
+build expectations from the same enum or parser being changed:
+
+1. Cite a versioned official CCI/CAS source or a separately captured broker
+   fixture, and assert **literal wire IDs** and boundary values.
+2. Assert actual returned and sent values for each affected type. Row counts,
+   high statement coverage and a self-skipped integration suite are not
+   evidence of protocol correctness.
+3. Record live-broker versions, executed cases and failures. If no CUBRID
+   server ran, mark the result **offline-only** and do not claim broad support.
+4. Confirm that error/NULL handling fails closed, that query handles are
+   cleaned on the correct session, and that transaction failures do not
+   silently commit on another connection.
+5. Review the exact npm package and public ESM/CJS/types contract before
+   a production-ready release decision.
+
+See the [v1.0.0 release regression review](docs/RELEASE_REGRESSION_REVIEW.md)
+for the historical evidence and [#120](https://github.com/cubrid-lab/cubrid-client/issues/120)
+for the separate required production-ready release gate.
+
+---
+
 ## Public API compatibility
 
 Read [the public API stability policy](docs/API_STABILITY.md) before changing
