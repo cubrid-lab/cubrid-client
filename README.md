@@ -358,6 +358,7 @@ npm run build        # TypeScript compilation (tsup)
 npm test             # Run offline tests
 npm run test:coverage # Coverage report (99%+ statements)
 npm run typecheck    # tsc --noEmit
+npm run api:check    # public API vs api/index.d.ts (run after build)
 ```
 
 ### Integration Tests
