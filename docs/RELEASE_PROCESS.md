@@ -54,3 +54,36 @@ disclosed. v1.2.0 is a scoped remediation release (#106) until full gates exist.
 PR #67 (tsup v9) requires Node >=22.18 for the **build tool**, while runtime
 Node support and current CI Node 18/20/22 are separate decisions. Review it
 independently.
+
+## Release-note ownership and style
+
+Release Please owns the generated `CHANGELOG.md` and semantic version bump.
+Contributors describe user-visible changes in their PRs; **do not hand-add
+Unreleased entries** to CHANGELOG because Release Please will also generate
+entries from merged Conventional Commit titles. Review the generated release
+PR against actual commits, rather than an anticipated issue milestone.
+
+Each release has a compact human-reviewed `docs/releases/vX.Y.Z.md` file.
+This file is the public GitHub Release body, not a second generated changelog:
+
+- **Highlights / Fixes:** explain what a user experiences, normally one
+  sentence per entry; include links to related PRs.
+- **Compatibility:** Node.js runtime floor, API changes and *actually verified*
+  CUBRID versions; never infer full broker compatibility from a unit test.
+- **Known limitations:** data-loss risks, unsupported types or methods,
+  missing live-version coverage and links to follow-up issues.
+- **Validation and release scope:** distinguish offline CI from real broker
+  execution, plus the review gate required for publishing.
+
+The manual publish workflow verifies the curated file exists, contains all
+required sections, has no placeholder text, and that CHANGELOG has a matching
+generated version section with no duplicated [Unreleased] block. **Preflight
+runs before creation of a GitHub tag**; exact-tag verification repeats the check
+and applies the approved notes with `gh release edit` before npm publication.
+If publication fails after tag creation, use `recovery_tag` and investigate.
+
+For the current release candidate see `docs/releases/v1.2.0.md`. This file
+does not authorize publication by itself: unresolved correctness issues,
+live CUBRID tests, npm contents and the release-gate checklist must still be
+reviewed. A generated release PR with absent CI checks or an incomplete DB
+matrix is not evidence of a successful production-ready release.
