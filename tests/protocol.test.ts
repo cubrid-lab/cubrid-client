@@ -649,13 +649,28 @@ test("writeFetch builds valid request", () => {
   assert.equal(payload[0], CASFunctionCode.FETCH);
 });
 
-test("parseFetch handles empty result (response code -1)", () => {
-  const buf = Buffer.alloc(4);
-  buf.writeInt32BE(-1, 0);
-  const columns: ColumnMeta[] = [];
-  const result = parseFetch(buf, columns);
-  assert.equal(result.tupleCount, 0);
-  assert.deepEqual(result.rows, []);
+test("parseFetch rejects malformed negative error frame instead of returning EOF", () => {
+  // A response code alone is not a complete CAS error block.
+  const buf = Buffer.from([0xff, 0xff, 0xff, 0xff]);
+  assert.throws(() => parseFetch(buf, []));
+});
+
+test("parseFetch rejects CAS -1 errors with literal server codes", () => {
+  // -1 envelope, then server code (-10006 invalid handle / -10012 no data).
+  for (const [code, message] of [
+    [-10006, "Server handle not found"],
+    [-10012, "No more data"],
+  ] as const) {
+    const msg = Buffer.from(message + "\0", "utf-8");
+    const buf = Buffer.alloc(8 + msg.length);
+    buf.writeInt32BE(-1, 0);
+    buf.writeInt32BE(code, 4);
+    msg.copy(buf, 8);
+    assert.throws(
+      () => parseFetch(buf, []),
+      (error: Error) => error.message.includes(String(code)) && error.message.includes(message),
+    );
+  }
 });
 
 test("parseFetch handles error response", () => {

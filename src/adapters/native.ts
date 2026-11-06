@@ -306,8 +306,18 @@ export class NativeCubridAdapter implements DriverAdapter {
       const fetchPayload = await cas.sendAndRecv(header, payload);
       const fetchResult = parseFetch(fetchPayload, result.columns);
 
-      if (fetchResult.tupleCount === 0) {
-        break;
+      // Returning a partial result as success silently corrupts the query
+      // contract. The execute response still promises more rows here.
+      if (fetchResult.tupleCount <= 0) {
+        throw new Error(
+          `CUBRID FETCH returned no rows before the expected ${result.totalTupleCount} rows`,
+        );
+      }
+      if (
+        fetchResult.rows.length !== fetchResult.tupleCount ||
+        fetched + fetchResult.tupleCount > result.totalTupleCount
+      ) {
+        throw new Error("CUBRID FETCH returned an inconsistent row count");
       }
 
       allRows.push(...fetchResult.rows);
