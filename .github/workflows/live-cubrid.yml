@@ -1,0 +1,92 @@
+name: Live CUBRID integration
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/integration.test.ts"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/live-cubrid.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/integration.test.ts"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/live-cubrid.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-cubrid:
+    name: CUBRID ${{ matrix.cubrid }} live protocol
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      # Keep pull-request checks useful without downloading four large server
+      # images on every code review. Full compatibility matrix runs on main
+      # and can also be invoked manually before a release.
+      matrix:
+        cubrid: ${{ fromJSON(github.event_name == 'pull_request' && '["11.4"]' || '["10.2","11.0","11.2","11.4"]') }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Start disposable CUBRID broker and database
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name cubrid-live \
+            -e CUBRID_DB=testdb \
+            -p 127.0.0.1:33000:33000 \
+            "cubrid/cubrid:${{ matrix.cubrid }}"
+      - name: Fail if live database never becomes ready
+        shell: bash
+        run: |
+          set -euo pipefail
+          ready=false
+          for attempt in $(seq 1 36); do
+            if docker exec cubrid-live csql -u dba testdb -c "SELECT 1" >/dev/null 2>&1; then
+              ready=true
+              break
+            fi
+            sleep 5
+          done
+          if [ "$ready" != true ]; then
+            docker logs cubrid-live
+            echo "::error::CUBRID ${{ matrix.cubrid }} did not start; this is not a skipped integration test"
+            exit 1
+          fi
+          docker exec cubrid-live cubrid version
+      - name: Execute non-skippable live integration tests
+        env:
+          CUBRID_LIVE_REQUIRED: "1"
+          CUBRID_TEST_PORT: "33000"
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run test:integration 2>&1 | tee live-integration.tap
+          if grep -Eq '^# skipped [1-9]' live-integration.tap; then
+            echo "::error::Live CUBRID tests were skipped"
+            exit 1
+          fi
+          passed=$(sed -n 's/^# pass //p' live-integration.tap | tail -1)
+          if [ -z "$passed" ] || [ "$passed" -lt 20 ]; then
+            echo "::error::Expected at least 20 live integration assertions; got ${passed:-none}"
+            exit 1
+          fi
+      - name: Print failed container logs
+        if: failure()
+        run: docker logs cubrid-live || true
+      - name: Remove disposable database
+        if: always()
+        run: docker rm -f cubrid-live >/dev/null 2>&1 || true
