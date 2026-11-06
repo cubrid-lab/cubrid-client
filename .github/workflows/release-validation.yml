@@ -3,6 +3,13 @@ name: Reviewed release validation
 # Can be dispatched as a no-publish dry run. Publication calls the same
 # jobs and requires their success before a GitHub tag can be created.
 on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/release-validation.yml"
+      - ".github/workflows/live-cubrid.yml"
+      - ".github/workflows/live-cubrid-tls.yml"
+      - ".github/workflows/publish.yml"
   workflow_dispatch:
     inputs:
       checkout_ref:
