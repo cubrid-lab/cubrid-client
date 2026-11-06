@@ -44,6 +44,10 @@ jobs:
         if: matrix.node-version == 22
         run: node scripts/verify-release-notes.mjs --candidate
 
+      - name: Public API parser regression tests
+        if: matrix.node-version == 22
+        run: node --test tests/api-public-surface.test.mjs
+
       # Declarations come from the same pinned tsup/TypeScript on every lane;
       # run the comparison once to avoid duplicate failures.
       - name: Public API check

@@ -3,6 +3,7 @@
 // files consumers get from the npm package) with the reviewed baseline in
 // api/index.d.ts. Run `npm run build` first. Use --update to rewrite the baseline.
 import { spawnSync } from "node:child_process";
+import { publicDeclarationSurface } from "./api-public-surface.mjs";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -40,12 +41,13 @@ try {
 	console.error("api/index.d.ts is missing. Run `npm run api:update` to create it.");
 	process.exit(2);
 }
-if (baseline === built[0]) {
+// Compare the consumer-facing API, not private class implementation details.
+if (publicDeclarationSurface(baseline) === publicDeclarationSurface(built[0])) {
 	console.log("Public API matches api/index.d.ts.");
 	process.exit(0);
 }
 
-console.error("Public API differs from the reviewed baseline api/index.d.ts:\n");
+console.error("Consumer-visible TypeScript API differs from the reviewed baseline api/index.d.ts:\n");
 const diff = spawnSync("diff", ["-u", "--label", "baseline", "--label", "built", baselinePath, builtPaths[0]], {
 	encoding: "utf8",
 });

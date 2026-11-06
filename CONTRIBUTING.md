@@ -85,7 +85,7 @@ The published surface is the built `dist/index.d.ts` (and the identical
 `dist/index.d.cts`), generated from `src/index.ts`. The reviewed copy of it is
 committed as `api/index.d.ts`. CI (the Node 22 lane) runs `npm run api:check`
 after the build and fails if the generated declarations differ from that file,
-so no export or type can change without a visible diff in the PR.
+so changed public exports and types require explicit review. Private class members are not public API.
 
 ```bash
 npm run build
@@ -114,9 +114,11 @@ The package follows semantic versioning. Within 1.x:
   the `query<T>()` generics or transaction signatures. These need a major
   version and explicit maintainer approval.
 
-The check is a textual comparison of the generated declarations. It does not
-decide for you whether a diff is additive or breaking; the reviewer does. It
-reports any change, including harmless ones such as a reordered declaration.
+The check parses TypeScript declarations to compare their normalized
+consumer-visible shapes, excluding private class members and JSDoc comments.
+It still does **not** decide whether a public diff is additive or breaking;
+the reviewer does. Whitespace-only and private implementation changes are
+not public contract changes.
 It does not check runtime behavior or ESM/CJS import behavior, and
 `query<T>()` types are compile-time only and do not validate result rows.
 The declarations come from the pinned `tsup` and `typescript` versions, so an
