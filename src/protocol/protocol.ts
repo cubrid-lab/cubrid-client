@@ -835,7 +835,18 @@ function parseRowData(
         }
       }
 
-      row[columns[c]!.name] = readValue(reader, colType, size);
+      const column = columns[c]!;
+      try {
+        row[column.name] = readValue(reader, colType, size);
+      } catch (error) {
+        // Keep unsupported non-NULL values distinct from SQL NULL. Framed
+        // parsing ends here; the adapter's query-handle finally block cleans
+        // up the allocated handle on the owning CAS session.
+        throw new Error(
+          `Failed to decode CUBRID column "${column.name}" (wire type ${colType}, ${size} bytes)`,
+          { cause: error },
+        );
+      }
     }
 
     rows.push(row);
@@ -893,8 +904,9 @@ function readValue(
 
     case CUBRIDDataType.NULL:
     default:
-      reader.skip(size);
-      return null;
+      // Never turn an unsupported non-NULL wire value into SQL NULL:
+      // callers would silently lose data and could persist the wrong result.
+      throw new Error(`Unsupported CUBRID CAS value type ${colType} (${size} bytes)`);
   }
 }
 

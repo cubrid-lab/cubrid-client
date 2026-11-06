@@ -1600,15 +1600,35 @@ test("parsePrepareAndExecute SELECT with NULL value (size <= 0)", () => {
   assert.equal(result.rows[0]!.val, null);
 });
 
-test("parsePrepareAndExecute SELECT with unknown type returns null", () => {
-  const data = Buffer.alloc(4); // 4 dummy bytes
+test("unknown and unsupported non-NULL wire values are never returned as SQL NULL", () => {
+  // Literal CAS/CCI wire numbers; these must not be derived from implementation enums.
+  for (const code of [16, 34, 99]) {
+    const buf = buildSelectResponseForTypes(
+      [{ name: "unsupported_column", type: code }],
+      [[{ type: code, data: Buffer.from([0x01, 0x02, 0x03, 0x04]) }]],
+    );
+    assert.throws(
+      () => parsePrepareAndExecute(buf, 1),
+      (error: Error) =>
+        error.message.includes("unsupported_column") &&
+        error.message.includes(`wire type ${code}`) &&
+        error.cause instanceof Error,
+    );
+  }
+});
+
+test("a real NULL and a valid empty string remain distinct", () => {
   const buf = buildSelectResponseForTypes(
-    [{ name: "val", type: 99 }], // Unknown type
-    [[{ type: 99, data }]],
+    [{ name: "val", type: 2 }], // CCI_U_TYPE_STRING
+    [
+      [{ type: 2, data: null }],
+      [{ type: 2, data: Buffer.from([0]) }],
+    ],
   );
   const result = parsePrepareAndExecute(buf, 1);
-  assert.equal(result.rows.length, 1);
+  assert.equal(result.rows.length, 2);
   assert.equal(result.rows[0]!.val, null);
+  assert.equal(result.rows[1]!.val, "");
 });
 
 test("parsePrepareAndExecute SELECT with high-bit column type (proto v7)", () => {
