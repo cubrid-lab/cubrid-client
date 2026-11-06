@@ -66,6 +66,13 @@ jobs:
             "$RUNNER_TEMP/negative-broker-test.log"
           echo "Confirmed: missing broker causes a hard integration failure"
 
+      - name: Validate release workflow syntax and expressions
+        if: matrix.node-version == 22
+        run: |
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 \
+            .github/workflows/publish.yml \
+            .github/workflows/release-please.yml
+
       - name: Public API check
         if: matrix.node-version == 22
         run: npm run api:check
