@@ -32,6 +32,9 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
       - run: npm ci
+      - name: Validate curated release notes before creating a release
+        if: matrix.node-version == 22
+        run: node scripts/verify-release-notes.mjs
       # Prevent a high/critical advisory from reaching the release-tag step.
       - name: Audit all dependencies before creating a GitHub Release
         if: matrix.node-version == 22
@@ -118,7 +121,14 @@ jobs:
           npm run typecheck
           npm test
           npm run build
+          npm run api:check
+          node scripts/verify-release-notes.mjs
           npm pack --dry-run
+      - name: Publish curated GitHub Release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.target.outputs.tag }}
+        run: gh release edit "$RELEASE_TAG" --notes-file "docs/releases/$RELEASE_TAG.md"
       - name: Check whether version is already published
         id: registry
         run: |
