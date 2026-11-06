@@ -44,17 +44,21 @@ CUBRID coverage.
 
 These results are a substantial improvement over the earlier targeted manual
 checks, but the suite is not an exhaustive type round-trip or
-fault-injection test. In particular, **SSL=ON broker coverage is not yet
-required or demonstrated in this matrix**, and independently validated
-collection/JSON/LOB support remains outstanding. Do not equate these 23 tests
+fault-injection test. A separately required
+[real SSL=ON CUBRID 11.4 workflow](https://github.com/cubrid-lab/cubrid-client/actions/runs/42217503095)
+now verifies **3/3 tests with 0 skips**: a trusted CA/hostname-verified SQL
+query, rejection of the untrusted self-signed certificate, and rejection
+of a wrong hostname even with the correct CA. It does **not** establish TLS
+compatibility on every database version, or independent collection/JSON/LOB
+coverage. Do not equate these 23 tests
 with production-ready certification. See [#95](https://github.com/cubrid-lab/cubrid-client/issues/95)
 and the [release gate](https://github.com/cubrid-lab/cubrid-client/issues/120).
 
 ## Release-blocking coverage still needed
 
-- [#95](https://github.com/cubrid-lab/cubrid-client/issues/95): add SSL=ON
-  broker testing and expand type/error/fault coverage; versioned live CI
-  baseline is now passing.
+- [#95](https://github.com/cubrid-lab/cubrid-client/issues/95):
+  mandatory version-matrix and SSL=ON broker lanes are now implemented;
+  their passing scope is exactly the 23+3 named tests, not every type/fault.
 - [#117](https://github.com/cubrid-lab/cubrid-client/issues/117): independent
   literal CAS byte/type/statement fixtures and malformed packet cases.
 - [#118](https://github.com/cubrid-lab/cubrid-client/issues/118): comparison
