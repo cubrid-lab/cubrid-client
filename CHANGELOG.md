@@ -33,7 +33,7 @@ user-visible behavior and known limitations, not just completed implementation.
 - Documented protocol correctness limitations were discovered later; consult current
   release notes and the issue tracker rather than treating v1.0.0 as production-certified.
 
-## [0.2.0](https://github.com/cubrid-lab/cubrid-client/releases/tag/v0.2.0) (2026-03-12)
+## [0.2.0](https://github.com/cubrid-lab/cubrid-client/tree/v0.2.0) (2026-03-12)
 
 ### Added
 
