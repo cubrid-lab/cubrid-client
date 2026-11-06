@@ -610,6 +610,8 @@ type QueryParam =
 | `Buffer` | `BLOB` / `BIT VARYING` | `Buffer.from("data")` |
 | `null` | `NULL` | `null` |
 
+Note: `BIGINT` columns in query results are returned as JavaScript `bigint` values (not `number`), so the full signed 64-bit range is preserved.
+
 ### QueryParams
 
 Array of query parameter values.
