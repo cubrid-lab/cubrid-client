@@ -1,0 +1,64 @@
+name: One-time approved v1.2.0 release dispatch
+
+# Temporary human-authorization bridge for the already reviewed 1.2.0 release.
+# Only a new, exact authorization comment from the repository administrator
+# on the existing release verification issue can dispatch the original
+# protected manual PUBLISH workflow. This file must be deleted afterwards.
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch-reviewed-release:
+    if: >-
+      github.repository == 'cubrid-lab/cubrid-client' &&
+      github.event.issue.number == 106 &&
+      github.event.issue.pull_request == null &&
+      github.actor == 'yeongseon' &&
+      github.event.comment.user.login == 'yeongseon' &&
+      github.event.comment.body == 'PUBLISH cubrid-client v1.2.0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Verify the explicitly reviewed 1.2.0 release candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -e '
+            const pkg = require("./package.json");
+            const lock = require("./package-lock.json");
+            const manifest = require("./.release-please-manifest.json");
+            if (pkg.version !== "1.2.0" || lock.version !== pkg.version ||
+                lock.packages[""].version !== pkg.version ||
+                manifest["."] !== pkg.version) {
+              throw new Error("Unreviewed package or manifest release version");
+            }
+          '
+          if gh release view v1.2.0 --repo "$GH_REPO" >/dev/null 2>&1; then
+            echo "::error::v1.2.0 GitHub Release already exists; do not dispatch twice."
+            exit 1
+          fi
+          if gh pr view 123 --repo "$GH_REPO" --json mergedAt --jq '.mergedAt' | grep -q '^null$'; then
+            echo "::error::Reviewed release PR #123 is not merged."
+            exit 1
+          fi
+      - name: Dispatch the existing manually approved publish workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run publish.yml --repo "$GH_REPO" --ref main -f confirmation=PUBLISH
+          echo "Dispatch requested; the original preflight, four-version CUBRID/TLS npm smoke gate, and protected npm-publish approval still apply." >> "$GITHUB_STEP_SUMMARY"
