@@ -63,6 +63,20 @@ Unreleased entries** to CHANGELOG because Release Please will also generate
 entries from merged Conventional Commit titles. Review the generated release
 PR against actual commits, rather than an anticipated issue milestone.
 
+**No emoji in release notes or the generated changelog.** Use plain-language headings
+and ordinary Markdown bullets without pictograms. CI checks all versioned
+`docs/releases/*.md` files and `CHANGELOG.md` before review or publication.
+The rule applies to historical corrections as well as future releases.
+
+The v1.0.0 and v1.1.0 published release descriptions contained either emoji,
+unverified coverage language, or changes not present in their tags. Their
+corrected, emoji-free archived notes live in `docs/releases/v1.0.0.md` and
+`docs/releases/v1.1.0.md`. Updating these files does not modify tag commits.
+The separate historical-release synchronization workflow updates the existing
+GitHub Release descriptions and titles after a reviewed merge to `main`.
+Verify the resulting GitHub Release pages; do not infer success from a
+successfully merged source PR.
+
 Each release has a compact human-reviewed `docs/releases/vX.Y.Z.md` file.
 This file is the public GitHub Release body, not a second generated changelog:
 
