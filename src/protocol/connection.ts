@@ -208,24 +208,50 @@ export class CASConnection {
   async sendAndRecv(header: Buffer, payload: Buffer): Promise<Buffer> {
     return this.enqueue(async () => {
       await this.checkReconnectUnlocked();
+      return this.exchangeUnlocked(header, payload);
+    });
+  }
 
-      let response: Buffer;
-      try {
-        await this.send(header, payload);
-        response = await this.recv();
-      } catch (error) {
-        // The stream position is unknown after a failed exchange, so this
-        // socket can never be trusted to line up with the next frame.
-        this.retireSocket();
-        throw error;
+  /**
+   * Exchange on one specific session, for requests that mean nothing on any
+   * other, such as closing a query handle. Unlike sendAndRecv() this never
+   * reconnects: a released CAS still answers on its socket and still holds its
+   * handles, whereas a new session would accept the request and do nothing.
+   *
+   * Returns null without sending anything when that session is gone.
+   */
+  async sendAndRecvOnSession(
+    generation: number,
+    header: Buffer,
+    payload: Buffer,
+  ): Promise<Buffer | null> {
+    return this.enqueue(async () => {
+      if (!this.connected || this._connectionGeneration !== generation) {
+        return null;
       }
 
-      // Update CAS_INFO from response
-      response.copy(this._casInfo, 0, 0, SIZE_CAS_INFO);
-
-      // Return payload portion (after CAS_INFO)
-      return response.subarray(SIZE_CAS_INFO);
+      return this.exchangeUnlocked(header, payload);
     });
+  }
+
+  /** Unlocked exchange body. MUST only be called from within the queue. */
+  private async exchangeUnlocked(header: Buffer, payload: Buffer): Promise<Buffer> {
+    let response: Buffer;
+    try {
+      await this.send(header, payload);
+      response = await this.recv();
+    } catch (error) {
+      // The stream position is unknown after a failed exchange, so this
+      // socket can never be trusted to line up with the next frame.
+      this.retireSocket();
+      throw error;
+    }
+
+    // Update CAS_INFO from response
+    response.copy(this._casInfo, 0, 0, SIZE_CAS_INFO);
+
+    // Return payload portion (after CAS_INFO)
+    return response.subarray(SIZE_CAS_INFO);
   }
 
   /**

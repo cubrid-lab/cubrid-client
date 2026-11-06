@@ -1100,24 +1100,6 @@ test("CASConnection retries a failed connect without inheriting the old socket's
   }
 });
 
-test("CASConnection discardSession drops the socket and allows reconnecting", async () => {
-  const { server, port } = await brokerWith((socket) => socket.write(frameResponse(CAS_INFO)));
-
-  try {
-    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
-    await cas.connect();
-
-    await cas.discardSession();
-    assert.equal(cas.isConnected, false);
-
-    await cas.connect();
-    assert.equal(cas.connectionGeneration, 2);
-    await cas.close();
-  } finally {
-    await closeServer(server);
-  }
-});
-
 // ---------------------------------------------------------------------------
 // Read timeout (#90)
 // ---------------------------------------------------------------------------
@@ -1467,6 +1449,138 @@ test("a readTimeout leaves nothing that keeps the process alive", { timeout: 150
 
     assert.equal(exitCode, 0);
     assert.equal(output.trim(), "ReadTimeoutError");
+  } finally {
+    await closeServer(server);
+  }
+});
+
+/** Run `use` on a connected CASConnection, then close it even if `use` failed. */
+async function withConnection(
+  port: number,
+  use: (cas: CASConnection) => Promise<void>,
+): Promise<void> {
+  const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+  await cas.connect();
+
+  try {
+    await use(cas);
+  } finally {
+    await cas.close();
+  }
+}
+
+test("CASConnection sendAndRecvOnSession stays on a released CAS's socket", async () => {
+  const released = Buffer.from([0x00, 0x02, 0x03, 0x04]);
+  const { server, port } = await brokerWith((socket) => socket.write(frameResponse(released)));
+
+  try {
+    await withConnection(port, async (cas) => {
+      await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+
+      const response = await cas.sendAndRecvOnSession(
+        cas.connectionGeneration,
+        REQUEST_HEADER,
+        REQUEST_PAYLOAD,
+      );
+
+      assert.notEqual(response, null);
+      assert.equal(cas.connectionGeneration, 1);
+    });
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("CASConnection sendAndRecvOnSession sends nothing on a replaced session", async () => {
+  const requests: number[] = [];
+  const { server, port } = await brokerWith((socket, requestIndex) => {
+    requests.push(requestIndex);
+    socket.write(frameResponse(CAS_INFO));
+  });
+
+  try {
+    await withConnection(port, async (cas) => {
+      const generation = cas.connectionGeneration;
+      await cas.discardSession();
+      await cas.connect();
+
+      const response = await cas.sendAndRecvOnSession(generation, REQUEST_HEADER, REQUEST_PAYLOAD);
+
+      assert.equal(response, null);
+      assert.deepEqual(requests, []);
+    });
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("CASConnection sendAndRecvOnSession sends nothing after the socket retired", async () => {
+  const { server, port } = await brokerWith((socket) => socket.write(frameResponse(CAS_INFO)));
+
+  try {
+    await withConnection(port, async (cas) => {
+      const generation = cas.connectionGeneration;
+      await cas.discardSession();
+
+      const response = await cas.sendAndRecvOnSession(generation, REQUEST_HEADER, REQUEST_PAYLOAD);
+
+      assert.equal(response, null);
+    });
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("CASConnection sendAndRecvOnSession checks the session after queued work", async () => {
+  const { server, port } = await brokerWith((socket) => socket.destroy());
+
+  try {
+    await withConnection(port, async (cas) => {
+      // The request ahead of it fails and retires the socket.
+      const failing = cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+      const queued = cas.sendAndRecvOnSession(
+        cas.connectionGeneration,
+        REQUEST_HEADER,
+        REQUEST_PAYLOAD,
+      );
+
+      await assert.rejects(failing);
+      assert.equal(await queued, null);
+    });
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("CASConnection sendAndRecvOnSession retires the socket when the exchange fails", async () => {
+  const { server, port } = await brokerWith((socket) => socket.destroy());
+
+  try {
+    await withConnection(port, async (cas) => {
+      await assert.rejects(
+        cas.sendAndRecvOnSession(cas.connectionGeneration, REQUEST_HEADER, REQUEST_PAYLOAD),
+      );
+
+      assert.equal(cas.isConnected, false);
+    });
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("CASConnection discardSession drops the socket and allows reconnecting", async () => {
+  const { server, port } = await brokerWith((socket) => socket.write(frameResponse(CAS_INFO)));
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+    await cas.connect();
+
+    await cas.discardSession();
+    assert.equal(cas.isConnected, false);
+
+    await cas.connect();
+    assert.equal(cas.connectionGeneration, 2);
+    await cas.close();
   } finally {
     await closeServer(server);
   }

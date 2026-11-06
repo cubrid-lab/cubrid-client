@@ -1,0 +1,47 @@
+name: Sync corrected historical release notes
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/releases/v1.0.0.md"
+      - "docs/releases/v1.1.0.md"
+      - ".github/workflows/sync-historical-release-notes.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Validate curated release notes
+        run: node scripts/verify-release-notes.mjs --candidate
+      - name: Normalize v0.1.0 GitHub Release title
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release view v0.1.0 --repo "$GH_REPO" > /dev/null
+          gh release edit v0.1.0 --repo "$GH_REPO" --title "cubrid-client v0.1.0"
+      - name: Update existing GitHub Release descriptions (not tags)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Only these published historical releases can be updated.
+          for tag in v1.0.0 v1.1.0; do
+            file="docs/releases/${tag}.md"
+            test -s "$file"
+            gh release view "$tag" --repo "$GH_REPO" > /dev/null
+            gh release edit "$tag" --repo "$GH_REPO" \
+              --title "cubrid-client $tag" \
+              --notes-file "$file"
+            echo "Updated published GitHub Release notes for $tag"
+          done

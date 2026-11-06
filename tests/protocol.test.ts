@@ -26,6 +26,7 @@ import {
   parseOpenDatabase,
   writePrepareAndExecute,
   parsePrepareAndExecute,
+  readQueryHandle,
   writeFetch,
   parseFetch,
   writeCloseReqHandle,
@@ -471,16 +472,63 @@ test("CLIENT_JDBC is 3", () => {
   assert.equal(CLIENT_JDBC, 3);
 });
 
-test("TYPE_NAMES maps all data types", () => {
-  assert.equal(TYPE_NAMES[CUBRIDDataType.INT], "INT");
-  assert.equal(TYPE_NAMES[CUBRIDDataType.STRING], "VARCHAR");
-  assert.equal(TYPE_NAMES[CUBRIDDataType.BIGINT], "BIGINT");
-  assert.equal(TYPE_NAMES[CUBRIDDataType.DATE], "DATE");
-  assert.equal(TYPE_NAMES[CUBRIDDataType.DATETIME], "DATETIME");
-  assert.equal(TYPE_NAMES[CUBRIDDataType.NULL], "NULL");
-  assert.equal(TYPE_NAMES[CUBRIDDataType.SET], "SET");
-  assert.equal(TYPE_NAMES[CUBRIDDataType.BLOB], "BLOB");
-  assert.equal(TYPE_NAMES[CUBRIDDataType.CLOB], "CLOB");
+// Literal wire codes from T_CCI_U_TYPE (CUBRID/cubrid src/broker/broker_cas_cci.h).
+// Deliberately not derived from CUBRIDDataType so a wrong constant cannot hide.
+// [name, enum value under test, literal wire code]
+const CCI_WIRE_CODES: Array<[string, number, number]> = [
+  ["NULL", CUBRIDDataType.NULL, 0],
+  ["CHAR", CUBRIDDataType.CHAR, 1],
+  ["STRING", CUBRIDDataType.STRING, 2],
+  ["NCHAR", CUBRIDDataType.NCHAR, 3],
+  ["VARNCHAR", CUBRIDDataType.VARNCHAR, 4],
+  ["BIT", CUBRIDDataType.BIT, 5],
+  ["VARBIT", CUBRIDDataType.VARBIT, 6],
+  ["NUMERIC", CUBRIDDataType.NUMERIC, 7],
+  ["INT", CUBRIDDataType.INT, 8],
+  ["SHORT", CUBRIDDataType.SHORT, 9],
+  ["MONETARY", CUBRIDDataType.MONETARY, 10],
+  ["FLOAT", CUBRIDDataType.FLOAT, 11],
+  ["DOUBLE", CUBRIDDataType.DOUBLE, 12],
+  ["DATE", CUBRIDDataType.DATE, 13],
+  ["TIME", CUBRIDDataType.TIME, 14],
+  ["TIMESTAMP", CUBRIDDataType.TIMESTAMP, 15],
+  ["SET", CUBRIDDataType.SET, 16],
+  ["MULTISET", CUBRIDDataType.MULTISET, 17],
+  ["SEQUENCE", CUBRIDDataType.SEQUENCE, 18],
+  ["OBJECT", CUBRIDDataType.OBJECT, 19],
+  ["RESULTSET", CUBRIDDataType.RESULTSET, 20],
+  ["BIGINT", CUBRIDDataType.BIGINT, 21],
+  ["DATETIME", CUBRIDDataType.DATETIME, 22],
+  ["BLOB", CUBRIDDataType.BLOB, 23],
+  ["CLOB", CUBRIDDataType.CLOB, 24],
+  ["ENUM", CUBRIDDataType.ENUM, 25],
+  ["JSON", CUBRIDDataType.JSON, 34],
+];
+
+test("CUBRIDDataType values match CCI wire codes", () => {
+  for (const [name, actual, expected] of CCI_WIRE_CODES) {
+    assert.equal(actual, expected, name);
+  }
+});
+
+test("TYPE_NAMES maps literal wire codes to type names", () => {
+  assert.equal(TYPE_NAMES[0], "NULL");
+  assert.equal(TYPE_NAMES[2], "VARCHAR");
+  assert.equal(TYPE_NAMES[8], "INT");
+  assert.equal(TYPE_NAMES[9], "SMALLINT");
+  assert.equal(TYPE_NAMES[13], "DATE");
+  assert.equal(TYPE_NAMES[16], "SET");
+  assert.equal(TYPE_NAMES[17], "MULTISET");
+  assert.equal(TYPE_NAMES[18], "SEQUENCE");
+  assert.equal(TYPE_NAMES[19], "OBJECT");
+  assert.equal(TYPE_NAMES[20], "RESULTSET");
+  assert.equal(TYPE_NAMES[21], "BIGINT");
+  assert.equal(TYPE_NAMES[22], "DATETIME");
+  assert.equal(TYPE_NAMES[23], "BLOB");
+  assert.equal(TYPE_NAMES[24], "CLOB");
+  assert.equal(TYPE_NAMES[34], "JSON");
+  // 26 is CCI_U_TYPE_USHORT, not BIGINT
+  assert.notEqual(TYPE_NAMES[26], "BIGINT");
 });
 
 test("OPEN_DB_TOTAL_SIZE is 628", () => {
@@ -602,13 +650,28 @@ test("writeFetch builds valid request", () => {
   assert.equal(payload[0], CASFunctionCode.FETCH);
 });
 
-test("parseFetch handles empty result (response code -1)", () => {
-  const buf = Buffer.alloc(4);
-  buf.writeInt32BE(-1, 0);
-  const columns: ColumnMeta[] = [];
-  const result = parseFetch(buf, columns);
-  assert.equal(result.tupleCount, 0);
-  assert.deepEqual(result.rows, []);
+test("parseFetch rejects malformed negative error frame instead of returning EOF", () => {
+  // A response code alone is not a complete CAS error block.
+  const buf = Buffer.from([0xff, 0xff, 0xff, 0xff]);
+  assert.throws(() => parseFetch(buf, []));
+});
+
+test("parseFetch rejects CAS -1 errors with literal server codes", () => {
+  // -1 envelope, then server code (-10006 invalid handle / -10012 no data).
+  for (const [code, message] of [
+    [-10006, "Server handle not found"],
+    [-10012, "No more data"],
+  ] as const) {
+    const msg = Buffer.from(message + "\0", "utf-8");
+    const buf = Buffer.alloc(8 + msg.length);
+    buf.writeInt32BE(-1, 0);
+    buf.writeInt32BE(code, 4);
+    msg.copy(buf, 8);
+    assert.throws(
+      () => parseFetch(buf, []),
+      (error: Error) => error.message.includes(String(code)) && error.message.includes(message),
+    );
+  }
 });
 
 test("parseFetch handles error response", () => {
@@ -752,7 +815,7 @@ test("encodeBindParams encodes large integer as BIGINT", () => {
   const large = 2147483648; // exceeds int32 max
   const buf = encodeBindParams([large]);
   assert.equal(buf.readInt32BE(0), 1 + 8); // type_byte + int64
-  assert.equal(buf[4], CUBRIDDataType.BIGINT);
+  assert.equal(buf[4], 21); // CCI_U_TYPE_BIGINT
   assert.equal(buf.readBigInt64BE(5), BigInt(large));
 });
 
@@ -765,7 +828,7 @@ test("encodeBindParams encodes floating point as DOUBLE", () => {
 
 test("encodeBindParams encodes bigint", () => {
   const buf = encodeBindParams([9876543210n]);
-  assert.equal(buf[4], CUBRIDDataType.BIGINT);
+  assert.equal(buf[4], 21); // CCI_U_TYPE_BIGINT
   assert.equal(buf.readBigInt64BE(5), 9876543210n);
 });
 
@@ -1039,6 +1102,78 @@ test("parsePrepareAndExecute throws on error response", () => {
   });
 });
 
+test("StatementType values match the CUBRID CCI/CAS statement type ids", () => {
+  // Literal ids (CUBRID T_CCI_CUBRID_STMT; node-cubrid CUBRIDStatementType;
+  // pycubrid CUBRIDStatementType). Deliberately not derived from the enum so
+  // that any renumbering fails here.
+  assert.equal(StatementType.ALTER_CLASS, 0);
+  assert.equal(StatementType.ALTER_SERIAL, 1);
+  assert.equal(StatementType.COMMIT_WORK, 2);
+  assert.equal(StatementType.REGISTER_DATABASE, 3);
+  assert.equal(StatementType.CREATE_CLASS, 4);
+  assert.equal(StatementType.CREATE_INDEX, 5);
+  assert.equal(StatementType.CREATE_TRIGGER, 6);
+  assert.equal(StatementType.CREATE_SERIAL, 7);
+  assert.equal(StatementType.DROP_DATABASE, 8);
+  assert.equal(StatementType.DROP_CLASS, 9);
+  assert.equal(StatementType.DROP_INDEX, 10);
+  assert.equal(StatementType.DROP_LABEL, 11);
+  assert.equal(StatementType.DROP_TRIGGER, 12);
+  assert.equal(StatementType.DROP_SERIAL, 13);
+  assert.equal(StatementType.EVALUATE, 14);
+  assert.equal(StatementType.RENAME_CLASS, 15);
+  assert.equal(StatementType.ROLLBACK_WORK, 16);
+  assert.equal(StatementType.GRANT, 17);
+  assert.equal(StatementType.REVOKE, 18);
+  assert.equal(StatementType.UPDATE_STATS, 19);
+  assert.equal(StatementType.INSERT, 20);
+  assert.equal(StatementType.SELECT, 21);
+  assert.equal(StatementType.UPDATE, 22);
+  assert.equal(StatementType.DELETE, 23);
+  assert.equal(StatementType.CALL, 24);
+  assert.equal(StatementType.GET_STATS, 41);
+  assert.equal(StatementType.CALL_SP, 0x7e);
+  assert.equal(StatementType.UNKNOWN, 0x7f);
+});
+
+test("parsePrepareAndExecute reports literal statement codes from the wire", () => {
+  for (const code of [0, 4, 9, 17, 20, 22, 23, 24]) {
+    const buf = Buffer.alloc(64);
+    let offset = 0;
+    buf.writeInt32BE(1, offset); offset += 4; // queryHandle
+    buf.writeInt32BE(0, offset); offset += 4; // cache lifetime
+    buf.writeInt8(code, offset); offset += 1; // statement type
+    buf.writeInt32BE(0, offset); offset += 4; // bind count
+    buf.writeInt8(0, offset); offset += 1; // is_updatable
+    buf.writeInt32BE(0, offset); offset += 4; // column count
+    buf.writeInt32BE(0, offset); offset += 4; // total tuple count
+    buf.writeInt8(0, offset); offset += 1; // cache_reusable
+    buf.writeInt32BE(0, offset); offset += 4; // result count
+    const result = parsePrepareAndExecute(buf.subarray(0, offset), 1);
+    assert.equal(result.statementType, code);
+    assert.deepEqual(result.rows, []);
+  }
+});
+
+test("readQueryHandle returns the handle of a response that cannot be decoded", () => {
+  const buf = Buffer.alloc(6);
+  buf.writeInt32BE(7, 0);
+
+  assert.equal(readQueryHandle(buf), 7);
+  assert.throws(() => parsePrepareAndExecute(buf, 1));
+});
+
+test("readQueryHandle returns null for a server error", () => {
+  const buf = Buffer.alloc(8);
+  buf.writeInt32BE(-1, 0);
+
+  assert.equal(readQueryHandle(buf), null);
+});
+
+test("readQueryHandle returns null when the handle itself is cut off", () => {
+  assert.equal(readQueryHandle(Buffer.alloc(3)), null);
+});
+
 test("parsePrepareAndExecute parses non-SELECT result", () => {
   // Build a minimal successful PrepareAndExecute response for INSERT
   // responseCode(4) + cacheLifetime(4) + stmtType(1) + bindCount(4) + isUpdatable(1) + colCount(4)
@@ -1227,12 +1362,23 @@ test("parsePrepareAndExecute SELECT with BIGINT column", () => {
   const data = Buffer.alloc(8);
   data.writeBigInt64BE(9876543210n, 0);
   const buf = buildSelectResponseForTypes(
-    [{ name: "val", type: CUBRIDDataType.BIGINT }],
-    [[{ type: CUBRIDDataType.BIGINT, data }]],
+    [{ name: "val", type: 21 }], // CCI_U_TYPE_BIGINT
+    [[{ type: 21, data }]],
   );
   const result = parsePrepareAndExecute(buf, 1);
   assert.equal(result.rows.length, 1);
   assert.equal(result.rows[0]!.val, 9876543210n);
+});
+
+test("parsePrepareAndExecute SELECT with negative BIGINT column (wire code 21)", () => {
+  const data = Buffer.alloc(8);
+  data.writeBigInt64BE(-9223372036854775808n, 0);
+  const buf = buildSelectResponseForTypes(
+    [{ name: "val", type: 21 }],
+    [[{ type: 21, data }]],
+  );
+  const result = parsePrepareAndExecute(buf, 1);
+  assert.equal(result.rows[0]!.val, -9223372036854775808n);
 });
 
 test("parsePrepareAndExecute SELECT with FLOAT column", () => {

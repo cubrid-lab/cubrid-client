@@ -244,6 +244,22 @@ export function parsePrepareAndExecute(
   };
 }
 
+/**
+ * Read the query handle from a PREPARE_AND_EXECUTE response without decoding
+ * the rest of it, so the handle can still be released if decoding fails.
+ * The caller must close the handle on its owning CAS session, never after an
+ * automatic reconnect where the same number could identify another request.
+ * Returns null when the response holds none: a server error, or too few bytes.
+ */
+export function readQueryHandle(data: Buffer): number | null {
+  if (data.length < SIZE_INT) {
+    return null;
+  }
+
+  const responseCode = data.readInt32BE(0);
+  return responseCode >= 0 ? responseCode : null;
+}
+
 // ---------------------------------------------------------------------------
 // Fetch (FC=8)
 // ---------------------------------------------------------------------------
@@ -286,10 +302,10 @@ export function parseFetch(
   const responseCode = reader.parseInt();
 
   if (responseCode < 0) {
-    // -1 means no more data — treat as empty result
-    if (responseCode === -1) {
-      return { tupleCount: 0, rows: [] };
-    }
+    // -1 is the CAS error envelope, not an unconditional EOF marker.
+    // For example, an invalid query handle reports -1 with a server code.
+    // A genuine exhaustion error is also not expected while the execute
+    // response still advertises additional tuples.
     const remaining = data.length - SIZE_INT;
     const err = reader.readError(remaining);
     throw new Error(`CUBRID fetch failed (${err.code}): ${err.message}`);
