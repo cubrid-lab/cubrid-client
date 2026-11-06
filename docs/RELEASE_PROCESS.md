@@ -33,6 +33,11 @@ before tagging. Ordinary source PRs retain the existing faster 11.4 smoke
 and their own CI.
 
 
+The [v1.2.0 release decision record](RELEASE_DECISION.md) lists the
+exact evidence, supported scope and unresolved **maintainer sign-off** needed
+before this candidate can be published. Its approval checklist is not
+automatically satisfied by a passing PR, version bump, or test count.
+
 ## Human-approved publication and recovery
 
 1. Review and merge the version/changelog Release PR.
