@@ -170,9 +170,8 @@ jobs:
     environment: npm-publish
     permissions:
       contents: write
-      # release-please comments on the merged Release PR and swaps its
-      # autorelease labels right after creating the release. Without this the
-      # step fails post-release and the leftover pending label blocks new PRs.
+      # Clear the pending state of the merged Release Please PR after npm
+      # publication, so future PR generation can start at the correct tag.
       pull-requests: write
       id-token: write
     steps:
@@ -296,3 +295,24 @@ jobs:
           done
           echo "::error::npm cubrid-client@$version has not become visible after GitHub Release creation"
           exit 1
+      - name: Mark the reviewed Release Please PR as tagged
+        if: ${{ inputs.recovery_tag == '' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.target.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          pr=$(gh pr list --repo "$GH_REPO" --state merged --base main --limit 100 \
+            --json number,title,headRefName \
+            --jq '.[] | select(.headRefName | startswith("release-please--")) | [.number,.title] | @tsv' \
+            | awk -F '\t' -v title="chore(main): release $version" '$2 == title {print $1; exit}')
+          if [[ -z "$pr" ]]; then
+            echo "::warning::Published $RELEASE_TAG but no matching PR was found for label cleanup"
+            exit 0
+          fi
+          gh pr edit "$pr" --repo "$GH_REPO" --remove-label "autorelease: pending"
+          echo "Cleared pending release label on PR #$pr" >> "$GITHUB_STEP_SUMMARY"
