@@ -54,7 +54,9 @@ No peer dependencies required.
 **Declared runtime requirement:** Node.js 18+. The
 [real-broker CI matrix](https://github.com/cubrid-lab/cubrid-client/actions/runs/42216017228)
 passed 23 integration tests (0 skipped) on CUBRID 10.2, 11.0, 11.2 and
-11.4. This is **not exhaustive** type, TLS or fault-injection validation;
+11.4. A separate real SSL=ON CUBRID 11.4 run also passed 3/3 certificate
+verification and rejection checks. This is **not exhaustive**
+type, cross-version TLS or fault-injection validation;
 see the [support matrix](docs/SUPPORT_MATRIX.md) before deployment.
 
 ## Quick Start
