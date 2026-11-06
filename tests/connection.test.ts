@@ -820,3 +820,298 @@ test("CASConnection concurrent close() invokes the hook at most once", async () 
     await closeServer(server);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Frame validation (#107)
+// ---------------------------------------------------------------------------
+
+function frameHeader(dataLength: number): Buffer {
+  const header = Buffer.alloc(SIZE_DATA_LENGTH);
+  header.writeInt32BE(dataLength, 0);
+  return header;
+}
+
+/** Complete the handshake, then pass each later request to `onRequest`. */
+function brokerWith(onRequest: (socket: NetSocket, requestIndex: number) => void) {
+  return createMockBroker((socket) => {
+    socket.once("data", () => {
+      socket.write(Buffer.alloc(4));
+      socket.once("data", () => {
+        socket.write(frameResponse(buildOpenDbResponse(1)));
+        let requestIndex = 0;
+        socket.on("data", () => onRequest(socket, requestIndex++));
+      });
+    });
+    socket.on("error", () => {});
+  });
+}
+
+const REQUEST_HEADER = Buffer.alloc(8);
+const REQUEST_PAYLOAD = Buffer.from([0x01]);
+const CAS_INFO = Buffer.from([0x01, 0x02, 0x03, 0x04]);
+
+test("CASConnection rejects a negative frame length and retires the socket", async () => {
+  const { server, port } = await brokerWith((socket) => socket.write(frameHeader(-1)));
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+    await cas.connect();
+
+    await assert.rejects(
+      cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD),
+      /Invalid CAS frame length -1/,
+    );
+    assert.equal(cas.isConnected, false);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("CASConnection rejects a frame over the limit without waiting for its body", async () => {
+  const { server, port } = await brokerWith((socket) => socket.write(frameHeader(17)));
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port, maxFrameLength: 16 });
+    await cas.connect();
+
+    await assert.rejects(
+      cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD),
+      /Invalid CAS frame length 17 \(expected 0 to 16\)/,
+    );
+    assert.equal(cas.isConnected, false);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("CASConnection rejects an oversized OpenDatabase frame", async () => {
+  const { server, port } = await createMockBroker((socket) => {
+    socket.once("data", () => {
+      socket.write(Buffer.alloc(4));
+      socket.once("data", () => socket.write(frameHeader(0x7fffffff)));
+    });
+    socket.on("error", () => {});
+  });
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+    await assert.rejects(cas.connect(), /Invalid CAS frame length 2147483647/);
+    assert.equal(cas.isConnected, false);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("CASConnection accepts a frame of exactly the limit", async () => {
+  const body = Buffer.alloc(32, 0xab);
+  const { server, port } = await brokerWith((socket) => {
+    socket.write(frameResponse(Buffer.concat([CAS_INFO, body])));
+  });
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port, maxFrameLength: 32 });
+    await cas.connect();
+
+    const response = await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+    assert.deepEqual(response, body);
+    await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("CASConnection accepts a zero-length frame as CAS_INFO only", async () => {
+  const { server, port } = await brokerWith((socket) => socket.write(frameResponse(CAS_INFO)));
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+    await cas.connect();
+
+    const response = await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+    assert.equal(response.length, 0);
+    assert.equal(cas.isConnected, true);
+    await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("CASConnection reassembles a frame split across many writes", async () => {
+  const body = Buffer.alloc(4096, 0x5a);
+  const framed = frameResponse(Buffer.concat([CAS_INFO, body]));
+  const { server, port } = await brokerWith((socket) => {
+    socket.setNoDelay(true);
+    let offset = 0;
+    const writeNext = (): void => {
+      if (offset < framed.length) {
+        socket.write(framed.subarray(offset, offset + 512));
+        offset += 512;
+        setImmediate(writeNext);
+      }
+    };
+    writeNext();
+  });
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+    await cas.connect();
+
+    const response = await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+    assert.deepEqual(response, body);
+    await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("CASConnection rejects a truncated frame and does not reuse the socket", async () => {
+  const { server, port } = await brokerWith((socket) => {
+    socket.write(frameHeader(100));
+    socket.end(CAS_INFO);
+  });
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+    await cas.connect();
+
+    await assert.rejects(
+      cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD),
+      /Connection (ended|closed) while reading/,
+    );
+    assert.equal(cas.isConnected, false);
+    await assert.rejects(
+      cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD),
+      /not connected/,
+    );
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("CASConnection reconnects cleanly after retiring a socket", async () => {
+  let connections = 0;
+  const { server, port } = await createMockBroker((socket) => {
+    const connection = ++connections;
+    socket.on("error", () => {});
+    socket.once("data", () => {
+      socket.write(Buffer.alloc(4));
+      socket.once("data", () => {
+        socket.write(frameResponse(buildOpenDbResponse(connection)));
+        socket.once("data", () => {
+          // Bytes after the bad length must not leak into the next connection.
+          socket.write(
+            connection === 1
+              ? Buffer.concat([frameHeader(-5), CAS_INFO])
+              : frameResponse(CAS_INFO),
+          );
+        });
+      });
+    });
+  });
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+    await cas.connect();
+    await assert.rejects(cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD), /Invalid CAS frame/);
+
+    await cas.connect();
+    assert.equal(cas.sessionId, 2);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const response = await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+    assert.equal(response.length, 0);
+    await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("CASConnection sends requests after a broker redirect", async () => {
+  const { server: casServer, port: casPort } = await createMockBroker((socket) => {
+    socket.once("data", () => {
+      socket.write(frameResponse(buildOpenDbResponse(42)));
+      socket.on("data", () => socket.write(frameResponse(CAS_INFO)));
+    });
+  });
+  const { server: broker, port: brokerPort } = await createMockBroker((socket) => {
+    socket.once("data", () => socket.write(frameHeader(casPort)));
+  });
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port: brokerPort });
+    await cas.connect();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const response = await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+    assert.equal(response.length, 0);
+    await cas.close();
+  } finally {
+    await closeServer(broker);
+    await closeServer(casServer);
+  }
+});
+
+test("CASConnection connectionGeneration changes on a transparent reconnect", async () => {
+  const released = Buffer.from([0x00, 0x02, 0x03, 0x04]);
+  const { server, port } = await brokerWith((socket) => socket.write(frameResponse(released)));
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+    await cas.connect();
+    assert.equal(cas.connectionGeneration, 1);
+
+    await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+    await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+
+    assert.equal(cas.connectionGeneration, 2);
+    await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("CASConnection retries a failed connect without inheriting the old socket's death", async () => {
+  let connections = 0;
+  const { server, port } = await createMockBroker((socket) => {
+    const connection = ++connections;
+    socket.on("error", () => {});
+    socket.once("data", () => {
+      socket.write(Buffer.alloc(4));
+      socket.once("data", () => {
+        socket.write(connection === 1 ? frameHeader(-1) : frameResponse(buildOpenDbResponse(2)));
+        socket.on("data", () => socket.write(frameResponse(CAS_INFO)));
+      });
+    });
+  });
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+    await assert.rejects(cas.connect(), /Invalid CAS frame/);
+    await cas.connect();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const response = await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+    assert.equal(response.length, 0);
+    await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("CASConnection discardSession drops the socket and allows reconnecting", async () => {
+  const { server, port } = await brokerWith((socket) => socket.write(frameResponse(CAS_INFO)));
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+    await cas.connect();
+
+    await cas.discardSession();
+    assert.equal(cas.isConnected, false);
+
+    await cas.connect();
+    assert.equal(cas.connectionGeneration, 2);
+    await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});

@@ -12,7 +12,7 @@
 
 import { Socket } from "node:net";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
-import { SIZE_CAS_INFO, SIZE_DATA_LENGTH } from "./constants.js";
+import { DEFAULT_MAX_FRAME_LENGTH, SIZE_CAS_INFO, SIZE_DATA_LENGTH } from "./constants.js";
 import { parseConnectionString } from "../utils/connection-string.js";
 import {
   writeClientInfoExchange,
@@ -51,6 +51,8 @@ export interface CASConnectionConfig {
   ca?: string | Buffer;
   /** Server name for SNI and certificate hostname verification. */
   servername?: string;
+  /** Largest accepted frame DATA_LENGTH. Default: DEFAULT_MAX_FRAME_LENGTH. */
+  maxFrameLength?: number;
 }
 
 /**
@@ -66,6 +68,7 @@ export class CASConnection {
   private _protoVersion = 1;
   private _sessionId = 0;
   private receiveBuffer: Buffer = Buffer.alloc(0);
+  private _connectionGeneration = 0;
 
   /**
    * Per-instance FIFO serialization queue. Public entry points that mutate
@@ -138,21 +141,19 @@ export class CASConnection {
       );
 
       // Step 5: Receive framed OpenDatabase response
-      const dataLengthBuf = await this.recvExact(this.socket, SIZE_DATA_LENGTH);
-      const dataLength = dataLengthBuf.readInt32BE(0);
-      const responseBody = await this.recvExact(this.socket, dataLength + SIZE_CAS_INFO);
+      const responseBody = await this.readFrame(this.socket);
 
       const result: OpenDatabaseResult = parseOpenDatabase(responseBody);
       this._casInfo = result.casInfo;
       this._protoVersion = result.protoVersion;
       this._sessionId = result.sessionId;
+      this._connectionGeneration += 1;
       this.connected = true;
     } catch (error) {
       brokerSocket.destroy();
-      if (this.socket && this.socket !== brokerSocket) {
-        this.socket.destroy();
-        this.socket = null;
-      }
+      this.socket?.destroy();
+      this.socket = null;
+      this.receiveBuffer = Buffer.alloc(0);
       throw error;
     }
   }
@@ -184,11 +185,7 @@ export class CASConnection {
       throw new Error("CASConnection is not connected");
     }
 
-    const dataLengthBuf = await this.recvExact(this.socket, SIZE_DATA_LENGTH);
-    const dataLength = dataLengthBuf.readInt32BE(0);
-    const totalLen = dataLength + SIZE_CAS_INFO;
-
-    return this.recvExact(this.socket, totalLen);
+    return this.readFrame(this.socket);
   }
 
   /**
@@ -202,8 +199,17 @@ export class CASConnection {
   async sendAndRecv(header: Buffer, payload: Buffer): Promise<Buffer> {
     return this.enqueue(async () => {
       await this.checkReconnectUnlocked();
-      await this.send(header, payload);
-      const response = await this.recv();
+
+      let response: Buffer;
+      try {
+        await this.send(header, payload);
+        response = await this.recv();
+      } catch (error) {
+        // The stream position is unknown after a failed exchange, so this
+        // socket can never be trusted to line up with the next frame.
+        this.retireSocket();
+        throw error;
+      }
 
       // Update CAS_INFO from response
       response.copy(this._casInfo, 0, 0, SIZE_CAS_INFO);
@@ -211,6 +217,14 @@ export class CASConnection {
       // Return payload portion (after CAS_INFO)
       return response.subarray(SIZE_CAS_INFO);
     });
+  }
+
+  /**
+   * Drop the current session so the server discards its uncommitted work.
+   * Queued: serialized against in-flight requests.
+   */
+  async discardSession(): Promise<void> {
+    return this.enqueue(async () => this.retireSocket());
   }
 
   /**
@@ -262,10 +276,7 @@ export class CASConnection {
     }
 
     if (this._casInfo[0] === CASConnection.CAS_INFO_STATUS_INACTIVE) {
-      this.socket.destroy();
-      this.socket = null;
-      this.connected = false;
-      this.receiveBuffer = Buffer.alloc(0);
+      this.retireSocket();
       await this.connectUnlocked();
     }
   }
@@ -294,6 +305,11 @@ export class CASConnection {
   /** Session ID from OpenDatabase. */
   get sessionId(): number {
     return this._sessionId;
+  }
+
+  /** Changes on every new session, including transparent reconnects. */
+  get connectionGeneration(): number {
+    return this._connectionGeneration;
   }
 
   /** Whether the connection is currently open. */
@@ -347,21 +363,7 @@ export class CASConnection {
         socket.setTimeout(0); // Disable timeout after successful connect
 
         // Track remote socket closure (broker may close after auto-commit)
-        socket.on("end", () => {
-          this.socketDead = true;
-        });
-
-        socket.on("close", () => {
-          this.socketDead = true;
-        });
-
-        // Absorb EPIPE / ECONNRESET from late writes to a dead socket.
-        // Without this handler Node.js treats the error event as unhandled
-        // and crashes the process.
-        socket.on("error", () => {
-          this.socketDead = true;
-        });
-
+        this.trackSocketDeath(socket);
         resolve(socket);
       });
     });
@@ -416,16 +418,7 @@ export class CASConnection {
         tlsSocket.removeListener("error", onError);
 
         // Re-wire dead-socket tracking onto the TLS socket.
-        tlsSocket.on("end", () => {
-          this.socketDead = true;
-        });
-        tlsSocket.on("close", () => {
-          this.socketDead = true;
-        });
-        tlsSocket.on("error", () => {
-          this.socketDead = true;
-        });
-
+        this.trackSocketDeath(tlsSocket);
         resolve(tlsSocket);
       };
 
@@ -434,6 +427,56 @@ export class CASConnection {
     });
   }
 
+
+  /**
+   * Mark the connection dead when `socket` goes away, unless `socket` has been
+   * replaced: a redirected broker socket or a retired socket closes after its
+   * successor exists, and that must not condemn the successor.
+   *
+   * The error listener also absorbs EPIPE / ECONNRESET from late writes, which
+   * Node.js would otherwise treat as unhandled and crash the process.
+   */
+  private trackSocketDeath(socket: Socket): void {
+    const markDead = (): void => {
+      if (this.socket === socket) {
+        this.socketDead = true;
+      }
+    };
+
+    socket.on("end", markDead);
+    socket.on("close", markDead);
+    socket.on("error", markDead);
+  }
+
+  /**
+   * Drop the current socket and its buffered bytes. `isConnected` turns false,
+   * so the next caller opens a fresh connection instead of reusing this one.
+   */
+  private retireSocket(): void {
+    const socket = this.socket;
+    this.socket = null;
+    this.connected = false;
+    this.receiveBuffer = Buffer.alloc(0);
+    socket?.destroy();
+  }
+
+  /**
+   * Read one framed response, rejecting an impossible DATA_LENGTH before any
+   * body bytes are awaited. Returns CAS_INFO + payload.
+   */
+  private async readFrame(socket: Socket): Promise<Buffer> {
+    const dataLengthBuf = await this.recvExact(socket, SIZE_DATA_LENGTH);
+    const dataLength = dataLengthBuf.readInt32BE(0);
+    const maxFrameLength = this.config.maxFrameLength ?? DEFAULT_MAX_FRAME_LENGTH;
+
+    if (dataLength < 0 || dataLength > maxFrameLength) {
+      throw new Error(
+        `Invalid CAS frame length ${dataLength} (expected 0 to ${maxFrameLength})`,
+      );
+    }
+
+    return this.recvExact(socket, dataLength + SIZE_CAS_INFO);
+  }
 
   private socketWrite(socket: Socket, data: Buffer): Promise<void> {
     return new Promise<void>((resolve, reject) => {
@@ -455,20 +498,29 @@ export class CASConnection {
     return new Promise<Buffer>((resolve, reject) => {
       // Check if we already have enough buffered data
       if (this.receiveBuffer.length >= size) {
-        const result = this.receiveBuffer.subarray(0, size);
-        this.receiveBuffer = this.receiveBuffer.subarray(size);
-        resolve(result);
+        resolve(this.takeBuffered(size));
         return;
       }
 
-      const onData = (chunk: Buffer): void => {
-        this.receiveBuffer = Buffer.concat([this.receiveBuffer, chunk]);
+      // A destroyed socket emits nothing further, so waiting would never end.
+      if (socket.destroyed) {
+        reject(new Error("Connection closed while reading"));
+        return;
+      }
 
-        if (this.receiveBuffer.length >= size) {
+      // Collect chunks and join once: re-concatenating on every chunk is
+      // quadratic in the frame size.
+      const chunks: Buffer[] = [this.receiveBuffer];
+      let received = this.receiveBuffer.length;
+
+      const onData = (chunk: Buffer): void => {
+        chunks.push(chunk);
+        received += chunk.length;
+
+        if (received >= size) {
           cleanup();
-          const result = this.receiveBuffer.subarray(0, size);
-          this.receiveBuffer = this.receiveBuffer.subarray(size);
-          resolve(result);
+          this.receiveBuffer = Buffer.concat(chunks, received);
+          resolve(this.takeBuffered(size));
         }
       };
 
@@ -499,5 +551,11 @@ export class CASConnection {
       socket.once("close", onClose);
       socket.once("end", onEnd);
     });
+  }
+
+  private takeBuffered(size: number): Buffer {
+    const result = this.receiveBuffer.subarray(0, size);
+    this.receiveBuffer = this.receiveBuffer.subarray(size);
+    return result;
   }
 }

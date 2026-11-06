@@ -1817,3 +1817,35 @@ test("parseFetch with zero tupleCount returns empty rows", () => {
   assert.equal(result.tupleCount, 0);
   assert.deepEqual(result.rows, []);
 });
+
+// ---------------------------------------------------------------------------
+// PacketReader bounds (#107)
+// ---------------------------------------------------------------------------
+
+test("PacketReader length-based reads reject ranges past the packet", () => {
+  const r = new PacketReader(Buffer.alloc(4));
+  r.skip(1);
+
+  assert.throws(() => r.parseBytes(4), /Malformed CAS packet: cannot read 4 bytes at offset 1/);
+  assert.throws(() => r.parseNullTermString(4), /Malformed CAS packet/);
+  assert.throws(() => r.skip(4), /Malformed CAS packet/);
+  assert.equal(r.position, 1);
+});
+
+test("PacketReader rejects negative and non-integer lengths without moving", () => {
+  const r = new PacketReader(Buffer.alloc(4));
+
+  assert.throws(() => r.skip(-1), /Malformed CAS packet/);
+  assert.throws(() => r.parseBytes(-1), /Malformed CAS packet/);
+  assert.throws(() => r.parseBytes(1.5), /Malformed CAS packet/);
+  assert.equal(r.position, 0);
+});
+
+test("PacketReader reads exactly to the end of the packet", () => {
+  const r = new PacketReader(Buffer.from([1, 2, 3, 4]));
+
+  r.skip(1);
+  assert.deepEqual(r.parseBytes(3), Buffer.from([2, 3, 4]));
+  assert.equal(r.remaining, 0);
+  r.skip(0);
+});

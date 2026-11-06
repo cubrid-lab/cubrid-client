@@ -196,7 +196,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         () => client.query("SELECT ? AS v", ["a\0b"]),
         (err: Error) => {
           assert.ok(err instanceof QueryError);
-          assert.match((err.cause as Error).message, /null byte/);
+          assert.match(((err.cause as Error).cause as Error).message, /null byte/);
           return true;
         },
       );
@@ -204,7 +204,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         () => client.query("SELECT ? AS v", ["a\x1ab"]),
         (err: Error) => {
           assert.ok(err instanceof QueryError);
-          assert.match((err.cause as Error).message, /Ctrl-Z/);
+          assert.match(((err.cause as Error).cause as Error).message, /Ctrl-Z/);
           return true;
         },
       );

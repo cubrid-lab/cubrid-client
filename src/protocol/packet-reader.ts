@@ -74,6 +74,7 @@ export class PacketReader {
   // ---------------------------------------------------------------------------
 
   parseBytes(length: number): Buffer {
+    this.assertAvailable(length);
     const data = Buffer.alloc(length);
     this.buf.copy(data, 0, this.offset, this.offset + length);
     this.offset += length;
@@ -85,6 +86,7 @@ export class PacketReader {
     if (length <= 0) {
       return "";
     }
+    this.assertAvailable(length);
     const raw = this.buf.subarray(this.offset, this.offset + length);
     this.offset += length;
     // Strip trailing null byte(s)
@@ -163,6 +165,7 @@ export class PacketReader {
   // ---------------------------------------------------------------------------
 
   skip(length: number): void {
+    this.assertAvailable(length);
     this.offset += length;
   }
 
@@ -172,5 +175,15 @@ export class PacketReader {
 
   get remaining(): number {
     return this.buf.length - this.offset;
+  }
+
+  /** Reject a length the packet cannot satisfy, before the offset moves. */
+  private assertAvailable(length: number): void {
+    if (!Number.isSafeInteger(length) || length < 0 || length > this.remaining) {
+      throw new RangeError(
+        `Malformed CAS packet: cannot read ${length} bytes at offset ${this.offset} ` +
+          `(${this.remaining} remaining)`,
+      );
+    }
   }
 }
