@@ -26,6 +26,10 @@ jobs:
         node-version: [18, 20, 22]
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Recovery must validate the immutable artifact, not unrelated main.
+          ref: ${{ inputs.recovery_tag || github.sha }}
+          persist-credentials: false
       - name: Setup Node.js ${{ matrix.node-version }}
         uses: actions/setup-node@v7
         with:
@@ -45,9 +49,19 @@ jobs:
         run: npm test
       - name: Build
         run: npm run build
+      - name: Verify TypeScript API before tagging
+        if: matrix.node-version == 22
+        run: npm run api:check
+
+  release-validation:
+    if: ${{ inputs.confirmation == 'PUBLISH' }}
+    needs: preflight
+    uses: ./.github/workflows/release-validation.yml
+    with:
+      checkout_ref: ${{ inputs.recovery_tag || github.sha }}
 
   publish:
-    needs: preflight
+    needs: [preflight, release-validation]
     runs-on: ubuntu-latest
     environment: npm-publish
     permissions:

@@ -1,0 +1,110 @@
+name: Reviewed release validation
+
+# Can be dispatched as a no-publish dry run. Publication calls the same
+# jobs and requires their success before a GitHub tag can be created.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/release-validation.yml"
+      - ".github/workflows/live-cubrid.yml"
+      - ".github/workflows/live-cubrid-tls.yml"
+      - ".github/workflows/publish.yml"
+  workflow_dispatch:
+    inputs:
+      checkout_ref:
+        description: "Exact git commit SHA or existing immutable tag; blank checks selected branch head"
+        type: string
+        required: false
+        default: ""
+  workflow_call:
+    inputs:
+      checkout_ref:
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  live-cubrid-matrix:
+    uses: ./.github/workflows/live-cubrid.yml
+    with:
+      checkout_ref: ${{ inputs.checkout_ref || github.sha }}
+
+  live-cubrid-tls:
+    uses: ./.github/workflows/live-cubrid-tls.yml
+    with:
+      checkout_ref: ${{ inputs.checkout_ref || github.sha }}
+
+  npm-consumer-smoke:
+    name: npm artifact / Node ${{ matrix.node-version }} smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci
+      - name: Validate dependencies on release build lane
+        if: matrix.node-version == 22
+        run: npm audit --audit-level=high
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - name: Verify reviewed TypeScript declarations and curated notes
+        if: matrix.node-version == 22
+        run: |
+          npm run api:check
+          node scripts/verify-release-notes.mjs --candidate
+      - name: Test packed npm package in real CJS and ESM consumers
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm pack --json > "$RUNNER_TEMP/npm-pack.json"
+          archive=$(node -p "JSON.parse(require('node:fs').readFileSync(process.env.RUNNER_TEMP + '/npm-pack.json', 'utf8'))[0].filename")
+          test -n "$archive"
+          smoke="$RUNNER_TEMP/npm-smoke"
+          mkdir -p "$smoke"
+          cd "$smoke"
+          npm init -y >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund "$GITHUB_WORKSPACE/$archive"
+          node -e 'const p = require("cubrid-client"); if (typeof p.createClient !== "function" || typeof p.ReadTimeoutError !== "function") process.exit(1);'
+          node --input-type=module -e 'import { createClient, ReadTimeoutError } from "cubrid-client"; if (typeof createClient !== "function" || typeof ReadTimeoutError !== "function") process.exit(1);'
+      - name: Write verification summary
+        if: always()
+        shell: bash
+        run: |
+          echo "Node ${{ matrix.node-version }} packed consumer smoke on ${{ inputs.checkout_ref || github.sha }}: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+
+  release-gate:
+    name: All reviewed release checks passed
+    if: always()
+    needs: [live-cubrid-matrix, live-cubrid-tls, npm-consumer-smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject missing, skipped, failed, or cancelled checks
+        env:
+          LIVE_MATRIX: ${{ needs.live-cubrid-matrix.result }}
+          LIVE_TLS: ${{ needs.live-cubrid-tls.result }}
+          NPM_SMOKE: ${{ needs.npm-consumer-smoke.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'Live database matrix: %s\nLive TLS: %s\nPacked npm consumers: %s\n' \
+            "$LIVE_MATRIX" "$LIVE_TLS" "$NPM_SMOKE"
+          if [[ "$LIVE_MATRIX" != success || "$LIVE_TLS" != success || "$NPM_SMOKE" != success ]]; then
+            echo "::error::Required release validation was absent, skipped, failed or cancelled."
+            exit 1
+          fi
+          echo "All required automated release validation jobs succeeded." >> "$GITHUB_STEP_SUMMARY"

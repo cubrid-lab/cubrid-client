@@ -31,18 +31,35 @@ Python release strategy. The GitHub Release and npm publish steps are separate.
    A successful offline test suite is not live protocol validation.
 3. Configure the npm-publish GitHub Environment with required reviewers and
    suitable branch protections. Keep NPM_TOKEN restricted to npm publishing.
-4. Run Actions -> Publish reviewed npm release -> Run workflow and type PUBLISH.
-   Leave recovery_tag empty for a new release. This first runs typecheck,
-   offline tests and builds on Node 18/20/22, and a mandatory full-dependency high/critical audit on Node 22 **before** creating a tag.
-5. The manual workflow then uses release-please to create the immutable
-   GitHub release/tag, checks out that exact tag, verifies package.json,
-   package-lock.json and manifest versions, repeats npm audit (high and above, see
-   SECURITY.md) on the immutable tag, runs tests/build/npm pack and
+4. Before publishing, run **Actions -> Reviewed release validation** as a
+   no-publish dry run on the exact candidate commit. Capture its run link.
+   This runs the four real CUBRID versions (10.2, 11.0, 11.2, 11.4), a
+   separately configured **SSL=ON** CUBRID 11.4 broker with verified CA and
+   hostname rejection tests, and packaged ESM/CJS consumer smoke on Node
+   18/20/22. A missing/skipped/failed job fails the gate. Review independent
+   protocol/type evidence and known limitations separately (#117/#120).
+5. Run Actions -> Publish reviewed npm release -> Run workflow and type PUBLISH.
+   Leave recovery_tag empty for a new release. Before tagging, it repeats
+   Node 18/20/22 typecheck, offline tests, build, API declaration check and
+   mandatory high/critical npm audit, then invokes that **same required
+   release validation** workflow for the exact commit. A failing live broker,
+   TLS job, packed npm consumer or incomplete check blocks tag creation.
+6. Only after both phases pass and the npm-publish environment approves does
+   release-please create an immutable GitHub Release/tag; it verifies
+   package.json, package-lock.json and manifest versions, repeats the security
+   and build checks on the tag, validates the curated notes and npm pack, then
    publishes via NPM_TOKEN.
-6. If npm publishing fails after GitHub Release creation, rerun with
+7. If npm publishing fails after GitHub Release creation, rerun with
    recovery_tag=vX.Y.Z; the workflow uses the existing immutable tag and
    avoids republishing an already-present npm version. Investigate failures
    before retries and verify GitHub/npm versions match after success.
+
+The separate [release validation workflow](../.github/workflows/release-validation.yml)
+is safe to run without publishing. Production-ready certification remains a
+**distinct maintainer decision**: the existing 23 live cases do not prove every
+CUBRID type, fault path, TLS version, transaction state or independent test
+oracle. The workflow addresses mandatory database/TLS/npm packaging evidence,
+but #117/#118/#120 and explicit human approval remain open.
 
 The previous automatic v* tag-push publish trigger has been removed to avoid
 unreviewed distribution and GITHUB_TOKEN tag event pitfalls. Provenance is
