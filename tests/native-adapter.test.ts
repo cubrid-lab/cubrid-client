@@ -1369,14 +1369,13 @@ test("query handle: a successful DML closes it exactly once", async () => {
   assert.deepEqual(fakeCAS.closedHandles, [1]);
 });
 
-test("query handle: a FETCH that ends early closes it exactly once", async () => {
+test("query handle: premature FETCH termination rejects and closes exactly once", async () => {
   const { adapter, fakeCAS } = createAdapterWithFakeCAS();
   fakeCAS.queueResponse(buildPartialSelectResponse(3));
   fakeCAS.queueResponse(buildErrorResponse(-1, "no more data"));
 
-  const rows = await adapter.query("SELECT id FROM t");
-
-  assert.equal(rows.length, 1);
+  // #129 disallows returning incomplete rows on a negative FETCH envelope.
+  await assertQueryFails(adapter, /CUBRID fetch failed/);
   assert.deepEqual(fakeCAS.closedHandles, [QUERY_HANDLE]);
 });
 
