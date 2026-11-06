@@ -76,6 +76,11 @@ count; state clearly when that check was not run.
 
 ## Public API compatibility
 
+Read [the public API stability policy](docs/API_STABILITY.md) before changing
+an exported TypeScript type, Promise contract, Node.js runtime requirement, or
+package entrypoint. The baseline diff is a reviewer aid, not SemVer approval.
+
+
 The published surface is the built `dist/index.d.ts` (and the identical
 `dist/index.d.cts`), generated from `src/index.ts`. The reviewed copy of it is
 committed as `api/index.d.ts`. CI (the Node 22 lane) runs `npm run api:check`
