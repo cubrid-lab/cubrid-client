@@ -9,6 +9,7 @@ import { CASConnection, type CASConnectionConfig } from "../protocol/connection.
 import {
   writePrepareAndExecute,
   parsePrepareAndExecute,
+  readQueryHandle,
   writeFetch,
   parseFetch,
   writeCloseReqHandle,
@@ -201,27 +202,49 @@ export class NativeCubridAdapter implements DriverAdapter {
       cas.casInfo,
     );
     const responsePayload = await cas.sendAndRecv(header, payload);
-    await this.bindTransactionSession(cas);
 
-    const result: PrepareAndExecuteResult = parsePrepareAndExecute(
-      responsePayload,
-      cas.protoVersion,
-    );
+    return this.withQueryHandle(cas, responsePayload, async () => {
+      await this.bindTransactionSession(cas);
 
-    if (result.statementType !== StatementType.SELECT) {
-      await this.closeQueryHandle(cas, result.queryHandle);
-      return [] as unknown as T[];
+      const result: PrepareAndExecuteResult = parsePrepareAndExecute(
+        responsePayload,
+        cas.protoVersion,
+      );
+
+      if (result.statementType !== StatementType.SELECT) {
+        return [] as unknown as T[];
+      }
+
+      const allRows = [...result.rows];
+
+      if (result.totalTupleCount > allRows.length) {
+        await this.fetchRemaining(cas, result, allRows);
+      }
+
+      return allRows as T[];
+    });
+  }
+
+  /**
+   * Run `use`, then release the query handle held by `response` however `use`
+   * ended. The handle is read first because decoding the response can fail
+   * after the server has already allocated it.
+   */
+  private async withQueryHandle<R>(
+    cas: CASConnection,
+    response: Buffer,
+    use: () => Promise<R>,
+  ): Promise<R> {
+    const queryHandle = readQueryHandle(response);
+    const generation = cas.connectionGeneration;
+
+    try {
+      return await use();
+    } finally {
+      if (queryHandle !== null) {
+        await this.closeQueryHandle(cas, queryHandle, generation);
+      }
     }
-
-    const allRows = [...result.rows];
-
-    if (result.totalTupleCount > allRows.length) {
-      await this.fetchRemaining(cas, result, allRows);
-    }
-
-    await this.closeQueryHandle(cas, result.queryHandle);
-
-    return allRows as T[];
   }
 
   /** True when an open transaction's session no longer exists. */
@@ -356,9 +379,9 @@ export class NativeCubridAdapter implements DriverAdapter {
       cas.casInfo,
     );
     const responsePayload = await cas.sendAndRecv(header, payload);
-    const result = parsePrepareAndExecute(responsePayload, cas.protoVersion);
 
-    try {
+    return this.withQueryHandle(cas, responsePayload, async () => {
+      const result = parsePrepareAndExecute(responsePayload, cas.protoVersion);
       const firstRow = result.rows[0];
       const length = firstRow ? Number(Object.values(firstRow)[0]) : NaN;
 
@@ -373,9 +396,7 @@ export class NativeCubridAdapter implements DriverAdapter {
           `returned ${String(length)} (expected 1 or 2). Refusing to guess, as an ` +
           `incorrect mode silently corrupts string parameters.`,
       );
-    } finally {
-      await this.closeQueryHandle(cas, result.queryHandle);
-    }
+    });
   }
 
   private async fetchRemaining(
@@ -414,11 +435,23 @@ export class NativeCubridAdapter implements DriverAdapter {
     }
   }
 
-  private async closeQueryHandle(cas: CASConnection, queryHandle: number): Promise<void> {
+  /**
+   * Best-effort release on the session that created the handle, so a cleanup
+   * failure cannot replace the caller's own error. If that session is gone the
+   * server has dropped the handle with it and nothing is sent.
+   */
+  private async closeQueryHandle(
+    cas: CASConnection,
+    queryHandle: number,
+    generation: number,
+  ): Promise<void> {
     try {
       const { header, payload } = writeCloseReqHandle(queryHandle, cas.casInfo);
-      const responsePayload = await cas.sendAndRecv(header, payload);
-      parseSimpleResponse(responsePayload);
+      const responsePayload = await cas.sendAndRecvOnSession(generation, header, payload);
+
+      if (responsePayload) {
+        parseSimpleResponse(responsePayload);
+      }
     } catch {
       // Best-effort cleanup — ignore errors
     }
