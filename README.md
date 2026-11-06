@@ -32,6 +32,17 @@ A modern CUBRID client that speaks the CAS binary protocol directly over TCP —
 | Transactions | `transaction(callback)` with auto commit/rollback |
 | Node.js | 18+ |
 
+## Versioning and compatibility
+
+`cubrid-client` follows SemVer for its public runtime and TypeScript APIs:
+compatible fixes use PATCH, additive options/features use MINOR, and breaking
+changes (including an increase of the declared Node.js minimum) require MAJOR.
+The current `engines.node` floor is Node.js 18. Types such as `query<T>()`
+are compile-time declarations, not runtime validation.
+See [API stability and compatibility](docs/API_STABILITY.md) for the precise
+contract and migration policy. Version numbers do not establish full live
+CUBRID compatibility; review the version support evidence and release notes.
+
 ## Installation
 
 ```bash
