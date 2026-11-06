@@ -23,6 +23,16 @@ Python release strategy. The GitHub Release and npm publish steps are separate.
   manually obtain and inspect CI checks on those generated PRs.
 - Ensure repository Actions settings permit workflow-created pull requests.
 
+A release PR that modifies `.release-please-manifest.json` or `CHANGELOG.md`
+automatically runs the **full Reviewed release validation gate**. It uses the
+four CUBRID 10.2/11.0/11.2/11.4 broker images rather than only the routine
+11.4 PR lane, plus real SSL=ON and Node 18/20/22 packaged consumer
+verification. Do not confuse the PR's proposed merge SHA with the final
+post-merge commit: the manual publish workflow revalidates that exact commit
+before tagging. Ordinary source PRs retain the existing faster 11.4 smoke
+and their own CI.
+
+
 ## Human-approved publication and recovery
 
 1. Review and merge the version/changelog Release PR.
