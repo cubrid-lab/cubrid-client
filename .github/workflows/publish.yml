@@ -1,12 +1,23 @@
-name: Publish reviewed npm release
+name: Publish verified npm release
 
-# Manual only: release-please uses GITHUB_TOKEN and tag pushes from that
-# token will not automatically trigger separate GitHub Actions workflows.
+# A reviewed version/CHANGELOG merge on main automatically runs all pre-tag
+# checks and publishes the package. Workflow changes also trigger this job,
+# allowing the initial v1.2.0 release to bootstrap without a manual dispatch.
+# GITHUB_TOKEN tag events do not trigger other workflows, so tagged verification
+# and npm publication remain in this same workflow.
 on:
+  push:
+    branches: [main]
+    paths:
+      - ".release-please-manifest.json"
+      - "CHANGELOG.md"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/publish.yml"
   workflow_dispatch:
     inputs:
       confirmation:
-        description: "Type PUBLISH after reviewing the release PR and live CUBRID evidence"
+        description: "Type PUBLISH only for an explicitly requested manual retry or release"
         required: true
         type: string
       recovery_tag:
@@ -17,8 +28,101 @@ on:
 permissions:
   contents: read
 
+# No parallel tag/npm publication for the same repository/version line.
+concurrency:
+  group: reviewed-npm-release-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
+  candidate:
+    name: Detect a reviewed, unpublished release candidate
+    runs-on: ubuntu-latest
+    outputs:
+      should_publish: ${{ steps.decide.outputs.should_publish }}
+      tag: ${{ steps.decide.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.recovery_tag || github.sha }}
+          persist-credentials: false
+      - name: Verify merged release version and idempotency
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          MANUAL_CONFIRMATION: ${{ inputs.confirmation }}
+          RECOVERY_TAG: ${{ inputs.recovery_tag }}
+          TRIGGER_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == workflow_dispatch && "$MANUAL_CONFIRMATION" != PUBLISH ]]; then
+            echo "::error::Manual recovery requires explicit PUBLISH confirmation"
+            exit 1
+          fi
+          node - <<'NODE'
+          const fs = require("node:fs");
+          const p = require("./package.json");
+          const l = require("./package-lock.json");
+          const m = require("./.release-please-manifest.json");
+          if (p.version !== l.version || p.version !== l.packages[""].version ||
+              p.version !== m["."] || !/^\d+\.\d+\.\d+$/.test(p.version)) {
+            throw new Error("Package, lockfile and Release Please manifest versions do not agree");
+          }
+          if (!fs.existsSync("docs/releases/v" + p.version + ".md")) {
+            throw new Error("Missing curated, reviewed release notes for " + p.version);
+          }
+          NODE
+          version=$(node -p "require('./package.json').version")
+          tag="v$version"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [[ -n "$RECOVERY_TAG" ]]; then
+            if [[ "$RECOVERY_TAG" != "$tag" ]]; then
+              echo "::error::Recovery tag and package version disagree"
+              exit 1
+            fi
+            gh release view "$tag" --repo "$GH_REPO" >/dev/null
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if gh release view "$tag" --repo "$GH_REPO" >/dev/null 2>&1; then
+            echo "::notice::$tag already has a GitHub Release; no duplicate publication."
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # An orphan tag must never be overwritten in an automatic retry.
+          if gh api "repos/$GH_REPO/git/ref/tags/$tag" >/dev/null 2>&1; then
+            echo "::error::$tag already exists without a GitHub Release; investigate manually."
+            exit 1
+          fi
+          if npm view "cubrid-client@$version" version >/dev/null 2>&1; then
+            echo "::error::npm package $version exists but its GitHub Release is missing."
+            exit 1
+          fi
+          if [[ "$EVENT_NAME" == push ]]; then
+            latest=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq '.object.sha')
+            if [[ "$latest" != "$TRIGGER_SHA" ]]; then
+              echo "::notice::Obsolete main commit; a later push will check the latest release candidate."
+              echo "should_publish=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          # Only a merged Release Please PR with the expected release title
+          # can authorize automated creation of a new immutable tag.
+          if ! gh pr list --repo "$GH_REPO" --state merged --base main --limit 100 \
+              --json title,headRefName \
+              --jq '.[] | select(.headRefName | startswith("release-please--")) | .title' \
+              | grep -Fxq "chore(main): release $version"; then
+            echo "::error::No merged, reviewed Release Please PR for $tag"
+            exit 1
+          fi
+          echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          echo "Verified reviewed release candidate $tag" >> "$GITHUB_STEP_SUMMARY"
+
   preflight:
+    if: needs.candidate.outputs.should_publish == 'true'
+    needs: candidate
     if: ${{ inputs.confirmation == 'PUBLISH' }}
     runs-on: ubuntu-latest
     strategy:
@@ -54,14 +158,15 @@ jobs:
         run: npm run api:check
 
   release-validation:
-    if: ${{ inputs.confirmation == 'PUBLISH' }}
-    needs: preflight
+    if: needs.candidate.outputs.should_publish == 'true'
+    needs: [candidate, preflight]
     uses: ./.github/workflows/release-validation.yml
     with:
       checkout_ref: ${{ inputs.recovery_tag || github.sha }}
 
   publish:
-    needs: [preflight, release-validation]
+    if: needs.candidate.outputs.should_publish == 'true'
+    needs: [candidate, preflight, release-validation]
     runs-on: ubuntu-latest
     environment: npm-publish
     permissions:
@@ -72,7 +177,7 @@ jobs:
       pull-requests: write
       id-token: write
     steps:
-      - name: Create GitHub Release only after explicit approval
+      - name: Create GitHub Release from the merged reviewed Release Please PR
         if: ${{ inputs.recovery_tag == '' }}
         id: release
         uses: googleapis/release-please-action@v4
@@ -87,6 +192,7 @@ jobs:
           RECOVERY_TAG: ${{ inputs.recovery_tag }}
           GENERATED_TAG: ${{ steps.release.outputs.tag_name }}
           RELEASE_CREATED: ${{ steps.release.outputs.release_created }}
+          EXPECTED_TAG: ${{ needs.candidate.outputs.tag }}
         run: |
           if [ -n "$RECOVERY_TAG" ]; then
             tag="$RECOVERY_TAG"
@@ -97,7 +203,7 @@ jobs:
             fi
             tag="$GENERATED_TAG"
           fi
-          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ || "$tag" != "$EXPECTED_TAG" ]]; then
             echo "::error::Expected vX.Y.Z tag, got: $tag"
             exit 1
           fi
@@ -142,7 +248,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.target.outputs.tag }}
-        run: gh release edit "$RELEASE_TAG" --notes-file "docs/releases/$RELEASE_TAG.md"
+        run: gh release edit "$RELEASE_TAG" --title "cubrid-client $RELEASE_TAG" --notes-file "docs/releases/$RELEASE_TAG.md"
       - name: Check whether version is already published
         id: registry
         run: |
@@ -158,3 +264,23 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public
+      - name: Verify npm and GitHub release consistency after publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.target.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=${RELEASE_TAG#v}
+          gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null
+          for attempt in $(seq 1 18); do
+            published=$(npm view "cubrid-client@$version" version 2>/dev/null || true)
+            if [[ "$published" == "$version" ]]; then
+              echo "Verified GitHub Release $RELEASE_TAG and npm cubrid-client@$version" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::npm cubrid-client@$version has not become visible after GitHub Release creation"
+          exit 1

@@ -13,7 +13,29 @@ jobs:
   release-pr:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Release Please otherwise proposes v1.3.0 from the same historical
+      # commits while v1.2.0 is merged but still awaiting its tag/npm publish.
+      - name: Wait for the current published version before proposing the next
+        id: current-version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./package.json').version")
+          if gh release view "v$version" --repo "$GH_REPO" >/dev/null 2>&1; then
+            echo "released=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::v$version has not been published on GitHub yet; do not generate the next release PR."
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Propose version, lockfile and changelog in a Release PR
+        if: steps.current-version.outputs.released == 'true'
         uses: googleapis/release-please-action@v4
         with:
           # Supply a restricted PAT for automatic PR CI (or mint an App token per run).
