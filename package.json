@@ -34,6 +34,8 @@
     "test:all": "node --import tsx --test 'tests/*.test.ts'",
     "test:coverage": "c8 --reporter=text --reporter=lcov node --import tsx --test 'tests/client.test.ts' 'tests/protocol.test.ts' 'tests/native-adapter.test.ts' 'tests/connection.test.ts' 'tests/connection-tls.test.ts' 'tests/connection-string.test.ts' 'tests/query-utils.test.ts'",
     "typecheck": "tsc --noEmit",
+    "api:check": "node scripts/api-check.mjs",
+    "api:update": "npm run build && node scripts/api-check.mjs --update",
     "check": "npm run typecheck && npm run test:coverage"
   },
   "keywords": [

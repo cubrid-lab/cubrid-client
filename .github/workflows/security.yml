@@ -26,8 +26,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Covers devDependencies on purpose: this package has no runtime
+      # dependencies, so --omit=dev would always pass, and the build tools
+      # produce the published files. See SECURITY.md.
       - name: Run npm audit
-        run: npm audit --production --audit-level=high || true
+        run: npm audit --audit-level=high
 
       - name: Run typecheck
         run: npm run typecheck

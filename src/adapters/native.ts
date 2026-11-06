@@ -65,6 +65,10 @@ export class NativeCubridAdapter implements DriverAdapter {
     try {
       return await this.executeQuery<T>(sql, params);
     } catch (error) {
+      // If the first transactional statement lost its session before the
+      // post-response bind, remember that failed generation. A ping/reconnect
+      // must never make subsequent statements commit on a replacement CAS.
+      this.bindSessionLostByFirstStatement();
       throw mapError("query", error, "Failed to execute CUBRID query.");
     }
   }
@@ -278,6 +282,18 @@ export class NativeCubridAdapter implements DriverAdapter {
     }
   }
 
+  /** Retain a failed first statement's session so reconnection cannot hide it. */
+  private bindSessionLostByFirstStatement(): void {
+    if (
+      !this.autoCommit &&
+      this.transactionGeneration === null &&
+      this.cas &&
+      !this.cas.isConnected
+    ) {
+      this.transactionGeneration = this.cas.connectionGeneration;
+    }
+  }
+
   private endTransaction(): void {
     this.autoCommit = true;
     this.transactionGeneration = null;
@@ -400,8 +416,18 @@ export class NativeCubridAdapter implements DriverAdapter {
       const fetchPayload = await cas.sendAndRecv(header, payload);
       const fetchResult = parseFetch(fetchPayload, result.columns);
 
-      if (fetchResult.tupleCount === 0) {
-        break;
+      // Returning a partial result as success silently corrupts the query
+      // contract. The execute response still promises more rows here.
+      if (fetchResult.tupleCount <= 0) {
+        throw new Error(
+          `CUBRID FETCH returned no rows before the expected ${result.totalTupleCount} rows`,
+        );
+      }
+      if (
+        fetchResult.rows.length !== fetchResult.tupleCount ||
+        fetched + fetchResult.tupleCount > result.totalTupleCount
+      ) {
+        throw new Error("CUBRID FETCH returned an inconsistent row count");
       }
 
       allRows.push(...fetchResult.rows);

@@ -300,10 +300,10 @@ export function parseFetch(
   const responseCode = reader.parseInt();
 
   if (responseCode < 0) {
-    // -1 means no more data — treat as empty result
-    if (responseCode === -1) {
-      return { tupleCount: 0, rows: [] };
-    }
+    // -1 is the CAS error envelope, not an unconditional EOF marker.
+    // For example, an invalid query handle reports -1 with a server code.
+    // A genuine exhaustion error is also not expected while the execute
+    // response still advertises additional tuples.
     const remaining = data.length - SIZE_INT;
     const err = reader.readError(remaining);
     throw new Error(`CUBRID fetch failed (${err.code}): ${err.message}`);

@@ -36,6 +36,15 @@ Examples include:
 - Insecure credential handling
 - Buffer overflow or memory safety issues
 
+## Dependency Audit Policy
+
+`npm audit --audit-level=high` runs on every pull request, on pushes to `main`, weekly, and on the exact tag before an npm release.
+
+- **Scope:** all dependencies, including `devDependencies`. The package has no runtime dependencies, so a production-only audit would always pass, and the build tools produce the published files.
+- **Effect:** a high or critical finding fails the check and stops a release. Moderate and low findings are reviewed through Dependabot and do not fail it.
+- **Failures:** npm exits non-zero when the audit service cannot be reached. Treat that as "not audited" and rerun the check.
+- **Exceptions:** no overrides for high or critical findings. Remediate or stop publication; document any risk and planned mitigation without bypassing the failing audit gate.
+
 ## Security Best Practices for Users
 
 When using cubrid-client, follow these security best practices:

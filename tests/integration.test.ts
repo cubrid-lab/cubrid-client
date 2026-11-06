@@ -199,7 +199,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         () => client.query("SELECT ? AS v", ["a\0b"]),
         (err: Error) => {
           assert.ok(err instanceof QueryError);
-          assert.match((err.cause as Error).message, /null byte/);
+          assert.match(((err.cause as Error).cause as Error).message, /null byte/);
           return true;
         },
       );
@@ -207,7 +207,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         () => client.query("SELECT ? AS v", ["a\x1ab"]),
         (err: Error) => {
           assert.ok(err instanceof QueryError);
-          assert.match((err.cause as Error).message, /Ctrl-Z/);
+          assert.match(((err.cause as Error).cause as Error).message, /Ctrl-Z/);
           return true;
         },
       );
@@ -260,6 +260,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       assert.equal(rows[0]!.int_col, 42);
       assert.equal(typeof rows[0]!.str_col, "string");
       assert.equal(rows[0]!.str_col, "test string");
+      assert.equal(rows[0]!.bigint_col, 9223372036854775807n);
 
       await client.query("DROP TABLE dt_test_native");
     } finally {

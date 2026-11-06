@@ -44,6 +44,7 @@ release safeguards. Do not create tool-dependent Oracle/Copilot routes.
 - `npm run typecheck`
 - `npm test`
 - `npm run build`
+- `npm run api:check` (after build; if the public API change is intentional run `npm run api:update` and commit `api/index.d.ts`)
 - `npm run check`
 
 ## Project Context — Performance Loop System
