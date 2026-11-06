@@ -247,6 +247,8 @@ export function parsePrepareAndExecute(
 /**
  * Read the query handle from a PREPARE_AND_EXECUTE response without decoding
  * the rest of it, so the handle can still be released if decoding fails.
+ * The caller must close the handle on its owning CAS session, never after an
+ * automatic reconnect where the same number could identify another request.
  * Returns null when the response holds none: a server error, or too few bytes.
  */
 export function readQueryHandle(data: Buffer): number | null {
