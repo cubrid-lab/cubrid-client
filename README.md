@@ -51,7 +51,10 @@ npm install cubrid-client
 
 No peer dependencies required.
 
-**Requirements**: Node.js 18+, CUBRID 10.2+
+**Declared runtime requirement:** Node.js 18+. CUBRID 10.2–11.4
+is the historically advertised **target range**, not a completed live-CI
+certification. Consult the [support matrix](docs/SUPPORT_MATRIX.md) before
+deploying to a specific broker version.
 
 ## Quick Start
 
@@ -73,6 +76,11 @@ console.log(rows);
 
 await db.close();
 ```
+
+See [CUBRID-to-JavaScript type behavior](docs/TYPES.md) for the current
+result and input mapping, including `BIGINT` as `bigint`, decimal `NUMERIC`
+as `string`, and unsupported collection/JSON values. The
+[roadmap](ROADMAP.md) tracks work that has **not** been released.
 
 ## Typed Queries
 
