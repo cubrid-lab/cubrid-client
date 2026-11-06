@@ -93,6 +93,7 @@ export const EXECUTE_QUERY_ALL = 0x02;
 
 // ---------------------------------------------------------------------------
 // CUBRID data types (wire type codes)
+// Source: T_CCI_U_TYPE (CCI_U_TYPE_*) in CUBRID/cubrid src/broker/broker_cas_cci.h
 // ---------------------------------------------------------------------------
 
 export const enum CUBRIDDataType {
@@ -112,34 +113,57 @@ export const enum CUBRIDDataType {
   DATE = 13,
   TIME = 14,
   TIMESTAMP = 15,
+  SET = 16,
+  MULTISET = 17,
+  SEQUENCE = 18,
+  OBJECT = 19,
+  RESULTSET = 20,
+  BIGINT = 21,
   DATETIME = 22,
   BLOB = 23,
   CLOB = 24,
   ENUM = 25,
-  BIGINT = 26,
-  OBJECT = 32,
-  SET = 33,
-  MULTISET = 34,
-  SEQUENCE = 35,
+  JSON = 34,
 }
 
 // ---------------------------------------------------------------------------
 // Statement types (from CAS response)
 // ---------------------------------------------------------------------------
 
+// Values are the CUBRID CCI/CAS T_CCI_CUBRID_STMT ids (CUBRID/cubrid
+// src/cci/cas_cci.h; CALL_SP and UNKNOWN are macros there). Names follow the
+// CCI names; there is no short alias such as CREATE or DROP because CREATE
+// INDEX, CREATE TRIGGER etc. have their own ids. Only ids verified against
+// CCI, node-cubrid and pycubrid are listed.
 export const enum StatementType {
-  ALTER = 6,
-  CALL = 7,
-  COMMIT = 8,
-  CREATE = 9,
-  DELETE = 23,
-  DROP = 10,
-  GET_STATS = 11,
+  ALTER_CLASS = 0,
+  ALTER_SERIAL = 1,
+  COMMIT_WORK = 2,
+  REGISTER_DATABASE = 3,
+  CREATE_CLASS = 4,
+  CREATE_INDEX = 5,
+  CREATE_TRIGGER = 6,
+  CREATE_SERIAL = 7,
+  DROP_DATABASE = 8,
+  DROP_CLASS = 9,
+  DROP_INDEX = 10,
+  DROP_LABEL = 11,
+  DROP_TRIGGER = 12,
+  DROP_SERIAL = 13,
+  EVALUATE = 14,
+  RENAME_CLASS = 15,
+  ROLLBACK_WORK = 16,
+  GRANT = 17,
+  REVOKE = 18,
+  UPDATE_STATS = 19,
   INSERT = 20,
-  ROLLBACK = 13,
   SELECT = 21,
   UPDATE = 22,
+  DELETE = 23,
+  CALL = 24,
+  GET_STATS = 41,
   CALL_SP = 0x7e,
+  UNKNOWN = 0x7f,
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +196,8 @@ export const TYPE_NAMES: Record<number, string> = {
   [CUBRIDDataType.SET]: "SET",
   [CUBRIDDataType.MULTISET]: "MULTISET",
   [CUBRIDDataType.SEQUENCE]: "SEQUENCE",
+  [CUBRIDDataType.RESULTSET]: "RESULTSET",
+  [CUBRIDDataType.JSON]: "JSON",
 };
 
 /**

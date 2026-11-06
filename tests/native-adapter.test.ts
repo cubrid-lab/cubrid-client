@@ -497,6 +497,41 @@ test("NativeCubridAdapter query DELETE returns empty array", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// query() — DDL and CALL (statement codes as observed from CUBRID 10.2 / 11.4)
+// ---------------------------------------------------------------------------
+
+for (const [label, code] of [
+  ["ALTER_CLASS", 0],
+  ["CREATE_CLASS", 4],
+  ["CREATE_INDEX", 5],
+  ["DROP_CLASS", 9],
+  ["GRANT", 17],
+] as const) {
+  test(`NativeCubridAdapter query DDL statement code ${code} (${label}) returns empty array`, async () => {
+    const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+
+    fakeCAS.queueResponse(buildDMLResponse(code, 0));
+    fakeCAS.queueResponse(buildSimpleResponse(0)); // CloseReqHandle
+
+    const result = await adapter.query("DDL");
+    assert.deepEqual(result, []);
+  });
+}
+
+// CALL (code 24) is a non-SELECT statement. The broker reports a result column
+// for it, but query() does not read inline rows for it and returns []. Reading
+// CALL results is currently unsupported.
+test("NativeCubridAdapter query CALL statement code 24 returns empty array (results unsupported)", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+
+  fakeCAS.queueResponse(buildDMLResponse(24, 1));
+  fakeCAS.queueResponse(buildSimpleResponse(0)); // CloseReqHandle
+
+  const result = await adapter.query("CALL login('dba', '') ON CLASS db_user");
+  assert.deepEqual(result, []);
+});
+
+// ---------------------------------------------------------------------------
 // query() — SELECT
 // ---------------------------------------------------------------------------
 
@@ -1021,7 +1056,7 @@ test("NativeCubridAdapter query SELECT fetches remaining rows", async () => {
   assert.equal(fakeCAS.sendAndRecvCalls, 3);
 });
 
-test("NativeCubridAdapter query SELECT fetchRemaining stops on zero tupleCount", async () => {
+test("NativeCubridAdapter rejects zero-tuple FETCH before the advertised total", async () => {
   const { adapter, fakeCAS } = createAdapterWithFakeCAS();
 
   // Build a SELECT response where totalTupleCount > inline rows
@@ -1044,10 +1079,8 @@ test("NativeCubridAdapter query SELECT fetchRemaining stops on zero tupleCount",
   // CloseReqHandle
   fakeCAS.queueResponse(buildSimpleResponse(0));
 
-  const rows = await adapter.query("SELECT id FROM t");
-  // Only 1 row (inline), fetchRemaining stopped because tupleCount = 0
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0]!.id, "1");
+  // A successful zero-row FETCH cannot complete a query that advertises 3 rows.
+  await assert.rejects(adapter.query("SELECT id FROM t"), QueryError);
 });
 
 // ---------------------------------------------------------------------------
@@ -1065,54 +1098,6 @@ test("NativeCubridAdapter query wraps connect failure as QueryError", async () =
     (err: Error) => {
       assert.ok(err instanceof QueryError);
       assert.match(err.message, /Failed to execute CUBRID query/);
-      return true;
-    },
-  );
-});
-
-// ---------------------------------------------------------------------------
-// ping()
-// ---------------------------------------------------------------------------
-
-test("NativeCubridAdapter ping delegates to CAS.ping", async () => {
-  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
-
-  let pingCalled = false;
-  (fakeCAS as FakeCASConnection & { ping: () => Promise<string> }).ping = async () => {
-    pingCalled = true;
-    return "11.2.9.0866";
-  };
-
-  const version = await adapter.ping();
-  assert.equal(version, "11.2.9.0866");
-  assert.ok(pingCalled);
-});
-
-test("NativeCubridAdapter ping auto-connects if not connected", async () => {
-  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
-  fakeCAS._isConnected = false;
-
-  (fakeCAS as FakeCASConnection & { ping: () => Promise<string> }).ping = async () => {
-    return "11.2";
-  };
-
-  const version = await adapter.ping();
-  assert.equal(version, "11.2");
-  assert.equal(fakeCAS.connectCalls, 1);
-});
-
-test("NativeCubridAdapter ping wraps error as ConnectionError", async () => {
-  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
-
-  (fakeCAS as FakeCASConnection & { ping: () => Promise<string> }).ping = async () => {
-    throw new Error("ping failed");
-  };
-
-  await assert.rejects(
-    () => adapter.ping(),
-    (err: Error) => {
-      assert.ok(err instanceof ConnectionError);
-      assert.match(err.message, /Health check failed/);
       return true;
     },
   );
@@ -1286,4 +1271,52 @@ test("NativeCubridAdapter beginTransaction refuses to hide a lost transaction", 
   await assert.rejects(adapter.rollback(), TransactionError);
   await adapter.beginTransaction();
   assert.equal(fakeCAS.connectCalls, 1);
+});
+
+// ---------------------------------------------------------------------------
+// ping()
+// ---------------------------------------------------------------------------
+
+test("NativeCubridAdapter ping delegates to CAS.ping", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+
+  let pingCalled = false;
+  (fakeCAS as FakeCASConnection & { ping: () => Promise<string> }).ping = async () => {
+    pingCalled = true;
+    return "11.2.9.0866";
+  };
+
+  const version = await adapter.ping();
+  assert.equal(version, "11.2.9.0866");
+  assert.ok(pingCalled);
+});
+
+test("NativeCubridAdapter ping auto-connects if not connected", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS._isConnected = false;
+
+  (fakeCAS as FakeCASConnection & { ping: () => Promise<string> }).ping = async () => {
+    return "11.2";
+  };
+
+  const version = await adapter.ping();
+  assert.equal(version, "11.2");
+  assert.equal(fakeCAS.connectCalls, 1);
+});
+
+test("NativeCubridAdapter ping wraps error as ConnectionError", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+
+  (fakeCAS as FakeCASConnection & { ping: () => Promise<string> }).ping = async () => {
+    throw new Error("ping failed");
+  };
+
+  await assert.rejects(
+    () => adapter.ping(),
+    (err: Error) => {
+      assert.ok(err instanceof ConnectionError);
+      assert.match(err.message, /Health check failed/);
+      return true;
+    },
+  );
 });

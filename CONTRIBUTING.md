@@ -9,6 +9,7 @@ and instructions for contributing to the project.
 
 - [Development Setup](#development-setup)
 - [Running Tests](#running-tests)
+- [Public API compatibility](#public-api-compatibility)
 - [Code Style](#code-style)
 - [Pull Request Guidelines](#pull-request-guidelines)
 - [Reporting Issues](#reporting-issues)
@@ -73,6 +74,59 @@ count; state clearly when that check was not run.
 
 ---
 
+## Public API compatibility
+
+Read [the public API stability policy](docs/API_STABILITY.md) before changing
+an exported TypeScript type, Promise contract, Node.js runtime requirement, or
+package entrypoint. The baseline diff is a reviewer aid, not SemVer approval.
+
+
+The published surface is the built `dist/index.d.ts` (and the identical
+`dist/index.d.cts`), generated from `src/index.ts`. The reviewed copy of it is
+committed as `api/index.d.ts`. CI (the Node 22 lane) runs `npm run api:check`
+after the build and fails if the generated declarations differ from that file,
+so changed public exports and types require explicit review. Private class members are not public API.
+
+```bash
+npm run build
+npm run api:check    # compare dist/index.d.ts with api/index.d.ts
+npm run api:update   # build, then rewrite api/index.d.ts
+```
+
+### Approving an intentional change
+
+1. Make the change, run `npm run api:update`, and commit `api/index.d.ts` in
+   the same PR. The diff of that file is what reviewers read.
+2. In the PR description, say whether the change is additive or breaking.
+3. Reviewers approve by merging the PR with the updated baseline. Do not update
+   the baseline to silence a failure you cannot explain.
+
+### What the 1.x contract allows
+
+The package follows semantic versioning. Within 1.x:
+
+- **Additive changes are allowed**: new exports, new optional options (for
+  example `readTimeout`), new optional properties, new overloads that keep the
+  old ones. They change the baseline, so they need the baseline update above.
+- **Breaking changes are not allowed**: removing or renaming an export,
+  removing a property or overload, making an optional property required,
+  narrowing a parameter type, changing a return type incompatibly, or changing
+  the `query<T>()` generics or transaction signatures. These need a major
+  version and explicit maintainer approval.
+
+The check parses TypeScript declarations to compare their normalized
+consumer-visible shapes, excluding private class members and JSDoc comments.
+It still does **not** decide whether a public diff is additive or breaking;
+the reviewer does. Whitespace-only and private implementation changes are
+not public contract changes.
+It does not check runtime behavior or ESM/CJS import behavior, and
+`query<T>()` types are compile-time only and do not validate result rows.
+The declarations come from the pinned `tsup` and `typescript` versions, so an
+upgrade of either can change the output; regenerate the baseline in that PR and
+check that the diff is cosmetic.
+
+---
+
 ## Code Style
 
 This project uses [Biome](https://biomejs.dev/) for linting and formatting.
@@ -125,6 +179,10 @@ scrutiny. No existing repository CI or release safeguards are waived.
    npm run check
    ```
 
+   If you touched `src/index.ts` or an exported type, also run
+   `npm run build && npm run api:check` (see
+   [Public API compatibility](#public-api-compatibility)).
+
 4. **Run lint checks**:
    ```bash
    npx biome check src/ tests/
@@ -136,7 +194,8 @@ scrutiny. No existing repository CI or release safeguards are waived.
 - Write a clear title and description explaining _what_ and _why_.
 - Reference any related issues (e.g., `Fixes #42`).
 - Update documentation if your change affects the public API.
-- Use Conventional Commits and summarize user-facing changes in the PR. Release Please owns generated version/changelog entries; review the Release PR for accuracy.
+- Title the PR `type: description` without a scope. PRs are squash-merged, so this becomes the commit subject on `main`, and CI checks it. Only the generated `chore(deps)` and `chore(main)` scopes are allowed.
+- Summarize user-facing changes in the PR. Release Please owns generated version/changelog entries; review the Release PR for accuracy.
 
 ### Review Process
 
