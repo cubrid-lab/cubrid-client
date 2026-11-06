@@ -53,3 +53,21 @@ jobs:
       - name: Public API check
         if: matrix.node-version == 22
         run: npm run api:check
+
+      # A wrong BIGINT code must fail for an independent reason; this catches
+      # the exact oracle-coupling problem that escaped the native v1.0 release.
+      - name: Prove protocol fixture detects a mutated BIGINT wire code
+        if: matrix.node-version == 22
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp src/protocol/constants.ts "$RUNNER_TEMP/constants-original.ts"
+          trap 'cp "$RUNNER_TEMP/constants-original.ts" src/protocol/constants.ts' EXIT
+          sed -i 's/^  BIGINT = 21,/  BIGINT = 26,/' src/protocol/constants.ts
+          grep -q '^  BIGINT = 26,' src/protocol/constants.ts
+          if node --import tsx --test tests/protocol-oracles.test.ts > "$RUNNER_TEMP/wire-mutant.log" 2>&1; then
+            echo "::error::Wrong BIGINT wire code unexpectedly passed independent fixture tests"
+            exit 1
+          fi
+          grep -q 'not ok.*literal CCI data-type IDs' "$RUNNER_TEMP/wire-mutant.log"
+          echo "Confirmed: BIGINT = 26 is rejected by the independent protocol oracle"
