@@ -5,15 +5,15 @@ This file is the **commit-level history**; the curated GitHub Release text for e
 version lives in `docs/releases/vX.Y.Z.md`. Release notes must describe verified
 user-visible behavior and known limitations, not just completed implementation.
 
-## [1.2.0](https://github.com/cubrid-lab/cubrid-client/compare/v1.1.0...v1.2.0) (2026-11-06)
+## [1.2.0](https://github.com/cubrid-lab/cubrid-client/compare/v1.1.0...v1.2.0)
 
 
 ### Features
 
 * add a read timeout for queries ([#128](https://github.com/cubrid-lab/cubrid-client/issues/128)) ([5fe9563](https://github.com/cubrid-lab/cubrid-client/commit/5fe95631eeb4b0cecff6a1c0b24e4e93e7f7b18c))
 * add connection string URL parser and query helpers ([df67d44](https://github.com/cubrid-lab/cubrid-client/commit/df67d448283a8ecdbe32f57f0f0f66673ef90843))
-* add EPIPE resilience, auto-retry, and health check ([#21](https://github.com/cubrid-lab/cubrid-client/issues/21)) ([65d06ad](https://github.com/cubrid-lab/cubrid-client/commit/65d06ad0f9a7e0eaecb06561d5a34fbf8bf26a24))
-* add opt-in TLS/SSL support (P1) ([#55](https://github.com/cubrid-lab/cubrid-client/issues/55)) ([f8082b1](https://github.com/cubrid-lab/cubrid-client/commit/f8082b1829609d7bd897b28c745a8bfa86850646))
+* improve EPIPE recovery and health checks (configurable connection retry count remains unsupported) ([#21](https://github.com/cubrid-lab/cubrid-client/issues/21)) ([65d06ad](https://github.com/cubrid-lab/cubrid-client/commit/65d06ad0f9a7e0eaecb06561d5a34fbf8bf26a24))
+* add opt-in TLS/SSL support ([#55](https://github.com/cubrid-lab/cubrid-client/issues/55)) ([f8082b1](https://github.com/cubrid-lab/cubrid-client/commit/f8082b1829609d7bd897b28c745a8bfa86850646))
 
 
 ### Bug Fixes
