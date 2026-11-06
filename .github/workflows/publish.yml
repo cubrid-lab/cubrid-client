@@ -32,6 +32,10 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
       - run: npm ci
+      # Prevent a high/critical advisory from reaching the release-tag step.
+      - name: Audit all dependencies before creating a GitHub Release
+        if: matrix.node-version == 22
+        run: npm audit --audit-level=high
       - name: Typecheck
         run: npm run typecheck
       - name: Offline tests
