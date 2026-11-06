@@ -6,6 +6,7 @@ on:
     paths:
       - "docs/releases/v1.0.0.md"
       - "docs/releases/v1.1.0.md"
+      - ".github/workflows/sync-historical-release-notes.yml"
 
 permissions:
   contents: write
@@ -20,6 +21,14 @@ jobs:
           persist-credentials: false
       - name: Validate curated release notes
         run: node scripts/verify-release-notes.mjs --candidate
+      - name: Normalize v0.1.0 GitHub Release title
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release view v0.1.0 --repo "$GH_REPO" > /dev/null
+          gh release edit v0.1.0 --repo "$GH_REPO" --title "cubrid-client v0.1.0"
       - name: Update existing GitHub Release descriptions (not tags)
         env:
           GH_TOKEN: ${{ github.token }}
