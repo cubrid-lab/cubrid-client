@@ -1187,6 +1187,29 @@ async function beginWithOneInsert() {
   return created;
 }
 
+test("NativeCubridAdapter does not resume a failed first transaction statement after ping", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  await adapter.beginTransaction();
+
+  fakeCAS.sendAndRecv = async () => {
+    fakeCAS.sendAndRecvCalls++;
+    fakeCAS._isConnected = false;
+    throw new Error("simulated socket loss during first INSERT");
+  };
+  await assert.rejects(adapter.query("INSERT INTO t VALUES (1)"), QueryError);
+
+  // Explicit reconnect (as ping() would do) must not move this transaction.
+  await fakeCAS.connect();
+  const callsBefore = fakeCAS.sendAndRecvCalls;
+  await assert.rejects(adapter.query("INSERT INTO t VALUES (2)"), (error: unknown) => {
+    assert.ok(error instanceof QueryError);
+    assert.match(String(error), /Failed to execute CUBRID query/);
+    return true;
+  });
+  await assert.rejects(adapter.commit(), TransactionError);
+  assert.equal(fakeCAS.sendAndRecvCalls, callsBefore);
+});
+
 test("NativeCubridAdapter does not commit part of a transaction after ping reconnects", async () => {
   const { adapter, fakeCAS } = await beginWithOneInsert();
   fakeCAS._isConnected = false;
