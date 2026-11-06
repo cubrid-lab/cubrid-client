@@ -176,36 +176,49 @@ jobs:
       pull-requests: write
       id-token: write
     steps:
-      - name: Create GitHub Release from the merged reviewed Release Please PR
-        if: ${{ inputs.recovery_tag == '' }}
-        id: release
-        uses: googleapis/release-please-action@v4
+      # The release-pr generator writes version+CHANGELOG; tagging must not
+      # depend on the mutable human-reviewed Release PR description. Release
+      # Please may otherwise refuse to parse a PR whose explanatory body was
+      # edited after creation, leaving a fully verified candidate untagged.
+      - uses: actions/checkout@v7
         with:
-          skip-github-pull-request: true
-          config-file: release-please-config.json
-          manifest-file: .release-please-manifest.json
+          ref: ${{ inputs.recovery_tag || github.sha }}
+          persist-credentials: false
+      - name: Create immutable version tag and reviewed GitHub Release
+        if: ${{ inputs.recovery_tag == '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EXPECTED_TAG: ${{ needs.candidate.outputs.tag }}
+          CANDIDATE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Candidate job has already checked version/manifest, absence of
+          # prior tag/npm release, and the matching merged Release Please PR.
+          # Every live DB, TLS, Node/npm smoke, audit and API check also passed.
+          gh release create "$EXPECTED_TAG" --repo "$GH_REPO" \
+            --target "$CANDIDATE_SHA" \
+            --title "cubrid-client $EXPECTED_TAG" \
+            --notes-file "docs/releases/$EXPECTED_TAG.md" \
+            --latest
 
       - name: Resolve immutable release tag
         id: target
         env:
           RECOVERY_TAG: ${{ inputs.recovery_tag }}
-          GENERATED_TAG: ${{ steps.release.outputs.tag_name }}
-          RELEASE_CREATED: ${{ steps.release.outputs.release_created }}
           EXPECTED_TAG: ${{ needs.candidate.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
         run: |
-          if [ -n "$RECOVERY_TAG" ]; then
-            tag="$RECOVERY_TAG"
-          else
-            if [ "$RELEASE_CREATED" != 'true' ]; then
-              echo "::error::No new release; merge a reviewed Release PR first."
-              exit 1
-            fi
-            tag="$GENERATED_TAG"
-          fi
+          set -euo pipefail
+          tag="${RECOVERY_TAG:-$EXPECTED_TAG}"
           if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ || "$tag" != "$EXPECTED_TAG" ]]; then
-            echo "::error::Expected vX.Y.Z tag, got: $tag"
+            echo "::error::Expected exact reviewed tag $EXPECTED_TAG, got: $tag"
             exit 1
           fi
+          gh release view "$tag" --repo "$GH_REPO" >/dev/null
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v7
