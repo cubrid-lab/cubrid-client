@@ -1,23 +1,66 @@
 # Roadmap
 
-> **Last updated**: 2026-03-20
->
-> This roadmap reflects current priorities. For the ecosystem-wide view, see the
-> [CUBRID Labs Ecosystem Roadmap](https://github.com/cubrid-lab/.github/blob/main/ROADMAP.md).
+Updated: 2026-11-06. This is the plan for the **TypeScript/Node.js**
+`cubrid-client` package. Issues are a work queue; the version labels below
+are **targets, not a promise that the changes have shipped**.
 
-## Links
+## Current release candidate: 1.2.0 remediation
 
-- 📋 [GitHub Milestones](https://github.com/cubrid-lab/cubrid-client/milestones)
-- 🗂️ [Org Project Board](https://github.com/orgs/cubrid-lab/projects/2)
-- 🌐 [Ecosystem Roadmap](https://github.com/cubrid-lab/.github/blob/main/ROADMAP.md)
+The existing [Release Please PR](https://github.com/cubrid-lab/cubrid-client/pull/123)
+remains **unmerged/unpublished** pending the release checklist
+([#106](https://github.com/cubrid-lab/cubrid-client/issues/106)).
+The branch's generated changelog needs regeneration against the actual main
+history. The final package tarball and curated, emoji-free release note must
+match what the tag contains.
 
-## Next Release — v1.2.0 — Reliability & Performance
+A successful offline Node.js matrix is **not** evidence of live CAS protocol
+compatibility. The known type, fetch, transaction and LOB limitations must be
+reviewed and disclosed; use a limited-scope hotfix path only if the maintainers
+record the exact live smoke evidence and conditions in [#120](https://github.com/cubrid-lab/cubrid-client/issues/120).
 
-- Connection resilience improvements with retry policies
-- Connection health checks and automatic reconnection
-- Performance benchmarking and optimization
-- Documentation enhancements
+## Correctness and evidence before broad feature expansion
 
-## Compatibility
+| Work | Tracking |
+| --- | --- |
+| Required live CUBRID version matrix and accurate support claims | [#95](https://github.com/cubrid-lab/cubrid-client/issues/95), [support matrix](docs/SUPPORT_MATRIX.md) |
+| Independently reviewed protocol bytes, literal type IDs, malformed frame cases | [#117](https://github.com/cubrid-lab/cubrid-client/issues/117) |
+| Native-versus-legacy result behavior parity | [#118](https://github.com/cubrid-lab/cubrid-client/issues/118) |
+| Production-readiness gate and postmortem controls | [#120](https://github.com/cubrid-lab/cubrid-client/issues/120), [#119](https://github.com/cubrid-lab/cubrid-client/issues/119) |
+| Collection and JSON values, date/timezone stability | [#82](https://github.com/cubrid-lab/cubrid-client/issues/82), [#111](https://github.com/cubrid-lab/cubrid-client/issues/111), [#113](https://github.com/cubrid-lab/cubrid-client/issues/113) |
+| Shared connection / FETCH ordering, manual transaction ownership | [#114](https://github.com/cubrid-lab/cubrid-client/issues/114), [#112](https://github.com/cubrid-lab/cubrid-client/issues/112), [#109](https://github.com/cubrid-lab/cubrid-client/issues/109) |
+| Actual retry/logger behavior and errors | [#83](https://github.com/cubrid-lab/cubrid-client/issues/83), [#100](https://github.com/cubrid-lab/cubrid-client/issues/100), [#89](https://github.com/cubrid-lab/cubrid-client/issues/89) |
 
-Node.js 18+, CUBRID 10.2–11.4
+Safety fixes can be merged after reviews and CI even when broader live matrix
+work remains open; they are **not release approval**. Record which acceptance
+criteria are verified and which are still pending real broker tests.
+
+## Proposed incremental public features (after correctness)
+
+- Query/DML metadata and optional server-side binding:
+  [#84](https://github.com/cubrid-lab/cubrid-client/issues/84),
+  [#88](https://github.com/cubrid-lab/cubrid-client/issues/88),
+  [#85](https://github.com/cubrid-lab/cubrid-client/issues/85).
+- Verified LOB read/write:
+  [#93](https://github.com/cubrid-lab/cubrid-client/issues/93),
+  [#103](https://github.com/cubrid-lab/cubrid-client/issues/103).
+- Transaction configuration and server version:
+  [#91](https://github.com/cubrid-lab/cubrid-client/issues/91),
+  [#102](https://github.com/cubrid-lab/cubrid-client/issues/102).
+- Pooling, batching, streaming and schema inspection after handle ownership
+  and lifecycle testing:
+  [#92](https://github.com/cubrid-lab/cubrid-client/issues/92),
+  [#86](https://github.com/cubrid-lab/cubrid-client/issues/86),
+  [#87](https://github.com/cubrid-lab/cubrid-client/issues/87),
+  [#94](https://github.com/cubrid-lab/cubrid-client/issues/94).
+
+## Compatibility and release policy
+
+The current npm runtime contract is `node >=18` and the public API is already
+1.x. [API stability](docs/API_STABILITY.md) requires a MAJOR for incompatible
+changes, including increasing the Node.js minimum. A build-tool upgrade
+(e.g. `tsup`) does not by itself justify changing the consumer Node.js floor.
+
+See the [TypeScript type mapping](docs/TYPES.md),
+[verified support matrix](docs/SUPPORT_MATRIX.md) and
+[release process](docs/RELEASE_PROCESS.md). Do not claim all features in this
+roadmap are implemented or production-ready.
