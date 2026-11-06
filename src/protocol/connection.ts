@@ -13,6 +13,7 @@
 import { Socket } from "node:net";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
 import { DEFAULT_MAX_FRAME_LENGTH, SIZE_CAS_INFO, SIZE_DATA_LENGTH } from "./constants.js";
+import { ReadTimeoutError } from "../errors/read-timeout-error.js";
 import { parseConnectionString } from "../utils/connection-string.js";
 import {
   writeClientInfoExchange,
@@ -31,6 +32,14 @@ export interface CASConnectionConfig {
   user: string;
   password: string;
   connectionTimeout?: number;
+  /**
+   * Fail a socket read, write or TLS handshake that makes no progress for this
+   * many milliseconds. Measures inactivity, not total time, so a large response
+   * that keeps arriving is not cut off. The clock only runs while this
+   * connection is using the socket: not while idle, and not while a request
+   * waits in the queue. Undefined or 0 disables it.
+   */
+  readTimeout?: number;
   /**
    * Enable TLS/SSL for the connection. Requires the CUBRID broker to be
    * configured with `SSL=ON` in `cubrid_broker.conf`. When enabled the client
@@ -425,15 +434,15 @@ export class CASConnection {
     }
 
     // Wrap the raw socket in TLS and wait for the handshake.
-    return new Promise<TLSSocket>((resolve, reject) => {
-      const tlsSocket = tlsConnect({
-        socket: rawSocket,
-        rejectUnauthorized: this.config.rejectUnauthorized ?? true,
-        ca: this.config.ca,
-        servername: this.config.servername,
-        minVersion: "TLSv1.2",
-      });
+    const tlsSocket = tlsConnect({
+      socket: rawSocket,
+      rejectUnauthorized: this.config.rejectUnauthorized ?? true,
+      ca: this.config.ca,
+      servername: this.config.servername,
+      minVersion: "TLSv1.2",
+    });
 
+    const handshake = new Promise<TLSSocket>((resolve, reject) => {
       const onError = (err: Error): void => {
         tlsSocket.removeListener("secureConnect", onSecure);
         tlsSocket.destroy();
@@ -451,8 +460,14 @@ export class CASConnection {
       tlsSocket.once("error", onError);
       tlsSocket.once("secureConnect", onSecure);
     });
-  }
 
+    try {
+      return await this.withReadTimeout(tlsSocket, handshake);
+    } catch (error) {
+      tlsSocket.destroy();
+      throw error;
+    }
+  }
 
   /**
    * Mark the connection dead when `socket` goes away, unless `socket` has been
@@ -504,8 +519,39 @@ export class CASConnection {
     return this.recvExact(socket, dataLength + SIZE_CAS_INFO);
   }
 
+  /**
+   * Settle with `operation`, or reject with ReadTimeoutError if `socket` goes
+   * quiet for `readTimeout` ms first. Node.js restarts this socket timer on
+   * every chunk read and on write progress, which is what makes the limit one
+   * of inactivity. The timer is cleared on the way out so an idle connection
+   * is never timed out. The caller must discard the socket on rejection: the
+   * abandoned operation is only released when the socket closes.
+   */
+  private async withReadTimeout<T>(socket: Socket, operation: Promise<T>): Promise<T> {
+    const readTimeout = this.config.readTimeout;
+
+    if (readTimeout === undefined || readTimeout === 0) {
+      return operation;
+    }
+
+    let onTimeout = (): void => {};
+    const timedOut = new Promise<never>((_resolve, reject) => {
+      onTimeout = () => reject(new ReadTimeoutError(readTimeout));
+    });
+
+    socket.setTimeout(readTimeout);
+    socket.once("timeout", onTimeout);
+
+    try {
+      return await Promise.race([operation, timedOut]);
+    } finally {
+      socket.removeListener("timeout", onTimeout);
+      socket.setTimeout(0);
+    }
+  }
+
   private socketWrite(socket: Socket, data: Buffer): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
+    const write = new Promise<void>((resolve, reject) => {
       socket.write(data, (err) => {
         if (err) {
           reject(err);
@@ -514,6 +560,8 @@ export class CASConnection {
         }
       });
     });
+
+    return this.withReadTimeout(socket, write);
   }
 
   /**
@@ -521,7 +569,7 @@ export class CASConnection {
    * Accumulates data chunks until the required amount is received.
    */
   private recvExact(socket: Socket, size: number): Promise<Buffer> {
-    return new Promise<Buffer>((resolve, reject) => {
+    const read = new Promise<Buffer>((resolve, reject) => {
       // Check if we already have enough buffered data
       if (this.receiveBuffer.length >= size) {
         resolve(this.takeBuffered(size));
@@ -577,6 +625,8 @@ export class CASConnection {
       socket.once("close", onClose);
       socket.once("end", onEnd);
     });
+
+    return this.withReadTimeout(socket, read);
   }
 
   private takeBuffered(size: number): Buffer {

@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createServer, type Server, type Socket as NetSocket } from "node:net";
 
+import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { CASConnection, type CASConnectionConfig } from "../src/protocol/connection.js";
 import {
   CAS_MAGIC,
@@ -1093,6 +1095,360 @@ test("CASConnection retries a failed connect without inheriting the old socket's
     const response = await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
     assert.equal(response.length, 0);
     await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Read timeout (#90)
+// ---------------------------------------------------------------------------
+
+const READ_TIMEOUT = 200;
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function assertReadTimeout(error: unknown): boolean {
+  assert.ok(error instanceof ReadTimeoutError);
+  assert.equal(error.timeoutMs, READ_TIMEOUT);
+  return true;
+}
+
+async function connectWithReadTimeout(port: number): Promise<CASConnection> {
+  const cas = new CASConnection({ ...DEFAULT_CONFIG, port, readTimeout: READ_TIMEOUT });
+  await cas.connect();
+  return cas;
+}
+
+test("readTimeout rejects and retires the socket when the server stops responding", { timeout: 5000 }, async () => {
+  let serverSocketClosed: () => void = () => {};
+  const closed = new Promise<void>((resolve) => {
+    serverSocketClosed = resolve;
+  });
+  const { server, port } = await brokerWith((socket) => {
+    socket.once("close", serverSocketClosed);
+  });
+
+  try {
+    const cas = await connectWithReadTimeout(port);
+    const started = Date.now();
+
+    await assert.rejects(cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD), assertReadTimeout);
+
+    assert.ok(Date.now() - started >= READ_TIMEOUT - 10);
+    assert.equal(cas.isConnected, false);
+    await closed;
+  } finally {
+    await closeServer(server);
+  }
+});
+
+for (const [name, partial] of [
+  ["inside the length prefix", Buffer.from([0x00, 0x00])],
+  ["right after the length prefix", frameHeader(100)],
+  ["inside the body", Buffer.concat([frameHeader(100), CAS_INFO, Buffer.alloc(10)])],
+] as const) {
+  test(`readTimeout rejects a frame that stalls ${name}`, { timeout: 5000 }, async () => {
+    const { server, port } = await brokerWith((socket) => socket.write(partial));
+
+    try {
+      const cas = await connectWithReadTimeout(port);
+
+      await assert.rejects(cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD), assertReadTimeout);
+      assert.equal(cas.isConnected, false);
+    } finally {
+      await closeServer(server);
+    }
+  });
+}
+
+test("readTimeout measures inactivity, so a slow frame that keeps arriving completes", { timeout: 5000 }, async () => {
+  const framed = frameResponse(Buffer.concat([CAS_INFO, Buffer.alloc(2, 0xab)]));
+  const { server, port } = await brokerWith(async (socket) => {
+    for (const byte of framed) {
+      socket.write(Buffer.from([byte]));
+      await sleep(READ_TIMEOUT / 2);
+    }
+  });
+
+  try {
+    const cas = await connectWithReadTimeout(port);
+    const started = Date.now();
+
+    const response = await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+
+    assert.ok(Date.now() - started > READ_TIMEOUT * 2);
+    assert.deepEqual(response, Buffer.alloc(2, 0xab));
+    assert.equal(cas.isConnected, true);
+    await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("readTimeout does not expire on an idle connection", { timeout: 5000 }, async () => {
+  const { server, port } = await brokerWith((socket) => socket.write(frameResponse(CAS_INFO)));
+
+  try {
+    const cas = await connectWithReadTimeout(port);
+    await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assert.equal((cas as any).socket.timeout, 0);
+    await sleep(READ_TIMEOUT * 2);
+
+    assert.equal(cas.isConnected, true);
+    await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+    await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("readTimeout does not count time spent waiting in the queue", { timeout: 5000 }, async () => {
+  const framed = frameResponse(CAS_INFO);
+  const { server, port } = await brokerWith(async (socket) => {
+    // Each exchange fits the limit, but two in a row do not.
+    socket.write(framed.subarray(0, 4));
+    await sleep(READ_TIMEOUT * 0.6);
+    socket.write(framed.subarray(4));
+  });
+
+  try {
+    const cas = await connectWithReadTimeout(port);
+
+    await Promise.all([
+      cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD),
+      cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD),
+    ]);
+
+    await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("after a readTimeout the queue moves on and queued work is not sent on a new session", { timeout: 5000 }, async () => {
+  let connections = 0;
+  const requestsByConnection = [0, 0, 0];
+  const { server, port } = await createMockBroker((socket) => {
+    const connection = ++connections;
+    socket.on("error", () => {});
+    socket.once("data", () => {
+      socket.write(Buffer.alloc(4));
+      socket.once("data", () => {
+        socket.write(frameResponse(buildOpenDbResponse(connection)));
+        socket.on("data", () => {
+          requestsByConnection[connection] = (requestsByConnection[connection] ?? 0) + 1;
+          if (connection > 1) {
+            socket.write(frameResponse(CAS_INFO));
+          }
+        });
+      });
+    });
+  });
+
+  try {
+    const cas = await connectWithReadTimeout(port);
+
+    const stalled = cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+    const queued = cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+    const reconnect = cas.connect();
+    const afterReconnect = cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+
+    await assert.rejects(stalled, assertReadTimeout);
+    await assert.rejects(queued, /not connected/);
+    await reconnect;
+    assert.equal((await afterReconnect).length, 0);
+
+    assert.equal(cas.sessionId, 2);
+    assert.deepEqual(requestsByConnection, [0, 1, 1]);
+    await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("close() queued behind a stalled request finishes after the readTimeout", { timeout: 5000 }, async () => {
+  const { server, port } = await brokerWith(() => {});
+
+  try {
+    const cas = await connectWithReadTimeout(port);
+
+    const stalled = cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+    const closing = cas.close();
+
+    await assert.rejects(stalled, assertReadTimeout);
+    await closing;
+    assert.equal(cas.isConnected, false);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("readTimeout bounds a request the server has stopped reading", { timeout: 15000 }, async () => {
+  let serverSocket: NetSocket | undefined;
+  const { server, port } = await createMockBroker((socket) => {
+    serverSocket = socket;
+    socket.on("error", () => {});
+    socket.once("data", () => {
+      socket.write(Buffer.alloc(4));
+      socket.once("data", () => {
+        socket.write(frameResponse(buildOpenDbResponse(1)));
+        socket.pause();
+      });
+    });
+  });
+
+  try {
+    const cas = await connectWithReadTimeout(port);
+
+    // Larger than the socket buffers, so the write can never finish.
+    await assert.rejects(
+      cas.sendAndRecv(REQUEST_HEADER, Buffer.alloc(256 * 1024 * 1024)),
+      assertReadTimeout,
+    );
+    assert.equal(cas.isConnected, false);
+  } finally {
+    serverSocket?.destroy();
+    await closeServer(server);
+  }
+});
+
+test("readTimeout rejects when the broker never sends the redirect port", { timeout: 5000 }, async () => {
+  const { server, port } = await createMockBroker((socket) => {
+    socket.on("error", () => {});
+    socket.resume();
+  });
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port, readTimeout: READ_TIMEOUT });
+
+    await assert.rejects(cas.connect(), assertReadTimeout);
+    assert.equal(cas.isConnected, false);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("readTimeout rejects when OpenDatabase is never answered, and connect can retry", { timeout: 5000 }, async () => {
+  let connections = 0;
+  const { server, port } = await createMockBroker((socket) => {
+    const connection = ++connections;
+    socket.on("error", () => {});
+    socket.once("data", () => {
+      socket.write(Buffer.alloc(4));
+      socket.once("data", () => {
+        if (connection > 1) {
+          socket.write(frameResponse(buildOpenDbResponse(connection)));
+        }
+      });
+    });
+  });
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port, readTimeout: READ_TIMEOUT });
+
+    await assert.rejects(cas.connect(), assertReadTimeout);
+    await cas.connect();
+
+    assert.equal(cas.sessionId, 2);
+    await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("readTimeout bounds the transparent reconnect of a released CAS", { timeout: 5000 }, async () => {
+  let connections = 0;
+  const { server, port } = await createMockBroker((socket) => {
+    const connection = ++connections;
+    socket.on("error", () => {});
+    socket.once("data", () => {
+      if (connection > 1) {
+        return;
+      }
+      socket.write(Buffer.alloc(4));
+      socket.once("data", () => {
+        socket.write(frameResponse(buildOpenDbResponse(connection)));
+        socket.once("data", () => {
+          socket.write(frameResponse(Buffer.from([0x00, 0x02, 0x03, 0x04])));
+        });
+      });
+    });
+  });
+
+  try {
+    const cas = await connectWithReadTimeout(port);
+    await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+
+    await assert.rejects(cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD), assertReadTimeout);
+    assert.equal(cas.isConnected, false);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+for (const readTimeout of [undefined, 0]) {
+  test(`readTimeout ${readTimeout} leaves a silent server waiting, as 1.x did`, { timeout: 5000 }, async () => {
+    let serverSocket: NetSocket | undefined;
+    const { server, port } = await brokerWith((socket) => {
+      serverSocket = socket;
+    });
+
+    try {
+      const cas = new CASConnection({
+        ...DEFAULT_CONFIG,
+        port,
+        ...(readTimeout !== undefined && { readTimeout }),
+      });
+      await cas.connect();
+
+      let settled = false;
+      const pending = cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD).finally(() => {
+        settled = true;
+      });
+      await sleep(READ_TIMEOUT * 2);
+
+      assert.equal(settled, false);
+      assert.equal(cas.isConnected, true);
+      serverSocket?.destroy();
+      await assert.rejects(pending, /Connection (ended|closed) while reading/);
+    } finally {
+      await closeServer(server);
+    }
+  });
+}
+
+test("a readTimeout leaves nothing that keeps the process alive", { timeout: 15000 }, async () => {
+  const { server, port } = await brokerWith(() => {});
+  const script = `
+    import { CASConnection } from "./src/protocol/connection.ts";
+    const cas = new CASConnection({
+      host: "127.0.0.1", port: ${port}, database: "testdb", user: "dba", password: "",
+      readTimeout: ${READ_TIMEOUT},
+    });
+    await cas.connect();
+    await cas.sendAndRecv(Buffer.alloc(8), Buffer.from([1])).catch((error) => {
+      console.log(error.name);
+    });
+  `;
+
+  try {
+    const child = spawn(
+      process.execPath,
+      ["--import", "tsx", "--input-type=module", "--eval", script],
+      { stdio: ["ignore", "pipe", "inherit"] },
+    );
+    let output = "";
+    child.stdout.on("data", (chunk) => {
+      output += chunk;
+    });
+
+    // The script never calls process.exit(), so it only ends once idle.
+    const exitCode = await new Promise((resolve) => child.once("exit", resolve));
+
+    assert.equal(exitCode, 0);
+    assert.equal(output.trim(), "ReadTimeoutError");
   } finally {
     await closeServer(server);
   }

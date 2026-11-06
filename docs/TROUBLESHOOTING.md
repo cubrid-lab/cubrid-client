@@ -16,6 +16,7 @@ Solutions for common issues when using `cubrid-client`.
 | `ENOTFOUND some-host` | Hostname cannot be resolved | Check `host` option — use IP address or valid hostname |
 | `ETIMEDOUT` | Firewall blocking port or wrong port | Check `port` (default: 33000) and firewall rules |
 | `connect timeout` | Server too slow to respond | Increase `connectionTimeout` option |
+| `ReadTimeoutError` | Server sent nothing for `readTimeout` ms: stalled broker or network, or a statement slower than the limit | Check the server, or raise `readTimeout`. Check whether a write or `COMMIT` took effect before retrying it |
 
 **Example**: Diagnose connection failures gracefully:
 

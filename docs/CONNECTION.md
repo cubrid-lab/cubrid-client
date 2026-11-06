@@ -43,6 +43,7 @@ await db.close();
 | `user` | `string` | Yes | — | Database user (typically `"dba"`) |
 | `password` | `string` | No | `""` | Database password (empty string for no password) |
 | `connectionTimeout` | `number` | No | — | Connection timeout in milliseconds |
+| `readTimeout` | `number` | No | — | Milliseconds of server inactivity before a request fails. See [Read timeout](#read-timeout) |
 | `maxConnectionRetryCount` | `number` | No | — | Maximum number of retry attempts on connection failure |
 | `logger` | `unknown` | No | — | Logger instance (passed to the underlying driver)
 | `connectionFactory` | `ConnectionFactory` | No | — | Custom factory for creating connections (advanced) |
@@ -57,9 +58,41 @@ const db = createClient({
   user: "dba",
   password: "secret",
   connectionTimeout: 5000,
+  readTimeout: 30000,
   maxConnectionRetryCount: 3,
 });
 ```
+
+## Read timeout
+
+`connectionTimeout` only covers opening the TCP connection. Without `readTimeout`, a query waits for as long as the server stays silent, and so does everything queued behind it on that connection. Set `readTimeout` to fail instead:
+
+```ts
+const db = createClient({
+  host: "localhost",
+  database: "demodb",
+  user: "dba",
+  readTimeout: 30000,
+});
+```
+
+**It measures inactivity, not total time.** The clock restarts whenever bytes arrive, so a large result that keeps flowing is never cut off, however long it takes. A server that sends one byte per interval is therefore never timed out. With `ssl` on, the clock restarts each time a complete TLS record arrives (up to 16 KB), not on every byte. The limit applies to:
+
+- waiting for each response, including the time the server spends executing the statement. Set it above your slowest expected statement.
+- sending each request. A request the server has stopped reading fails too. Progress here is only visible as the operating system's send buffer drains, so a very short timeout can fail a large request sent over a slow link. With `ssl` on, progress is not visible at all: each request must finish sending within `readTimeout`.
+- each read during connect and reconnect, and the TLS handshake when `ssl` is on.
+
+It does not run while the connection is idle, or while a request waits its turn behind another one. A caller at the back of the queue only starts its own clock when its request is sent.
+
+**On timeout** the request rejects with [`ReadTimeoutError`](API_REFERENCE.md#readtimeouterror) and the socket is destroyed, because a late response could otherwise be read as the answer to the next request. Then:
+
+- The next query opens a new connection automatically, unless a transaction was open.
+- Requests already queued on that connection fail straight away with a `QueryError`, without being sent. Nothing is replayed automatically, so they are safe to retry.
+- Inside a transaction the session is gone and the server discards its uncommitted work. Later `query()` and `commit()` calls fail instead of continuing on a new session, until `commit()` or `rollback()` acknowledges the loss.
+
+**The outcome of the timed-out request is unknown.** The client stops waiting, but this does not cancel the statement: the server may still finish it. An autocommit write may have been applied, and a timed-out `COMMIT` may have succeeded, so check before retrying either.
+
+The timeout is per client and applies to the built-in native driver. A custom `connectionFactory` receives the value in its `ClientConfig` and decides what to do with it.
 
 ## Lazy Connection
 
@@ -67,7 +100,7 @@ const db = createClient({
 
 This means:
 
-1. `createClient()` always succeeds synchronously (no network I/O)
+1. `createClient()` returns synchronously with no network I/O (it only throws for an out-of-range `readTimeout`)
 2. Connection errors surface when you call `.query()`, `.transaction()`, or `.beginTransaction()`
 3. A single shared connection is reused across all non-transaction queries
 

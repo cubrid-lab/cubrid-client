@@ -317,6 +317,9 @@ export class NativeCubridAdapter implements DriverAdapter {
         ...(this.config.connectionTimeout !== undefined && {
           connectionTimeout: this.config.connectionTimeout,
         }),
+        ...(this.config.readTimeout !== undefined && {
+          readTimeout: this.config.readTimeout,
+        }),
         ...this.resolveSslConfig(),
       };
       this.cas = new CASConnection(casConfig);
