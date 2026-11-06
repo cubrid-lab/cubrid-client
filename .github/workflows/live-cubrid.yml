@@ -43,7 +43,7 @@ jobs:
       # images on every code review. Full compatibility matrix runs on main
       # and can also be invoked manually before a release.
       matrix:
-        cubrid: ${{ fromJSON(inputs.full_matrix || github.event_name != 'pull_request' && '["10.2","11.0","11.2","11.4"]' || '["11.4"]') }}
+        cubrid: ${{ fromJSON((inputs.full_matrix || github.event_name != 'pull_request') && '["10.2","11.0","11.2","11.4"]' || '["11.4"]') }}
     steps:
       - uses: actions/checkout@v7
         with:
