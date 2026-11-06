@@ -136,7 +136,8 @@ scrutiny. No existing repository CI or release safeguards are waived.
 - Write a clear title and description explaining _what_ and _why_.
 - Reference any related issues (e.g., `Fixes #42`).
 - Update documentation if your change affects the public API.
-- Use Conventional Commits and summarize user-facing changes in the PR. Release Please owns generated version/changelog entries; review the Release PR for accuracy.
+- Title the PR `type: description` without a scope. PRs are squash-merged, so this becomes the commit subject on `main`, and CI checks it. Only the generated `chore(deps)` and `chore(main)` scopes are allowed.
+- Summarize user-facing changes in the PR. Release Please owns generated version/changelog entries; review the Release PR for accuracy.
 
 ### Review Process
 
