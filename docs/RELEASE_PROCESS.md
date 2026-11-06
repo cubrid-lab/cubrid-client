@@ -33,11 +33,11 @@ Python release strategy. The GitHub Release and npm publish steps are separate.
    suitable branch protections. Keep NPM_TOKEN restricted to npm publishing.
 4. Run Actions -> Publish reviewed npm release -> Run workflow and type PUBLISH.
    Leave recovery_tag empty for a new release. This first runs typecheck,
-   offline tests and builds on Node 18/20/22.
+   offline tests and builds on Node 18/20/22, and a mandatory full-dependency high/critical audit on Node 22 **before** creating a tag.
 5. The manual workflow then uses release-please to create the immutable
    GitHub release/tag, checks out that exact tag, verifies package.json,
-   package-lock.json and manifest versions, runs npm audit (high and above, see
-   SECURITY.md), tests/build/npm pack and
+   package-lock.json and manifest versions, repeats npm audit (high and above, see
+   SECURITY.md) on the immutable tag, runs tests/build/npm pack and
    publishes via NPM_TOKEN.
 6. If npm publishing fails after GitHub Release creation, rerun with
    recovery_tag=vX.Y.Z; the workflow uses the existing immutable tag and
