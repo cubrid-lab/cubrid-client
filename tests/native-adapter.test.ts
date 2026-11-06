@@ -1345,7 +1345,15 @@ async function assertQueryFails(
     () => adapter.query(sql),
     (err: Error) => {
       assert.ok(err instanceof QueryError);
-      assert.match((err.cause as Error).message, causePattern);
+      // A column-aware decoding error wraps the original malformed-packet
+      // cause; inspect the cause chain without hiding the underlying failure.
+      const messages: string[] = [];
+      let current: unknown = err.cause;
+      while (current instanceof Error) {
+        messages.push(current.message);
+        current = current.cause;
+      }
+      assert.match(messages.join(" | "), causePattern);
       return true;
     },
   );
