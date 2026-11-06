@@ -10,6 +10,9 @@ on:
       - ".github/workflows/live-cubrid.yml"
       - ".github/workflows/live-cubrid-tls.yml"
       - ".github/workflows/publish.yml"
+      # Release Please candidates change these, normal source PRs do not.
+      - ".release-please-manifest.json"
+      - "CHANGELOG.md"
   workflow_dispatch:
     inputs:
       checkout_ref:
@@ -32,6 +35,7 @@ jobs:
     uses: ./.github/workflows/live-cubrid.yml
     with:
       checkout_ref: ${{ inputs.checkout_ref || github.sha }}
+      full_matrix: true
 
   live-cubrid-tls:
     uses: ./.github/workflows/live-cubrid-tls.yml
