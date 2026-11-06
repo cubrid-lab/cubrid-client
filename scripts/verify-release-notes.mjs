@@ -39,7 +39,7 @@ if (notes) {
 }
 
 for (const filename of readdirSync(join("docs", "releases"))) {
-  if (!/^v\\d+\\.\\d+\\.\\d+\\.md$/.test(filename)) continue;
+  if (!/^v\d+\.\d+\.\d+\.md$/.test(filename)) continue;
   const path = join("docs", "releases", filename);
   if (emojiPattern.test(readFileSync(path, "utf8"))) {
     fail(`emoji are not allowed in ${path}`);
