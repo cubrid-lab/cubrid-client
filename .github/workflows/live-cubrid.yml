@@ -1,6 +1,12 @@
 name: Live CUBRID integration
 
 on:
+  workflow_call:
+    inputs:
+      checkout_ref:
+        type: string
+        required: false
+        default: ""
   pull_request:
     branches: [main]
     paths:
@@ -36,6 +42,9 @@ jobs:
         cubrid: ${{ fromJSON(github.event_name == 'pull_request' && '["11.4"]' || '["10.2","11.0","11.2","11.4"]') }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-node@v7
         with:
           node-version: 22
