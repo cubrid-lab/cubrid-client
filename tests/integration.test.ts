@@ -37,12 +37,17 @@ async function isCubridAvailable(): Promise<boolean> {
     await adapter.close();
     return true;
   } catch (err) {
-    console.log(`⚠ CUBRID not available — skipping integration tests: ${(err as Error).message}`);
+    console.log(`CUBRID not available; offline integration tests are skipped: ${(err as Error).message}`);
     return false;
   }
 }
 
 const available = await isCubridAvailable();
+if (!available && process.env.CUBRID_LIVE_REQUIRED === "1") {
+  // Fail before registering the self-skipping suite. A release/CI job
+  // cannot claim live verification when a broker was unreachable.
+  throw new Error("Live CUBRID integration was required but the broker was unreachable");
+}
 
 // ---------------------------------------------------------------------------
 // Connection tests (always run)
