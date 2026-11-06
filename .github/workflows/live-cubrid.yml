@@ -93,6 +93,48 @@ jobs:
             echo "::error::Expected at least 20 live integration assertions; got ${passed:-none}"
             exit 1
           fi
+      - name: Checkout original node-cubrid driver at reviewed source revision
+        uses: actions/checkout@v7
+        with:
+          repository: CUBRID/node-cubrid
+          ref: 89733f0a9a8f3d9796f65b46a1f4694fed683340
+          path: legacy-node-cubrid
+          persist-credentials: false
+      - name: Install legacy driver runtime dependencies only
+        run: npm install --prefix legacy-node-cubrid --omit=dev --ignore-scripts --no-audit --no-fund
+      - name: Compare legacy and native SQL behavior against this broker
+        env:
+          CUBRID_LIVE_REQUIRED: "1"
+          CUBRID_TEST_PORT: "33000"
+          NODE_CUBRID_ENTRY: ${{ github.workspace }}/legacy-node-cubrid/index.js
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --import tsx --test tests/legacy-parity.test.ts 2>&1 | tee legacy-parity.tap
+          grep -q '^# tests 1
+        run: docker logs cubrid-live || true
+      - name: Remove disposable database
+        if: always()
+        run: docker rm -f cubrid-live >/dev/null 2>&1 || true
+ legacy-parity.tap
+          grep -q '^# pass 1
+        run: docker logs cubrid-live || true
+      - name: Remove disposable database
+        if: always()
+        run: docker rm -f cubrid-live >/dev/null 2>&1 || true
+ legacy-parity.tap
+          grep -q '^# fail 0
+        run: docker logs cubrid-live || true
+      - name: Remove disposable database
+        if: always()
+        run: docker rm -f cubrid-live >/dev/null 2>&1 || true
+ legacy-parity.tap
+          grep -q '^# skipped 0
+        run: docker logs cubrid-live || true
+      - name: Remove disposable database
+        if: always()
+        run: docker rm -f cubrid-live >/dev/null 2>&1 || true
+ legacy-parity.tap
       - name: Print failed container logs
         if: failure()
         run: docker logs cubrid-live || true
