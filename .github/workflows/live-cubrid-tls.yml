@@ -1,0 +1,122 @@
+name: Live CUBRID TLS integration
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/integration-tls.test.ts"
+      - ".github/workflows/live-cubrid-tls.yml"
+      - "package.json"
+      - "package-lock.json"
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/integration-tls.test.ts"
+      - ".github/workflows/live-cubrid-tls.yml"
+      - "package.json"
+      - "package-lock.json"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ssl-broker:
+    name: CUBRID 11.4 SSL=ON and certificate validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Generate disposable localhost certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cubrid-tls"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -keyout "$RUNNER_TEMP/cubrid-tls/cas_ssl_cert.key" \
+            -out "$RUNNER_TEMP/cubrid-tls/cas_ssl_cert.crt" \
+            -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+          chmod 600 "$RUNNER_TEMP/cubrid-tls/cas_ssl_cert.key"
+      - name: Start CUBRID 11.4 with SSL=ON broker
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name cubrid-tls-live \
+            -e CUBRID_DB=testdb \
+            -p 127.0.0.1:33000:33000 \
+            "cubrid/cubrid:11.4"
+          # The stock container starts an SSL=OFF broker. Wait for it before
+          # applying configuration, otherwise the entrypoint can overwrite it.
+          found=false
+          for n in $(seq 1 40); do
+            if docker exec --user cubrid cubrid-tls-live bash -lc \
+               "cubrid broker status | grep -q '^% broker1'"; then
+              found=true
+              break
+            fi
+            sleep 3
+          done
+          test "$found" = true
+
+          docker cp "$RUNNER_TEMP/cubrid-tls/cas_ssl_cert.crt" \
+            cubrid-tls-live:/home/cubrid/CUBRID/conf/cas_ssl_cert.crt
+          docker cp "$RUNNER_TEMP/cubrid-tls/cas_ssl_cert.key" \
+            cubrid-tls-live:/home/cubrid/CUBRID/conf/cas_ssl_cert.key
+          docker exec cubrid-tls-live bash -lc \
+            "chown cubrid:cubrid /home/cubrid/CUBRID/conf/cas_ssl_cert.* && chmod 600 /home/cubrid/CUBRID/conf/cas_ssl_cert.key"
+
+          docker exec --user cubrid cubrid-tls-live bash -lc '
+            set -euo pipefail
+            conf="$CUBRID/conf/cubrid_broker.conf"
+            sed -i "/^\\[%BROKER1\\]/,/^\\[/ s/^[[:space:]]*SSL[[:space:]]*=[[:space:]]*OFF/SSL=ON/" "$conf"
+            # The selected broker must have SSL=ON, not merely a second
+            # broker configuration that happens to enable TLS.
+            sed -n "/^\\[%BROKER1\\]/,/^\\[/p" "$conf" | grep -Eq "^[[:space:]]*SSL[[:space:]]*=[[:space:]]*ON"
+            stopped=false
+            for i in $(seq 1 10); do
+              cubrid broker stop || true
+              if cubrid broker status 2>&1 | grep -q "cubrid broker is not running"; then
+                stopped=true; break
+              fi
+              sleep 3
+            done
+            test "$stopped" = true
+            cubrid broker start
+            cubrid broker status | grep -q "^% broker1"
+            db_ready=false
+            for i in $(seq 1 30); do
+              if cubrid server status testdb 2>/dev/null | grep -q "Server testdb"; then
+                db_ready=true; break
+              fi
+              cubrid server start testdb || true
+              sleep 3
+            done
+            test "$db_ready" = true
+          '
+      - name: Run strict real broker TLS tests
+        env:
+          CUBRID_TLS_REQUIRED: "1"
+          CUBRID_TLS_PORT: "33000"
+          CUBRID_TLS_CA_FILE: ${{ runner.temp }}/cubrid-tls/cas_ssl_cert.crt
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --import tsx --test tests/integration-tls.test.ts 2>&1 | tee live-tls.tap
+          grep -q '^# tests 3$' live-tls.tap
+          grep -q '^# pass 3$' live-tls.tap
+          grep -q '^# fail 0$' live-tls.tap
+          grep -q '^# skipped 0$' live-tls.tap
+      - name: Logs on failure
+        if: failure()
+        run: docker logs cubrid-tls-live || true
+      - name: Remove disposable broker
+        if: always()
+        run: docker rm -f cubrid-tls-live >/dev/null 2>&1 || true
