@@ -256,7 +256,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
           2.718281828,
           "test string",
           new Date("2025-01-15"),
-          new Date("2025-06-15T10:30:00"),
+          new Date("2025-06-15T10:30:00Z"),
         ],
       );
 
