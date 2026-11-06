@@ -67,7 +67,7 @@ jobs:
           const l = require("./package-lock.json");
           const m = require("./.release-please-manifest.json");
           if (p.version !== l.version || p.version !== l.packages[""].version ||
-              p.version !== m["."] || !/^\\d+\\.\\d+\\.\\d+$/.test(p.version)) {
+              p.version !== m["."] || !/^\d+\.\d+\.\d+$/.test(p.version)) {
             throw new Error("Package, lockfile and Release Please manifest versions do not agree");
           }
           if (!fs.existsSync("docs/releases/v" + p.version + ".md")) {
@@ -112,7 +112,7 @@ jobs:
           # can authorize automated creation of a new immutable tag.
           if ! gh pr list --repo "$GH_REPO" --state merged --base main --limit 100 \
               --json title,headRefName \
-              --jq ".[] | select(.title == \\"chore(main): release $version\\" and (.headRefName | startswith(\\"release-please--\\"))) | .title" \
+              --jq '.[] | select(.headRefName | startswith("release-please--")) | .title' \
               | grep -Fxq "chore(main): release $version"; then
             echo "::error::No merged, reviewed Release Please PR for $tag"
             exit 1
