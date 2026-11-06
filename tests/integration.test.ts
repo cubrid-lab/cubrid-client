@@ -256,7 +256,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
           2.718281828,
           "test string",
           new Date("2025-01-15"),
-          new Date("2025-06-15T10:30:00"),
+          new Date("2025-06-15T10:30:00Z"),
         ],
       );
 
@@ -266,6 +266,28 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       assert.equal(typeof rows[0]!.str_col, "string");
       assert.equal(rows[0]!.str_col, "test string");
       assert.equal(rows[0]!.bigint_col, 9223372036854775807n);
+      assert.equal(typeof rows[0]!.bigint_col, "bigint");
+      // FLOAT is a 32-bit value; DOUBLE retains approximately 15 decimal digits.
+      assert.equal(typeof rows[0]!.float_col, "number");
+      assert.ok(Math.abs((rows[0]!.float_col as number) - 3.14) < 1e-5);
+      assert.equal(typeof rows[0]!.double_col, "number");
+      assert.ok(Math.abs((rows[0]!.double_col as number) - 2.718281828) < 1e-9);
+      // CUBRID DATE and DATETIME have no stored timezone. Check each returned
+      // SQL wall-clock component rather than claiming stable UTC instants.
+      const sqlDate = rows[0]!.date_col;
+      const sqlDatetime = rows[0]!.datetime_col;
+      assert.ok(sqlDate instanceof Date);
+      assert.ok(sqlDatetime instanceof Date);
+      assert.equal(sqlDate.getFullYear(), 2025);
+      assert.equal(sqlDate.getMonth(), 0);
+      assert.equal(sqlDate.getDate(), 15);
+      assert.equal(sqlDatetime.getFullYear(), 2025);
+      assert.equal(sqlDatetime.getMonth(), 5);
+      assert.equal(sqlDatetime.getDate(), 15);
+      // The inserted JS Date is formatted using UTC components by this driver.
+      const expectedUtc = new Date("2025-06-15T10:30:00Z");
+      assert.equal(sqlDatetime.getHours(), expectedUtc.getUTCHours());
+      assert.equal(sqlDatetime.getMinutes(), expectedUtc.getUTCMinutes());
 
       await client.query("DROP TABLE dt_test_native");
     } finally {
