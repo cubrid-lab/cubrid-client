@@ -612,6 +612,15 @@ type QueryParam =
 
 Note: `BIGINT` columns in query results are returned as JavaScript `bigint` values (not `number`), so the full signed 64-bit range is preserved.
 
+Unsupported non-NULL CUBRID wire values (including collection and JSON types
+that do not yet have a decoder) now reject the query with a `QueryError`
+rather than silently appearing as SQL `null`. The underlying error identifies
+the column name and CAS type number. A genuine SQL NULL is still returned as
+`null`; an empty SQL string is still `""`. See [#82](https://github.com/cubrid-lab/cubrid-client/issues/82)
+for collection decoding and [#111](https://github.com/cubrid-lab/cubrid-client/issues/111)
+for JSON/type coverage. This is a fail-closed correctness repair, not newly
+added decoding support.
+
 ### QueryParams
 
 Array of query parameter values.
