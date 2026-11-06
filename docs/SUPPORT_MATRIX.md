@@ -19,29 +19,42 @@ governed by [API_STABILITY.md](API_STABILITY.md).
 
 ## CUBRID server / broker
 
-The README historically advertised CUBRID 10.2–11.4, but the required
-repository CI workflow provisions **no CUBRID server**; its integration suite
-self-skips live database tests. Consequently, **none** of the following
-versions has a complete mandatory live CI pass.
+The dedicated [Live CUBRID integration workflow](../.github/workflows/live-cubrid.yml)
+now provisions disposable databases. On **2026-11-06**, the
+[main branch full-matrix run](https://github.com/cubrid-lab/cubrid-client/actions/runs/42216017228)
+used Node.js 22 and finished **23 passed, 0 failed, 0 skipped** on each
+of the four image tags. It exercises the integration suite's actual assertions,
+not all possible SQL types, broker options or fault-injection scenarios.
 
-| CUBRID release | Required live CI | Reported manual evidence (not full certification) |
+| CUBRID image tag | Actual live CI | Scope of evidence |
 | --- | --- | --- |
-| 10.2 | Not configured | Selected CAS statement codes and frames reported in [#130](https://github.com/cubrid-lab/cubrid-client/pull/130) and [#122](https://github.com/cubrid-lab/cubrid-client/pull/122) |
-| 11.0 | Not configured | No complete version-specific check recorded here |
-| 11.2 | Not configured | TLS connection round-trip and selected frames reported in [#55](https://github.com/cubrid-lab/cubrid-client/pull/55) and [#122](https://github.com/cubrid-lab/cubrid-client/pull/122) |
-| 11.4 | Not configured | Targeted BIGINT, statement-code, handle cleanup and frame tests reported in [#126](https://github.com/cubrid-lab/cubrid-client/pull/126), [#130](https://github.com/cubrid-lab/cubrid-client/pull/130), [#127](https://github.com/cubrid-lab/cubrid-client/pull/127) |
-| Other server releases | Not configured | No support claim |
+| 10.2 | 23/23 passed, 0 skipped | Current integration suite with a real broker |
+| 11.0 | 23/23 passed, 0 skipped | Current integration suite with a real broker |
+| 11.2 | 23/23 passed, 0 skipped | Current integration suite with a real broker |
+| 11.4 | 23/23 passed, 0 skipped | Current integration suite with a real broker |
+| Other versions | Not tested in this workflow | No coverage claim |
 
-Manual reports are evidence of **only the named scenarios**, not a universal
-version, type, TLS or transaction matrix. Do not infer compatibility from
-`npm test`, offline coverage statistics, typecheck, or successful connection
-to a single version. Final combined source changes may need fresh live
-regression tests even when earlier PR branches reported passing checks.
+Pull requests touching runtime code or the live workflow execute the 11.4
+integration suite; a push to main executes the four-version matrix. A manual
+dispatch can run all four versions before a release. The dedicated workflow
+uses `CUBRID_LIVE_REQUIRED=1` so an unreachable server fails rather than
+quietly self-skipping. The separate general-purpose Node.js CI still runs
+its offline/self-skipping integration command and is **not** evidence of live
+CUBRID coverage.
+
+These results are a substantial improvement over the earlier targeted manual
+checks, but the suite is not an exhaustive type round-trip or
+fault-injection test. In particular, **SSL=ON broker coverage is not yet
+required or demonstrated in this matrix**, and independently validated
+collection/JSON/LOB support remains outstanding. Do not equate these 23 tests
+with production-ready certification. See [#95](https://github.com/cubrid-lab/cubrid-client/issues/95)
+and the [release gate](https://github.com/cubrid-lab/cubrid-client/issues/120).
 
 ## Release-blocking coverage still needed
 
-- [#95](https://github.com/cubrid-lab/cubrid-client/issues/95): real CUBRID
-  integration jobs for the exact versions the package promises.
+- [#95](https://github.com/cubrid-lab/cubrid-client/issues/95): add SSL=ON
+  broker testing and expand type/error/fault coverage; versioned live CI
+  baseline is now passing.
 - [#117](https://github.com/cubrid-lab/cubrid-client/issues/117): independent
   literal CAS byte/type/statement fixtures and malformed packet cases.
 - [#118](https://github.com/cubrid-lab/cubrid-client/issues/118): comparison
@@ -49,5 +62,5 @@ regression tests even when earlier PR branches reported passing checks.
 - [#120](https://github.com/cubrid-lab/cubrid-client/issues/120): required
   package/API/type/live-DB release decision, not just a green offline job.
 
-Until those are complete, describe supported database versions as **targeted /
-partially verified** and avoid an unqualified production-ready claim.
+Until those are complete, describe the documented live matrix as **verified
+for the 23 named integration tests only**, not broadly production-ready.
