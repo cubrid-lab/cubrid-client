@@ -183,4 +183,4 @@ declare function buildWhere(conditions: Record<string, unknown>): {
     params: unknown[];
 };
 
-export { type ClientConfig, type ClientOptions, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, CubridClient, CubridTransaction, NativeCubridAdapter, QueryError, ReadTimeoutError, type QueryParam, type QueryParams, type QueryResultRow, type Queryable, type TransactionCallback, type TransactionClient, TransactionError, buildWhere, createClient, escapeIdentifier, parseConnectionString };
+export { type ClientConfig, type ClientOptions, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, CubridClient, CubridTransaction, NativeCubridAdapter, QueryError, type QueryParam, type QueryParams, type QueryResultRow, type Queryable, ReadTimeoutError, type TransactionCallback, type TransactionClient, TransactionError, buildWhere, createClient, escapeIdentifier, parseConnectionString };
