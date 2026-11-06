@@ -50,6 +50,22 @@ jobs:
 
       # Declarations come from the same pinned tsup/TypeScript on every lane;
       # run the comparison once to avoid duplicate failures.
+      # Prove that a release check cannot report green if the real
+      # broker is absent; offline CI intentionally has no broker on port 1.
+      - name: Prove required live DB checks reject an absent broker
+        if: matrix.node-version == 22
+        shell: bash
+        run: |
+          set -euo pipefail
+          if CUBRID_LIVE_REQUIRED=1 CUBRID_TEST_PORT=1 npm run test:integration \
+              > "$RUNNER_TEMP/negative-broker-test.log" 2>&1; then
+            echo "::error::Required integration suite falsely passed without CUBRID"
+            exit 1
+          fi
+          grep -q "Live CUBRID integration was required but the broker was unreachable" \
+            "$RUNNER_TEMP/negative-broker-test.log"
+          echo "Confirmed: missing broker causes a hard integration failure"
+
       - name: Public API check
         if: matrix.node-version == 22
         run: npm run api:check
