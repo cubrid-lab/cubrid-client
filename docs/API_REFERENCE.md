@@ -410,7 +410,11 @@ try {
 
 #### `beginTransaction()`
 
-Manually begins a transaction on the shared connection. Prefer `transaction()` for automatic commit/rollback.
+Manually begins a transaction on the **shared connection**. Prefer `transaction()` for automatic commit/rollback **and connection ownership**.
+
+**Concurrency limitation in the existing 1.x API:** `beginTransaction()`, ordinary `db.query()`/`db.execute()`, `commit()` and `rollback()` have no caller or ownership token. Packet-level serialization alone cannot distinguish the task that began a manual transaction from an unrelated asynchronous caller. **Any call using the same client during that transaction may become part of it**, including another request's read or write. Sharing one manually transacting client between concurrent requests is therefore unsafe; no concurrent ownership guarantee is made for the current manual API.
+
+For concurrent workloads, use the scoped `await db.transaction(async (tx) => { ... })` callback and issue the transaction's statements through **`tx`**, not `db`. It owns a dedicated connection, while unrelated `db.query()` calls use the separate shared connection. Alternatively give each manual transaction its own unshared `CubridClient` instance. This is a usage boundary, not a claim that `beginTransaction()` itself now rejects or isolates unrelated callers. See [issue #112](https://github.com/cubrid-lab/cubrid-client/issues/112) for the unresolved ownership contract.
 
 ```ts
 async beginTransaction(): Promise<void>

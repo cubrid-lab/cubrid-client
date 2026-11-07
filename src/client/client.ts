@@ -258,6 +258,13 @@ export class CubridClient implements Queryable, ResultQueryable, Executable, Pre
     }
   }
 
+  /**
+   * Start a manual transaction on the shared connection. This 1.x signature
+   * has no ownership token: another caller using this client can join the
+   * same server transaction. For concurrent work use transaction(async tx =>)
+   * (a dedicated connection), or keep this client private to one operation.
+   * See docs/API_REFERENCE.md and issue #112.
+   */
   async beginTransaction(): Promise<void> {
     try {
       const connection = await this.getSharedConnection();
