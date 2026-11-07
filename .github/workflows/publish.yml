@@ -270,10 +270,30 @@ jobs:
           else
             echo "already_published=false" >> "$GITHUB_OUTPUT"
           fi
-      - name: Publish to npm
+      - name: Use an npm CLI that supports trusted OIDC publishing
+        # npm CLI 11.5.1+ supports OIDC, which avoids long-lived write tokens.
+        # This publish job uses Node.js 22; Node 18/20 consumers are tested
+        # separately before the immutable tag is created.
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global npm@11
+          node --version
+          npm --version
+          npm --version | node -e '
+            const version = require("node:fs").readFileSync(0, "utf8").trim();
+            const parts = version.split(".").map(Number);
+            if (parts[0] < 11 || (parts[0] === 11 && (parts[1] < 5 || parts[1] === 5 && parts[2] < 1))) {
+              throw new Error("npm CLI 11.5.1 or newer is required for trusted publishing");
+            }
+          '
+      - name: Publish to npm using OIDC trusted publishing
         if: ${{ steps.registry.outputs.already_published == 'false' }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # Do not set NODE_AUTH_TOKEN: the old registry token is rejected.
+        # npm exchanges GitHub's short-lived OIDC identity for publish auth.
+        # Requires npm package owner to configure Trusted Publisher:
+        # cubrid-lab / cubrid-client / publish.yml / npm-publish,
+        # with the direct npm publish operation explicitly allowed.
         run: npm publish --access public
       - name: Verify npm and GitHub release consistency after publication
         env:

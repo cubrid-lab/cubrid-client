@@ -77,9 +77,15 @@ descriptions without changing tags or packages.
    version/changelog PR generator**, while the publication job independently
    checks the reviewed PR/title and version files. This avoids relying on the
    mutable explanatory text of a human-reviewed Release Please PR.
-   Configure `NPM_TOKEN` appropriately. **If the environment requires
-   reviewers, GitHub still requests approval**; the automated trigger
-   respects repository approval rules.
+   Use **npm Trusted Publishing (OIDC)** rather than a long-lived
+   `NPM_TOKEN`: an npm package maintainer must first register the publisher
+   for organization `cubrid-lab`, repository `cubrid-client`, workflow
+   filename `publish.yml`, and environment `npm-publish`, with direct
+   `npm publish` permission (not just staging). The publish job uses Node
+   22, an npm 11 CLI supporting OIDC and existing `id-token: write`
+   GitHub permissions. The published package's GitHub source must match
+   this repository. **If the environment requires reviewers, GitHub still
+   requests approval**; the automated trigger does not bypass protection.
 6. The release job checks out the immutable tag and re-verifies the
    versions, API declarations, tests, package and audited dependencies,
    publishes the emoji-free curated Release notes under the title
@@ -119,6 +125,37 @@ disclosed. v1.2.0 is a scoped remediation release (#106) until full gates exist.
 The closed PR #67 (tsup v9) requires Node >=22.18 for the **build tool**, while runtime
 Node support and current CI Node 18/20/22/24/26 are separate decisions. Review it
 independently.
+
+## npm registry authentication and failed-publication recovery
+
+GitHub Releases and npm are separate registries. The existence of a
+`vX.Y.Z` tag and a green database/TLS matrix **does not mean npm
+published that version**; the final `npm view cubrid-client@X.Y.Z version`
+check is mandatory.
+
+For v1.2.0, the initial GitHub Release exists, but the npm publish step
+failed with `E404` on `PUT https://registry.npmjs.org/cubrid-client`.
+A read-only follow-up diagnostic also demonstrated that the previous
+`NPM_TOKEN` failed `npm whoami`:
+[release run](https://github.com/cubrid-lab/cubrid-client/actions/runs/42315470123),
+[auth diagnostic](https://github.com/cubrid-lab/cubrid-client/actions/runs/42320289488).
+Never create a different version to work around a registry credential failure.
+
+An **npm package maintainer** must configure the Trusted Publisher under
+npmjs.com → package `cubrid-client` → Settings → Trusted Publishing.
+Set the provider to GitHub Actions, organization/user `cubrid-lab`,
+repository `cubrid-client`, workflow `publish.yml`, environment
+`npm-publish`, and enable direct `npm publish`. The package owner must
+perform this one-time external-account operation. See the
+[official npm setup](https://docs.npmjs.com/trusted-publishers/).
+
+After that setup, use the existing Actions → Publish verified npm release
+manual recovery with `confirmation=PUBLISH` and
+`recovery_tag=v1.2.0`. This checks and republishes **the original
+immutable tag** without creating or modifying another GitHub Release.
+Confirm the actual npm registry version after the workflow succeeds.
+See [#166](https://github.com/cubrid-lab/cubrid-client/issues/166)
+for the tracked release discrepancy.
 
 ## Release-note ownership and style
 
