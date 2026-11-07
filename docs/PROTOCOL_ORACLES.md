@@ -26,9 +26,30 @@ replies to INSERT, UPDATE, DELETE, DDL and a two-statement string, and to
 GET_LAST_INSERT_ID (function code 40), captured the same way. Facts they pin
 down: the per-statement row count is in the execute result list (one entry per
 statement of a multi-statement string); GET_LAST_INSERT_ID answers size `-1`
-after an autocommit statement because the commit clears the value; after a
-multi-row INSERT it is the first generated id; and after an INSERT into a table
-without AUTO_INCREMENT it still holds an earlier INSERT's value. The INSERT reply is the same bytes for a table with and without AUTO_INCREMENT, and two fresh AUTO_INCREMENT tables both answer `1` in one transaction, so the wire holds no signal that a statement generated the value; a commit or a rollback clears it (CUBRID 10.2 and 11.4).
+on a session that has generated nothing; after a multi-row INSERT it is the first
+generated id; and after an INSERT into a table without AUTO_INCREMENT it still
+holds an earlier INSERT's value. The INSERT reply is the same bytes for a table
+with and without AUTO_INCREMENT, and two fresh AUTO_INCREMENT tables both answer
+`1`, so the wire holds no signal that a statement generated the value. The value
+belongs to the session: a commit, a rollback, the autocommit flag and a failed
+statement all leave it in place, and only a new session starts without one.
+
+CAS_INFO status, measured on the wire on CUBRID 10.2, 11.0, 11.2 and 11.4 and
+pinned by the fake CAS in `tests/concurrent-lifecycle.test.ts`:
+
+| Reply to | `CAS_INFO[0]` |
+| --- | --- |
+| OPEN_DATABASE | 1 |
+| A statement with the autocommit flag, and CLOSE_REQ_HANDLE after it | 0 |
+| An autocommit SELECT with rows left to fetch | 1 |
+| A statement without the flag, failed or not, including after `-72` | 1 |
+| END_TRAN | 0 |
+| CHECK_CAS | 1, even on an idle session |
+
+Status 0 therefore means the last transaction ended, not that the CAS has gone.
+That is the state in which a CAS closes its socket on purpose, and CHECK_CAS holds
+it until the next statement ends, which is what makes the client's check before a
+request safe.
 
 ## Separate numeric domains
 

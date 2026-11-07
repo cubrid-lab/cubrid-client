@@ -132,7 +132,7 @@ const db = createClient({
 
 - waiting for each response, including the time the server spends executing the statement. Set it above your slowest expected statement.
 - sending each request. A request the server has stopped reading fails too. Progress here is only visible as the operating system's send buffer drains, so a very short timeout can fail a large request sent over a slow link. With `ssl` on, progress is not visible at all: each request must finish sending within `readTimeout`.
-- each read during connect and reconnect, and the TLS handshake when `ssl` is on.
+- each read during connect and reconnect, the [session check](#session-reuse) before a request, and the TLS handshake when `ssl` is on.
 
 **The connect handshake has a default limit.** When `readTimeout` is unset (or `0`), the broker handshake, the TLS handshake and the OpenDatabase exchange still fail with a `ReadTimeoutError` after 10 seconds of server inactivity, so `connect()` and the queries behind it cannot wait forever on a silent broker. That default applies only to the handshake and never to later requests. A set `readTimeout` replaces it, so use a larger value to allow a slower handshake. A handshake timeout is not retried by `maxConnectionRetryCount`.
 
@@ -195,6 +195,25 @@ sequenceDiagram
     Client->>Conn1: Close Connection #1
 ```
 
+### Session Reuse
+
+A connection keeps one CAS session across statements, in autocommit mode too. Anything the session holds therefore carries over to the next statement until the session is replaced: `SET TRANSACTION LOCK TIMEOUT`, `SET TRANSACTION ISOLATION LEVEL`, session variables such as `SET @x = 1`, the last generated `AUTO_INCREMENT` value, and the measured backslash mode.
+
+When a statement finishes a transaction the CAS may close its socket afterwards, so the client checks before the next request:
+
+- It sends one CHECK_CAS round trip. This runs no SQL, and it holds the CAS for the request that follows, so the CAS cannot be taken away between the two. A request inside an open transaction needs no check.
+- If the CAS answered, the request runs on the same session.
+- If it did not, for example after a broker restart or because the CAS went to another client, the client opens a new session and sends the request there. This happens at most once per request, before the request is first sent, so the request is not at risk of running twice. No SQL is ever replayed.
+
+A replaced session starts from the server's defaults, so `SET` commands and session variables from the old one are gone. Inside a transaction a replaced session is a [lost transaction](#read-timeout), and the client does not continue on a new one.
+
+The broker's `KEEP_CONNECTION` decides how long a client holds its CAS. Measured on CUBRID 10.2, 11.0, 11.2 and 11.4 with `AUTO` (the default) and `ON`; those brokers refuse to start with `OFF`:
+
+| `KEEP_CONNECTION` | Between statements | When every CAS is taken |
+|-------------------|--------------------|-------------------------|
+| `AUTO` | The client keeps its CAS | The broker closes the socket of a client that is out of a transaction and gives its CAS to the waiting client. The first client gets a new session on its next request. |
+| `ON` | The client keeps its CAS until it closes | A new client waits until a CAS is free, so idle open clients can block it. Set `MAX_NUM_APPL_SERVER` above your number of open clients. A waiting client fails after `readTimeout`, or after 10 seconds if that is unset. |
+
 ### Concurrent Statements on One Connection
 
 `query()`, `transaction()` statements, `commit()`, `rollback()`, `ping()` and `close()` can be issued at the same time, for example with `Promise.all`. The client runs the statements of one connection strictly in the order they were issued, each one finishing all its work (execute, every FETCH, handle release) before the next starts:
@@ -216,7 +235,7 @@ This is required rather than conservative. CUBRID closes every open cursor on a 
 What this means for an application:
 
 - **Promises settle independently.** A failed statement rejects only its own promise. The statements around it still run.
-- **A `ping()` inside a manual transaction does not end it.** It sends CHECK_CAS, which reaches the database server, and then asks for the version without committing. Outside a transaction it asks for the version with autocommit on, as `query()` does.
+- **A `ping()` inside a manual transaction does not end it.** It sends CHECK_CAS, which reaches the database server, and then asks for the version without committing. Outside a transaction it asks for the version with autocommit on, as `query()` does, after the same [session check](#session-reuse).
 - **Concurrency does not make one connection faster.** Statements wait for each other, so a slow query delays the ones behind it. Waiting does not count towards `readTimeout`. For queries that must run in parallel, use several clients.
 - **`commit()`, `rollback()` and `close()` wait for the statements issued before them**, and apply only to those. A statement issued after `rollback()` runs outside that transaction.
 - **A lost connection fails the waiting queries too.** Queries that were waiting when a request failed on the connection reject without being sent, including those issued before a new client finished connecting. They are never retried, and the first query issued afterwards opens a new session. A failed connection attempt sends nothing, so a waiting query still makes its own attempt.

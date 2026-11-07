@@ -129,8 +129,9 @@ export interface ResultQueryable {
  * DDL and SELECT, and 0 when an UPDATE or DELETE matched nothing.
  *
  * `lastInsertId` is set only when an INSERT ran and the session then holds a
- * generated AUTO_INCREMENT value: a `number` while it is a safe integer and a
- * `bigint` beyond that, so no precision is lost. It is absent otherwise.
+ * new generated AUTO_INCREMENT value: a `number` while it is a safe integer and
+ * a `bigint` beyond that, so no precision is lost. It is absent otherwise,
+ * including when the value equals the one seen before the statement.
  */
 export interface ExecuteResult {
   affectedRows: number;
