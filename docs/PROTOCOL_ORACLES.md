@@ -42,6 +42,7 @@ pinned by the fake CAS in `tests/concurrent-lifecycle.test.ts`:
 | OPEN_DATABASE | 1 |
 | A statement with the autocommit flag, and CLOSE_REQ_HANDLE after it | 0 |
 | An autocommit SELECT with rows left to fetch | 1 |
+| CLOSE_REQ_HANDLE of that SELECT before its last row | 1 |
 | A statement without the flag, failed or not, including after `-72` | 1 |
 | END_TRAN | 0 |
 | CHECK_CAS | 1, even on an idle session |
@@ -70,6 +71,21 @@ client closed or was cut off, starts from the server defaults (4 and `-1` on a s
 server). The reply to the database server restart case was `-111` and then `-224`
 inside a transaction, after which the CAS closed its socket, so no session lost its
 settings without the client opening a new one.
+
+An autocommit SELECT closed before its last row therefore stays in a transaction:
+it keeps its table lock and its CAS, and a second session's `ALTER TABLE` waits,
+until the next statement or an END_TRAN. So `stream()` sends END_TRAN when it stops
+early in autocommit mode. An END_TRAN between two FETCHes closes the cursor, and the
+next FETCH fails with `-1012`, which is why a stream that read LOB content sends it
+once, after the cursor is finished, and never between rows. LOB_READ itself leaves
+the cursor and the status alone.
+
+FETCH replies, measured the same way and pinned by the `stream()` tests in
+`tests/integration.test.ts`: the server **ignores the requested fetch size**. The
+reply to a FETCH of 1 row and of 5000 rows was the same 16 KiB (819 INT rows, or 131
+rows of about 110 bytes), and a 100 KB row came back alone. The rows inlined in the
+execute reply follow the same limit. So one reply is the unit of buffering for
+`stream()`, and the `fetchSize` option is sent but has no effect on these servers.
 
 ## Separate numeric domains
 

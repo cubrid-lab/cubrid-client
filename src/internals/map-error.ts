@@ -1,7 +1,7 @@
 import { ConnectionError } from "../errors/connection-error.js";
 import { definedErrorDetails } from "../errors/error-details.js";
 import type { CubridErrorDetails, CubridErrorOptions } from "../errors/error-details.js";
-import { CasReplyError, ConnectionLostError } from "../errors/internal-errors.js";
+import { CasReplyError, ConnectionLostError, StreamBusyError } from "../errors/internal-errors.js";
 import {
   ConstraintError,
   DeadlockError,
@@ -12,7 +12,7 @@ import {
 import { ReadTimeoutError } from "../errors/read-timeout-error.js";
 import { TransactionError } from "../errors/transaction-error.js";
 
-type ErrorKind = "connection" | "query" | "transaction";
+export type ErrorKind = "connection" | "query" | "transaction";
 
 export function mapError(kind: ErrorKind, error: unknown, message: string): Error {
   // Kept as-is at every layer so callers can test for it without unwrapping.
@@ -22,16 +22,19 @@ export function mapError(kind: ErrorKind, error: unknown, message: string): Erro
 
   const cause = toError(error);
   const options: CubridErrorOptions = { cause, ...findErrorDetails(cause) };
+  // A refused statement can only be fixed in the caller's code, so the reason stays
+  // in the first line anyone reads rather than at the end of the cause chain.
+  const text = options.kind === "stream-busy" ? cause.message : message;
 
   if (kind === "connection") {
-    return new ConnectionError(message, options);
+    return new ConnectionError(text, options);
   }
 
   if (kind === "query") {
-    return createQueryError(message, options);
+    return createQueryError(text, options);
   }
 
-  return new TransactionError(message, options);
+  return new TransactionError(text, options);
 }
 
 function createQueryError(message: string, options: CubridErrorOptions): QueryError {
@@ -67,6 +70,7 @@ function findErrorDetails(error: Error): CubridErrorDetails {
     if (
       current instanceof CasReplyError ||
       current instanceof ConnectionLostError ||
+      current instanceof StreamBusyError ||
       current instanceof QueryError ||
       current instanceof TransactionError ||
       current instanceof ConnectionError

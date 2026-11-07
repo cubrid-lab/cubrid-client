@@ -41,7 +41,7 @@ production compatibility from a small successful fixture.
 | Logger | Uses injected logger for query/protocol events | `logger` receives redacted structured events for connections, queries and transactions; no SQL, parameters, rows or credentials; no protocol-level events | Implemented with a different, redacted contract [#100](https://github.com/cubrid-lab/cubrid-client/issues/100) |
 | TLS with verified certificate | Not a documented common feature in historical native API | Implemented; live SSL=ON 11.4 CA/hostname checks | Native-specific, not a legacy parity requirement |
 | DML metadata, errors | Richer result packets and error structures | `query()` returns no rows for DML; `execute()` returns `{ affectedRows, lastInsertId }` ([#84](https://github.com/cubrid-lab/cubrid-client/issues/84)); error mapping differs | Affected rows and generated id implemented; remaining gap tracked [#89](https://github.com/cubrid-lab/cubrid-client/issues/89) |
-| Large results / streaming | Query handles and `fetch` | Internal fetch with automatic handle cleanup | Compare complete result content and lifecycle; public streaming planned [#87](https://github.com/cubrid-lab/cubrid-client/issues/87) |
+| Large results / streaming | Query handles and `fetch` | `query()` fetches internally with automatic handle cleanup; `stream()` reads one reply at a time | `stream()` verified on 10.2 to 11.4, see [`stream()`](API_REFERENCE.md#streamtsql-params-options) [#87](https://github.com/cubrid-lab/cubrid-client/issues/87) |
 
 ## Live comparative acceptance
 

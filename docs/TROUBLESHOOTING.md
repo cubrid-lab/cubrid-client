@@ -404,3 +404,11 @@ process.on("SIGTERM", async () => {
 - [API Reference](./API_REFERENCE.md) — Full method signatures and types
 - [Connection Guide](./CONNECTION.md) — Connection configuration details
 - [CUBRID Documentation](https://www.cubrid.org/manual/) — Official CUBRID documentation
+
+### A statement rejects with `kind: "stream-busy"`
+
+The statement waited behind an open [`stream()`](API_REFERENCE.md#streamtsql-params-options) on the same client, and the code reading that stream asked for no row for `consumerTimeout` milliseconds (5000 by default). Nothing was sent, and the stream still works.
+
+- **The statement is awaited inside the `for await` loop.** It could never run, because the stream ends only after the loop goes on. Use `db.transaction()`, which has its own connection, or a second client.
+- **The stream was left open.** A manual `next()` loop must call `return()`. `for await` does this on its own.
+- **The consumer is slow and other code uses the same client.** Raise `consumerTimeout`, or give the stream a client of its own.

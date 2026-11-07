@@ -5,6 +5,7 @@
 cubrid-client provides a clean, typed wrapper around the CUBRID database for Node.js and TypeScript projects. It features generic query result typing, structured error classes, and transaction support.
 
 Key facts:
+- Large results: `for await (const row of db.stream<User>("SELECT * FROM users")) { ... }` holds one server reply at a time; a statement awaited on the same client inside the loop rejects with `kind: "stream-busy"`, so use `db.transaction()` or another client there
 - Install: `npm install cubrid-client`
 - Connect: `createClient({ host: "localhost", port: 33000, database: "demodb", user: "dba" })`
 - Query: `await db.query<User>("SELECT * FROM users WHERE id = ?", [1])`

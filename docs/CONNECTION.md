@@ -78,7 +78,7 @@ const client = createClient({ host: "localhost", database: "demodb", user: "dba"
 | Level | Event | Fields |
 |-------|-------|--------|
 | `info` | A connection was created (`operation: "connection"`) | `host`, `port`, `database` |
-| `debug` | `connect`, `query`, `queryResult`, `setTransactionOptions`, `beginTransaction`, `commit`, `rollback`, `close` or `ping` succeeded | `operation`, `durationMs`; `paramCount` and `rowCount` for `query` |
+| `debug` | `connect`, `query`, `queryResult`, `stream`, `beginTransaction`, `commit`, `rollback`, `close` or `ping` succeeded. A `stream` reports once, when it ends or closes early | `operation`, `durationMs`; `paramCount` and `rowCount` for `query` and `stream` |
 | `error` | The same operations failed | `operation`, `durationMs`, `errorName`; `paramCount` for `query` |
 | `error` | A connection could not be created (`operation: "connection"`; the original error is rethrown unchanged) | `operation`, `host`, `port`, `database`, `durationMs`, `errorName` |
 
@@ -312,7 +312,8 @@ What this means for an application:
 - **Promises settle independently.** A failed statement rejects only its own promise. The statements around it still run.
 - **A `ping()` inside a manual transaction does not end it.** It sends CHECK_CAS, which reaches the database server, and then asks for the version without committing. Outside a transaction it asks for the version with autocommit on, as `query()` does, after the same [session check](#session-reuse).
 - **Concurrency does not make one connection faster.** Statements wait for each other, so a slow query delays the ones behind it. Waiting does not count towards `readTimeout`. For queries that must run in parallel, use several clients.
-- **`commit()`, `rollback()` and `close()` wait for the statements issued before them**, and apply only to those. A statement issued after `rollback()` runs outside that transaction.
+- **An open [`stream()`](API_REFERENCE.md#streamtsql-params-options) holds its turn between reads**, until its last reply has arrived or it closes, because of the table above. The statements behind it wait, and its consumer decides for how long. A statement rejects with `kind: "stream-busy"` once the consumer has asked for no row for `consumerTimeout`. So never await a statement of the same client inside the loop: that statement could never run.
+- **`commit()`, `rollback()` and `close()` wait for the statements issued before them**, and apply only to those. The exception is `close()`, which ends an open stream rather than wait for its consumer. A statement issued after `rollback()` runs outside that transaction.
 - **A lost connection fails the waiting queries too.** Queries that were waiting when a request failed on the connection reject without being sent, including those issued before a new client finished connecting. They are never retried, and the first query issued afterwards opens a new session. A failed connection attempt sends nothing, so a waiting query still makes its own attempt.
 
 ### Transaction Connection

@@ -1,7 +1,10 @@
-import type { ClientConfig, ClientOptions, TransactionOptions } from "../types/client.js";
+import type { ClientConfig, ClientOptions, StreamOptions, TransactionOptions } from "../types/client.js";
 
 /** Largest delay Node.js timers support. */
 const MAX_READ_TIMEOUT = 2 ** 31 - 1;
+
+/** FETCH carries its size as a signed 32-bit int. */
+const MAX_FETCH_SIZE = 2 ** 31 - 1;
 
 /** Largest lock timeout the server's int32 parameter holds, in milliseconds. */
 const MAX_LOCK_TIMEOUT = 2 ** 31 - 1;
@@ -66,8 +69,34 @@ export function pickTransactionOptions(
   };
 }
 
+/** The adapter, which is public and skips normalizeConfig(), checks this too. */
+export function assertValidFetchSize(size: number | undefined): void {
+  if (size !== undefined && !(Number.isInteger(size) && size > 0 && size <= MAX_FETCH_SIZE)) {
+    throw new RangeError(`fetchSize must be an integer between 1 and ${MAX_FETCH_SIZE}.`);
+  }
+}
+
+/** Disabling the limit is not offered: that is what would let a nested statement hang. */
+export function assertValidStreamOptions(options: StreamOptions | undefined): void {
+  assertValidFetchSize(options?.fetchSize);
+  const consumerTimeout = options?.consumerTimeout;
+
+  if (
+    consumerTimeout !== undefined &&
+    !(
+      Number.isInteger(consumerTimeout) &&
+      consumerTimeout >= 0 &&
+      consumerTimeout <= MAX_READ_TIMEOUT
+    )
+  ) {
+    throw new RangeError(
+      `consumerTimeout must be an integer between 0 and ${MAX_READ_TIMEOUT} milliseconds.`,
+    );
+  }
+}
+
 export function normalizeConfig(options: ClientOptions): ClientConfig {
-  const { readTimeout, maxLobBytes } = options;
+  const { readTimeout, maxLobBytes, fetchSize } = options;
 
   // A value that quietly disabled the timeout would leave queries able to hang.
   if (
@@ -81,6 +110,7 @@ export function normalizeConfig(options: ClientOptions): ClientConfig {
 
   assertValidRetryCount(options.maxConnectionRetryCount);
   assertValidMaxLobBytes(maxLobBytes);
+  assertValidFetchSize(fetchSize);
   assertValidTransactionOptions(options);
 
   return {
@@ -92,6 +122,7 @@ export function normalizeConfig(options: ClientOptions): ClientConfig {
     connectionTimeout: options.connectionTimeout,
     ...(readTimeout !== undefined && { readTimeout }),
     ...(maxLobBytes !== undefined && { maxLobBytes }),
+    ...(fetchSize !== undefined && { fetchSize }),
     ...pickTransactionOptions(options),
     maxConnectionRetryCount: options.maxConnectionRetryCount,
     ssl: options.ssl,

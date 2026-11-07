@@ -184,12 +184,19 @@ A query over the limit rejects before any content is read, with an
 any open transaction stay usable. Raise the limit, select fewer rows, or leave the
 LOB column out. The limit counts bytes, including the bytes of a multibyte CLOB.
 
+[`stream()`](API_REFERENCE.md#streamtsql-params-options) applies the same limit to
+**each row** instead. It reads a row's content when the consumer reaches that row, so
+it holds one row's content at a time, and a result over the limit in total can be
+read in full. A row over the limit rejects when it is reached, after the rows before
+it were delivered.
+
 **Cost.** Every non-empty LOB takes at least one request after the query, and one
 per 81908 bytes, the most the server sends at once. Select LOB columns only when
 you need them: `SELECT *` on such a table now transfers the content. `readTimeout`
 applies to each of those requests and not to the whole read.
 
-**Why no streaming handle.** A locator does not stay readable. After a commit that
+**Why no LOB streaming handle.** A value arrives complete even from `stream()`. A
+locator does not stay readable. After a commit that
 deletes or updates the row, or a rollback, the file is gone and reading it fails
 with error -1020, and the protocol has no request that holds a file or releases
 one. So the driver reads within the query's own turn and keeps nothing afterwards.

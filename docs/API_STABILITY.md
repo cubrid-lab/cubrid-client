@@ -90,6 +90,21 @@ working as long as no setting is requested. Requesting one from a connection wit
 and the meaning of `lockTimeout` are public behavior; see
 [Isolation Level and Lock Timeout](CONNECTION.md#isolation-level-and-lock-timeout).
 
+### Streaming additions
+
+`stream()`, its `StreamOptions` and `Streamable` types, and the `fetchSize` client
+option are a backward-compatible MINOR feature
+([#87](https://github.com/cubrid-lab/cubrid-client/issues/87)). `query()` and
+`queryResult()` keep their signatures, return arrays and send the same fetch size by
+default. `ConnectionLike.stream` is optional, so existing connection factories still
+compile, and `TransactionClient` is unchanged. `CubridErrorKind` gains
+`"stream-busy"`, which only `stream()` can cause; a `switch` over that type that
+checks for exhaustiveness at compile time needs a case for it.
+
+The `stream-busy` limit is part of the contract. A statement waits as long as the
+consumer keeps reading, and a consumer that stops cannot make a statement wait for
+ever: `consumerTimeout` can be raised but not disabled.
+
 ## Node.js, TypeScript and distribution
 
 - **Current runtime declaration:** `engines.node >=18` in

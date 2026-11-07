@@ -3946,3 +3946,199 @@ test("beginTransaction resolves only once a new session's settings hold", async 
     server.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// stream(): LOB content is read row by row
+// ---------------------------------------------------------------------------
+
+/** Replaces the sizes of the two LOB cells of rows 1 and 2 of the captured reply. */
+function lobReplyWithSizes(row1: [bigint, bigint], row2: [bigint, bigint]): Buffer {
+  const reply = lobSelectReply(row1[0], row1[1]);
+  const second = (typeCode: string): number =>
+    reply.indexOf(Buffer.from(typeCode, "hex"), reply.indexOf(Buffer.from(typeCode, "hex")) + 8) + 4;
+  reply.writeBigInt64BE(row2[0], second("00000021"));
+  reply.writeBigInt64BE(row2[1], second("00000022"));
+  return reply;
+}
+
+test("stream LOB: content is read when its row is reached, and END_TRAN waits for the end", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  fakeCAS.queueResponse(lobReplyWithSizes([1n, 0n], [1n, 0n]));
+  fakeCAS.queueResponse(lobReadReply(Buffer.from([7])));
+  fakeCAS.queueResponse(lobReadReply(Buffer.from([8])));
+
+  const rows = adapter.stream(SELECT_LOBS);
+  const first = await rows.next();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.deepEqual(first.value, { id: 1, b: Buffer.from([7]), c: "" });
+  assert.deepEqual(lobReads(fakeCAS), [[0, 1]]);
+
+  assert.deepEqual((await rows.next()).value, { id: 2, b: Buffer.from([8]), c: "" });
+  assert.deepEqual((await rows.next()).value, { id: 3, b: null, c: null });
+  assert.equal((await rows.next()).done, true);
+
+  assert.deepEqual(functionsSent(fakeCAS), [
+    FC_PREPARE_AND_EXECUTE,
+    FC_LOB_READ,
+    FC_LOB_READ,
+    FC_END_TRAN,
+    FC_CLOSE_REQ_HANDLE,
+  ]);
+});
+
+test("stream LOB: maxLobBytes limits each row, so a result over it in total still streams", async () => {
+  const { adapter, fakeCAS } = lobAdapter({ maxLobBytes: 2 });
+  fakeCAS.queueResponse(lobReplyWithSizes([2n, 0n], [2n, 0n]));
+  fakeCAS.queueResponse(lobReadReply(Buffer.from([1, 2])));
+  fakeCAS.queueResponse(lobReadReply(Buffer.from([3, 4])));
+
+  const blobs: unknown[] = [];
+  for await (const row of adapter.stream(SELECT_LOBS)) {
+    blobs.push(row.b);
+  }
+
+  assert.deepEqual(blobs, [Buffer.from([1, 2]), Buffer.from([3, 4]), null]);
+});
+
+test("stream LOB: a row over maxLobBytes fails at that row and keeps the connection", async () => {
+  const { adapter, fakeCAS } = lobAdapter({ maxLobBytes: 2 });
+  fakeCAS.queueResponse(lobReplyWithSizes([2n, 0n], [2n, 1n]));
+  fakeCAS.queueResponse(lobReadReply(Buffer.from([1, 2])));
+
+  const rows = adapter.stream(SELECT_LOBS);
+  await rows.next();
+
+  await assert.rejects(
+    () => rows.next(),
+    (error: Error) => {
+      assert.ok(error instanceof QueryError);
+      assert.equal((error.cause as Error).name, "UnsupportedValueError");
+      assert.match(
+        (error.cause as Error).message,
+        /column "c" takes this row's LOB content to 3 bytes, over the maxLobBytes limit of 2/,
+      );
+      return true;
+    },
+  );
+
+  assert.deepEqual(lobReads(fakeCAS), [[0, 2]]);
+  assert.deepEqual(fakeCAS.closedHandles, [1]);
+  assert.equal(fakeCAS.discardCalls, 0);
+  assert.equal(functionsSent(fakeCAS).filter((code) => code === FC_END_TRAN).length, 1);
+});
+
+test("stream LOB: the last row releases the turn before the consumer reads it", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  fakeCAS.queueResponse(lobReplyWithSizes([0n, 0n], [0n, 0n]));
+
+  const rows = adapter.stream(SELECT_LOBS, undefined, { consumerTimeout: 0 });
+  await rows.next();
+  await rows.next();
+  assert.deepEqual((await rows.next()).value, { id: 3, b: null, c: null });
+  // Lets the handle's release take its reply before the next statement's is queued.
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  fakeCAS.queueResponse(lobReplyWithSizes([0n, 0n], [0n, 0n]));
+  assert.equal((await adapter.query(SELECT_LOBS)).length, 3);
+  assert.equal((await rows.next()).done, true);
+});
+
+test("stream LOB: a break after a read still ends the read transaction", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  fakeCAS.queueResponse(lobReplyWithSizes([1n, 0n], [1n, 0n]));
+  fakeCAS.queueResponse(lobReadReply(Buffer.from([7])));
+
+  for await (const row of adapter.stream(SELECT_LOBS)) {
+    assert.ok(row);
+    break;
+  }
+
+  assert.deepEqual(functionsSent(fakeCAS), [
+    FC_PREPARE_AND_EXECUTE,
+    FC_LOB_READ,
+    FC_END_TRAN,
+    FC_CLOSE_REQ_HANDLE,
+  ]);
+});
+
+test("stream LOB: only empty and NULL content ends no transaction", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  fakeCAS.queueResponse(lobReplyWithSizes([0n, 0n], [0n, 0n]));
+
+  for await (const row of adapter.stream(SELECT_LOBS)) {
+    assert.ok(row);
+  }
+
+  assert.deepEqual(functionsSent(fakeCAS), [FC_PREPARE_AND_EXECUTE, FC_CLOSE_REQ_HANDLE]);
+});
+
+test("stream LOB: reads inside a transaction send no END_TRAN", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  await adapter.beginTransaction();
+  fakeCAS.queueResponse(lobReplyWithSizes([1n, 0n], [1n, 0n]));
+  fakeCAS.queueResponse(lobReadReply(Buffer.from([7])));
+  fakeCAS.queueResponse(lobReadReply(Buffer.from([8])));
+
+  for await (const row of adapter.stream(SELECT_LOBS)) {
+    assert.ok(row);
+  }
+
+  assert.equal(functionsSent(fakeCAS).includes(FC_END_TRAN), false);
+});
+
+test("stream LOB: a malformed LOB_READ reply retires the session and nothing follows it", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  fakeCAS.queueResponse(lobReplyWithSizes([4n, 0n], [1n, 0n]));
+  fakeCAS.queueResponse(Buffer.from("0000000501", "hex"));
+
+  await assert.rejects(() => adapter.stream(SELECT_LOBS).next(), QueryError);
+
+  assert.equal(fakeCAS.discardCalls, 1);
+  assert.deepEqual(functionsSent(fakeCAS), [FC_PREPARE_AND_EXECUTE, FC_LOB_READ]);
+});
+
+test("stream LOB: a failed read in the last window still ends the read transaction", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  fakeCAS.queueResponse(lobReplyWithSizes([1n, 0n], [0n, 0n]));
+  fakeCAS.queueResponse(buildServerErrorResponse(-493));
+
+  await assert.rejects(() => adapter.stream(SELECT_LOBS).next(), QueryError);
+  assert.deepEqual(functionsSent(fakeCAS), [
+    FC_PREPARE_AND_EXECUTE,
+    FC_LOB_READ,
+    FC_END_TRAN,
+    FC_CLOSE_REQ_HANDLE,
+  ]);
+});
+
+test("stream LOB: abort after a partial reply stops subsequent reads and cleans up", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  const controller = new AbortController();
+  fakeCAS.queueResponse(lobSelectReply(200_000n, 0n));
+  fakeCAS.queueResponse(lobReadReply(Buffer.alloc(81_908)));
+  fakeCAS.onSendAndRecv = () => {
+    if (!controller.signal.aborted && fakeCAS.sentPayloads.at(-1)?.[0] === FC_LOB_READ) {
+      controller.abort(new Error("stop streamed LOB"));
+    }
+  };
+
+  await assert.rejects(
+    () => adapter.stream(SELECT_LOBS, undefined, { signal: controller.signal }).next(),
+    /stop streamed LOB/,
+  );
+  assert.deepEqual(lobReads(fakeCAS), [[0, 131072]]);
+  assert.deepEqual(functionsSent(fakeCAS), [
+    FC_PREPARE_AND_EXECUTE,
+    FC_LOB_READ,
+    FC_END_TRAN,
+    FC_CLOSE_REQ_HANDLE,
+  ]);
+});
+
+test("stream: the adapter checks its options and fetchSize config like the client", () => {
+  assert.throws(() => new NativeCubridAdapter({ ...DEFAULT_CONFIG, fetchSize: 0 }), RangeError);
+  const { adapter } = createAdapterWithFakeCAS();
+  assert.throws(() => adapter.stream("SELECT 1", undefined, { fetchSize: 0 }), RangeError);
+  assert.throws(() => adapter.stream("SELECT 1", undefined, { consumerTimeout: -1 }), RangeError);
+});

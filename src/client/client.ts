@@ -3,6 +3,7 @@ import { CallbackTransaction } from "./transaction.js";
 import { TransactionError } from "../errors/transaction-error.js";
 import { mapError, toError } from "../internals/map-error.js";
 import {
+  assertValidStreamOptions,
   assertValidTransactionOptions,
   pickTransactionOptions,
 } from "../internals/normalize-config.js";
@@ -18,6 +19,8 @@ import type {
   Queryable,
   ResultQueryable,
   ResultTransactionClient,
+  Streamable,
+  StreamOptions,
   TransactionCallback,
   TransactionOptions,
 } from "../types/client.js";
@@ -31,7 +34,7 @@ import type {
   SchemaTable,
 } from "../types/schema.js";
 
-export class CubridClient implements Queryable, ResultQueryable, Executable, PreparedQueryable {
+export class CubridClient implements Queryable, ResultQueryable, Executable, PreparedQueryable, Streamable {
   private sharedConnectionPromise: Promise<ConnectionLike> | undefined;
   private closed = false;
   private readonly schemaOperations = new Set<Promise<unknown>>();
@@ -121,6 +124,79 @@ export class CubridClient implements Queryable, ResultQueryable, Executable, Pre
       return await connection.executePrepared(sql, params);
     } catch (error) {
       throw mapError("query", error, "Statement failed.");
+    }
+  }
+
+  /**
+   * Run a statement and read its rows one at a time with `for await`, holding at
+   * most one server reply of rows in memory. Nothing is sent before the first read.
+   *
+   * The open cursor holds this connection's turn until the rows run out or the
+   * stream closes. A `break`, a throw or a failed read closes it and releases the
+   * query handle; code that drives the iterator by hand must call `return()`.
+   * Statements issued on this client meanwhile wait, so one awaited inside the loop
+   * can never run: it rejects with `kind: "stream-busy"` after
+   * {@link StreamOptions.consumerTimeout}. Use `transaction()`, which has its own
+   * connection, or another client. See `docs/API_REFERENCE.md`.
+   *
+   * @throws RangeError at once when an option is invalid.
+   */
+  stream<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+    options?: StreamOptions,
+  ): AsyncGenerator<T, void, undefined> {
+    assertValidStreamOptions(options);
+    return this.streamRows<T>(sql, params, options);
+  }
+
+  private async *streamRows<T extends QueryResultRow>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: StreamOptions | undefined,
+  ): AsyncGenerator<T, void, undefined> {
+    // An abort is the caller's own decision, so its reason stays as it is.
+    const failure = (error: unknown): unknown =>
+      options?.signal?.aborted && error === options.signal.reason
+        ? error
+        : mapError("query", error, "Query failed.");
+
+    let rows: AsyncIterator<T>;
+    try {
+      const connection = await this.getSharedConnection();
+      if (!connection.stream) {
+        throw new Error("Underlying connection does not support stream.");
+      }
+      rows = connection.stream<T>(sql, params, options)[Symbol.asyncIterator]();
+    } catch (error) {
+      throw failure(error);
+    }
+
+    let exhausted = false;
+    try {
+      for (;;) {
+        let next: IteratorResult<T>;
+        try {
+          next = await rows.next();
+        } catch (error) {
+          exhausted = true;
+          throw failure(error);
+        }
+
+        if (next.done) {
+          exhausted = true;
+          return;
+        }
+        yield next.value;
+      }
+    } finally {
+      if (!exhausted) {
+        try {
+          await rows.return?.();
+        } catch (error) {
+          throw failure(error);
+        }
+      }
     }
   }
 

@@ -59,8 +59,7 @@ criteria are verified and which are still pending real broker tests.
   [#102](https://github.com/cubrid-lab/cubrid-client/issues/102).
 - Pooling, batching and streaming after handle ownership and lifecycle testing:
   [#92](https://github.com/cubrid-lab/cubrid-client/issues/92),
-  [#86](https://github.com/cubrid-lab/cubrid-client/issues/86),
-  [#87](https://github.com/cubrid-lab/cubrid-client/issues/87).
+  [#86](https://github.com/cubrid-lab/cubrid-client/issues/86),.
 - Schema introspection for tables, columns, primary keys and indexes
   ([#94](https://github.com/cubrid-lab/cubrid-client/issues/94)) reads the
   catalog views; migration diff and DDL generation stay out of scope.

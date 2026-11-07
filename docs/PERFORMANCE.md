@@ -47,6 +47,25 @@ In this benchmark shape, CUBRID is faster than MySQL in every tested TypeScript 
 - Stable latency appears on mixed read/write micro-benchmarks.
 - Performance is sensitive to round-trip count when workloads are highly chatty.
 
+## Streaming memory
+
+`query()` needs memory proportional to the whole result. `stream()` holds one server reply, about 16 KiB of rows or one row when a row is larger. Measured with `process.memoryUsage()` after a forced garbage collection and with `process.resourceUsage().maxRSS`, in a new Node.js 24 process per run, reading a table of 1,000,000 rows of about 500 bytes (477 MiB of column data) from a local Docker server:
+
+| Server | Method | Heap growth after GC | Peak RSS | Time |
+|---|---|---:|---:|---:|
+| 10.2 | `stream()` | 0.9 MiB | 86 MiB | 7.6 s |
+| 10.2 | `query()` | 560 MiB | 775 MiB | 6.9 s |
+| 11.0 | `stream()` | 0.9 MiB | 88 MiB | 6.8 s |
+| 11.0 | `query()` | 560 MiB | 798 MiB | 5.5 s |
+| 11.2 | `stream()` | 0.9 MiB | 88 MiB | 7.2 s |
+| 11.2 | `query()` | 560 MiB | 797 MiB | 5.6 s |
+| 11.4 | `stream()` | 0.9 MiB | 88 MiB | 6.3 s |
+| 11.4 | `query()` | 560 MiB | 791 MiB | 5.8 s |
+
+The stream's heap stayed between 0.8 and 0.9 MiB above its starting point at every 100,000th row. Its peak RSS is about 20 MiB above the idle process. These are single runs, not benchmarks: the times only show that streaming costs no large slowdown.
+
+The live test `memory stays bounded on a result much larger than the limit asserted` in `tests/integration.test.ts` keeps this checked on every server version.
+
 ## Optimization Tips
 
 - Reuse a single client/pool per process instead of reconnecting per request. An autocommit statement stays on the client's session; the client adds one CHECK_CAS round trip before it instead of opening a new session (see [Session Reuse](CONNECTION.md#session-reuse)).

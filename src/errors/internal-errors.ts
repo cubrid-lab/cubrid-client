@@ -72,3 +72,8 @@ export function isServerTransactionAbort(error: unknown): error is CasReplyError
 export class ConnectionLostError extends Error {
   readonly kind: CubridErrorKind = "connection-lost";
 }
+
+/** A statement stopped waiting behind a stream whose consumer stopped asking for rows. */
+export class StreamBusyError extends Error {
+  readonly kind: CubridErrorKind = "stream-busy";
+}

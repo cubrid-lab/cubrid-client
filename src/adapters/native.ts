@@ -55,22 +55,43 @@ import {
 import {
   ConnectionLostError,
   isServerTransactionAbort,
+  StreamBusyError,
   type CasReplyError,
 } from "../errors/internal-errors.js";
-import { mapError } from "../internals/map-error.js";
+import { mapError, type ErrorKind } from "../internals/map-error.js";
 import { TransactionError } from "../errors/transaction-error.js";
 import {
+  assertValidFetchSize,
   assertValidMaxLobBytes,
   assertValidRetryCount,
+  assertValidStreamOptions,
   assertValidTransactionOptions,
   pickTransactionOptions,
 } from "../internals/normalize-config.js";
+import { StreamCursor } from "./stream-cursor.js";
 import type { DriverAdapter } from "./base.js";
-import type { ClientConfig, ExecuteResult, TransactionOptions } from "../types/client.js";
+import type { ClientConfig, ExecuteResult, StreamOptions, TransactionOptions } from "../types/client.js";
 import type { QueryParams } from "../types/query.js";
 import type { ColumnInfo, QueryResult, QueryResultRow } from "../types/result.js";
 
 const DEFAULT_FETCH_SIZE = 100;
+
+const QUERY_FAILED = "Failed to execute CUBRID query.";
+
+/** A stream's maximum idle-consumer wait, unless configured otherwise. */
+const DEFAULT_CONSUMER_TIMEOUT_MS = 5000;
+
+/** Internal control-flow signal: an orderly iterator close is not a query error. */
+const STREAM_STOPPED = Symbol("stream stopped");
+
+/** A cancelled stream must not issue another CAS request after an in-flight reply. */
+function assertStreamWanted(cursor?: StreamCursor): void {
+  if (!cursor) return;
+  cursor.assertNotCancelled();
+  if (cursor.isStopped) throw STREAM_STOPPED;
+}
+
+
 
 /** Fatal so a CLOB that is not UTF-8 is refused, not silently given U+FFFD. */
 const CLOB_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
@@ -80,6 +101,13 @@ interface IssuedOn {
   cas: CASConnection;
   failedExchanges: number;
 }
+
+/** A statement that has not started yet. See inTurn(). */
+interface WaitingStatement {
+  since: number;
+  refuse: (reason: Error) => void;
+}
+
 
 /** Whether any parameter renders differently under the two backslash modes. */
 function needsBackslashMode(params: QueryParams): boolean {
@@ -164,9 +192,24 @@ export class NativeCubridAdapter implements DriverAdapter {
    */
   private statementQueue: Promise<void> = Promise.resolve();
 
+  /** Statements behind the running one, which a stalled stream can make refuse. */
+  private readonly waitingStatements = new Set<WaitingStatement>();
+
+  /** Every stream between its first read and its end, so close() can stop them. */
+  private readonly openCursors = new Set<StreamCursor>();
+
+  /** The stream whose turn is waiting for its consumer to ask for more rows. */
+  private heldBy: StreamCursor | null = null;
+
+  /** Timer of the next possible refusal. See watchHeldTurn(). */
+  private refusalTimer: NodeJS.Timeout | null = null;
+
+
+
   constructor(private readonly config: ClientConfig) {
     assertValidRetryCount(config.maxConnectionRetryCount);
     assertValidMaxLobBytes(config.maxLobBytes);
+    assertValidFetchSize(config.fetchSize);
     assertValidTransactionOptions(config);
     this.transactionOptions = pickTransactionOptions(config);
   }
@@ -194,13 +237,71 @@ export class NativeCubridAdapter implements DriverAdapter {
   ): Promise<QueryResult<T>> {
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
-    return this.inTurn(() => this.queryNow<T>(sql, params, issued, undefined));
+    return this.inTurn("query", QUERY_FAILED, () => this.queryNow<T>(sql, params, issued, undefined));
+  }
+
+  /**
+   * Reads a result one server reply at a time. See `CubridClient.stream()` for the
+   * contract. The statement is issued by the first read, like any other statement
+   * in the queue, and keeps its turn until it has released its query handle.
+   */
+  stream<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+    options?: StreamOptions,
+  ): AsyncGenerator<T, void, undefined> {
+    assertValidStreamOptions(options);
+    return this.streamRows<T>(sql, params, options);
+  }
+
+  private async *streamRows<T extends QueryResultRow>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: StreamOptions | undefined,
+  ): AsyncGenerator<T, void, undefined> {
+    const signal = options?.signal;
+    signal?.throwIfAborted();
+
+    const cursor = new StreamCursor(options?.consumerTimeout ?? DEFAULT_CONSUMER_TIMEOUT_MS);
+    const fetchSize = options?.fetchSize ?? this.config.fetchSize ?? DEFAULT_FETCH_SIZE;
+    const onAbort = (): void => cursor.cancel(signal?.reason);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    this.openCursors.add(cursor);
+
+    try {
+      const cas = this.getOrCreateCAS();
+      const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
+      cursor.run(
+        this.inTurn("query", QUERY_FAILED, async () => {
+          if (cursor.begin()) {
+            await this.streamNow(cursor, sql, params, fetchSize, issued);
+          }
+        }),
+      );
+
+      for (;;) {
+        const rows = await cursor.take();
+        if (rows === null) {
+          return;
+        }
+
+        for (const row of rows) {
+          cursor.assertNotCancelled();
+          yield row as T;
+          cursor.activityAt = Date.now();
+        }
+      }
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
+      this.openCursors.delete(cursor);
+      await cursor.close();
+    }
   }
 
   async execute(sql: string, params?: QueryParams): Promise<ExecuteResult> {
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
-    return this.inTurn(() => this.executeNow(sql, params, issued, undefined));
+    return this.inTurn("query", "Failed to execute CUBRID statement.", () => this.executeNow(sql, params, issued, undefined));
   }
 
   async queryPrepared<T extends QueryResultRow = QueryResultRow>(
@@ -217,14 +318,14 @@ export class NativeCubridAdapter implements DriverAdapter {
     const binds = bindOrRefuse(sql, params, "Failed to execute CUBRID query.");
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
-    return this.inTurn(() => this.queryNow<T>(sql, params, issued, binds));
+    return this.inTurn("query", QUERY_FAILED, () => this.queryNow<T>(sql, params, issued, binds));
   }
 
   async executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult> {
     const binds = bindOrRefuse(sql, params, "Failed to execute CUBRID statement.");
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
-    return this.inTurn(() => this.executeNow(sql, params, issued, binds));
+    return this.inTurn("query", "Failed to execute CUBRID statement.", () => this.executeNow(sql, params, issued, binds));
   }
 
   private async executeNow(
@@ -270,6 +371,36 @@ export class NativeCubridAdapter implements DriverAdapter {
     }
   }
 
+  private async streamNow(
+    cursor: StreamCursor,
+    sql: string,
+    params: QueryParams | undefined,
+    fetchSize: number,
+    issued: IssuedOn,
+  ): Promise<void> {
+    try {
+      await this.runStatement(sql, params, issued, async (cas, result) => {
+        this.forgetInsertIdAfterQuery(result);
+
+        if (result.statementType === StatementType.SELECT) {
+          await this.streamWindows(cursor, cas, result, fetchSize);
+        }
+      });
+    } catch (error) {
+      throw this.queryFailure(error);
+    }
+  }
+
+  private queryFailure(error: unknown): Error {
+    // If the first transactional statement lost its session before the
+    // post-response bind, remember that failed generation. A ping/reconnect
+    // must never make subsequent statements commit on a replacement CAS.
+    this.forgetInsertId();
+    this.bindSessionLostByFirstStatement();
+    this.recordTransactionAbort(error);
+    return mapError("query", error, QUERY_FAILED);
+  }
+
   /**
    * Keep these settings on every session of this connection, in place of what was
    * set before and leaving any option not given as it is. close() goes back to
@@ -281,7 +412,7 @@ export class NativeCubridAdapter implements DriverAdapter {
    */
   async setTransactionOptions(options: TransactionOptions): Promise<void> {
     assertValidTransactionOptions(options);
-    return this.inTurn(() => this.setTransactionOptionsNow(options));
+    return this.inTurn("transaction", "Failed to apply transaction options.", () => this.setTransactionOptionsNow(options));
   }
 
   private async setTransactionOptionsNow(options: TransactionOptions): Promise<void> {
@@ -300,7 +431,7 @@ export class NativeCubridAdapter implements DriverAdapter {
   }
 
   async beginTransaction(): Promise<void> {
-    return this.inTurn(() => this.beginTransactionNow());
+    return this.inTurn("transaction", "Failed to start transaction.", () => this.beginTransactionNow());
   }
 
   private async beginTransactionNow(): Promise<void> {
@@ -325,7 +456,7 @@ export class NativeCubridAdapter implements DriverAdapter {
   }
 
   async commit(): Promise<void> {
-    return this.inTurn(() => this.commitNow());
+    return this.inTurn("transaction", "Failed to commit transaction.", () => this.commitNow());
   }
 
   private async commitNow(): Promise<void> {
@@ -356,7 +487,7 @@ export class NativeCubridAdapter implements DriverAdapter {
   }
 
   async rollback(): Promise<void> {
-    return this.inTurn(() => this.rollbackNow());
+    return this.inTurn("transaction", "Failed to roll back transaction.", () => this.rollbackNow());
   }
 
   private async rollbackNow(): Promise<void> {
@@ -380,7 +511,17 @@ export class NativeCubridAdapter implements DriverAdapter {
   }
 
   async close(): Promise<void> {
-    return this.inTurn(() => this.closeNow());
+    for (const cursor of this.openCursors) {
+      cursor.cancel(
+        mapError(
+          "query",
+          new ConnectionLostError("The connection was closed while this stream was open"),
+          QUERY_FAILED,
+        ),
+      );
+    }
+
+    return this.queueStatement(() => this.closeNow());
   }
 
   private async closeNow(): Promise<void> {
@@ -412,7 +553,7 @@ export class NativeCubridAdapter implements DriverAdapter {
   }
 
   async ping(): Promise<string> {
-    return this.inTurn(() => this.pingNow());
+    return this.inTurn("connection", "Health check failed.", () => this.pingNow());
   }
 
   private async pingNow(): Promise<string> {
@@ -449,12 +590,175 @@ export class NativeCubridAdapter implements DriverAdapter {
    * Nothing runs here but this adapter's own statements, so a statement can
    * never wait on its own turn. Waiting does not count towards readTimeout.
    */
-  private inTurn<T>(statement: () => Promise<T>): Promise<T> {
+  private inTurn<T>(
+    kind: ErrorKind,
+    failureMessage: string,
+    statement: () => Promise<T>,
+  ): Promise<T> {
+    let waiting!: WaitingStatement;
+    const refused = new Promise<never>((_resolve, reject) => {
+      waiting = {
+        since: Date.now(),
+        refuse: (reason) => reject(mapError(kind, reason, failureMessage)),
+      };
+    });
+
+    this.waitingStatements.add(waiting);
+    this.watchHeldTurn();
+
+    const turn = this.queueStatement(async () => {
+      // A refused statement keeps its place in the queue but must not run.
+      if (this.waitingStatements.delete(waiting)) {
+        return statement();
+      }
+      return undefined as T;
+    });
+
+    return Promise.race([turn, refused]);
+  }
+
+  private queueStatement<T>(statement: () => Promise<T>): Promise<T> {
     const turn = this.statementQueue.then(statement);
     // The tail drops the result, so an idle connection does not keep its rows.
     const settled = (): void => undefined;
     this.statementQueue = turn.then(settled, settled);
     return turn;
+  }
+
+  /**
+   * Arms the timer that refuses statements stuck behind a held stream, at the
+   * earliest moment one of them could have waited `consumerTimeout` with no sign of
+   * the consumer. Reading only the timestamps here keeps a row's cost at one
+   * assignment: a consumer that is still reading just moves the deadline.
+   */
+  private watchHeldTurn(): void {
+    const cursor = this.heldBy;
+    if (!cursor || this.refusalTimer || this.waitingStatements.size === 0) {
+      return;
+    }
+
+    const deadline = (statement: WaitingStatement): number =>
+      Math.max(statement.since, cursor.activityAt) + cursor.consumerTimeout;
+    let soonest = Number.POSITIVE_INFINITY;
+    for (const statement of this.waitingStatements) {
+      soonest = Math.min(soonest, deadline(statement));
+    }
+
+    this.refusalTimer = setTimeout(() => {
+      this.refusalTimer = null;
+      const now = Date.now();
+
+      for (const statement of this.waitingStatements) {
+        if (this.heldBy === cursor && now >= deadline(statement)) {
+          this.waitingStatements.delete(statement);
+          statement.refuse(
+            new StreamBusyError(
+              `This statement waited ${cursor.consumerTimeout}ms behind a stream whose ` +
+                "consumer asked for no row. A statement awaited while iterating stream() " +
+                "on the same connection can never run: finish or close the stream first, " +
+                "or use transaction() or another client. Nothing was sent.",
+            ),
+          );
+        }
+      }
+
+      this.watchHeldTurn();
+    }, Math.max(0, soonest - Date.now()));
+  }
+
+  /** Hands rows over and, while more can follow, waits for the consumer to ask for them. */
+  private async offerRows(
+    cursor: StreamCursor,
+    rows: Record<string, unknown>[],
+    more: boolean,
+  ): Promise<void> {
+    const offered = cursor.offer(rows, more);
+
+    if (more) {
+      this.heldBy = cursor;
+      this.watchHeldTurn();
+      await offered;
+      this.heldBy = null;
+
+      if (this.refusalTimer) {
+        clearTimeout(this.refusalTimer);
+        this.refusalTimer = null;
+      }
+    }
+  }
+
+  /**
+   * Feeds a stream from an open cursor, one window at a time and only on demand.
+   *
+   * LOB content is read when the consumer reaches its row, so `maxLobBytes` limits
+   * one row and a stream holds one row's content, not a window's. Reads must not
+   * be followed by the END_TRAN that query() sends after them: in autocommit mode
+   * that would close this cursor (-1012), so it waits until the cursor is finished.
+   *
+   * An autocommit SELECT reports IN_TRAN until it reaches its last row, and closing
+   * its handle earlier does not end that transaction: on CUBRID 10.2 to 11.4 the
+   * session keeps its table lock, and its CAS, until the next statement. So a stream
+   * that stops early commits. It changed nothing unless the SQL text did, and an
+   * autocommit statement that ran is committed anyway.
+   */
+  private async streamWindows(
+    cursor: StreamCursor,
+    cas: CASConnection,
+    result: PrepareAndExecuteResult,
+    fetchSize: number,
+  ): Promise<void> {
+    const generation = cas.connectionGeneration;
+    const lobColumns = result.columns.some(mayHoldLob);
+    let rows = result.rows;
+    let fetched = rows.length;
+    let lobsRead = false;
+    let replyDamaged = false;
+
+    try {
+      for (;;) {
+        const lastWindow = fetched >= result.totalTupleCount;
+
+        if (lobColumns) {
+          for (const [index, row] of rows.entries()) {
+            if (cursor.isStopped) {
+              return;
+            }
+            // Detach the delivered row: decoded FETCH windows may remain referenced
+            // by the query response while the consumer holds a large BLOB/CLOB.
+            const delivered = { ...row };
+            // Mark LOB activity before awaiting a read: a server error or abort
+            // must still release the autocommit read transaction.
+            lobsRead = this.measureLobs([delivered], "row").total > 0 || lobsRead;
+            await this.loadRowLobs(cas, generation, delivered, cursor);
+            await this.offerRows(cursor, [delivered], !lastWindow || index < rows.length - 1);
+          }
+        } else if (rows.length > 0) {
+          await this.offerRows(cursor, rows, !lastWindow);
+        }
+
+        if (lastWindow || cursor.isStopped) {
+          return;
+        }
+
+        rows = await this.fetchWindow(cas, generation, result, fetched, fetchSize);
+        fetched += rows.length;
+      }
+    } catch (error) {
+      if (error === STREAM_STOPPED) return;
+      replyDamaged = error instanceof MalformedReplyError;
+      throw error;
+    } finally {
+      if (this.autoCommit && !replyDamaged && (lobsRead || fetched < result.totalTupleCount)) {
+        await this.endReadTransaction(cas, generation);
+      }
+    }
+  }
+
+  /** An INSERT executed by a query path can invalidate the insert-ID baseline. */
+  private forgetInsertIdAfterQuery(result: PrepareAndExecuteResult): void {
+    if (result.resultInfos.some((info) => info.statementType !== StatementType.SELECT)) {
+      this.forgetInsertId();
+    }
   }
 
   private executeQuery<T extends QueryResultRow>(
@@ -996,41 +1300,47 @@ export class NativeCubridAdapter implements DriverAdapter {
     result: PrepareAndExecuteResult,
     allRows: Record<string, unknown>[],
   ): Promise<void> {
-    let fetched = allRows.length;
     const generation = cas.connectionGeneration;
+    const fetchSize = this.config.fetchSize ?? DEFAULT_FETCH_SIZE;
 
-    while (fetched < result.totalTupleCount) {
-      const { header, payload } = writeFetch(
-        result.queryHandle,
-        fetched,
-        DEFAULT_FETCH_SIZE,
-        cas.casInfo,
-      );
-      // The handle exists only on this session, and FETCH is not a new request
-      // that could be probed or moved to another one.
-      const fetchPayload = await cas.sendAndRecvOnSession(generation, header, payload);
-      if (fetchPayload === null) {
-        throw new ConnectionLostError("Connection lost during FETCH");
-      }
-      const fetchResult = parseFetch(fetchPayload, result.columns);
-
-      // Returning a partial result as success silently corrupts the query
-      // contract. The execute response still promises more rows here.
-      if (fetchResult.tupleCount <= 0) {
-        throw new Error(
-          `CUBRID FETCH returned no rows before the expected ${result.totalTupleCount} rows`,
-        );
-      }
-      if (
-        fetchResult.rows.length !== fetchResult.tupleCount ||
-        fetched + fetchResult.tupleCount > result.totalTupleCount
-      ) {
-        throw new Error("CUBRID FETCH returned an inconsistent row count");
-      }
-
-      allRows.push(...fetchResult.rows);
-      fetched += fetchResult.tupleCount;
+    while (allRows.length < result.totalTupleCount) {
+      const rows = await this.fetchWindow(cas, generation, result, allRows.length, fetchSize);
+      allRows.push(...rows);
     }
+  }
+
+  /** Sends one FETCH for the rows after the first `fetched`, and returns its rows. */
+  private async fetchWindow(
+    cas: CASConnection,
+    generation: number,
+    result: PrepareAndExecuteResult,
+    fetched: number,
+    fetchSize: number,
+  ): Promise<Record<string, unknown>[]> {
+    const { header, payload } = writeFetch(result.queryHandle, fetched, fetchSize, cas.casInfo);
+    // The handle exists only on this session, and FETCH is not a new request
+    // that could be probed or moved to another one.
+    const fetchPayload = await cas.sendAndRecvOnSession(generation, header, payload);
+    if (fetchPayload === null) {
+      throw new ConnectionLostError("Connection lost during FETCH");
+    }
+    const fetchResult = parseFetch(fetchPayload, result.columns);
+
+    // Returning a partial result as success silently corrupts the query
+    // contract. The execute response still promises more rows here.
+    if (fetchResult.tupleCount <= 0) {
+      throw new Error(
+        `CUBRID FETCH returned no rows before the expected ${result.totalTupleCount} rows`,
+      );
+    }
+    if (
+      fetchResult.rows.length !== fetchResult.tupleCount ||
+      fetched + fetchResult.tupleCount > result.totalTupleCount
+    ) {
+      throw new Error("CUBRID FETCH returned an inconsistent row count");
+    }
+
+    return fetchResult.rows;
   }
 
   /**
@@ -1084,9 +1394,57 @@ export class NativeCubridAdapter implements DriverAdapter {
     } finally {
       // An empty LOB sends no LOB_READ, and nothing may follow a damaged reply.
       if (total > 0 && !replyDamaged && endsReadTransaction) {
-        await this.endLobReadTransaction(cas, generation);
+        await this.endReadTransaction(cas, generation);
       }
     }
+  }
+
+  /** Loads one row of a stream and returns whether that sent a LOB_READ. See streamWindows(). */
+  private async loadRowLobs(
+    cas: CASConnection,
+    generation: number,
+    row: Record<string, unknown>,
+    cursor?: StreamCursor,
+  ): Promise<boolean> {
+    const { cells, total } = this.measureLobs([row], "row");
+
+    for (const { name, lob } of cells) {
+      assertStreamWanted(cursor);
+      setColumn(row, name, decodeLob(name, lob, await this.readLob(cas, generation, name, lob, cursor)));
+    }
+
+    return total > 0;
+  }
+
+  /** Finds the LOB cells of `rows` and refuses them if their content is over the limit. */
+  private measureLobs(
+    rows: Record<string, unknown>[],
+    scope: "query" | "row",
+  ): {
+    cells: Array<{ row: Record<string, unknown>; name: string; lob: LobLocator }>;
+    total: number;
+  } {
+    const limit = this.config.maxLobBytes ?? DEFAULT_MAX_LOB_BYTES;
+    const cells: Array<{ row: Record<string, unknown>; name: string; lob: LobLocator }> = [];
+    let total = 0;
+
+    for (const row of rows) {
+      for (const [name, lob] of Object.entries(row)) {
+        if (!(lob instanceof LobLocator)) {
+          continue;
+        }
+        total += lob.size;
+        if (total > limit) {
+          throw new UnsupportedValueError(
+            `CUBRID column "${name}" takes this ${scope}'s LOB content to ${total} bytes, ` +
+              `over the maxLobBytes limit of ${limit}`,
+          );
+        }
+        cells.push({ row, name, lob });
+      }
+    }
+
+    return { cells, total };
   }
 
   private async readLob(
@@ -1094,11 +1452,13 @@ export class NativeCubridAdapter implements DriverAdapter {
     generation: number,
     name: string,
     lob: LobLocator,
+    cursor?: StreamCursor,
   ): Promise<Buffer> {
     const chunks: Buffer[] = [];
     let received = 0;
 
     while (received < lob.size) {
+      assertStreamWanted(cursor);
       const length = Math.min(lob.size - received, LOB_READ_CHUNK_SIZE);
       const { header, payload } = writeLobRead(lob.handle, received, length, cas.casInfo);
       const response = await cas.sendAndRecvOnSession(generation, header, payload);
@@ -1108,6 +1468,9 @@ export class NativeCubridAdapter implements DriverAdapter {
       }
 
       const chunk = parseLobRead(response, length);
+      // The reply has now been consumed; cancellation may interrupt before
+      // any subsequent LOB_READ or another column, never mid-frame.
+      assertStreamWanted(cursor);
       if (chunk.length === 0) {
         throw new UnsupportedValueError(
           `CUBRID column "${name}" holds ${received} of its declared ${lob.size} LOB bytes`,
@@ -1127,7 +1490,7 @@ export class NativeCubridAdapter implements DriverAdapter {
    * releasable: an idle client would keep its CAS. Nothing was changed, so this
    * only ends that. Inside a caller's transaction there is nothing to do.
    */
-  private async endLobReadTransaction(cas: CASConnection, generation: number): Promise<void> {
+  private async endReadTransaction(cas: CASConnection, generation: number): Promise<void> {
     if (!this.autoCommit) {
       return;
     }

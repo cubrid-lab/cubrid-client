@@ -37,6 +37,8 @@ export type {
   Queryable,
   ResultQueryable,
   ResultTransactionClient,
+  Streamable,
+  StreamOptions,
   TransactionCallback,
   TransactionClient,
   TransactionOptions,

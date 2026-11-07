@@ -124,6 +124,26 @@ test("normalizeConfig keeps a valid maxLobBytes and adds none by default", () =>
   assert.ok(!("maxLobBytes" in normalizeConfig(baseOptions())));
 });
 
+test("normalizeConfig keeps a valid fetchSize and adds none by default", () => {
+  assert.equal(normalizeConfig({ ...baseOptions(), fetchSize: 500 }).fetchSize, 500);
+  assert.ok(!("fetchSize" in normalizeConfig(baseOptions())));
+});
+
+for (const fetchSize of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31]) {
+  test(`createClient and stream() reject fetchSize ${fetchSize}`, () => {
+    assert.throws(() => createClient({ ...baseOptions(), fetchSize }), RangeError);
+    const client = createClient(baseOptions({ connectionFactory: () => new FakeConnection() }));
+    assert.throws(() => client.stream("SELECT 1", undefined, { fetchSize }), RangeError);
+  });
+}
+
+for (const consumerTimeout of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31]) {
+  test(`stream() rejects consumerTimeout ${consumerTimeout}`, () => {
+    const client = createClient(baseOptions({ connectionFactory: () => new FakeConnection() }));
+    assert.throws(() => client.stream("SELECT 1", undefined, { consumerTimeout }), RangeError);
+  });
+}
+
 for (const maxLobBytes of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 53]) {
   test(`createClient rejects maxLobBytes ${maxLobBytes}`, () => {
     assert.throws(() => createClient({ ...baseOptions(), maxLobBytes }), RangeError);
@@ -2624,4 +2644,146 @@ test("a failed setTransactionOptions rejects transaction() without a rollback an
   );
 
   assert.deepEqual(connection.calls, ["setTransactionOptions", "close"]);
+});
+
+/** A connection whose stream() records what the client asked of it. */
+class StreamingConnection extends FakeConnection {
+  streamCalls: unknown[][] = [];
+  returned = false;
+  failure?: Error;
+  failureOnReturn?: Error;
+
+  stream<T extends Record<string, unknown>>(...args: unknown[]): AsyncIterable<T> {
+    this.streamCalls.push(args);
+    const { failure, failureOnReturn } = this;
+    const onReturn = (): void => {
+      this.returned = true;
+    };
+    let index = 0;
+
+    return {
+      [Symbol.asyncIterator]: () => ({
+        next: async () => {
+          if (failure && index === 1) {
+            throw failure;
+          }
+          index += 1;
+          return index > 2
+            ? { done: true as const, value: undefined }
+            : { done: false as const, value: { n: index } as unknown as T };
+        },
+        return: async () => {
+          onReturn();
+          if (failureOnReturn) {
+            throw failureOnReturn;
+          }
+          return { done: true as const, value: undefined };
+        },
+      }),
+    };
+  }
+}
+
+test("stream forwards its arguments and yields the connection's rows", async () => {
+  const connection = new StreamingConnection();
+  const client = createClient(baseOptions({ connectionFactory: () => connection }));
+  const options = { fetchSize: 7 };
+  const rows: unknown[] = [];
+
+  for await (const row of client.stream("SELECT n FROM t", [1], options)) {
+    rows.push(row);
+  }
+
+  assert.deepEqual(rows, [{ n: 1 }, { n: 2 }]);
+  assert.deepEqual(connection.streamCalls, [["SELECT n FROM t", [1], options]]);
+  assert.equal(connection.returned, false);
+});
+
+test("stream rejects on its first read when the connection does not support it", async () => {
+  const client = createClient(baseOptions({ connectionFactory: () => new FakeConnection() }));
+
+  await assert.rejects(
+    () => client.stream("SELECT 1").next(),
+    (error: Error) => {
+      assert.ok(error instanceof QueryError);
+      assert.match((error.cause as Error).message, /does not support stream/);
+      return true;
+    },
+  );
+});
+
+test("stream wraps a failed read and a failed release in QueryError", async () => {
+  const connection = new StreamingConnection();
+  connection.failure = new Error("read failed");
+  const client = createClient(baseOptions({ connectionFactory: () => connection }));
+
+  await assert.rejects(async () => {
+    for await (const row of client.stream("SELECT 1")) {
+      assert.ok(row);
+    }
+  }, (error: Error) => error instanceof QueryError && error.cause === connection.failure);
+  assert.equal(connection.returned, false);
+
+  const releasing = new StreamingConnection();
+  releasing.failureOnReturn = new Error("release failed");
+  const other = createClient(baseOptions({ connectionFactory: () => releasing }));
+
+  await assert.rejects(async () => {
+    for await (const row of other.stream("SELECT 1")) {
+      assert.ok(row);
+      break;
+    }
+  }, (error: Error) => error instanceof QueryError && error.cause === releasing.failureOnReturn);
+});
+
+test("stream reports an abort with the signal's own reason", async () => {
+  const connection = new StreamingConnection();
+  const controller = new AbortController();
+  const reason = new Error("stopped by the caller");
+  connection.failure = reason;
+  controller.abort(reason);
+  const client = createClient(baseOptions({ connectionFactory: () => connection }));
+
+  await assert.rejects(async () => {
+    for await (const row of client.stream("SELECT 1", undefined, { signal: controller.signal })) {
+      assert.ok(row);
+    }
+  }, (error) => error === reason);
+});
+
+test("stream closes the connection's iterator on break and on a loop body failure", async () => {
+  const connection = new StreamingConnection();
+  const client = createClient(baseOptions({ connectionFactory: () => connection }));
+
+  for await (const row of client.stream("SELECT 1")) {
+    assert.ok(row);
+    break;
+  }
+  assert.equal(connection.returned, true);
+
+  connection.returned = false;
+  const failure = new Error("the loop failed");
+  await assert.rejects(async () => {
+    for await (const row of client.stream("SELECT 1")) {
+      assert.ok(row);
+      throw failure;
+    }
+  }, (error) => error === failure);
+  assert.equal(connection.returned, true);
+});
+
+test("stream after close() rejects on its first read and opens no connection", async () => {
+  let opened = 0;
+  const client = createClient(
+    baseOptions({
+      connectionFactory: () => {
+        opened += 1;
+        return new StreamingConnection();
+      },
+    }),
+  );
+  await client.close();
+
+  await assert.rejects(() => client.stream("SELECT 1").next(), QueryError);
+  assert.equal(opened, 0);
 });

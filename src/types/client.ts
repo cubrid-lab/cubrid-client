@@ -25,7 +25,7 @@ export type ClientLogLevel = "debug" | "info" | "error";
  * parameter values, row data, credentials or error messages.
  */
 export interface ClientLogFields {
-  /** `connection`, `connect`, `query`, `queryResult`, `execute`, `queryPrepared`, `queryResultPrepared`, `executePrepared`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`. */
+  /** `connection`, `connect`, `query`, `queryResult`, `execute`, `queryPrepared`, `queryResultPrepared`, `executePrepared`, `stream`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`. */
   operation?: string;
   host?: string;
   port?: number;
@@ -34,7 +34,7 @@ export interface ClientLogFields {
   durationMs?: number;
   /** Number of bound parameters of a `query`, not their values. */
   paramCount?: number;
-  /** Number of rows a successful `query` returned. */
+  /** Number of rows a successful `query` returned, or a `stream` handed to its consumer. */
   rowCount?: number;
   /**
    * Class of the error of a failed operation: one of this library's error
@@ -82,6 +82,8 @@ export interface ClientConfig {
   readTimeout?: number | undefined;
   /** See {@link ClientOptions.maxLobBytes}. */
   maxLobBytes?: number | undefined;
+  /** See {@link ClientOptions.fetchSize}. */
+  fetchSize?: number | undefined;
   /** See {@link ClientOptions.isolationLevel}. */
   isolationLevel?: IsolationLevel | undefined;
   /** See {@link ClientOptions.lockTimeout}. */
@@ -112,6 +114,7 @@ export interface ClientOptions {
    * in memory, so this bounds what a row of large objects can cost. A query over
    * the limit rejects with a `QueryError` before any content is read, and the
    * connection stays usable. Must be a positive integer. Default: 64 MiB.
+   * `stream()` applies the same limit to each row instead, see {@link StreamOptions}.
    */
   maxLobBytes?: number;
   /**
@@ -127,6 +130,14 @@ export interface ClientOptions {
    * wait and `-1` has no limit. Unset leaves the server's default.
    */
   lockTimeout?: number;
+  /**
+   * Rows asked for in each FETCH by `query()`, `queryResult()` and `stream()`.
+   * CUBRID 10.2 to 11.4 ignore this number and answer every FETCH with about
+   * 16 KiB of rows, or one row when a row is larger, so it changes neither the
+   * round trips nor the memory used on those servers. Must be an integer from 1
+   * to 2147483647. Default: 100.
+   */
+  fetchSize?: number;
   maxConnectionRetryCount?: number;
   ssl?: boolean | ClientSSLOptions;
   /**
@@ -153,6 +164,45 @@ export interface ResultQueryable {
     sql: string,
     params?: QueryParams,
   ): Promise<QueryResult<T>>;
+}
+
+/**
+ * Options of `stream()`.
+ *
+ * LOB limit: `maxLobBytes` applies to each row of a stream, not to the whole
+ * result as in `query()`. A row's BLOB and CLOB content is read when that row is
+ * reached, so one row's content is the most a stream holds at once.
+ */
+export interface StreamOptions {
+  /** Rows asked for in each FETCH. Default: {@link ClientOptions.fetchSize}. */
+  fetchSize?: number;
+  /**
+   * Stops the stream. The next read rejects with `signal.reason`, the query handle
+   * is released and the statement's turn ends, even if the consumer is not reading.
+   * A reply already awaited is not interrupted: the stream stops when it arrives,
+   * so `readTimeout` limits how long that takes. The session stays usable.
+   */
+  signal?: AbortSignal;
+  /**
+   * Milliseconds a statement issued on this connection waits while the consumer
+   * asks for no row, before it rejects with `kind: "stream-busy"`. Such a statement
+   * may be the consumer's own, which could never run. Other statements wait as long
+   * as the consumer keeps reading. 0 refuses them at once while the stream holds
+   * the connection. This limit cannot be disabled. Default: 5000.
+   */
+  consumerTimeout?: number;
+}
+
+/**
+ * Runs a statement and reads its rows one at a time, without holding the whole
+ * result in memory. See the `stream()` method of `CubridClient`.
+ */
+export interface Streamable {
+  stream<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+    options?: StreamOptions,
+  ): AsyncIterable<T>;
 }
 
 /**
@@ -274,6 +324,15 @@ export interface ConnectionLike {
    * transaction fails, because running without the setting would hide that.
    */
   setTransactionOptions?(options: TransactionOptions): Promise<void>;
+  /**
+   * Optional so 1.x connection factories keep compiling. `stream()` on a client
+   * fails on its first read when its connection does not provide it.
+   */
+  stream?<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+    options?: StreamOptions,
+  ): AsyncIterable<T>;
   ping?(): Promise<string>;
 }
 
