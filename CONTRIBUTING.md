@@ -20,9 +20,10 @@ and instructions for contributing to the project.
 
 ### Prerequisites
 
-- Node.js 18 or later
-- Git
-- Docker (for integration tests)
+- Node.js 22 recommended for local development tooling; the published library continues to declare Node.js >=18 for **consumers**
+- Git and npm
+- A separately provisioned disposable CUBRID broker only for actual database integration tests (no root Docker Compose file is included)
+- Setup and known limitations: [Development setup](docs/DEVELOPMENT_SETUP.md)
 
 ### Installation
 
@@ -31,8 +32,8 @@ and instructions for contributing to the project.
 git clone https://github.com/cubrid-lab/cubrid-client.git
 cd cubrid-client
 
-# Install dependencies
-npm install
+# Install locked dependencies reproducibly
+npm ci
 
 # Build
 npm run build
@@ -166,24 +167,16 @@ check that the diff is cosmetic.
 
 ## Code Style
 
-This project uses [Biome](https://biomejs.dev/) for linting and formatting.
-
-### Rules
-
-- **Indent**: Tabs
-- **Line width**: 100 characters
-- **Quote style**: Double quotes
-- **Semicolons**: Always
-
-### Running Checks
+This repository's committed `.editorconfig` specifies 2-space indentation, UTF-8 and LF line endings. `package.json` currently **does not include Biome or an ESLint lint script**; do not run an unpinned `npx biome` installation or claim lint verification. Keep style changes scoped and use the existing build/typecheck/test/API checks until a formatter/linter is explicitly selected in a separate reviewed tooling change.
 
 ```bash
-# Check lint and format
-npx biome check src/ tests/
-
-# Auto-fix
-npx biome check --write src/ tests/
+npm run typecheck
+npm test
+npm run build
+npm run api:check
 ```
+
+See [Development setup](docs/DEVELOPMENT_SETUP.md) for the reproducible baseline and separate live CUBRID tests.
 
 ---
 
@@ -220,10 +213,7 @@ scrutiny. No existing repository CI or release safeguards are waived.
    `npm run build && npm run api:check` (see
    [Public API compatibility](#public-api-compatibility)).
 
-4. **Run lint checks**:
-   ```bash
-   npx biome check src/ tests/
-   ```
+4. **Review formatting and tooling** against `.editorconfig`, and report real validation commands from `package.json`. The repository has no configured Biome command today; do not claim a lint pass from an uninstalled tool.
 
 ### PR Content
 
