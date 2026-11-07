@@ -105,6 +105,8 @@ The `stream-busy` limit is part of the contract. A statement waits as long as th
 consumer keeps reading, and a consumer that stops cannot make a statement wait for
 ever: `consumerTimeout` can be raised but not disabled.
 
+For the complete 1.x line, Node.js 18 and 20 are retained even though they are upstream EOL. [ADR 0006](adr/0006-node-18-support-through-1x.md) records the explicit Node 18 release commitment and independent Node 18 **packed-package** test requirement. A higher Node minimum is reserved for a possible, separately reviewed 2.0 MAJOR, not a 1.x development-tooling update.
+
 ## Node.js, TypeScript and distribution
 
 - **Current runtime declaration:** `engines.node >=18` in
