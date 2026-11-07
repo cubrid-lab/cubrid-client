@@ -48,8 +48,7 @@ of a sentence or putting the citation on a continuation line.
 Check the **published GitHub Release page**, not only the Markdown file,
 after updating an existing release. The
 [`sync-historical-release-notes.yml`](../.github/workflows/sync-historical-release-notes.yml)
-workflow resynchronizes the corrected existing v1.0.0, v1.1.0 and v1.2.0
-descriptions without changing tags or packages.
+workflow synchronizes every existing published GitHub Release from its reviewed `docs/releases/vX.Y.Z.md` source, without changing tags or npm packages. The v0.2.0 tag exists but has no historical GitHub Release page: its curated source note is retained and synchronization skips creation of a new Release.
 
 ## Automated publication and recovery
 
@@ -167,14 +166,11 @@ Unreleased entries** to CHANGELOG because Release Please will also generate
 entries from merged Conventional Commit titles. Review the generated release
 PR against actual commits, rather than an anticipated issue milestone.
 
-**Use concise, contributor-credited GitHub Release notes.** Starting with v1.3.0, write `## vX.Y.Z (YYYY-MM-DD)`, optional `### Upgrade notes`, `### Features`, `### Bug Fixes` and other nonempty change sections, and end with `**Full Changelog:** vPREVIOUS...vCURRENT`. Each change or closely related group ends with `by @username`, using the actual PR author or verified human co-author (not a bot). Welcome a first-time contributor inline as `by @username (first contribution 🎉)` instead of adding a separate contributors section. Each change should appear once, not in both a Highlights list and a generated commit list.
+**Use concise, contributor-credited GitHub Release notes.** For all tagged versions, write `## vX.Y.Z (YYYY-MM-DD)`, optional `### Upgrade notes`, `### Features`, `### Bug Fixes` and other nonempty change sections, and end with `**Full Changelog:** vPREVIOUS...vCURRENT`. Each change or closely related group ends with `by @username`, using the verified PR author or tagged commit author (a bot receives plain attribution only, never a first-contribution celebration). Welcome a first-time contributor inline as `by @username (first contribution 🎉)` instead of adding a separate contributors section. Each change should appear once, not in both a Highlights list and a generated commit list.
 
-Use one Markdown source line per change and do not insert hard wraps. Decorative emoji are disallowed in curated release notes and generated CHANGELOG content, except for the exact inline first-contribution celebration. The validation script enforces section order, attribution and duplicate PR references for v1.3.0 and later; earlier published notes retain their historical structure. GitHub Release descriptions are synced from reviewed source notes without rewriting immutable tags or republishing npm artifacts.
+Use one Markdown source line per change and do not insert hard wraps. Decorative emoji are disallowed in curated release notes and generated CHANGELOG content, except for the exact inline first-contribution celebration. The validation script enforces section order, attribution and duplicate PR references for all versioned source notes, including historical releases. GitHub Release descriptions are synced from reviewed source notes without rewriting immutable tags or republishing npm artifacts.
 
-The v1.0.0 and v1.1.0 published release descriptions contained either emoji,
-unverified coverage language, or changes not present in their tags. Their
-corrected, emoji-free archived notes live in `docs/releases/v1.0.0.md` and
-`docs/releases/v1.1.0.md`. Updating these files does not modify tag commits.
+The historical v0.1.0, v0.2.0, v1.0.0, v1.1.0 and v1.2.0 notes are curated against immutable tag contents and the actual contributor/PR history. v0.1.0 credits the author of PR #1 as `@Copilot` without declaring a bot to be a first-time human contributor. The tagged v0.2.0 has no corresponding GitHub Release page; retaining a source note is not authorization to create one. Updating these files does not modify tag commits or npm artifacts.
 The separate historical-release synchronization workflow updates the existing
 GitHub Release descriptions and titles after a reviewed merge to `main`.
 Verify the resulting GitHub Release pages; do not infer success from a
