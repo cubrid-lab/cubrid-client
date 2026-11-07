@@ -102,7 +102,9 @@ interface ClientConfig {
     user: string;
     password: string;
     connectionTimeout?: number | undefined;
+    /** See {@link ClientOptions.readTimeout}. */
     readTimeout?: number | undefined;
+    /** See {@link ClientOptions.maxLobBytes}. */
     maxLobBytes?: number | undefined;
     maxConnectionRetryCount?: number | undefined;
     ssl?: boolean | ClientSSLOptions | undefined;
@@ -115,10 +117,31 @@ interface ClientOptions {
     user: string;
     password?: string;
     connectionTimeout?: number;
+    /**
+     * Discard the connection and reject with `ReadTimeoutError` when the server
+     * sends nothing for this many milliseconds while a response is awaited. This
+     * limits inactivity, not total query time, so it must exceed the longest time
+     * the server may spend executing a statement before its first response byte.
+     * Undefined or 0 means no timeout.
+     */
     readTimeout?: number;
+    /**
+     * Largest total of BLOB and CLOB content, in bytes, that one query may load.
+     * `query()` returns BLOB columns as `Buffer` and CLOB columns as `string`, all
+     * in memory, so this bounds what a row of large objects can cost. A query over
+     * the limit rejects with a `QueryError` before any content is read, and the
+     * connection stays usable. Must be a positive integer. Default: 64 MiB.
+     */
     maxLobBytes?: number;
     maxConnectionRetryCount?: number;
     ssl?: boolean | ClientSSLOptions;
+    /**
+     * Receives redacted diagnostics: `info` when a connection is created,
+     * `debug` for each successful operation and `error` for each failed one (see
+     * {@link ClientLogFields}). Use a {@link ClientLogger}, `console` or any
+     * object with those methods; other values are ignored. A logger that throws
+     * never affects a request. Declared `unknown` so 1.x code keeps compiling.
+     */
     logger?: unknown;
     connectionFactory?: ConnectionFactory;
 }
@@ -191,10 +214,71 @@ interface ConnectionLike {
 }
 type ConnectionFactory = (config: ClientConfig) => ConnectionLike | Promise<ConnectionLike>;
 
+/** Selects the owner (CUBRID calls it the schema) of the table to inspect. */
+interface SchemaOptions {
+    /**
+     * Owner of the table, for example `DBA`, matched without regard to case. It
+     * is needed only when several visible users own a table with the same name,
+     * which CUBRID 11.2 and later allow. When omitted and the name is ambiguous,
+     * the call rejects with a `QueryError` that lists the owners.
+     */
+    schema?: string;
+}
+/** A table or view returned by `getTables()`. */
+interface SchemaTable {
+    /** The table name as the catalog stores it: CUBRID folds identifiers to lower case. */
+    name: string;
+    /** The owner of the table, as the catalog stores it, for example `DBA`. */
+    schema: string;
+    type: "table" | "view";
+}
+/** A column returned by `getColumns()`. */
+interface SchemaColumn {
+    name: string;
+    /** 1-based position in the table. */
+    position: number;
+    /** The catalog's type name, for example `INTEGER`, `STRING` (VARCHAR) or `NUMERIC`. */
+    dataType: string;
+    /** The catalog's precision: the length of a string or the digits of a `NUMERIC`. */
+    precision: number;
+    scale: number;
+    nullable: boolean;
+    /** The default as the catalog's text, for example `zz` or `SYS_DATETIME`; `null` when none. */
+    defaultValue: string | null;
+}
+/** A primary key returned by `getPrimaryKey()`. */
+interface SchemaPrimaryKey {
+    name: string;
+    /** Column names in key order. */
+    columns: string[];
+}
+/** One key column of an index. */
+interface SchemaIndexColumn {
+    /** `null` for an expression of a function-based index; see `expression`. */
+    name: string | null;
+    /** The expression text of a function-based index key. */
+    expression?: string;
+    order: "asc" | "desc";
+    /** The prefix length of a prefix index such as `c(5)`. */
+    prefixLength?: number;
+}
+/** An index returned by `getIndexes()`. Primary and foreign keys are indexes too. */
+interface SchemaIndex {
+    name: string;
+    unique: boolean;
+    reverse: boolean;
+    primaryKey: boolean;
+    foreignKey: boolean;
+    /** The condition of a filtered index; `null` when the index covers every row. */
+    filter: string | null;
+    columns: SchemaIndexColumn[];
+}
+
 declare class CubridClient implements Queryable, ResultQueryable, Executable {
     private readonly config;
     private readonly connectionFactory;
     private sharedConnectionPromise;
+    private closed;
     constructor(config: ClientConfig, connectionFactory: ConnectionFactory);
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
     queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
@@ -211,6 +295,18 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable {
      * reconnect behavior; only the failure message differs.
      */
     getServerVersion(): Promise<string>;
+    /**
+     * List the user tables and views the connected user may SELECT from, ordered
+     * by owner and name. See {@link SchemaOptions} to list one owner only.
+     */
+    getTables(options?: SchemaOptions): Promise<SchemaTable[]>;
+    /** List the columns of a table or view in table order. */
+    getColumns(table: string, options?: SchemaOptions): Promise<SchemaColumn[]>;
+    /** Return the primary key of a table, or `null` when it has none. */
+    getPrimaryKey(table: string, options?: SchemaOptions): Promise<SchemaPrimaryKey | null>;
+    /** List the indexes of a table, including its primary and foreign keys. */
+    getIndexes(table: string, options?: SchemaOptions): Promise<SchemaIndex[]>;
+    private readonly schemaQuery;
     private getSharedConnection;
 }
 
@@ -306,6 +402,14 @@ declare class LockTimeoutError extends QueryError {
     name: string;
 }
 
+/**
+ * The server sent nothing for `timeoutMs` milliseconds while a response was
+ * awaited. The connection has been discarded, so a late response can never be
+ * mistaken for the next operation's. The request's outcome on the server is
+ * unknown: it may still have run, and a COMMIT may have succeeded.
+ * Applications must verify the outcome; a timed-out COMMIT is never retried
+ * automatically by the driver.
+ */
 declare class ReadTimeoutError extends ConnectionError {
     readonly timeoutMs: number;
     name: string;
@@ -334,23 +438,122 @@ declare class NativeCubridAdapter implements DriverAdapter {
     private cas;
     private autoCommit;
     /**
-     * Server backslash-escaping mode, negotiated once per physical connection via
+     * Server backslash-escaping mode, negotiated once per physical session via
      * `SELECT CHAR_LENGTH('\\')`. `null` until negotiated. `true` means the CUBRID
      * default `no_backslash_escapes=yes` (backslash is a literal char); `false`
      * means backslash-escape processing is active. See `negotiateBackslashEscapes`.
      */
     private noBackslashEscapes;
+    /** Session (`connectionGeneration`) that `noBackslashEscapes` was measured on. */
+    private backslashModeGeneration;
+    /**
+     * Session that holds the open transaction's statements. Set by the first
+     * statement rather than by beginTransaction(): a released CAS legitimately
+     * reconnects on that first statement, before there is any work to lose.
+     */
+    private transactionGeneration;
+    /**
+     * The reply that said the server rolled back the open transaction on its own.
+     * The session is still healthy, but its next statement would start a new
+     * server transaction, and a commit would persist that statement alone. So
+     * until the caller acknowledges it, this counts as a lost transaction.
+     */
+    private transactionAbort;
+    /**
+     * The server's last generated AUTO_INCREMENT value as this adapter last saw it
+     * inside the open transaction: `undefined` for none, `null` when a query()
+     * INSERT may have changed it unseen. See readExecuteResult().
+     */
+    private insertIdBaseline;
+    /**
+     * Tail of the statement queue; see inTurn(). It never rejects, so one failed
+     * statement cannot block the ones behind it.
+     */
+    private statementQueue;
     constructor(config: ClientConfig);
     connect(): Promise<void>;
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
     queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
     execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+    private executeNow;
+    private queryNow;
     beginTransaction(): Promise<void>;
+    private beginTransactionNow;
     commit(): Promise<void>;
+    private commitNow;
     rollback(): Promise<void>;
+    private rollbackNow;
     close(): Promise<void>;
+    private closeNow;
     ping(): Promise<string>;
+    private pingNow;
+    /**
+     * Run `statement` after every statement issued before it has settled.
+     *
+     * One query is several CAS requests (execute, FETCHes, handle release), and
+     * CASConnection only keeps those frames apart. A statement that ran between
+     * them would be unsafe: on CUBRID 10.2 to 11.4 the end of a transaction closes
+     * every other cursor on the session, and in autocommit mode that end comes
+     * with DML, an error, a ping or another query's last row. The CAS_INFO status
+     * of that reply then sends the next FETCH to a new session, where the same
+     * handle number can be another query's result. So at most one query
+     * lifecycle is live at a time. Autocommit could not do better; an open
+     * transaction could, but its commit and rollback would still have to wait.
+     *
+     * Nothing runs here but this adapter's own statements, so a statement can
+     * never wait on its own turn. Waiting does not count towards readTimeout.
+     */
+    private inTurn;
     private executeQuery;
+    /**
+     * Counts a statement's affected rows and, after an INSERT, asks for the
+     * session's last generated AUTO_INCREMENT value. See ExecuteResult.
+     */
+    private readExecuteResult;
+    /**
+     * Sends one statement and hands its decoded reply to `use` while the handle
+     * is open.
+     *
+     * `commitAfter` runs an autocommit statement as a transaction that ends only
+     * after `use`: the server forgets the generated AUTO_INCREMENT value when it
+     * commits, so a statement sent with the autocommit flag could never be asked
+     * for it (verified on CUBRID 10.2, 11.0, 11.2 and 11.4). The statement is
+     * then committed with END_TRAN, or rolled back if anything failed.
+     */
+    private runStatement;
+    /** Ends the transaction of a statement run by runStatement(commitAfter), on its own session. */
+    private endStatementTransaction;
+    /** Sends GET_LAST_INSERT_ID and returns the session's value, or undefined if it has none. */
+    private fetchLastInsertId;
+    /**
+     * After a query() INSERT inside a transaction the baseline is unknown, so read
+     * the server's value before the next execute() statement to have one.
+     */
+    private readInsertIdBaseline;
+    /**
+     * Run `use`, then release the query handle held by `response` however `use`
+     * ended. The handle is read first because decoding the response can fail
+     * after the server has already allocated it. A discarded session has no
+     * handle left to release, and closeQueryHandle() sends nothing on it.
+     */
+    private withQueryHandle;
+    /** True when an open transaction's session is gone, or the server rolled it back. */
+    private isTransactionSessionLost;
+    /** Nothing was lost if this adapter never held a transaction on a session. */
+    private notConnectedError;
+    private assertTransactionSession;
+    /**
+     * Called after a statement ran. If the session changed underneath it, that
+     * statement is open on the new session, so drop the session rather than
+     * let a later autocommit query persist work reported here as failed.
+     */
+    private bindTransactionSession;
+    /** Retain a failed first statement's session so reconnection cannot hide it. */
+    private bindSessionLostByFirstStatement;
+    private recordTransactionAbort;
+    private endTransaction;
+    /** The server discarded the work, so there is nothing left to end. */
+    private endTransactionIfSessionLost;
     private getOrCreateCAS;
     /**
      * Translate the public `ssl` option (boolean | ClientSSLOptions) into the flat
@@ -360,7 +563,7 @@ declare class NativeCubridAdapter implements DriverAdapter {
     private resolveSslConfig;
     /**
      * Return the negotiated backslash-escaping mode for the current connection,
-     * running the one-time probe on first use.
+     * probing again whenever the session has changed since it was measured.
      */
     private ensureBackslashMode;
     /**
@@ -377,6 +580,33 @@ declare class NativeCubridAdapter implements DriverAdapter {
      */
     private negotiateBackslashEscapes;
     private fetchRemaining;
+    /**
+     * Replace every LOB locator in `rows` with its content: a Buffer for a BLOB and
+     * a string for a CLOB. A row never leaves the driver holding a locator.
+     *
+     * This runs inside the query's own turn because a locator cannot be kept: on
+     * CUBRID 10.2 to 11.4 a later commit of a DELETE or UPDATE, or a rollback,
+     * deletes the file it names, and there is no request that holds it or releases
+     * it. The session is pinned for the same reason a query handle's release is:
+     * sendAndRecv() would open a new session after an autocommit reply.
+     *
+     * The sizes are checked before the first read, so a result over the limit
+     * costs no LOB transfer and no memory.
+     */
+    private loadLobs;
+    private readLob;
+    /**
+     * LOB_READ opens a transaction on the server, so an autocommit session is left
+     * with one after its statement finished, and CAS_INFO stops reporting it as
+     * releasable: an idle client would keep its CAS. Nothing was changed, so this
+     * only ends that. Inside a caller's transaction there is nothing to do.
+     */
+    private endLobReadTransaction;
+    /**
+     * Best-effort release on the session that created the handle, so a cleanup
+     * failure cannot replace the caller's own error. If that session is gone the
+     * server has dropped the handle with it and nothing is sent.
+     */
     private closeQueryHandle;
 }
 
@@ -395,4 +625,4 @@ declare function buildWhere(conditions: Record<string, unknown>): {
     params: unknown[];
 };
 
-export { type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteResult, LockTimeoutError, NativeCubridAdapter, QueryError, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, SqlSyntaxError, type TransactionCallback, type TransactionClient, TransactionError, buildWhere, createClient, escapeIdentifier, parseConnectionString };
+export { type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteResult, LockTimeoutError, NativeCubridAdapter, QueryError, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type TransactionCallback, type TransactionClient, TransactionError, buildWhere, createClient, escapeIdentifier, parseConnectionString };

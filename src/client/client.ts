@@ -1,3 +1,4 @@
+import * as schema from "./schema.js";
 import { CubridTransaction } from "./transaction.js";
 import { mapError } from "../internals/map-error.js";
 import type {
@@ -14,6 +15,13 @@ import type {
 } from "../types/client.js";
 import type { QueryParams } from "../types/query.js";
 import type { QueryResult, QueryResultRow } from "../types/result.js";
+import type {
+  SchemaColumn,
+  SchemaIndex,
+  SchemaOptions,
+  SchemaPrimaryKey,
+  SchemaTable,
+} from "../types/schema.js";
 
 export class CubridClient implements Queryable, ResultQueryable, Executable {
   private sharedConnectionPromise: Promise<ConnectionLike> | undefined;
@@ -159,6 +167,31 @@ export class CubridClient implements Queryable, ResultQueryable, Executable {
       throw mapError("connection", error, "Failed to get the server version.");
     }
   }
+
+  /**
+   * List the user tables and views the connected user may SELECT from, ordered
+   * by owner and name. See {@link SchemaOptions} to list one owner only.
+   */
+  getTables(options?: SchemaOptions): Promise<SchemaTable[]> {
+    return schema.getTables(this.schemaQuery, options);
+  }
+
+  /** List the columns of a table or view in table order. */
+  getColumns(table: string, options?: SchemaOptions): Promise<SchemaColumn[]> {
+    return schema.getColumns(this.schemaQuery, table, options);
+  }
+
+  /** Return the primary key of a table, or `null` when it has none. */
+  getPrimaryKey(table: string, options?: SchemaOptions): Promise<SchemaPrimaryKey | null> {
+    return schema.getPrimaryKey(this.schemaQuery, table, options);
+  }
+
+  /** List the indexes of a table, including its primary and foreign keys. */
+  getIndexes(table: string, options?: SchemaOptions): Promise<SchemaIndex[]> {
+    return schema.getIndexes(this.schemaQuery, table, options);
+  }
+
+  private readonly schemaQuery: schema.SchemaQuery = (sql, params) => this.query(sql, params);
 
   private getSharedConnection(): Promise<ConnectionLike> {
     if (this.closed) {

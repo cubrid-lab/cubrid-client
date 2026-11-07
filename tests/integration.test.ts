@@ -2085,6 +2085,284 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
   // execute(): affected rows and last insert ID
   // -------------------------------------------------------------------------
 
+  describe("schema introspection", () => {
+    const PARENT = "cc_sch_parent";
+    const CHILD = "cc_sch_child";
+    const VIEW = "cc_sch_view";
+    const ODD = "cc_sch Odd Table";
+    const DUP = "cc_sch_dup";
+    const USER_A = "cc_sch_ua";
+    const USER_B = "cc_sch_ub";
+
+    async function serverAtLeast(client: ReturnType<typeof createClient>, major: number, minor: number) {
+      const [maj, min] = (await client.getServerVersion()).split(".").map(Number);
+      return maj! > major || (maj === major && min! >= minor);
+    }
+
+    async function cleanup(client: ReturnType<typeof createClient>) {
+      const owners = await serverAtLeast(client, 11, 2);
+      for (const sql of [
+        `DROP VIEW IF EXISTS ${VIEW}`,
+        `DROP TABLE IF EXISTS ${CHILD}`,
+        `DROP TABLE IF EXISTS ${PARENT}`,
+        `DROP TABLE IF EXISTS "${ODD}"`,
+        // Only 11.2 and later keep one table per owner; older servers own it by DBA.
+        ...(owners
+          ? [`DROP TABLE IF EXISTS ${USER_A}.${DUP}`, `DROP TABLE IF EXISTS ${USER_B}.${DUP}`]
+          : [`DROP TABLE IF EXISTS ${DUP}`]),
+      ]) {
+        await client.query(sql);
+      }
+      for (const user of [USER_A, USER_B]) {
+        const exists = await client.query("SELECT name FROM db_user WHERE name = ?", [user.toUpperCase()]);
+        if (exists.length > 0) {
+          await client.query(`DROP USER ${user}`);
+        }
+      }
+    }
+
+    test("create the fixtures", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        await cleanup(client);
+        await client.query(`CREATE USER ${USER_A}`);
+        await client.query(`CREATE USER ${USER_B}`);
+        await client.query(
+          `CREATE TABLE ${PARENT} (a INT, b INT, c VARCHAR(10) NOT NULL DEFAULT 'zz', ` +
+            `n NUMERIC(8,3), d DATETIME DEFAULT SYS_DATETIME, s SET(INT), p VARCHAR(30), ` +
+            `CONSTRAINT pk_cc_sch_parent PRIMARY KEY (b, a))`,
+        );
+        await client.query(`CREATE UNIQUE INDEX u_cc_sch_c ON ${PARENT} (c)`);
+        await client.query(`CREATE INDEX i_cc_sch_ab ON ${PARENT} (a DESC, b)`);
+        await client.query(`CREATE REVERSE INDEX r_cc_sch_n ON ${PARENT} (n)`);
+        await client.query(`CREATE INDEX i_cc_sch_prefix ON ${PARENT} (p(5))`);
+        await client.query(`CREATE INDEX i_cc_sch_lower ON ${PARENT} (LOWER(c))`);
+        await client.query(`CREATE INDEX i_cc_sch_filter ON ${PARENT} (d) WHERE d IS NOT NULL`);
+        await client.query(
+          `CREATE TABLE ${CHILD} (id INT PRIMARY KEY, pa INT, pb INT, ` +
+            `FOREIGN KEY fk_cc_sch_child (pb, pa) REFERENCES ${PARENT} (b, a))`,
+        );
+        await client.query(`CREATE VIEW ${VIEW} AS SELECT a FROM ${PARENT}`);
+        await client.query(`CREATE TABLE "${ODD}" ("Odd Col" INT PRIMARY KEY)`);
+        await client.query(`GRANT SELECT ON ${PARENT} TO ${USER_A}`);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("getTables lists user tables and views with their owner, and no system classes", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        const tables = await client.getTables();
+        const byName = new Map(tables.map((table) => [table.name, table]));
+        assert.deepEqual(byName.get(PARENT), { name: PARENT, schema: "DBA", type: "table" });
+        assert.deepEqual(byName.get(VIEW), { name: VIEW, schema: "DBA", type: "view" });
+        assert.equal(byName.get(ODD.toLowerCase())?.type, "table");
+        assert.equal(byName.has("db_class"), false);
+        assert.equal(byName.has("_db_class"), false);
+        assert.deepEqual(await client.getTables({ schema: "nobody_owns_this" }), []);
+        assert.ok((await client.getTables({ schema: "dba" })).some((table) => table.name === PARENT));
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("getColumns reports position, type, precision, scale, nullability and default", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        const columns = await client.getColumns(PARENT);
+        assert.deepEqual(
+          columns.map((column) => [column.name, column.position, column.dataType, column.nullable]),
+          [
+            ["a", 1, "INTEGER", false],
+            ["b", 2, "INTEGER", false],
+            ["c", 3, "STRING", false],
+            ["n", 4, "NUMERIC", true],
+            ["d", 5, "DATETIME", true],
+            ["s", 6, "SET", true],
+            ["p", 7, "STRING", true],
+          ],
+        );
+        assert.deepEqual(columns[2], {
+          name: "c",
+          position: 3,
+          dataType: "STRING",
+          precision: 10,
+          scale: 0,
+          nullable: false,
+          defaultValue: "zz",
+        });
+        assert.equal(columns[3]?.precision, 8);
+        assert.equal(columns[3]?.scale, 3);
+        assert.equal(columns[0]?.defaultValue, null);
+        assert.equal(columns[4]?.defaultValue, "SYS_DATETIME");
+        assert.deepEqual((await client.getColumns(VIEW)).map((column) => column.name), ["a"]);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("table names match without regard to case, and a quoted name is given bare", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        assert.equal((await client.getColumns(PARENT.toUpperCase())).length, 7);
+        assert.equal((await client.getColumns(PARENT, { schema: "Dba" })).length, 7);
+        // CREATE TABLE "cc_sch Odd Table" stores the name and its column in lower case.
+        assert.deepEqual((await client.getColumns(ODD)).map((column) => column.name), ["odd col"]);
+        assert.deepEqual(await client.getPrimaryKey(ODD), {
+          name: (await client.getPrimaryKey(ODD))?.name,
+          columns: ["odd col"],
+        });
+        // Quotes are not part of the name, so they find nothing.
+        await assert.rejects(() => client.getColumns(`"${ODD}"`), QueryError);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("getPrimaryKey returns the key columns in key order, or null", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        assert.deepEqual(await client.getPrimaryKey(PARENT), {
+          name: "pk_cc_sch_parent",
+          columns: ["b", "a"],
+        });
+        await client.query("CREATE TABLE cc_sch_nopk (x INT)");
+        try {
+          assert.equal(await client.getPrimaryKey("cc_sch_nopk"), null);
+        } finally {
+          await client.query("DROP TABLE cc_sch_nopk");
+        }
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("getIndexes reports uniqueness, order, prefix, expression, filter and keys", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        const indexes = new Map(
+          (await client.getIndexes(PARENT)).map((index) => [index.name, index]),
+        );
+        assert.deepEqual(indexes.get("pk_cc_sch_parent"), {
+          name: "pk_cc_sch_parent",
+          unique: true,
+          reverse: false,
+          primaryKey: true,
+          foreignKey: false,
+          filter: null,
+          columns: [
+            { name: "b", order: "asc" },
+            { name: "a", order: "asc" },
+          ],
+        });
+        assert.equal(indexes.get("u_cc_sch_c")?.unique, true);
+        assert.deepEqual(indexes.get("i_cc_sch_ab")?.columns, [
+          { name: "a", order: "desc" },
+          { name: "b", order: "asc" },
+        ]);
+        assert.equal(indexes.get("r_cc_sch_n")?.reverse, true);
+        assert.deepEqual(indexes.get("i_cc_sch_prefix")?.columns, [
+          { name: "p", order: "asc", prefixLength: 5 },
+        ]);
+        const fn = indexes.get("i_cc_sch_lower")?.columns[0];
+        assert.equal(fn?.name, null);
+        assert.match(fn?.expression ?? "", /lower/i);
+        assert.match(indexes.get("i_cc_sch_filter")?.filter ?? "", /is not null/i);
+
+        const fk = (await client.getIndexes(CHILD)).find((index) => index.foreignKey);
+        assert.deepEqual(fk?.columns.map((column) => column.name), ["pb", "pa"]);
+        assert.equal(fk?.primaryKey, false);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("a table name is bound, never run as SQL, and an unknown table is a QueryError", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        for (const hostile of [`${PARENT}' OR '1'='1`, `x'; DROP TABLE ${PARENT}; --`, "%", "cc_sch_missing"]) {
+          await assert.rejects(() => client.getColumns(hostile), QueryError);
+          await assert.rejects(() => client.getIndexes(hostile), QueryError);
+          await assert.rejects(() => client.getPrimaryKey(hostile), QueryError);
+        }
+        await assert.rejects(() => client.getColumns(PARENT, { schema: "nobody_owns_this" }), QueryError);
+        assert.equal((await client.getColumns(PARENT)).length, 7);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("a user sees only the tables it may SELECT, and the rest look absent", async () => {
+      const granted = createClient({ ...TEST_CONFIG, user: USER_A });
+      const denied = createClient({ ...TEST_CONFIG, user: USER_B });
+
+      try {
+        assert.equal((await granted.getColumns(PARENT)).length, 7);
+        assert.deepEqual(
+          (await granted.getTables()).map((table) => table.name),
+          [PARENT],
+        );
+        await assert.rejects(() => granted.getColumns(CHILD), /was not found, or the connected user may not SELECT/);
+        assert.deepEqual(await denied.getTables(), []);
+        await assert.rejects(() => denied.getIndexes(PARENT), QueryError);
+      } finally {
+        await granted.close();
+        await denied.close();
+      }
+    });
+
+    test("several owners of one table name need a schema (CUBRID 11.2 and later)", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        await client.query(`CREATE TABLE ${USER_A}.${DUP} (a_only INT PRIMARY KEY)`);
+
+        if (!(await serverAtLeast(client, 11, 2))) {
+          // Older servers keep one table per name and own it by the creator, DBA.
+          const found = (await client.getTables()).filter((table) => table.name === DUP);
+          assert.deepEqual(found, [{ name: DUP, schema: "DBA", type: "table" }]);
+          assert.deepEqual((await client.getColumns(DUP, { schema: "dba" })).map((c) => c.name), ["a_only"]);
+          return;
+        }
+
+        await client.query(`CREATE TABLE ${USER_B}.${DUP} (b_only INT, b_two INT)`);
+        assert.deepEqual(
+          (await client.getTables()).filter((table) => table.name === DUP).map((table) => table.schema),
+          [USER_A.toUpperCase(), USER_B.toUpperCase()],
+        );
+        await assert.rejects(() => client.getColumns(DUP), /owned by several users \(CC_SCH_UA, CC_SCH_UB\)/);
+        assert.deepEqual((await client.getColumns(DUP, { schema: USER_A })).map((c) => c.name), ["a_only"]);
+        assert.deepEqual(
+          (await client.getColumns(DUP, { schema: USER_B })).map((c) => c.name),
+          ["b_only", "b_two"],
+        );
+        assert.equal((await client.getPrimaryKey(DUP, { schema: USER_A }))?.columns[0], "a_only");
+        assert.equal(await client.getPrimaryKey(DUP, { schema: USER_B }), null);
+        assert.equal((await client.getIndexes(DUP, { schema: USER_B })).length, 0);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("drop the fixtures", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        await cleanup(client);
+      } finally {
+        await client.close();
+      }
+    });
+  });
+
   describe("execute results", () => {
     const AUTO = "cc_exec_auto";
     const PLAIN = "cc_exec_plain";
