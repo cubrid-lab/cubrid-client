@@ -11,7 +11,16 @@ broker qualify as live CI coverage.
 | 18 | `engines.node >=18` | Included | Not established |
 | 20 | Included by >=18 | Included | Not established |
 | 22 | Included by >=18 | Included, plus declaration API check | Not established |
-| Newer versions | Included by >=18 | Not claimed as matrix coverage | Not established |
+| 24 | Included by >=18 | Included | Not established |
+| 26 | Included by >=18 | Included | Not established |
+| Other newer versions | Included by >=18 | Not claimed as matrix coverage | Not established |
+
+Node.js 18 and 20 have reached end-of-life upstream but remain in the
+declared 1.x contract; see the
+[Node.js support schedule](API_STABILITY.md#nodejs-support-schedule). The
+`@types/node` development dependency stays on `^18.19.0` to match the lowest
+declared version. The packed-package consumer smoke
+(`release-validation.yml`) still runs on Node 18/20/22 only.
 
 The `tsup` build-tool Node.js requirement is **not** the runtime floor for
 users importing the emitted npm package. A change to `engines` in 1.x is

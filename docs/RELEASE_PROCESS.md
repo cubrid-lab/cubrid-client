@@ -117,7 +117,7 @@ must follow verified evidence, and limitations (#81/#82/#110/#116) must be
 disclosed. v1.2.0 is a scoped remediation release (#106) until full gates exist.
 
 The closed PR #67 (tsup v9) requires Node >=22.18 for the **build tool**, while runtime
-Node support and current CI Node 18/20/22 are separate decisions. Review it
+Node support and current CI Node 18/20/22/24/26 are separate decisions. Review it
 independently.
 
 ## Release-note ownership and style
