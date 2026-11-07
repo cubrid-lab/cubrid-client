@@ -164,7 +164,7 @@ What this means for an application:
 - **Promises settle independently.** A failed statement rejects only its own promise. The statements around it still run.
 - **Concurrency does not make one connection faster.** Statements wait for each other, so a slow query delays the ones behind it. Waiting does not count towards `readTimeout`. For queries that must run in parallel, use several clients.
 - **`commit()`, `rollback()` and `close()` wait for the statements issued before them**, and apply only to those. A statement issued after `rollback()` runs outside that transaction.
-- **A lost connection fails the waiting queries too.** Queries that were waiting when the connection failed reject without being sent. They are never retried, and the first query issued afterwards opens a new session.
+- **A lost connection fails the waiting queries too.** Queries that were waiting when a request failed on the connection reject without being sent, including those issued before a new client finished connecting. They are never retried, and the first query issued afterwards opens a new session. A failed connection attempt sends nothing, so a waiting query still makes its own attempt.
 
 ### Transaction Connection
 

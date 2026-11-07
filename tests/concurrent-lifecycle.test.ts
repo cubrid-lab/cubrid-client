@@ -21,6 +21,7 @@ import assert from "node:assert/strict";
 import { createServer, type Server, type Socket as NetSocket } from "node:net";
 
 import { createClient } from "../src/client/create-client.js";
+import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { CASFunctionCode, EndTranType } from "../src/protocol/constants.js";
 
 const CAS_ER_NO_MORE_DATA = -1012;
@@ -142,6 +143,10 @@ class FakeCas {
   failFetchOf: string | null = null;
   /** Drop the socket at the first FETCH of this owner. */
   dropAtFetchOf: string | null = null;
+  /** Leave the execute of this owner unanswered. */
+  stallAtExecuteOf: string | null = null;
+  /** Close this many incoming connections before their handshake. */
+  refuseConnections = 0;
 
   private server!: Server;
   private sessionCount = 0;
@@ -165,6 +170,12 @@ class FakeCas {
   }
 
   private accept(socket: NetSocket): void {
+    if (this.refuseConnections > 0) {
+      this.refuseConnections -= 1;
+      socket.destroy();
+      return;
+    }
+
     this.sessionCount += 1;
     this.sockets.add(socket);
     const session: Session = {
@@ -281,6 +292,11 @@ class FakeCas {
     });
     session.inTransaction = true;
 
+    if (owner !== undefined && owner === this.stallAtExecuteOf) {
+      this.stallAtExecuteOf = null;
+      return;
+    }
+
     if (sql.startsWith("FAIL")) {
       if (autocommit) {
         this.endTransaction(session);
@@ -365,6 +381,7 @@ class FakeCas {
 
 async function withClient(
   run: (client: ReturnType<typeof createClient>, cas: FakeCas) => Promise<void>,
+  readTimeout = 2000,
 ): Promise<void> {
   const cas = new FakeCas();
   const port = await cas.start();
@@ -373,7 +390,7 @@ async function withClient(
     port,
     database: "testdb",
     user: "dba",
-    readTimeout: 2000,
+    readTimeout,
   });
 
   try {
@@ -532,6 +549,73 @@ test("a lost socket rejects the queries waiting on it without sending them anywh
     const executions = cas.of(CASFunctionCode.PREPARE_AND_EXECUTE);
     assert.deepEqual(executions.map((request) => request.owner), ["a"]);
     assert.equal(cas.of(CASFunctionCode.CLOSE_REQ_HANDLE).length, 0);
+  });
+});
+
+test("an INSERT queued on a new client is not sent after the first query loses its socket", { timeout: 10000 }, async () => {
+  await withClient(async (client, cas) => {
+    cas.dropAtFetchOf = "a";
+
+    const [lost, queued] = await Promise.allSettled([
+      client.query(selectFor("a")),
+      client.query("INSERT INTO items VALUES (1)"),
+    ]);
+
+    assert.equal(lost.status, "rejected");
+    assert.equal(queued.status, "rejected");
+    const executions = cas.of(CASFunctionCode.PREPARE_AND_EXECUTE);
+    assert.deepEqual(executions.map((request) => request.owner), ["a"]);
+  });
+});
+
+test("an INSERT queued on a new client is not sent after the first query times out", { timeout: 10000 }, async () => {
+  await withClient(async (client, cas) => {
+    cas.stallAtExecuteOf = "a";
+
+    const [timedOut, queued] = await Promise.allSettled([
+      client.query(selectFor("a")),
+      client.query("INSERT INTO items VALUES (1)"),
+    ]);
+
+    assert.equal(timedOut.status, "rejected");
+    assert.ok(timedOut.status === "rejected" && timedOut.reason instanceof ReadTimeoutError);
+    assert.equal(queued.status, "rejected");
+    const executions = cas.of(CASFunctionCode.PREPARE_AND_EXECUTE);
+    assert.deepEqual(executions.map((request) => request.owner), ["a"]);
+  }, 100);
+});
+
+test("a ping that reconnects does not release the INSERT queued behind a lost socket", { timeout: 10000 }, async () => {
+  await withClient(async (client, cas) => {
+    await client.ping();
+    cas.dropAtFetchOf = "a";
+
+    const [lost, health, queued] = await Promise.allSettled([
+      client.query(selectFor("a")),
+      client.ping(),
+      client.query("INSERT INTO items VALUES (1)"),
+    ]);
+
+    assert.equal(lost.status, "rejected");
+    assert.equal(health.status, "fulfilled");
+    assert.equal(queued.status, "rejected");
+    const executions = cas.of(CASFunctionCode.PREPARE_AND_EXECUTE);
+    assert.deepEqual(executions.map((request) => request.owner), ["a"]);
+  });
+});
+
+test("a query queued behind a failed first connect still gets its own attempt", { timeout: 10000 }, async () => {
+  await withClient(async (client, cas) => {
+    cas.refuseConnections = 1;
+
+    const [refused, queued] = await Promise.allSettled([
+      client.query(selectFor("a")),
+      client.query(selectFor("b")),
+    ]);
+
+    assert.equal(refused.status, "rejected");
+    assert.equal(queued.status, "fulfilled");
+    assert.deepEqual(queued.status === "fulfilled" && queued.value, rowsOf("b"));
   });
 });
 

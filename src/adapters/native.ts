@@ -28,6 +28,12 @@ import type { QueryResultRow } from "../types/result.js";
 
 const DEFAULT_FETCH_SIZE = 100;
 
+/** The connection a query was issued on, and its failure count at that moment. */
+interface IssuedOn {
+  cas: CASConnection;
+  failedExchanges: number;
+}
+
 export class NativeCubridAdapter implements DriverAdapter {
   private cas: CASConnection | null = null;
   private autoCommit = true;
@@ -68,17 +74,18 @@ export class NativeCubridAdapter implements DriverAdapter {
     sql: string,
     params?: QueryParams,
   ): Promise<T[]> {
-    const issuedOn = this.cas?.isConnected ? this.cas : null;
-    return this.inTurn(() => this.queryNow<T>(sql, params, issuedOn));
+    const cas = this.getOrCreateCAS();
+    const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
+    return this.inTurn(() => this.queryNow<T>(sql, params, issued));
   }
 
   private async queryNow<T extends QueryResultRow>(
     sql: string,
     params: QueryParams | undefined,
-    issuedOn: CASConnection | null,
+    issued: IssuedOn,
   ): Promise<T[]> {
     try {
-      return await this.executeQuery<T>(sql, params, issuedOn);
+      return await this.executeQuery<T>(sql, params, issued);
     } catch (error) {
       // If the first transactional statement lost its session before the
       // post-response bind, remember that failed generation. A ping/reconnect
@@ -237,7 +244,7 @@ export class NativeCubridAdapter implements DriverAdapter {
   private async executeQuery<T extends QueryResultRow>(
     sql: string,
     params: QueryParams | undefined,
-    issuedOn: CASConnection | null,
+    issued: IssuedOn,
   ): Promise<T[]> {
     const cas = this.getOrCreateCAS();
 
@@ -245,15 +252,17 @@ export class NativeCubridAdapter implements DriverAdapter {
     // and let a later commit() persist only the ones that follow.
     this.assertTransactionSession(cas);
 
-    if (!cas.isConnected) {
-      // A statement that was waiting when its session failed fails with it.
-      // Moving it to a new session would hide that the statements before it
-      // did not complete, and a hung server would hold every waiting statement
-      // for its own readTimeout. The next statement issued reconnects.
-      if (cas === issuedOn) {
-        throw new Error("CASConnection is not connected");
-      }
+    // A query that was waiting when an earlier request ended with an unknown
+    // outcome fails too, even if that session opened after this query was
+    // issued or a ping has since reconnected. Running it on a new session would
+    // hide that the statements before it may not have completed, and a hung
+    // server would hold every waiting query for its own readTimeout. The next
+    // query issued reconnects.
+    if (cas === issued.cas && cas.failedExchanges !== issued.failedExchanges) {
+      throw new Error("CASConnection is not connected");
+    }
 
+    if (!cas.isConnected) {
       await cas.connect();
     }
 
