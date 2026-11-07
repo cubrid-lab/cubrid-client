@@ -28,6 +28,12 @@ import {
   type OpenDatabaseResult,
 } from "./protocol.js";
 
+const RETRY_BASE_DELAY_MS = 100;
+const RETRY_MAX_DELAY_MS = 2000;
+
+/** The TCP connection could not be opened; no byte was sent, so a retry is safe. */
+class SocketConnectError extends Error {}
+
 export interface CASConnectionConfig {
   host: string;
   port: number;
@@ -35,6 +41,14 @@ export interface CASConnectionConfig {
   user: string;
   password: string;
   connectionTimeout?: number;
+  /**
+   * Retries after a failed first attempt to open a TCP connection to the broker
+   * or CAS (refused, unreachable, timed out). Only that step is retried, so no
+   * request has been sent and nothing can run twice. Rejected credentials and
+   * every failure after the socket opened are not retried. Delays between
+   * attempts double from 100 ms up to 2 s. Default: 0.
+   */
+  maxConnectionRetryCount?: number;
   /**
    * Fail a socket read, write or TLS handshake that makes no progress for this
    * many milliseconds. Measures inactivity, not total time, so a large response
@@ -122,6 +136,24 @@ export class CASConnection {
 
   /** Unlocked connect body. MUST only be called from within the queue. */
   private async connectUnlocked(): Promise<void> {
+    const retries = this.config.maxConnectionRetryCount ?? 0;
+
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this.handshakeUnlocked();
+      } catch (error) {
+        if (!(error instanceof SocketConnectError) || attempt >= retries) {
+          throw error;
+        }
+
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.min(RETRY_BASE_DELAY_MS * 2 ** attempt, RETRY_MAX_DELAY_MS)),
+        );
+      }
+    }
+  }
+
+  private async handshakeUnlocked(): Promise<void> {
     if (this.connected) {
       return;
     }
@@ -427,12 +459,12 @@ export class CASConnection {
 
       socket.once("error", (err) => {
         socket.destroy();
-        reject(new Error(`Failed to connect to ${host}:${port}: ${err.message}`));
+        reject(new SocketConnectError(`Failed to connect to ${host}:${port}: ${err.message}`));
       });
 
       socket.once("timeout", () => {
         socket.destroy();
-        reject(new Error(`Connection to ${host}:${port} timed out`));
+        reject(new SocketConnectError(`Connection to ${host}:${port} timed out`));
       });
 
       socket.connect(port, host, () => {

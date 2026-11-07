@@ -1626,3 +1626,113 @@ test("CASConnection discardSession drops the socket and allows reconnecting", as
     await closeServer(server);
   }
 });
+
+// ---------------------------------------------------------------------------
+// maxConnectionRetryCount — retries only the TCP connection
+// ---------------------------------------------------------------------------
+
+/** A port nothing listens on: bind an ephemeral port, then release it. */
+async function closedPort(): Promise<number> {
+  const { server, port } = await createMockBroker(() => undefined);
+  await closeServer(server);
+  return port;
+}
+
+/** A broker that counts connections and answers the ClientInfoExchange with `redirect`. */
+function countingBroker(redirect: number, onOpenDatabase?: (socket: NetSocket) => void) {
+  const counter = { connections: 0 };
+  const ready = createMockBroker((socket) => {
+    counter.connections += 1;
+    socket.on("error", () => undefined);
+    socket.once("data", () => {
+      const portBuf = Buffer.alloc(4);
+      portBuf.writeInt32BE(redirect, 0);
+      socket.write(portBuf);
+
+      if (onOpenDatabase) {
+        socket.once("data", () => onOpenDatabase(socket));
+      }
+    });
+  });
+  return { counter, ready };
+}
+
+test("CASConnection connect — retries a refused connection until the broker is up", async () => {
+  const port = await closedPort();
+  let server: Server | undefined;
+  const late = setTimeout(() => {
+    server = createServer((socket) => {
+      socket.once("data", () => {
+        socket.write(Buffer.alloc(4));
+        socket.once("data", () => socket.write(frameResponse(buildOpenDbResponse(7))));
+      });
+    }).listen(port, "127.0.0.1");
+  }, 150);
+
+  const cas = new CASConnection({ ...DEFAULT_CONFIG, port, maxConnectionRetryCount: 5 });
+
+  try {
+    await cas.connect();
+    assert.equal(cas.isConnected, true);
+    assert.equal(cas.sessionId, 7);
+  } finally {
+    clearTimeout(late);
+    await cas.close();
+    if (server) await closeServer(server);
+  }
+});
+
+test("CASConnection connect — a refused connection is not retried by default", async () => {
+  const cas = new CASConnection({ ...DEFAULT_CONFIG, port: await closedPort() });
+  const started = Date.now();
+  await assert.rejects(() => cas.connect(), /Failed to connect/);
+  assert.ok(Date.now() - started < 90, "no backoff delay without retries");
+});
+
+test("CASConnection connect — retries stop after the configured count", async () => {
+  // The redirect target is closed, so every attempt reaches the broker once and fails.
+  const { counter, ready } = countingBroker(await closedPort());
+  const { server, port } = await ready;
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port, maxConnectionRetryCount: 2 });
+    await assert.rejects(() => cas.connect(), /Failed to connect/);
+    assert.equal(counter.connections, 3); // first attempt + 2 retries
+    assert.equal(cas.isConnected, false);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("CASConnection connect — rejected credentials are not retried", async () => {
+  const { counter, ready } = countingBroker(0, (socket) => {
+    const message = Buffer.from("Access denied\0");
+    const body = Buffer.alloc(4 + 4 + 4 + message.length);
+    body.writeInt32BE(-1, 4);
+    body.writeInt32BE(-165, 8);
+    message.copy(body, 12);
+    socket.write(frameResponse(body));
+  });
+  const { server, port } = await ready;
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port, maxConnectionRetryCount: 5 });
+    await assert.rejects(() => cas.connect(), /Access denied/);
+    assert.equal(counter.connections, 1);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("CASConnection connect — a handshake that fails after the socket opened is not retried", async () => {
+  const { counter, ready } = countingBroker(0, (socket) => socket.destroy());
+  const { server, port } = await ready;
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port, maxConnectionRetryCount: 5 });
+    await assert.rejects(() => cas.connect());
+    assert.equal(counter.connections, 1);
+  } finally {
+    await closeServer(server);
+  }
+});

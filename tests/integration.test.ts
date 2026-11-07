@@ -10,6 +10,7 @@
  */
 import test, { describe, after } from "node:test";
 import assert from "node:assert/strict";
+import { createServer, connect as netConnect, type Server } from "node:net";
 
 import { createClient } from "../src/client/create-client.js";
 import { NativeCubridAdapter } from "../src/adapters/native.js";
@@ -1881,5 +1882,69 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     await client.query("SELECT 1");
     await client.close();
     await client.close(); // Should not throw
+  });
+});
+
+// ---------------------------------------------------------------------------
+// maxConnectionRetryCount against a live broker, reached through a TCP relay
+// that starts late and counts connections.
+// ---------------------------------------------------------------------------
+
+describe("Integration: maxConnectionRetryCount", { skip: !available }, () => {
+  async function freePort(): Promise<number> {
+    const probe = createServer();
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const { port } = probe.address() as { port: number };
+    await new Promise((resolve) => probe.close(resolve));
+    return port;
+  }
+
+  function relay(port: number, counter: { connections: number }): Promise<Server> {
+    const server = createServer((client) => {
+      counter.connections += 1;
+      const upstream = netConnect(TEST_CONFIG.port, TEST_CONFIG.host);
+      client.on("error", () => upstream.destroy());
+      upstream.on("error", () => client.destroy());
+      client.pipe(upstream).pipe(client);
+    });
+    return new Promise((resolve) => server.listen(port, "127.0.0.1", () => resolve(server)));
+  }
+
+  test("a client retries until the broker answers, then queries normally", async () => {
+    const port = await freePort();
+    const counter = { connections: 0 };
+    let server: Server | undefined;
+    const late = setTimeout(() => void relay(port, counter).then((s) => (server = s)), 300);
+    const client = createClient({ ...TEST_CONFIG, port, maxConnectionRetryCount: 6 });
+
+    try {
+      const rows = await client.query<{ n: number }>("SELECT 1 AS n FROM db_root");
+      assert.equal(rows[0]?.n, 1);
+      assert.equal(counter.connections, 1);
+    } finally {
+      clearTimeout(late);
+      await client.close();
+      server?.close();
+    }
+  });
+
+  test("wrong credentials fail at once without a retry", async () => {
+    const port = await freePort();
+    const counter = { connections: 0 };
+    const server = await relay(port, counter);
+    const client = createClient({
+      ...TEST_CONFIG,
+      port,
+      password: "definitely-wrong",
+      maxConnectionRetryCount: 5,
+    });
+
+    try {
+      await assert.rejects(() => client.query("SELECT 1 FROM db_root"), QueryError);
+      assert.equal(counter.connections, 1);
+    } finally {
+      await client.close();
+      server.close();
+    }
   });
 });

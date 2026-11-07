@@ -44,7 +44,7 @@ await db.close();
 | `password` | `string` | No | `""` | Database password (empty string for no password) |
 | `connectionTimeout` | `number` | No | — | Connection timeout in milliseconds |
 | `readTimeout` | `number` | No | — | Milliseconds of server inactivity before a request fails. See [Read timeout](#read-timeout) |
-| `maxConnectionRetryCount` | `number` | No | — | Maximum number of retry attempts on connection failure |
+| `maxConnectionRetryCount` | `number` | No | — | Retries after a failed TCP connect (default `0`). See [Connection retries](#connection-retries) |
 | `logger` | `unknown` | No | — | Receives redacted diagnostics (connection created, operation timing and failures). See [Logging](#logging) |
 | `connectionFactory` | `ConnectionFactory` | No | — | Custom factory for creating connections (advanced) |
 
@@ -91,6 +91,29 @@ with a custom `connectionFactory`. No protocol-level events are emitted. The
 option is declared `unknown`, so existing 1.x code keeps compiling; the
 `ClientLogger`, `ClientLogFields` and `ClientLogLevel` types describe the
 contract.
+
+## Connection retries
+
+`maxConnectionRetryCount` is the number of retries after a failed first attempt to open the TCP connection to the broker or CAS: connection refused, host unreachable, or `connectionTimeout` expired. It defaults to `0` (no retry) and must be a non-negative integer, or `createClient()` throws a `RangeError`. Delays between attempts double from 100 ms up to 2 s, so the total wait is bounded by `maxConnectionRetryCount` times 2 s plus the connection timeouts.
+
+```ts
+const client = createClient({
+  host: "localhost",
+  database: "demodb",
+  user: "dba",
+  connectionTimeout: 2000,
+  maxConnectionRetryCount: 3,
+});
+```
+
+Only that step is retried. A retry never runs SQL again and never replays a request whose outcome is unknown:
+
+- Rejected credentials or a database error in the handshake fail at once.
+- A failure after the socket opened (a broker closing the connection, a TLS failure, a malformed reply, `readTimeout`) fails at once.
+- A request or transaction that fails after it was sent is not retried.
+- There is no fallback to another host.
+
+When every attempt fails, the `ConnectionError` carries the last failure as `cause`.
 
 ## Read timeout
 

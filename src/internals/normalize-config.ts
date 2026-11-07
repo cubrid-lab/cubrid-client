@@ -16,6 +16,15 @@ export function normalizeConfig(options: ClientOptions): ClientConfig {
     );
   }
 
+  const { maxConnectionRetryCount } = options;
+
+  if (
+    maxConnectionRetryCount !== undefined &&
+    !(Number.isInteger(maxConnectionRetryCount) && maxConnectionRetryCount >= 0)
+  ) {
+    throw new RangeError("maxConnectionRetryCount must be a non-negative integer.");
+  }
+
   return {
     host: options.host,
     port: options.port ?? 33000,

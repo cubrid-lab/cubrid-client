@@ -439,6 +439,9 @@ export class NativeCubridAdapter implements DriverAdapter {
         ...(this.config.connectionTimeout !== undefined && {
           connectionTimeout: this.config.connectionTimeout,
         }),
+        ...(this.config.maxConnectionRetryCount !== undefined && {
+          maxConnectionRetryCount: this.config.maxConnectionRetryCount,
+        }),
         ...(this.config.readTimeout !== undefined && {
           readTimeout: this.config.readTimeout,
         }),

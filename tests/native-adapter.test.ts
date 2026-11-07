@@ -16,6 +16,17 @@ import { CAPTURED_FRAMES } from "./fixtures/collection-frames.js";
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** A port nothing listens on: bind an ephemeral port, then release it. */
+function closedPort(): Promise<number> {
+  return new Promise((resolve) => {
+    const server = createServer();
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address() as { port: number };
+      server.close(() => resolve(port));
+    });
+  });
+}
+
 const DEFAULT_CONFIG: ClientConfig = {
   host: "127.0.0.1",
   port: 33000,
@@ -492,6 +503,25 @@ test("NativeCubridAdapter connect creates CAS lazily if not set", async () => {
       return true;
     },
   );
+});
+
+test("NativeCubridAdapter connect passes maxConnectionRetryCount to the CAS and keeps the cause", async () => {
+  const adapter = new NativeCubridAdapter({
+    ...DEFAULT_CONFIG,
+    port: await closedPort(),
+    maxConnectionRetryCount: 2,
+  });
+  const started = Date.now();
+  await assert.rejects(
+    () => adapter.connect(),
+    (err: Error) => {
+      assert.ok(err instanceof ConnectionError);
+      assert.match((err.cause as Error).message, /Failed to connect/);
+      return true;
+    },
+  );
+  // Two retries wait 100 ms and 200 ms; without the option the failure is immediate.
+  assert.ok(Date.now() - started >= 250);
 });
 
 test("NativeCubridAdapter connect wraps error as ConnectionError", async () => {
