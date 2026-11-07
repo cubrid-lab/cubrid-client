@@ -43,10 +43,11 @@ SHA and its corresponding run URL into the sign-off section below.
   metadata is not exposed by the present Promise result
   ([#85](https://github.com/cubrid-lab/cubrid-client/issues/85),
   [#84](https://github.com/cubrid-lab/cubrid-client/issues/84)).
-- Accepted `maxConnectionRetryCount` and `logger` options do not yet
-  implement their advertised configurable behavior
-  ([#83](https://github.com/cubrid-lab/cubrid-client/issues/83),
-  [#100](https://github.com/cubrid-lab/cubrid-client/issues/100)).
+- The accepted `maxConnectionRetryCount` option does not yet implement its
+  advertised configurable behavior
+  ([#83](https://github.com/cubrid-lab/cubrid-client/issues/83)). The `logger`
+  option now emits redacted diagnostics
+  ([#100](https://github.com/cubrid-lab/cubrid-client/issues/100)).
 - CUBRID DATE/DATETIME have no embedded timezone; current decoding is
   process-timezone-sensitive ([#113](https://github.com/cubrid-lab/cubrid-client/issues/113)).
 - Query-scoped deadline/AbortSignal, full transaction ownership and full

@@ -9,6 +9,9 @@ export { NativeCubridAdapter } from "./adapters/native.js";
 export { parseConnectionString } from "./utils/connection-string.js";
 export { escapeIdentifier, buildWhere } from "./utils/query.js";
 export type {
+  ClientLogFields,
+  ClientLogLevel,
+  ClientLogger,
   ClientOptions,
   ClientConfig,
   ConnectionFactory,

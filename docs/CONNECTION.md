@@ -45,7 +45,7 @@ await db.close();
 | `connectionTimeout` | `number` | No | — | Connection timeout in milliseconds |
 | `readTimeout` | `number` | No | — | Milliseconds of server inactivity before a request fails. See [Read timeout](#read-timeout) |
 | `maxConnectionRetryCount` | `number` | No | — | Maximum number of retry attempts on connection failure |
-| `logger` | `unknown` | No | — | Logger instance (passed to the underlying driver)
+| `logger` | `unknown` | No | — | Receives redacted diagnostics (connection created, operation timing and failures). See [Logging](#logging) |
 | `connectionFactory` | `ConnectionFactory` | No | — | Custom factory for creating connections (advanced) |
 
 ### Full Example with All Options
@@ -62,6 +62,35 @@ const db = createClient({
   maxConnectionRetryCount: 3,
 });
 ```
+
+## Logging
+
+Pass `logger` to `createClient()` to receive redacted diagnostics. The object
+needs any of `debug`, `info` and `error` methods, each called as
+`(message, fields)`; `console` works as is. Other values are ignored. A logger
+that throws, or returns a promise that rejects, never affects a request and is
+never awaited.
+
+```ts
+const client = createClient({ host: "localhost", database: "demodb", user: "dba", logger: console });
+```
+
+| Level | Event | Fields |
+|-------|-------|--------|
+| `info` | A connection was created (`operation: "connection"`) | `host`, `port`, `database` |
+| `debug` | `connect`, `query`, `beginTransaction`, `commit`, `rollback`, `close` or `ping` succeeded | `operation`, `durationMs`; `paramCount` and `rowCount` for `query` |
+| `error` | The same operations failed | `operation`, `durationMs`, `errorName`; `paramCount` for `query` |
+| `error` | A connection could not be created (`operation: "connection"`; the original error is rethrown unchanged) | `operation`, `host`, `port`, `database`, `durationMs`, `errorName` |
+
+Fields never contain SQL text, bound parameter values, row data, passwords or
+error messages (servers can echo SQL in them). `errorName` is the error's class
+(one of this library's errors or a standard `Error` subclass, otherwise
+`Error`), not its mutable `name`. Events are emitted for the
+shared client connection and for each `transaction()` connection, including
+with a custom `connectionFactory`. No protocol-level events are emitted. The
+option is declared `unknown`, so existing 1.x code keeps compiling; the
+`ClientLogger`, `ClientLogFields` and `ClientLogLevel` types describe the
+contract.
 
 ## Read timeout
 
