@@ -1,21 +1,41 @@
-## High level description of this Pull-request
-Include motivations, reasons, and background to add context to your contribution.
-Include a description of changes associated with your commit(s)
+## Summary
 
-## Related Issues
-- List all related issues or NA
+Explain the motivation, behavior affected and boundaries of this change.
+
+## Related issues
+
+Link specific issues or write N/A.
+
+## Change type
+
+- [ ] Bug fix or regression
+- [ ] Feature / public API
+- [ ] Documentation
+- [ ] Refactor
+- [ ] CI, tooling, dependencies or release infrastructure
+
+## Implementation and test evidence
+
+State **actual** commands and outcomes; if a check did not run or was skipped, say so. Do not mark a mock suite or a healthy container as real database verification.
+
+- [ ] The owning layer, expected behavior and relevant ADR/design constraints were reviewed.
+- [ ] For behavior changes: describe the observed failing RED case, minimum GREEN fix and REFACTOR checks (or explain why TDD is inapplicable).
+- [ ] Run the applicable `npm run check` (typecheck + tests), `npm run build` and `npm run api:check`; link final-head CI evidence.
+- [ ] For database behavior: include a real CUBRID version, executed SQL/results, transaction/failure tests and actual nonzero pass/fail/skip counts, or explicitly note missing evidence.
+- [ ] For releases/API changes: verify the packed ESM/CJS consumer on **Node 18**. Node 18 and 20 remain supported throughout `cubrid-client@1.x`; Node 22 developer tooling is not a support-floor increase.
+- [ ] Update docs, compatibility ranges, release notes and genuine contributor credit if applicable.
+- [ ] No insecure automatic SQL replay, swallowed transaction failure, fabricated insert ID or silent type coercion is introduced.
+
+## Compatibility and release impact
+
+Describe potential breaking changes, affected CUBRID versions, and rollback/recovery, or write N/A. An approved PR does not imply npm publication.
 
 ## Reviewers
-- Use @Mentions to specify the reviewers for your PR.
 
-# CHECKLIST:
-Make sure all items are marked when you submit the pull-request.
+Mention relevant reviewers, or state that they are not assigned.
 
-- [ ] Relevant documentation for functions, tests, classes, the wiki, etc. have been made
-- [ ] All tests pass with no errors (`npm run check`)
-- [ ] TypeScript types are correct (`npm run typecheck`)
-- [ ] Update the CHANGELOG.md with a summary of your changes if requested
+## Repository-owned change and reference review
 
-## Test-first evidence and design approval
-
-For behavioral code changes, link the reviewed contract/ADR, describe a real failing **Red** assertion, the **Green** fix and **Refactor** checks, and give the actual command/results. The final PR must pass CI. For CUBRID behavior, distinguish mock from live database evidence with versions and skipped tests; release candidates cannot bypass real DB gates. For docs-only changes, mark TDD N/A with a reason. See [ADR 0004](../docs/adr/0004-test-first-development.md) and [design sign-off plan](../docs/DESIGN_SIGNOFF.md) (the latter may be in a draft design PR).
+- [ ] This PR stays within **cubrid-client** responsibilities (Node.js/TypeScript CAS driver and npm consumer contract), rather than copying another project's API or release process.
+- [ ] Cross-repository references have a genuine driver/ORM dependency, independent JDBC comparison, or coordination purpose; they are not substitutes for this repository's test evidence.
+- [ ] Issue/PR/ADR text does not contain copied tooling, version commitments or test claims from an unrelated language or repository.
