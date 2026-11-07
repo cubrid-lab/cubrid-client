@@ -167,10 +167,9 @@ Unreleased entries** to CHANGELOG because Release Please will also generate
 entries from merged Conventional Commit titles. Review the generated release
 PR against actual commits, rather than an anticipated issue milestone.
 
-**No emoji in release notes or the generated changelog.** Use plain-language headings
-and ordinary Markdown bullets without pictograms. CI checks all versioned
-`docs/releases/*.md` files and `CHANGELOG.md` before review or publication.
-The rule applies to historical corrections as well as future releases.
+**Use concise, contributor-credited GitHub Release notes.** Starting with v1.3.0, write `## vX.Y.Z (YYYY-MM-DD)`, optional `### Upgrade notes`, `### Features`, `### Bug Fixes` and other nonempty change sections, and end with `**Full Changelog:** vPREVIOUS...vCURRENT`. Each change or closely related group ends with `by @username`, using the actual PR author or verified human co-author (not a bot). Welcome a first-time contributor inline as `by @username (first contribution 🎉)` instead of adding a separate contributors section. Each change should appear once, not in both a Highlights list and a generated commit list.
+
+Use one Markdown source line per change and do not insert hard wraps. Decorative emoji are disallowed in curated release notes and generated CHANGELOG content, except for the exact inline first-contribution celebration. The validation script enforces section order, attribution and duplicate PR references for v1.3.0 and later; earlier published notes retain their historical structure. GitHub Release descriptions are synced from reviewed source notes without rewriting immutable tags or republishing npm artifacts.
 
 The v1.0.0 and v1.1.0 published release descriptions contained either emoji,
 unverified coverage language, or changes not present in their tags. Their
