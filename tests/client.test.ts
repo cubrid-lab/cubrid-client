@@ -22,10 +22,12 @@ import type {
   ClientOptions,
   ConnectionLike,
   ExecuteResult,
+  TransactionOptions,
+  PreparedTransactionClient,
   TransactionClient,
 } from "../src/types/client.js";
 import type { QueryParams } from "../src/types/query.js";
-import type { QueryResult } from "../src/types/result.js";
+import type { QueryResult, QueryResultRow } from "../src/types/result.js";
 
 class FakeConnection implements ConnectionLike {
   queries: Array<{ sql: string; params: QueryParams | undefined }> = [];
@@ -1995,6 +1997,9 @@ const TRANSACTION_STATEMENTS: Array<
   ["query", (tx, sql) => tx.query(sql)],
   ["queryResult", (tx, sql) => tx.queryResult(sql)],
   ["execute", (tx, sql) => tx.execute(sql)],
+  ["queryPrepared", (tx, sql) => tx.queryPrepared(sql)],
+  ["queryResultPrepared", (tx, sql) => tx.queryResultPrepared(sql)],
+  ["executePrepared", (tx, sql) => tx.executePrepared(sql)],
 ];
 
 /** Sends all three statement methods through the recorded, gated query(). */
@@ -2009,6 +2014,24 @@ class RecordingStatementConnection extends RecordingConnection {
   async execute(sql: string, params?: QueryParams): Promise<ExecuteResult> {
     await this.query(sql, params);
     return { affectedRows: 1 };
+  }
+
+  async queryPrepared<T extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<T[]> {
+    return this.query<T>(sql, params);
+  }
+
+  async queryResultPrepared<T extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>> {
+    return this.queryResult<T>(sql, params);
+  }
+
+  async executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult> {
+    return this.execute(sql, params);
   }
 }
 
@@ -2035,6 +2058,24 @@ class FailingStatementConnection extends FakeConnection {
     }
 
     return { affectedRows: 0 };
+  }
+
+  async queryPrepared<T extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<T[]> {
+    return (await this.queryResult<T>(sql, params)).rows;
+  }
+
+  async queryResultPrepared<T extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>> {
+    return this.queryResult<T>(sql, params);
+  }
+
+  async executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult> {
+    return this.execute(sql, params);
   }
 }
 
@@ -2210,7 +2251,7 @@ test("Promise.all of every statement method commits once after all of them", asy
     Promise.all(TRANSACTION_STATEMENTS.map(([name, run]) => run(tx, name))),
   );
 
-  assert.equal(results.length, 3);
+  assert.equal(results.length, TRANSACTION_STATEMENTS.length);
   assert.deepEqual(connection.calls.slice(-2), ["commit", "close"]);
   assert.equal(connection.commitCalls, 1);
   assert.equal(connection.rollbackCalls, 0);
@@ -2314,6 +2355,295 @@ test("close does not stop a transaction already running on its own connection", 
     "commit",
     "close",
   ]);
+});
+
+test("the prepared methods never fall back to SQL literals on a connection without them", async () => {
+  const connection = new FakeConnection();
+  const client = createClient(baseOptions({ connectionFactory: () => connection }));
+
+  for (const [name, run] of [
+    ["queryPrepared", () => client.queryPrepared("SELECT ?", [1])],
+    ["queryResultPrepared", () => client.queryResultPrepared("SELECT ?", [1])],
+    ["executePrepared", () => client.executePrepared("DELETE FROM t WHERE a = ?", [1])],
+  ] as const) {
+    await assert.rejects(
+      run,
+      (error: Error) => error instanceof QueryError && error.cause instanceof Error &&
+        error.cause.message === `Underlying connection does not support ${name}.`,
+    );
+  }
+  const inTransaction: Array<(tx: PreparedTransactionClient) => Promise<unknown>> = [
+    (tx) => tx.queryPrepared("SELECT ?", [1]),
+    (tx) => tx.queryResultPrepared("SELECT ?", [1]),
+    (tx) => tx.executePrepared("DELETE FROM t WHERE a = ?", [1]),
+  ];
+  for (const run of inTransaction) {
+    await assert.rejects(() => client.transaction(run), TransactionError);
+  }
+});
+
+test("the prepared methods reach the connection's own on a client and in a transaction", async () => {
+  const calls: string[] = [];
+  const connection = Object.assign(new FakeConnection(), {
+    async queryPrepared<T>(sql: string): Promise<T[]> {
+      calls.push(`queryPrepared ${sql}`);
+      return [];
+    },
+    async queryResultPrepared<T>(sql: string): Promise<QueryResult<T & QueryResultRow>> {
+      calls.push(`queryResultPrepared ${sql}`);
+      return { rows: [], columns: [] };
+    },
+    async executePrepared(sql: string): Promise<ExecuteResult> {
+      calls.push(`executePrepared ${sql}`);
+      return { affectedRows: 1 };
+    },
+  });
+  const client = createClient(baseOptions({ connectionFactory: () => connection }));
+
+  await client.queryPrepared("a");
+  await client.queryResultPrepared("b");
+  assert.deepEqual(await client.executePrepared("c"), { affectedRows: 1 });
+  await client.transaction(async (tx) => {
+    await tx.queryPrepared("d");
+    await tx.queryResultPrepared("e");
+    await tx.executePrepared("f");
+  });
+
+  assert.deepEqual(calls, [
+    "queryPrepared a",
+    "queryResultPrepared b",
+    "executePrepared c",
+    "queryPrepared d",
+    "queryResultPrepared e",
+    "executePrepared f",
+  ]);
+  assert.deepEqual(connection.queries, []);
+});
+
+// ---------------------------------------------------------------------------
+// Isolation level and lock timeout options
+// ---------------------------------------------------------------------------
+
+class ConfigurableConnection extends RecordingConnection {
+  options: TransactionOptions[] = [];
+  optionsError?: Error;
+
+  async setTransactionOptions(options: TransactionOptions): Promise<void> {
+    this.calls.push("setTransactionOptions");
+    this.options.push(options);
+
+    if (this.optionsError) {
+      throw this.optionsError;
+    }
+  }
+}
+
+test("normalizeConfig keeps valid transaction settings and adds none by default", () => {
+  const config = normalizeConfig({
+    ...baseOptions(),
+    isolationLevel: "repeatable read",
+    lockTimeout: 0,
+  });
+
+  assert.equal(config.isolationLevel, "repeatable read");
+  assert.equal(config.lockTimeout, 0);
+  assert.ok(!("isolationLevel" in normalizeConfig(baseOptions())));
+  assert.ok(!("lockTimeout" in normalizeConfig(baseOptions())));
+});
+
+for (const isolationLevel of ["READ COMMITTED", "read uncommitted", "snapshot", 4, ""]) {
+  test(`createClient and new CubridClient reject isolationLevel ${String(isolationLevel)}`, () => {
+    const options = { ...baseOptions(), isolationLevel } as unknown as ClientOptions;
+
+    assert.throws(() => createClient(options), RangeError);
+    assert.throws(
+      () => new CubridClient(options as never, () => new FakeConnection()),
+      RangeError,
+    );
+  });
+}
+
+// -2 matters most: the server would accept it and silently wait forever.
+for (const lockTimeout of [-2, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31, "1000"]) {
+  test(`createClient rejects lockTimeout ${String(lockTimeout)}`, () => {
+    assert.throws(
+      () => createClient({ ...baseOptions(), lockTimeout } as unknown as ClientOptions),
+      RangeError,
+    );
+  });
+}
+
+for (const lockTimeout of [-1, 0, 1, 2 ** 31 - 1]) {
+  test(`createClient accepts lockTimeout ${lockTimeout} and keeps it`, () => {
+    assert.ok(createClient({ ...baseOptions(), lockTimeout }) instanceof CubridClient);
+    assert.equal(normalizeConfig({ ...baseOptions(), lockTimeout }).lockTimeout, lockTimeout);
+  });
+}
+
+test("transaction() rejects invalid options before opening a connection", async () => {
+  let opened = 0;
+  const client = createClient(
+    baseOptions({
+      connectionFactory: () => {
+        opened += 1;
+        return new ConfigurableConnection();
+      },
+    }),
+  );
+
+  await assert.rejects(
+    client.transaction(async () => undefined, {
+      isolationLevel: "dirty read" as "serializable",
+    }),
+    RangeError,
+  );
+  await assert.rejects(client.transaction(async () => undefined, { lockTimeout: -2 }), RangeError);
+
+  assert.equal(opened, 0);
+});
+
+test("transaction() applies its options on its own connection before the transaction begins", async () => {
+  const shared = new ConfigurableConnection();
+  const dedicated = new ConfigurableConnection();
+  const connections = [shared, dedicated];
+  const client = createClient(baseOptions({ connectionFactory: () => connections.shift()! }));
+
+  await client.query("SELECT 1");
+  await client.transaction(async (tx) => tx.query("SELECT 2"), { isolationLevel: "serializable" });
+
+  assert.deepEqual(shared.options, []);
+  assert.deepEqual(dedicated.options, [{ isolationLevel: "serializable" }]);
+  assert.deepEqual(dedicated.calls.slice(0, 2), ["setTransactionOptions", "begin"]);
+});
+
+test("client settings apply to the shared connection and to each transaction connection", async () => {
+  const shared = new ConfigurableConnection();
+  const dedicated = new ConfigurableConnection();
+  const connections = [shared, dedicated];
+  const client = createClient(
+    baseOptions({
+      isolationLevel: "repeatable read",
+      lockTimeout: 2000,
+      connectionFactory: () => connections.shift()!,
+    }),
+  );
+
+  await client.query("SELECT 1");
+  await client.query("SELECT 2");
+  await client.transaction(async () => undefined);
+
+  const expected = { isolationLevel: "repeatable read", lockTimeout: 2000 };
+  assert.deepEqual(shared.options, [expected]);
+  assert.deepEqual(dedicated.options, [expected]);
+
+  // A client without settings calls nothing, so 1.x connections behave as before.
+  const plain = new ConfigurableConnection();
+  const plainClient = transactionClient(plain);
+  await plainClient.query("SELECT 1");
+  await plainClient.transaction(async () => undefined);
+  assert.ok(!plain.calls.includes("setTransactionOptions"));
+});
+
+test("transaction() options override the client's, key by key", async () => {
+  const shared = new ConfigurableConnection();
+  const dedicated = new ConfigurableConnection();
+  const connections = [dedicated, shared];
+  const client = createClient(
+    baseOptions({
+      isolationLevel: "repeatable read",
+      lockTimeout: 2000,
+      connectionFactory: () => connections.shift()!,
+    }),
+  );
+
+  await client.transaction(async () => undefined, { lockTimeout: 0 });
+  await client.query("SELECT 1");
+
+  assert.deepEqual(dedicated.options, [{ isolationLevel: "repeatable read", lockTimeout: 0 }]);
+  assert.deepEqual(shared.options, [{ isolationLevel: "repeatable read", lockTimeout: 2000 }]);
+});
+
+test("an undefined option keeps the client's value", async () => {
+  const connection = new ConfigurableConnection();
+  const client = createClient(
+    baseOptions({ isolationLevel: "serializable", connectionFactory: () => connection }),
+  );
+
+  await client.transaction(async () => undefined, {
+    isolationLevel: undefined,
+  } as unknown as TransactionOptions);
+
+  assert.deepEqual(connection.options, [{ isolationLevel: "serializable" }]);
+});
+
+test("a transaction option on a connection that cannot apply it fails before the callback runs", async () => {
+  const connection = new RecordingConnection();
+  const client = transactionClient(connection);
+  let ran = false;
+
+  await assert.rejects(
+    client.transaction(
+      async () => {
+        ran = true;
+      },
+      { isolationLevel: "serializable" },
+    ),
+    (error: unknown) =>
+      error instanceof TransactionError &&
+      /does not support transaction options/.test(String(error.cause)),
+  );
+
+  assert.equal(ran, false);
+  assert.deepEqual(connection.calls, ["close"]);
+});
+
+test("a client setting on a connection that cannot apply it fails every statement", async () => {
+  const connections = [new RecordingConnection(), new RecordingConnection()];
+  const opened = [...connections];
+  const client = createClient(
+    baseOptions({ lockTimeout: 1000, connectionFactory: () => connections.shift()! }),
+  );
+
+  await assert.rejects(
+    client.query("SELECT 1"),
+    (error: unknown) =>
+      error instanceof QueryError &&
+      /does not support transaction options/.test(String(error.cause)),
+  );
+  await assert.rejects(client.query("SELECT 2"), QueryError);
+
+  for (const connection of opened) {
+    assert.deepEqual(connection.calls, ["close"]);
+  }
+});
+
+test("a failed setTransactionOptions on the shared connection is retried on a new one", async () => {
+  const failing = new ConfigurableConnection();
+  failing.optionsError = new Error("refused");
+  const working = new ConfigurableConnection();
+  const connections = [failing, working];
+  const client = createClient(
+    baseOptions({ lockTimeout: 1000, connectionFactory: () => connections.shift()! }),
+  );
+
+  await assert.rejects(client.query("SELECT 1"), QueryError);
+  await client.query("SELECT 2");
+
+  assert.deepEqual(failing.calls, ["setTransactionOptions", "close"]);
+  assert.deepEqual(working.calls.slice(0, 2), ["setTransactionOptions", "query:SELECT 2"]);
+});
+
+test("a failed setTransactionOptions rejects transaction() without a rollback and closes", async () => {
+  const connection = new ConfigurableConnection();
+  connection.optionsError = new Error("refused");
+  const client = transactionClient(connection);
+
+  await assert.rejects(
+    client.transaction(async () => undefined, { lockTimeout: 1000 }),
+    TransactionError,
+  );
+
+  assert.deepEqual(connection.calls, ["setTransactionOptions", "close"]);
 });
 
 /** A connection whose stream() records what the client asked of it. */

@@ -86,6 +86,24 @@ export const enum EndTranType {
 }
 
 // ---------------------------------------------------------------------------
+// Session parameters (used with SET_DB_PARAMETER)
+// ---------------------------------------------------------------------------
+
+/** CCI_PARAM_*. There is no autocommit entry: the CAS ignores that parameter. */
+export const enum DbParameter {
+  ISOLATION_LEVEL = 1,
+  /** In milliseconds. The server reads any negative value as no limit. */
+  LOCK_TIMEOUT = 2,
+}
+
+/** Server isolation levels. CUBRID 10.2 to 11.4 refuse every other number with -1157. */
+export const ISOLATION_LEVEL_CODES = {
+  "read committed": 4,
+  "repeatable read": 5,
+  serializable: 6,
+} as const;
+
+// ---------------------------------------------------------------------------
 // Prepare options
 // ---------------------------------------------------------------------------
 

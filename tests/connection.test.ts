@@ -1103,7 +1103,7 @@ const OUT_TRAN = Buffer.from([0x00, 0x02, 0x03, 0x04]);
  * and answer it through `onRequest`. The sessions count up from 1.
  */
 async function recordingBroker(
-  onRequest: (socket: NetSocket, code: number, session: number) => void,
+  onRequest: (socket: NetSocket, code: number, session: number, frame: Buffer) => void,
 ): Promise<{ server: Server; port: number; requests: string[] }> {
   const requests: string[] = [];
   let sessions = 0;
@@ -1117,7 +1117,7 @@ async function recordingBroker(
         socket.on("data", (data) => {
           const code = (data as Buffer)[8]!;
           requests.push(`${session}:${code}`);
-          onRequest(socket, code, session);
+          onRequest(socket, code, session, data as Buffer);
         });
       });
     });
@@ -1246,6 +1246,206 @@ test("the CAS closing right after its reply is noticed without a probe on the de
       assert.deepEqual(requests, [`1:${STATEMENT[0]}`]);
       assert.equal(cas.connectionGeneration, 2);
       assert.equal(cas.outOfTransactionReplies, 1);
+    });
+  } finally {
+    await closeServer(server);
+  }
+});
+
+const SET_DB_PARAMETER: number = CASFunctionCode.SET_DB_PARAMETER;
+/** A successful SET_DB_PARAMETER reply body: result code 0. */
+const SET_OK = Buffer.alloc(4);
+const SESSION_PARAMETERS = [
+  { parameter: 1, value: 5 },
+  { parameter: 2, value: 1500 },
+];
+
+/** Parameter and value of a SET_DB_PARAMETER frame: two length-prefixed ints after the code. */
+function setParameter(frame: Buffer): string {
+  return `${frame.readInt32BE(13)}=${frame.readInt32BE(21)}`;
+}
+
+test("session parameters reach each new session before any request, and CHECK_CAS holds its CAS", async () => {
+  // SET_DB_PARAMETER replies OUT_TRAN even on a new session, measured on CUBRID 10.2
+  // to 11.4, and in that state the CAS may leave. CHECK_CAS is what keeps it.
+  const set: string[] = [];
+  let statements = 0;
+  const { server, port, requests } = await recordingBroker((socket, code, session, frame) => {
+    if (code === SET_DB_PARAMETER) {
+      set.push(`${session}:${setParameter(frame)}`);
+      socket.write(frameResponse(Buffer.concat([OUT_TRAN, SET_OK])));
+    } else if (code === CHECK_CAS && session === 1 && statements > 0) {
+      socket.destroy();
+    } else if (code === CHECK_CAS) {
+      socket.write(frameResponse(CAS_INFO));
+    } else {
+      statements += 1;
+      socket.write(frameResponse(OUT_TRAN));
+    }
+  });
+  const cas = new CASConnection({ ...DEFAULT_CONFIG, port, sessionParameters: SESSION_PARAMETERS });
+
+  try {
+    await cas.connect();
+    await cas.sendAndRecv(REQUEST_HEADER, STATEMENT);
+    await cas.sendAndRecv(REQUEST_HEADER, STATEMENT);
+
+    const code = STATEMENT[0];
+    assert.deepEqual(requests, [
+      `1:${SET_DB_PARAMETER}`,
+      `1:${SET_DB_PARAMETER}`,
+      `1:${CHECK_CAS}`,
+      `1:${code}`,
+      `1:${CHECK_CAS}`,
+      `2:${SET_DB_PARAMETER}`,
+      `2:${SET_DB_PARAMETER}`,
+      `2:${CHECK_CAS}`,
+      `2:${code}`,
+    ]);
+    assert.deepEqual(set, ["1:1=5", "1:2=1500", "2:1=5", "2:2=1500"]);
+    // Only the two statements count: no transaction can have ended during the setup.
+    assert.equal(cas.outOfTransactionReplies, 2);
+    assert.equal(cas.failedExchanges, 0);
+  } finally {
+    await cas.close();
+    await closeServer(server);
+  }
+});
+
+for (const [failure, fail] of [
+  ["refuses a parameter", (socket: NetSocket) => socket.write(frameResponse(Buffer.concat([CAS_INFO, ERROR_REPLY])))],
+  ["closes the socket", (socket: NetSocket) => socket.destroy()],
+] as const) {
+  test(`a new session that ${failure} is never used`, async () => {
+    let statements = 0;
+    const { server, port, requests } = await recordingBroker((socket, code, session) => {
+      if (code === SET_DB_PARAMETER && session === 2) {
+        fail(socket);
+      } else if (code === CHECK_CAS && session === 1 && statements > 0) {
+        socket.destroy();
+      } else if (code === SET_DB_PARAMETER) {
+        socket.write(frameResponse(Buffer.concat([OUT_TRAN, SET_OK])));
+      } else if (code === CHECK_CAS) {
+        socket.write(frameResponse(CAS_INFO));
+      } else {
+        statements += 1;
+        socket.write(frameResponse(OUT_TRAN));
+      }
+    });
+    const cas = new CASConnection({
+      ...DEFAULT_CONFIG,
+      port,
+      sessionParameters: SESSION_PARAMETERS,
+    });
+
+    try {
+      await cas.connect();
+      await cas.sendAndRecv(REQUEST_HEADER, STATEMENT);
+
+      await assert.rejects(
+        cas.sendAndRecv(REQUEST_HEADER, STATEMENT),
+        /session settings could not be applied/,
+      );
+
+      assert.equal(cas.isConnected, false);
+      assert.equal(statements, 1);
+      assert.equal(requests.at(-1), `2:${SET_DB_PARAMETER}`);
+      // That session ran no statement, so whatever waits behind it stays valid.
+      assert.equal(cas.failedExchanges, 0);
+    } finally {
+      await cas.close();
+      await closeServer(server);
+    }
+  });
+}
+
+test("a silent CAS during session setup is reported as a read timeout", { timeout: 5000 }, async () => {
+  const { server, port } = await recordingBroker(() => {});
+  const cas = new CASConnection({
+    ...DEFAULT_CONFIG,
+    port,
+    readTimeout: 100,
+    sessionParameters: SESSION_PARAMETERS,
+  });
+
+  try {
+    await assert.rejects(cas.connect(), ReadTimeoutError);
+    assert.equal(cas.isConnected, false);
+  } finally {
+    await cas.close();
+    await closeServer(server);
+  }
+});
+
+test("setSessionParameters applies to the open session and to every session after it", async () => {
+  const set: string[] = [];
+  const { server, port, requests } = await recordingBroker((socket, code, session, frame) => {
+    if (code === SET_DB_PARAMETER) {
+      set.push(`${session}:${setParameter(frame)}`);
+    }
+    socket.write(frameResponse(code === SET_DB_PARAMETER ? Buffer.concat([OUT_TRAN, SET_OK]) : CAS_INFO));
+  });
+
+  try {
+    await withConnection(port, async (cas) => {
+      await cas.setSessionParameters(SESSION_PARAMETERS);
+      assert.deepEqual(set, ["1:1=5", "1:2=1500"]);
+      assert.equal(requests.at(-1), `1:${CHECK_CAS}`);
+
+      await cas.discardSession();
+      await cas.ensureSession();
+      assert.deepEqual(set, ["1:1=5", "1:2=1500", "2:1=5", "2:2=1500"]);
+    });
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("setSessionParameters on a closed connection only records them", async () => {
+  const { server, port, requests } = await recordingBroker((socket, code) => {
+    socket.write(frameResponse(code === SET_DB_PARAMETER ? Buffer.concat([OUT_TRAN, SET_OK]) : CAS_INFO));
+  });
+  const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+
+  try {
+    // Without parameters a session gets nothing extra, as before.
+    await withConnection(port, async (plain) => {
+      await plain.sendAndRecv(REQUEST_HEADER, STATEMENT);
+    });
+    assert.deepEqual(requests, [`1:${STATEMENT[0]}`]);
+    requests.length = 0;
+
+    await cas.setSessionParameters(SESSION_PARAMETERS);
+    assert.deepEqual(requests, []);
+
+    await cas.connect();
+    assert.deepEqual(requests, [
+      `2:${SET_DB_PARAMETER}`,
+      `2:${SET_DB_PARAMETER}`,
+      `2:${CHECK_CAS}`,
+    ]);
+  } finally {
+    await cas.close();
+    await closeServer(server);
+  }
+});
+
+test("setSessionParameters that fails drops the session, so it cannot run with the old values", async () => {
+  const { server, port } = await recordingBroker((socket, code) => {
+    socket.write(
+      frameResponse(
+        code === SET_DB_PARAMETER ? Buffer.concat([CAS_INFO, ERROR_REPLY]) : CAS_INFO,
+      ),
+    );
+  });
+
+  try {
+    await withConnection(port, async (cas) => {
+      await assert.rejects(
+        cas.setSessionParameters(SESSION_PARAMETERS),
+        /session settings could not be applied/,
+      );
+      assert.equal(cas.isConnected, false);
     });
   } finally {
     await closeServer(server);

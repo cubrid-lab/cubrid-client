@@ -29,7 +29,7 @@ A modern CUBRID client that speaks the CAS binary protocol directly over TCP —
 | TypeScript | Full generics (`query<T>()`) |
 | Results | `Record<string, unknown>[]` objects |
 | Errors | `ConnectionError`, `QueryError`, `TransactionError`, with the server's numeric `code` and a `kind` |
-| Transactions | `transaction(callback)` with auto commit/rollback |
+| Transactions | `transaction(callback, options?)` with auto commit/rollback, and `isolationLevel` and `lockTimeout` options |
 | Node.js | 18+ |
 
 ## Versioning and compatibility
@@ -94,6 +94,19 @@ that cannot be decoded. The [roadmap](ROADMAP.md) tracks work that has **not** b
 ```ts
 const version = await db.getServerVersion(); // "11.4.6.1963"
 ```
+
+## Schema Introspection
+
+`getTables()`, `getColumns()`, `getPrimaryKey()` and `getIndexes()` return typed metadata read from the catalog views, which behave the same on CUBRID 10.2 to 11.4. Pass the bare table name; matching ignores case, and a `schema` option picks the owner when CUBRID 11.2 or later has the same table name under several users.
+
+```ts
+const tables = await db.getTables(); // [{ name: "athlete", schema: "DBA", type: "table" }, ...]
+const columns = await db.getColumns("athlete"); // name, position, dataType, precision, scale, nullable, defaultValue
+const pk = await db.getPrimaryKey("athlete"); // { name: "pk_athlete_code", columns: ["code"] } or null
+const indexes = await db.getIndexes("athlete"); // unique, reverse, primaryKey, foreignKey, filter, columns
+```
+
+The catalog lists only tables the connected user may `SELECT`, so an inaccessible table is absent from `getTables()` and rejects with a `QueryError` in the others. See the [API reference](docs/API_REFERENCE.md#schema-introspection-gettables-getcolumns-getprimarykey-getindexes) for names, owners, permissions and what is not included.
 
 ## Result Columns
 
@@ -184,6 +197,20 @@ const { affectedRows, lastInsertId } = await db.execute(
 [`execute()`](docs/API_REFERENCE.md#executesql-params) for what the server
 reports for multi-row and multi-statement inserts.
 
+### Server-side prepared binding
+
+`query()` and `execute()` render parameters into SQL text. To send them as typed
+binds instead, use `queryPrepared()`, `queryResultPrepared()` or
+`executePrepared()`, on the client or on a transaction:
+
+```ts
+const rows = await db.queryPrepared("SELECT id FROM users WHERE name = ?", [name]);
+```
+
+It is opt-in, takes more round trips than `query()` and has no reusable statement
+object. See [prepared binding](docs/TYPES.md#prepared-binding) for the type
+mapping, the values it refuses and where results differ.
+
 ### Date parameters are serialized in UTC
 
 `Date` parameters are rendered as a `DATETIME'YYYY-MM-DD HH:MM:SS.mmm'`
@@ -260,6 +287,20 @@ statement: one that is still running when the commit starts and then fails
 rolls the transaction back. See the
 [transaction lifecycle](docs/API_REFERENCE.md#transaction-lifecycle) for every
 outcome and the [compatibility notes](docs/API_STABILITY.md#transaction-callback-guards).
+
+### Isolation level and lock timeout
+
+Set them on the client, or on one transaction. They are applied before the transaction starts, and again on any session that replaces the first one, so they never disappear silently after a reconnect.
+
+```typescript
+const db = createClient({ host, database, user, lockTimeout: 5000 });
+
+await db.transaction(async (tx) => {
+  await tx.query('UPDATE stock SET qty = qty - 1 WHERE id = ?', [1]);
+}, { isolationLevel: 'repeatable read', lockTimeout: 0 });
+```
+
+`serializable` behaves like `repeatable read` on CUBRID 10.2 to 11.4, and it still allows write skew. See [what each level does](docs/CONNECTION.md#isolation-level-and-lock-timeout), and [Autocommit](docs/CONNECTION.md#autocommit) for its behavior after a reconnect.
 
 ### Manual
 
@@ -378,21 +419,23 @@ Creates a client instance. Connection is established lazily on first query.
 | `connectionTimeout` | `number` | — | Connection timeout (ms) |
 | `maxConnectionRetryCount` | `number` | `0` | Retries after a failed TCP connect to the broker (see [Connection retries](docs/CONNECTION.md#connection-retries)) |
 | `readTimeout` | `number` | — | Fail a query after this many ms with no activity from the server (see [Read timeout](docs/CONNECTION.md#read-timeout)). Unset means no timeout for queries; the connect handshake still gives up after 10 s |
-| `maxLobBytes` | `number` | 64 MiB | Most BLOB and CLOB content one query may load, in bytes. A query over it rejects (see [BLOB and CLOB columns](docs/TYPES.md#blob-and-clob-columns)) |
 | `fetchSize` | `number` | `100` | Rows requested per FETCH. CUBRID 10.2 to 11.4 ignore it and send about 16 KiB per reply (see [`fetchSize`](docs/API_REFERENCE.md#clientoptions)) |
+| `maxLobBytes` | `number` | 64 MiB | Most BLOB and CLOB content one query may load, in bytes. A query over it rejects (see [BLOB and CLOB columns](docs/TYPES.md#blob-and-clob-columns)) |
+| `isolationLevel` | `"read committed" \| "repeatable read" \| "serializable"` | Server default | Isolation level of every session this client opens, restored after a reconnect (see [Isolation Level and Lock Timeout](docs/CONNECTION.md#isolation-level-and-lock-timeout)) |
+| `lockTimeout` | `number` | Server default | Longest a statement waits for a lock, in ms. `0` does not wait and `-1` has no limit. Restored after a reconnect |
 | `ssl` | `boolean \| ClientSSLOptions` | `false` | Enable TLS. `true` for defaults, or an object for cert/verification control (see [TLS/SSL](#tlsssl)) |
-
-### `client.query<T>(sql, params?): Promise<T[]>`
-
-Executes SQL and returns typed row objects. DDL/DML statements return `[]`. BLOB columns return a complete `Buffer` and CLOB columns a complete `string`.
 
 ### `client.stream<T>(sql, params?, options?): AsyncGenerator<T>`
 
 Reads a result row by row with `for await`, with bounded memory. See [Streaming Large Results](#streaming-large-results).
 
-### `client.transaction<T>(callback): Promise<T>`
+### `client.query<T>(sql, params?): Promise<T[]>`
 
-Runs `callback` in an isolated transaction with exactly one commit or rollback.
+Executes SQL and returns typed row objects. DDL/DML statements return `[]`. BLOB columns return a complete `Buffer` and CLOB columns a complete `string`.
+
+### `client.transaction<T>(callback, options?): Promise<T>`
+
+Runs `callback` in an isolated transaction with exactly one commit or rollback. `options` can set `isolationLevel` and `lockTimeout` for that transaction.
 
 ### `client.beginTransaction(): Promise<void>`
 

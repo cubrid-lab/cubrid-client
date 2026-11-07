@@ -4,12 +4,15 @@ import type {
   ConnectionLike,
   ExecuteResult,
   ExecutableTransactionClient,
+  PreparedTransactionClient,
   ResultTransactionClient,
 } from "../types/client.js";
 import type { QueryParams } from "../types/query.js";
 import type { QueryResult, QueryResultRow } from "../types/result.js";
 
-export class CubridTransaction implements ResultTransactionClient, ExecutableTransactionClient {
+export class CubridTransaction
+  implements ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient
+{
   constructor(private readonly connection: ConnectionLike) {}
 
   async query<T extends QueryResultRow = QueryResultRow>(
@@ -43,6 +46,45 @@ export class CubridTransaction implements ResultTransactionClient, ExecutableTra
         throw new Error("Underlying connection does not support execute.");
       }
       return await this.connection.execute(sql, params);
+    } catch (error) {
+      throw mapError("transaction", error, "Transaction statement failed.");
+    }
+  }
+
+  async queryPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<T[]> {
+    try {
+      if (!this.connection.queryPrepared) {
+        throw new Error("Underlying connection does not support queryPrepared.");
+      }
+      return await this.connection.queryPrepared<T>(sql, params);
+    } catch (error) {
+      throw mapError("transaction", error, "Transaction query failed.");
+    }
+  }
+
+  async queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>> {
+    try {
+      if (!this.connection.queryResultPrepared) {
+        throw new Error("Underlying connection does not support queryResultPrepared.");
+      }
+      return await this.connection.queryResultPrepared<T>(sql, params);
+    } catch (error) {
+      throw mapError("transaction", error, "Transaction query failed.");
+    }
+  }
+
+  async executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult> {
+    try {
+      if (!this.connection.executePrepared) {
+        throw new Error("Underlying connection does not support executePrepared.");
+      }
+      return await this.connection.executePrepared(sql, params);
     } catch (error) {
       throw mapError("transaction", error, "Transaction statement failed.");
     }
@@ -102,6 +144,24 @@ export class CallbackTransaction extends CubridTransaction {
 
   override execute(sql: string, params?: QueryParams): Promise<ExecuteResult> {
     return this.track(() => super.execute(sql, params));
+  }
+
+  override queryPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<T[]> {
+    return this.track(() => super.queryPrepared<T>(sql, params));
+  }
+
+  override queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>> {
+    return this.track(() => super.queryResultPrepared<T>(sql, params));
+  }
+
+  override executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult> {
+    return this.track(() => super.executePrepared(sql, params));
   }
 
   override commit(): Promise<void> {

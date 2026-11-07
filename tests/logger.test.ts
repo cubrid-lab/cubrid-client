@@ -408,3 +408,63 @@ test("stream is exposed only when the connection supports it, and checks its opt
     RangeError,
   );
 });
+
+test("logger reports setTransactionOptions and the wrapper keeps the method", async () => {
+  const { logger, entries } = recorder();
+  const connection = fakeConnection();
+  let applied: unknown;
+  connection.setTransactionOptions = async (options) => {
+    applied = options;
+  };
+  const c = client(logger, connection);
+
+  await c.transaction(async () => undefined, { isolationLevel: "serializable" });
+
+  assert.deepEqual(applied, { isolationLevel: "serializable" });
+  const entry = entries.find((e) => e.fields.operation === "setTransactionOptions");
+  assert.equal(entry?.level, "debug");
+});
+
+test("the logging wrapper does not claim setTransactionOptions for a connection without it", async () => {
+  const { logger } = recorder();
+  const c = client(logger, fakeConnection());
+
+  await assert.rejects(
+    c.transaction(async () => undefined, { isolationLevel: "serializable" }),
+    (error: unknown) =>
+      error instanceof TransactionError &&
+      /does not support transaction options/.test(String(error.cause)),
+  );
+});
+
+test("logger reports the prepared methods without SQL, parameters or rows", async () => {
+  const { logger, entries } = recorder();
+  const connection = fakeConnection();
+  connection.queryPrepared = async <T>() => [{ v: ROW_VALUE }] as unknown as T[];
+  connection.queryResultPrepared = async <T>() => ({
+    rows: [{ v: ROW_VALUE }] as unknown as T[],
+    columns: [],
+  });
+  connection.executePrepared = async () => ({ affectedRows: 5, lastInsertId: 99 });
+  const c = client(logger, connection);
+  const sql = `SELECT '${SQL_LITERAL}', ?`;
+
+  await c.queryPrepared(sql, [PARAM]);
+  await c.queryResultPrepared(sql, [PARAM]);
+  await c.executePrepared(sql, [PARAM]);
+
+  for (const [operation, rowCount] of [
+    ["queryPrepared", 1],
+    ["queryResultPrepared", 1],
+    ["executePrepared", undefined],
+  ] as const) {
+    const entry = entries.find((e) => e.fields.operation === operation);
+    assert.ok(entry);
+    assert.equal(entry.fields.paramCount, 1);
+    assert.equal(entry.fields.rowCount, rowCount);
+  }
+  const logged = JSON.stringify(entries);
+  assert.equal(logged.includes(SQL_LITERAL), false);
+  assert.equal(logged.includes(PARAM), false);
+  assert.equal(logged.includes(ROW_VALUE), false);
+});

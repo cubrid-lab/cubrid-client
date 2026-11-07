@@ -7,10 +7,20 @@
 
 import { TextDecoder } from "node:util";
 
-import { CASConnection, type CASConnectionConfig } from "../protocol/connection.js";
+import {
+  CASConnection,
+  type CASConnectionConfig,
+  type SessionParameter,
+} from "../protocol/connection.js";
 import {
   writePrepareAndExecute,
   parsePrepareAndExecute,
+  writePrepare,
+  parsePrepare,
+  writeExecute,
+  parseExecute,
+  encodePreparedParams,
+  assertPreparableSql,
   readQueryHandle,
   MalformedReplyError,
   writeFetch,
@@ -30,11 +40,14 @@ import {
   writeGetLastInsertId,
   parseGetLastInsertId,
   type PrepareAndExecuteResult,
+  type PreparedBinds,
 } from "../protocol/protocol.js";
 import {
   CUBRIDDataType,
+  DbParameter,
   DEFAULT_MAX_LOB_BYTES,
   EndTranType,
+  ISOLATION_LEVEL_CODES,
   LOB_READ_CHUNK_SIZE,
   StatementType,
   TYPE_NAMES,
@@ -46,15 +59,18 @@ import {
   type CasReplyError,
 } from "../errors/internal-errors.js";
 import { mapError, type ErrorKind } from "../internals/map-error.js";
+import { TransactionError } from "../errors/transaction-error.js";
 import {
   assertValidFetchSize,
   assertValidMaxLobBytes,
   assertValidRetryCount,
   assertValidStreamOptions,
+  assertValidTransactionOptions,
+  pickTransactionOptions,
 } from "../internals/normalize-config.js";
 import { StreamCursor } from "./stream-cursor.js";
 import type { DriverAdapter } from "./base.js";
-import type { ClientConfig, ExecuteResult, StreamOptions } from "../types/client.js";
+import type { ClientConfig, ExecuteResult, StreamOptions, TransactionOptions } from "../types/client.js";
 import type { QueryParams } from "../types/query.js";
 import type { ColumnInfo, QueryResult, QueryResultRow } from "../types/result.js";
 
@@ -72,8 +88,7 @@ function assertStreamWanted(cursor?: StreamCursor): void {
   if (cursor.isStopped) throw STREAM_STOPPED;
 }
 
-/** How long a statement waits for a stream whose consumer has stopped asking for rows. */
-const DEFAULT_CONSUMER_TIMEOUT_MS = 5000;
+
 
 /** Fatal so a CLOB that is not UTF-8 is refused, not silently given U+FFFD. */
 const CLOB_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
@@ -89,6 +104,7 @@ interface WaitingStatement {
   since: number;
   refuse: (reason: Error) => void;
 }
+
 
 /** Whether any parameter renders differently under the two backslash modes. */
 function needsBackslashMode(params: QueryParams): boolean {
@@ -108,9 +124,24 @@ function needsBackslashMode(params: QueryParams): boolean {
   });
 }
 
+function toSessionParameters({ isolationLevel, lockTimeout }: TransactionOptions): SessionParameter[] {
+  return [
+    ...(isolationLevel === undefined
+      ? []
+      : [{ parameter: DbParameter.ISOLATION_LEVEL, value: ISOLATION_LEVEL_CODES[isolationLevel] }]),
+    ...(lockTimeout === undefined
+      ? []
+      : [{ parameter: DbParameter.LOCK_TIMEOUT, value: lockTimeout }]),
+  ];
+}
+
 export class NativeCubridAdapter implements DriverAdapter {
   private cas: CASConnection | null = null;
   private autoCommit = true;
+
+  /** What every session of this connection must hold. See setTransactionOptions(). */
+  private transactionOptions: TransactionOptions;
+
   /**
    * Server backslash-escaping mode, negotiated once per physical session via
    * `SELECT CHAR_LENGTH('\\')`. `null` until negotiated. `true` means the CUBRID
@@ -170,10 +201,14 @@ export class NativeCubridAdapter implements DriverAdapter {
   /** Timer of the next possible refusal. See watchHeldTurn(). */
   private refusalTimer: NodeJS.Timeout | null = null;
 
+
+
   constructor(private readonly config: ClientConfig) {
     assertValidRetryCount(config.maxConnectionRetryCount);
     assertValidMaxLobBytes(config.maxLobBytes);
     assertValidFetchSize(config.fetchSize);
+    assertValidTransactionOptions(config);
+    this.transactionOptions = pickTransactionOptions(config);
   }
 
   async connect(): Promise<void> {
@@ -199,7 +234,7 @@ export class NativeCubridAdapter implements DriverAdapter {
   ): Promise<QueryResult<T>> {
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
-    return this.inTurn("query", QUERY_FAILED, () => this.queryNow<T>(sql, params, issued));
+    return this.inTurn("query", QUERY_FAILED, () => this.queryNow<T>(sql, params, issued, undefined));
   }
 
   /**
@@ -263,15 +298,38 @@ export class NativeCubridAdapter implements DriverAdapter {
   async execute(sql: string, params?: QueryParams): Promise<ExecuteResult> {
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
-    return this.inTurn("query", "Failed to execute CUBRID statement.", () =>
-      this.executeNow(sql, params, issued),
-    );
+    return this.inTurn("query", "Failed to execute CUBRID statement.", () => this.executeNow(sql, params, issued, undefined));
+  }
+
+  async queryPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<T[]> {
+    return (await this.queryResultPrepared<T>(sql, params)).rows;
+  }
+
+  async queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>> {
+    const binds = bindOrRefuse(sql, params, "Failed to execute CUBRID query.");
+    const cas = this.getOrCreateCAS();
+    const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
+    return this.inTurn("query", QUERY_FAILED, () => this.queryNow<T>(sql, params, issued, binds));
+  }
+
+  async executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult> {
+    const binds = bindOrRefuse(sql, params, "Failed to execute CUBRID statement.");
+    const cas = this.getOrCreateCAS();
+    const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
+    return this.inTurn("query", "Failed to execute CUBRID statement.", () => this.executeNow(sql, params, issued, binds));
   }
 
   private async executeNow(
     sql: string,
     params: QueryParams | undefined,
     issued: IssuedOn,
+    binds: PreparedBinds | undefined,
   ): Promise<ExecuteResult> {
     try {
       await this.readInsertIdBaseline(sql);
@@ -281,6 +339,7 @@ export class NativeCubridAdapter implements DriverAdapter {
         issued,
         (cas, result) => this.readExecuteResult(cas, result),
         true,
+        binds,
       );
     } catch (error) {
       this.forgetInsertId();
@@ -294,11 +353,18 @@ export class NativeCubridAdapter implements DriverAdapter {
     sql: string,
     params: QueryParams | undefined,
     issued: IssuedOn,
+    binds: PreparedBinds | undefined,
   ): Promise<QueryResult<T>> {
     try {
-      return await this.executeQuery<T>(sql, params, issued);
+      return await this.executeQuery<T>(sql, params, issued, binds);
     } catch (error) {
-      throw this.queryFailure(error);
+      // If the first transactional statement lost its session before the
+      // post-response bind, remember that failed generation. A ping/reconnect
+      // must never make subsequent statements commit on a replacement CAS.
+      this.forgetInsertId();
+      this.bindSessionLostByFirstStatement();
+      this.recordTransactionAbort(error);
+      throw mapError("query", error, "Failed to execute CUBRID query.");
     }
   }
 
@@ -332,10 +398,37 @@ export class NativeCubridAdapter implements DriverAdapter {
     return mapError("query", error, QUERY_FAILED);
   }
 
+  /**
+   * Keep these settings on every session of this connection, in place of what was
+   * set before and leaving any option not given as it is. close() goes back to
+   * the configured values, so an adapter reused after a transaction inherits none.
+   *
+   * Refused inside a transaction: the server would apply it to the running
+   * transaction at once, so reads before and after it could follow different
+   * levels, while the caller believes the whole transaction ran under one.
+   */
+  async setTransactionOptions(options: TransactionOptions): Promise<void> {
+    assertValidTransactionOptions(options);
+    return this.inTurn("transaction", "Failed to apply transaction options.", () => this.setTransactionOptionsNow(options));
+  }
+
+  private async setTransactionOptionsNow(options: TransactionOptions): Promise<void> {
+    if (!this.autoCommit) {
+      throw new TransactionError(
+        "Transaction options cannot change inside a transaction, so nothing was sent.",
+      );
+    }
+
+    try {
+      this.transactionOptions = { ...this.transactionOptions, ...pickTransactionOptions(options) };
+      await this.cas?.setSessionParameters(toSessionParameters(this.transactionOptions));
+    } catch (error) {
+      throw mapError("connection", error, "Failed to apply transaction options.");
+    }
+  }
+
   async beginTransaction(): Promise<void> {
-    return this.inTurn("transaction", "Failed to start transaction.", () =>
-      this.beginTransactionNow(),
-    );
+    return this.inTurn("transaction", "Failed to start transaction.", () => this.beginTransactionNow());
   }
 
   private async beginTransactionNow(): Promise<void> {
@@ -391,9 +484,7 @@ export class NativeCubridAdapter implements DriverAdapter {
   }
 
   async rollback(): Promise<void> {
-    return this.inTurn("transaction", "Failed to roll back transaction.", () =>
-      this.rollbackNow(),
-    );
+    return this.inTurn("transaction", "Failed to roll back transaction.", () => this.rollbackNow());
   }
 
   private async rollbackNow(): Promise<void> {
@@ -416,11 +507,6 @@ export class NativeCubridAdapter implements DriverAdapter {
     }
   }
 
-  /**
-   * Waits for the statements issued before it, as they wait for nothing but the
-   * server, except a stream, which would wait for its consumer. So an open stream
-   * ends here: its next read rejects, and it releases its handle before this runs.
-   */
   async close(): Promise<void> {
     for (const cursor of this.openCursors) {
       cursor.cancel(
@@ -436,6 +522,8 @@ export class NativeCubridAdapter implements DriverAdapter {
   }
 
   private async closeNow(): Promise<void> {
+    this.transactionOptions = pickTransactionOptions(this.config);
+
     if (!this.cas) {
       return;
     }
@@ -496,13 +584,8 @@ export class NativeCubridAdapter implements DriverAdapter {
    * not do better; an open
    * transaction could, but its commit and rollback would still have to wait.
    *
-   * Waiting does not count towards readTimeout. A statement waits only for the
-   * statements ahead of it, and those wait only for the server, with one exception:
-   * a stream holds its turn while its consumer reads. If the consumer itself awaits
-   * a statement issued here, both wait for each other for ever, and nothing tells
-   * that consumer apart from unrelated code on this connection. So a statement
-   * waits as long as the consumer keeps asking for rows, and rejects once it has
-   * not for `consumerTimeout`. See watchHeldTurn().
+   * Nothing runs here but this adapter's own statements, so a statement can
+   * never wait on its own turn. Waiting does not count towards readTimeout.
    */
   private inTurn<T>(
     kind: ErrorKind,
@@ -672,9 +755,17 @@ export class NativeCubridAdapter implements DriverAdapter {
     sql: string,
     params: QueryParams | undefined,
     issued: IssuedOn,
+    binds: PreparedBinds | undefined,
   ): Promise<QueryResult<T>> {
-    return this.runStatement(sql, params, issued, async (cas, result) => {
-      this.forgetInsertIdAfterQuery(result);
+    const read = async (
+      cas: CASConnection,
+      result: PrepareAndExecuteResult,
+    ): Promise<QueryResult<T>> => {
+      // This may generate a value that nobody reads, so a later execute() on this
+      // session could not tell it from its own.
+      if (result.resultInfos.some((info) => info.statementType !== StatementType.SELECT)) {
+        this.forgetInsertId();
+      }
 
       if (result.statementType !== StatementType.SELECT) {
         return { rows: [], columns: [] };
@@ -688,21 +779,15 @@ export class NativeCubridAdapter implements DriverAdapter {
       }
 
       if (result.columns.some(mayHoldLob)) {
-        await this.loadLobs(cas, generation, allRows);
+        // A prepared statement's transaction belongs to runStatement(), which
+        // commits it only once everything succeeded.
+        await this.loadLobs(cas, generation, allRows, binds === undefined);
       }
 
       return { rows: allRows as T[], columns: result.columns.map(toColumnInfo) };
-    });
-  }
+    };
 
-  /**
-   * A statement run for its rows may generate a value that nobody reads, so a later
-   * execute() on this session could not tell it from its own.
-   */
-  private forgetInsertIdAfterQuery(result: PrepareAndExecuteResult): void {
-    if (result.resultInfos.some((info) => info.statementType !== StatementType.SELECT)) {
-      this.forgetInsertId();
-    }
+    return this.runStatement(sql, params, issued, read, false, binds);
   }
 
   /**
@@ -759,6 +844,12 @@ export class NativeCubridAdapter implements DriverAdapter {
    * commit lets the CAS go, so a question asked after the autocommit flag could
    * reach a new session that holds no value. The statement is then committed with
    * END_TRAN, or rolled back if anything failed.
+   *
+   * `binds`, encoded when the call was made, sends PREPARE and EXECUTE with
+   * typed binds instead of SQL text holding the values. The handle belongs to this one call and is released
+   * like any other, so it can never outlive its session or be reused. Prepared
+   * statements always end by END_TRAN in autocommit mode, so a failed PREPARE,
+   * which leaves the session in a transaction, is rolled back.
    */
   private async runStatement<R>(
     sql: string,
@@ -766,6 +857,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     issued: IssuedOn,
     use: (cas: CASConnection, result: PrepareAndExecuteResult) => Promise<R>,
     commitAfter = false,
+    binds?: PreparedBinds,
   ): Promise<R> {
     const cas = this.getOrCreateCAS();
 
@@ -792,7 +884,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     // Only a backslash, CR or LF is escaped differently by the two modes, so any
     // other parameters bind the same on every session and skip the probe.
     const resolvedSql =
-      params && params.length > 0
+      !binds && params && params.length > 0
         ? interpolateParams(
             sql,
             params,
@@ -800,12 +892,10 @@ export class NativeCubridAdapter implements DriverAdapter {
           )
         : sql;
 
-    const deferCommit = commitAfter && this.autoCommit;
-    const { header, payload } = writePrepareAndExecute(
-      resolvedSql,
-      this.autoCommit && !deferCommit,
-      cas.casInfo,
-    );
+    const deferCommit = (commitAfter || binds !== undefined) && this.autoCommit;
+    const { header, payload } = binds
+      ? writePrepare(sql, cas.casInfo)
+      : writePrepareAndExecute(resolvedSql, this.autoCommit && !deferCommit, cas.casInfo);
 
     // Before the first statement a ping may truthfully report OUT_TRAN.
     if (!this.autoCommit && this.transactionGeneration === null) {
@@ -822,10 +912,9 @@ export class NativeCubridAdapter implements DriverAdapter {
       const finished = await this.withQueryHandle(cas, responsePayload, async () => {
         await this.bindTransactionSession(cas);
 
-        const result: PrepareAndExecuteResult = parsePrepareAndExecute(
-          responsePayload,
-          cas.protoVersion,
-        );
+        const result: PrepareAndExecuteResult = binds
+          ? await this.executeHandle(cas, responsePayload, binds, generation)
+          : parsePrepareAndExecute(responsePayload, cas.protoVersion);
 
         const value = await use(cas, result);
         if (deferCommit) {
@@ -849,6 +938,43 @@ export class NativeCubridAdapter implements DriverAdapter {
       }
       throw error;
     }
+  }
+
+  /**
+   * Sends EXECUTE for the handle in a PREPARE reply. It must reach the session
+   * that prepared it: on any other session the same number is another statement
+   * or nothing. The CAS ignores extra values and the literal path ignores extra
+   * parameters, so the count is checked against the server's here.
+   */
+  private async executeHandle(
+    cas: CASConnection,
+    prepareReply: Buffer,
+    binds: PreparedBinds,
+    generation: number,
+  ): Promise<PrepareAndExecuteResult> {
+    const statement = parsePrepare(prepareReply);
+    if (statement.bindCount !== binds.count) {
+      throw new Error(
+        `Parameter count mismatch: the statement has ${statement.bindCount} markers, got ${binds.count} values`,
+      );
+    }
+
+    const { header, payload } = writeExecute(statement, binds, cas.casInfo);
+    const reply = await this.exchangeOnSession(cas, generation, header, payload);
+    return parseExecute(reply, statement, cas.protoVersion);
+  }
+
+  private async exchangeOnSession(
+    cas: CASConnection,
+    generation: number,
+    header: Buffer,
+    payload: Buffer,
+  ): Promise<Buffer> {
+    const reply = await cas.sendAndRecvOnSession(generation, header, payload);
+    if (!reply) {
+      throw new ConnectionLostError("Connection lost before the prepared statement finished");
+    }
+    return reply;
   }
 
   /** Ends the transaction of a statement run by runStatement(commitAfter), on its own session. */
@@ -1072,6 +1198,7 @@ export class NativeCubridAdapter implements DriverAdapter {
         ...(this.config.readTimeout !== undefined && {
           readTimeout: this.config.readTimeout,
         }),
+        sessionParameters: toSessionParameters(this.transactionOptions),
         ...this.resolveSslConfig(),
       };
       this.cas = new CASConnection(casConfig);
@@ -1223,8 +1350,28 @@ export class NativeCubridAdapter implements DriverAdapter {
     cas: CASConnection,
     generation: number,
     rows: Record<string, unknown>[],
+    endsReadTransaction: boolean,
   ): Promise<void> {
-    const { cells, total } = this.measureLobs(rows, "query");
+    const limit = this.config.maxLobBytes ?? DEFAULT_MAX_LOB_BYTES;
+    const cells: Array<{ row: Record<string, unknown>; name: string; lob: LobLocator }> = [];
+    let total = 0;
+
+    for (const row of rows) {
+      for (const [name, lob] of Object.entries(row)) {
+        if (!(lob instanceof LobLocator)) {
+          continue;
+        }
+        total += lob.size;
+        if (total > limit) {
+          throw new UnsupportedValueError(
+            `CUBRID column "${name}" takes this query's LOB content to ${total} bytes, ` +
+              `over the maxLobBytes limit of ${limit}`,
+          );
+        }
+        cells.push({ row, name, lob });
+      }
+    }
+
     let replyDamaged = false;
 
     try {
@@ -1236,7 +1383,7 @@ export class NativeCubridAdapter implements DriverAdapter {
       throw error;
     } finally {
       // An empty LOB sends no LOB_READ, and nothing may follow a damaged reply.
-      if (total > 0 && !replyDamaged) {
+      if (total > 0 && !replyDamaged && endsReadTransaction) {
         await this.endReadTransaction(cas, generation);
       }
     }
@@ -1328,11 +1475,10 @@ export class NativeCubridAdapter implements DriverAdapter {
   }
 
   /**
-   * LOB_READ opens a transaction on the server, and so does a SELECT whose cursor
-   * was not read to its end, so an autocommit session is left with one after its
-   * statement finished, and CAS_INFO stops reporting it as releasable: an idle
-   * client would keep its CAS. Nothing was changed, so this only ends that. Inside
-   * a caller's transaction there is nothing to do.
+   * LOB_READ opens a transaction on the server, so an autocommit session is left
+   * with one after its statement finished, and CAS_INFO stops reporting it as
+   * releasable: an idle client would keep its CAS. Nothing was changed, so this
+   * only ends that. Inside a caller's transaction there is nothing to do.
    */
   private async endReadTransaction(cas: CASConnection, generation: number): Promise<void> {
     if (!this.autoCommit) {
@@ -1376,6 +1522,21 @@ export class NativeCubridAdapter implements DriverAdapter {
     } catch {
       // Best-effort cleanup — ignore errors
     }
+  }
+}
+
+/**
+ * Checks the SQL and encodes the values when a prepared method is called, before
+ * it waits for its turn or sends anything: a refused statement must not read the
+ * insert id, open a session or be probed. The binds are a snapshot, so changing
+ * the array afterwards does not change what is sent.
+ */
+function bindOrRefuse(sql: string, params: QueryParams | undefined, message: string): PreparedBinds {
+  try {
+    assertPreparableSql(sql);
+    return encodePreparedParams(params ?? []);
+  } catch (error) {
+    throw mapError("query", error, message);
   }
 }
 

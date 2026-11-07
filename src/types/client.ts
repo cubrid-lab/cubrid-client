@@ -25,7 +25,7 @@ export type ClientLogLevel = "debug" | "info" | "error";
  * parameter values, row data, credentials or error messages.
  */
 export interface ClientLogFields {
-  /** `connection`, `connect`, `query`, `queryResult`, `execute`, `stream`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`. */
+  /** `connection`, `connect`, `query`, `queryResult`, `execute`, `queryPrepared`, `queryResultPrepared`, `executePrepared`, `stream`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`. */
   operation?: string;
   host?: string;
   port?: number;
@@ -54,6 +54,23 @@ export interface ClientLogger {
   error?(message: string, fields: ClientLogFields): void;
 }
 
+/**
+ * The isolation levels CUBRID 10.2 to 11.4 accept. Every other server level is
+ * refused, so no level reads uncommitted rows. `serializable` behaved like
+ * `repeatable read` on all four and still allows write skew.
+ */
+export type IsolationLevel = "read committed" | "repeatable read" | "serializable";
+
+/** Settings for a whole transaction, applied before it starts. */
+export interface TransactionOptions {
+  isolationLevel?: IsolationLevel;
+  /**
+   * Longest one statement waits for a lock, in milliseconds. `0` does not wait
+   * and `-1` has no limit. Must be an integer from `-1` to `2147483647`.
+   */
+  lockTimeout?: number;
+}
+
 export interface ClientConfig {
   host: string;
   port: number;
@@ -67,6 +84,10 @@ export interface ClientConfig {
   maxLobBytes?: number | undefined;
   /** See {@link ClientOptions.fetchSize}. */
   fetchSize?: number | undefined;
+  /** See {@link ClientOptions.isolationLevel}. */
+  isolationLevel?: IsolationLevel | undefined;
+  /** See {@link ClientOptions.lockTimeout}. */
+  lockTimeout?: number | undefined;
   maxConnectionRetryCount?: number | undefined;
   ssl?: boolean | ClientSSLOptions | undefined;
   logger?: unknown;
@@ -96,6 +117,19 @@ export interface ClientOptions {
    * `stream()` applies the same limit to each row instead, see {@link StreamOptions}.
    */
   maxLobBytes?: number;
+  /**
+   * Isolation level of every session this client opens, on the shared connection
+   * and on each `transaction()` connection. A session that replaces one gets it
+   * before its first statement, or that statement fails. Unset leaves the
+   * server's default. A `transaction()` option overrides it for that transaction.
+   */
+  isolationLevel?: IsolationLevel;
+  /**
+   * Longest a statement waits for a lock, in milliseconds, on every session this
+   * client opens and with the same guarantee as `isolationLevel`. `0` does not
+   * wait and `-1` has no limit. Unset leaves the server's default.
+   */
+  lockTimeout?: number;
   /**
    * Rows asked for in each FETCH by `query()`, `queryResult()` and `stream()`.
    * CUBRID 10.2 to 11.4 ignore this number and answer every FETCH with about
@@ -132,6 +166,24 @@ export interface ResultQueryable {
   ): Promise<QueryResult<T>>;
 }
 
+/**
+ * Outcome of a statement run with `execute()`.
+ *
+ * `affectedRows` is the number of rows an INSERT, UPDATE, DELETE or MERGE
+ * changed, added over every statement of a multi-statement string. It is 0 for
+ * DDL and SELECT, and 0 when an UPDATE or DELETE matched nothing.
+ *
+ * `lastInsertId` is set only when an INSERT ran and the session then holds a
+ * new generated AUTO_INCREMENT value: a `number` while it is a safe integer and
+ * a `bigint` beyond that, so no precision is lost. It is absent otherwise,
+ * including when the value equals the one seen before the statement.
+ */
+export interface ExecuteResult {
+  affectedRows: number;
+  lastInsertId?: number | bigint;
+}
+
+/** Runs a statement and reports its {@link ExecuteResult} instead of rows. */
 /**
  * Options of `stream()`.
  *
@@ -193,6 +245,25 @@ export interface Executable {
   execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
 }
 
+/**
+ * Runs statements with server-side prepared binding: the values travel as typed
+ * binds, never as SQL text. Each call prepares, executes and releases its own
+ * handle, so nothing is reused between calls. The results match `query()`,
+ * `queryResult()` and `execute()`; the differences in how values convert are in
+ * docs/TYPES.md. The methods without `Prepared` keep rendering SQL literals.
+ */
+export interface PreparedQueryable {
+  queryPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<T[]>;
+  queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>>;
+  executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+}
+
 export interface TransactionClient extends Queryable {
   commit(): Promise<void>;
   rollback(): Promise<void>;
@@ -220,6 +291,13 @@ export type TransactionCallback<
  */
 export interface ResultTransactionClient extends TransactionClient, ResultQueryable {}
 
+/**
+ * The transaction client `CubridClient.transaction()` passes in: a
+ * {@link TransactionClient} that can also bind on the server. Kept apart from
+ * `TransactionClient` so 1.x code that implements that interface keeps compiling.
+ */
+export interface PreparedTransactionClient extends TransactionClient, PreparedQueryable {}
+
 export interface ConnectionLike {
   connect(): Promise<void>;
   query<T extends QueryResultRow = QueryResultRow>(
@@ -240,6 +318,31 @@ export interface ConnectionLike {
    */
   execute?(sql: string, params?: QueryParams): Promise<ExecuteResult>;
   /**
+   * Optional so 1.x connection factories keep compiling. The prepared methods
+   * on a client or transaction fail when their connection does not provide
+   * them, rather than falling back to SQL literals.
+   */
+  queryPrepared?<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<T[]>;
+  queryResultPrepared?<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>>;
+  executePrepared?(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+  beginTransaction(): Promise<void>;
+  commit(): Promise<void>;
+  rollback(): Promise<void>;
+  close(): Promise<void>;
+  /**
+   * Keeps these settings on every session of this connection, leaving any option
+   * not given as it is. Optional so 1.x connection factories keep compiling, and
+   * called only when a setting is in effect. Without it such a client or
+   * transaction fails, because running without the setting would hide that.
+   */
+  setTransactionOptions?(options: TransactionOptions): Promise<void>;
+  /**
    * Optional so 1.x connection factories keep compiling. `stream()` on a client
    * fails on its first read when its connection does not provide it.
    */
@@ -248,10 +351,6 @@ export interface ConnectionLike {
     params?: QueryParams,
     options?: StreamOptions,
   ): AsyncIterable<T>;
-  beginTransaction(): Promise<void>;
-  commit(): Promise<void>;
-  rollback(): Promise<void>;
-  close(): Promise<void>;
   ping?(): Promise<string>;
 }
 

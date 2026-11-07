@@ -23,7 +23,7 @@
 
 ## Planned Evolution
 
-- prepared statements
+- reusable prepared statements (each `queryPrepared()` call prepares its own handle today)
 - pooling
 - retry policies
 - instrumentation hooks
