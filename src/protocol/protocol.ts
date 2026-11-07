@@ -933,8 +933,8 @@ function parseRowData(
   let unsupported: UnsupportedValueError | undefined;
 
   for (let t = 0; t < tupleCount; t++) {
-    if (reader.remaining <= 0) break;
-
+    // A reply that ends before tupleCount rows overruns the reader and is
+    // reported as malformed, never returned as a short result.
     reader.parseInt(); // row index
     reader.skip(SIZE_OID); // OID
 

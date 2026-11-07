@@ -233,6 +233,30 @@ test("the first unsupported value is reported only once the whole reply holds to
   );
 });
 
+test("a reply that ends before its declared rows is malformed, not a short result", () => {
+  const column = { type: 8, name: "n" } as never;
+  const row = Buffer.concat([i32(1), Buffer.alloc(8), i32(4), i32(42)]);
+
+  // FETCH declares two rows. One complete row, then none, then a row cut inside its cells.
+  for (const body of [row, Buffer.alloc(0), row.subarray(0, -2)]) {
+    assert.throws(
+      () => parseFetch(Buffer.concat([i32(0), i32(2), body]), [column]),
+      (error: Error) => error instanceof MalformedReplyError,
+    );
+  }
+  assert.deepEqual(parseFetch(Buffer.concat([i32(0), i32(1), row]), [column]).rows, [{ n: 42 }]);
+
+  // The inline rows of PREPARE_AND_EXECUTE declare two tuples but carry one.
+  const wire = selectWire(8, i32(42));
+  assert.deepEqual(parsePrepareAndExecute(wire, 1).rows, [{ value: 42 }]);
+  const tupleCountAt = wire.length - (4 + 8 + 4 + 4) - 4;
+  wire.writeInt32BE(2, tupleCountAt);
+  assert.throws(
+    () => parsePrepareAndExecute(wire, 1),
+    (error: Error) => error instanceof MalformedReplyError,
+  );
+});
+
 test("truncated packets and literal FETCH error envelopes reject", () => {
   const truncated = selectWire(21, Buffer.from("000000000000002a", "hex")).subarray(0, -4);
   assert.throws(() => parsePrepareAndExecute(truncated, 1));
