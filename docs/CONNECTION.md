@@ -275,7 +275,7 @@ try {
 }
 ```
 
-`close()` is safe to call multiple times — if no connection was established (no queries were ever made), it's a no-op.
+`close()` is safe to call multiple times — if no connection was established (no queries were ever made), it's a no-op. A closed client stays closed: a query issued after `close()` is called, even in the same tick, rejects and never opens a new connection.
 
 ## Connection Errors
 

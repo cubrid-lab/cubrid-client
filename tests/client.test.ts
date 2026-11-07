@@ -407,6 +407,56 @@ test("client close closes the shared connection", async () => {
   assert.equal(connection.closeCalls, 1);
 });
 
+test("a query started in the same tick as close rejects without opening a connection", async () => {
+  let opened = 0;
+  const client = createClient(
+    baseOptions({
+      connectionFactory: () => {
+        opened += 1;
+        return new FakeConnection();
+      },
+    }),
+  );
+
+  const closing = client.close();
+  const query = client.query("SELECT 1");
+
+  await assert.rejects(query, (error: unknown) => {
+    assert.ok(error instanceof QueryError);
+    assert.match((error.cause as Error).message, /closed/);
+    return true;
+  });
+  await closing;
+  assert.equal(opened, 0);
+});
+
+test("a query after close rejects and leaves no connection open", async () => {
+  const connections: FakeConnection[] = [];
+  const client = createClient(
+    baseOptions({
+      connectionFactory: () => {
+        const connection = new FakeConnection();
+        connections.push(connection);
+        return connection;
+      },
+    }),
+  );
+
+  await client.query("SELECT 1");
+  const closing = client.close();
+  const sameTick = client.query("SELECT 2");
+  await closing;
+  const later = client.query("SELECT 3");
+
+  await assert.rejects(sameTick, QueryError);
+  await assert.rejects(later, QueryError);
+  await assert.rejects(client.ping(), ConnectionError);
+  await assert.rejects(client.beginTransaction(), TransactionError);
+  assert.equal(connections.length, 1);
+  assert.equal(connections[0]?.closeCalls, 1);
+  assert.equal(connections[0]?.queries.length, 1);
+});
+
 test("client close maps close errors to ConnectionError", async () => {
   const connection = new FakeConnection();
   connection.closeError = new Error("close");

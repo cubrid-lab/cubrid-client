@@ -14,6 +14,7 @@ import type { QueryResult, QueryResultRow } from "../types/result.js";
 
 export class CubridClient implements Queryable, ResultQueryable {
   private sharedConnectionPromise: Promise<ConnectionLike> | undefined;
+  private closed = false;
 
   constructor(
     private readonly config: ClientConfig,
@@ -99,6 +100,9 @@ export class CubridClient implements Queryable, ResultQueryable {
   }
 
   async close(): Promise<void> {
+    // Set first, in the same tick, so no later call can open a connection.
+    this.closed = true;
+
     if (!this.sharedConnectionPromise) {
       return;
     }
@@ -142,6 +146,10 @@ export class CubridClient implements Queryable, ResultQueryable {
   }
 
   private getSharedConnection(): Promise<ConnectionLike> {
+    if (this.closed) {
+      return Promise.reject(new Error("Client is closed."));
+    }
+
     if (!this.sharedConnectionPromise) {
       this.sharedConnectionPromise = Promise.resolve(
         this.connectionFactory(this.config),
