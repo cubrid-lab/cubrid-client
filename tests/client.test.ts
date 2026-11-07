@@ -1976,6 +1976,9 @@ const TRANSACTION_STATEMENTS: Array<
   ["query", (tx, sql) => tx.query(sql)],
   ["queryResult", (tx, sql) => tx.queryResult(sql)],
   ["execute", (tx, sql) => tx.execute(sql)],
+  ["queryPrepared", (tx, sql) => tx.queryPrepared(sql)],
+  ["queryResultPrepared", (tx, sql) => tx.queryResultPrepared(sql)],
+  ["executePrepared", (tx, sql) => tx.executePrepared(sql)],
 ];
 
 /** Sends all three statement methods through the recorded, gated query(). */
@@ -1990,6 +1993,24 @@ class RecordingStatementConnection extends RecordingConnection {
   async execute(sql: string, params?: QueryParams): Promise<ExecuteResult> {
     await this.query(sql, params);
     return { affectedRows: 1 };
+  }
+
+  async queryPrepared<T extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<T[]> {
+    return this.query<T>(sql, params);
+  }
+
+  async queryResultPrepared<T extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>> {
+    return this.queryResult<T>(sql, params);
+  }
+
+  async executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult> {
+    return this.execute(sql, params);
   }
 }
 
@@ -2016,6 +2037,24 @@ class FailingStatementConnection extends FakeConnection {
     }
 
     return { affectedRows: 0 };
+  }
+
+  async queryPrepared<T extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<T[]> {
+    return (await this.queryResult<T>(sql, params)).rows;
+  }
+
+  async queryResultPrepared<T extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>> {
+    return this.queryResult<T>(sql, params);
+  }
+
+  async executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult> {
+    return this.execute(sql, params);
   }
 }
 
@@ -2191,7 +2230,7 @@ test("Promise.all of every statement method commits once after all of them", asy
     Promise.all(TRANSACTION_STATEMENTS.map(([name, run]) => run(tx, name))),
   );
 
-  assert.equal(results.length, 3);
+  assert.equal(results.length, TRANSACTION_STATEMENTS.length);
   assert.deepEqual(connection.calls.slice(-2), ["commit", "close"]);
   assert.equal(connection.commitCalls, 1);
   assert.equal(connection.rollbackCalls, 0);

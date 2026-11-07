@@ -16,6 +16,7 @@ import type {
   ExecutableTransactionClient,
   ResultTransactionClient,
 } from "../src/types/client.js";
+import type { QueryParam } from "../src/types/query.js";
 import { CAPTURED_FRAMES } from "./fixtures/collection-frames.js";
 import { ZONED_FRAMES } from "./fixtures/zoned-frames.js";
 import { LOB_FRAMES, LOB_READ_REPLY_LIMIT } from "./fixtures/lob-frames.js";
@@ -3589,4 +3590,115 @@ test("executePrepared reports affected rows from the EXECUTE reply", async () =>
   fakeCAS.queueResponse(preparedReply(update));
 
   assert.deepEqual(await adapter.executePrepared("UPDATE t SET a = ?", [7]), { affectedRows: 2 });
+});
+
+// ---------------------------------------------------------------------------
+// Prepared binding: what happens before the first request, and LOB content
+// ---------------------------------------------------------------------------
+
+/**
+ * The captured three-row LOB SELECT split where a PREPARE_AND_EXECUTE reply turns
+ * into its execute part: the tuple count 3, cache_reusable 0, one result, SELECT.
+ */
+function preparedLobReplies(blobSize?: bigint, clobSize?: bigint): [Buffer, Buffer] {
+  const reply = lobSelectReply(blobSize, clobSize);
+  const split = reply.indexOf(Buffer.from("00000003" + "00" + "00000001" + "15", "hex"));
+  assert.ok(split > 0);
+  return [reply.subarray(0, split), reply.subarray(split)];
+}
+
+test("prepared LOB content is committed once, by the statement, after it is read", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  for (const reply of preparedLobReplies()) {
+    fakeCAS.queueResponse(reply);
+  }
+  fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readBlobReply, "hex"));
+  fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readClobReply, "hex"));
+
+  const rows = await adapter.queryPrepared(SELECT_LOBS);
+
+  assert.deepEqual(rows[0]?.b, Buffer.from([1, 2, 3]));
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.COMMIT]);
+  assert.deepEqual(fakeCAS.closedHandles, [1]);
+});
+
+test("a prepared LOB read that fails commits nothing and rolls the statement back", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  for (const reply of preparedLobReplies()) {
+    fakeCAS.queueResponse(reply);
+  }
+  fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readBlobReply, "hex"));
+  // The CLOB read fails with a server error, after a statement of the same
+  // call may already have written.
+  const failure = Buffer.alloc(8);
+  failure.writeInt32BE(-2, 0);
+  failure.writeInt32BE(-1001, 4);
+  fakeCAS.queueResponse(Buffer.concat([failure, Buffer.from("failed\0")]));
+
+  await assert.rejects(adapter.queryPrepared(SELECT_LOBS), QueryError);
+
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+  assert.deepEqual(fakeCAS.closedHandles, [1]);
+});
+
+test("query() still ends its own LOB read transaction when a read fails", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  fakeCAS.queueResponse(lobSelectReply());
+  fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readBlobReply, "hex"));
+  const failure = Buffer.alloc(8);
+  failure.writeInt32BE(-2, 0);
+  failure.writeInt32BE(-1001, 4);
+  fakeCAS.queueResponse(Buffer.concat([failure, Buffer.from("failed\0")]));
+
+  await assert.rejects(adapter.query(SELECT_LOBS), QueryError);
+
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.COMMIT]);
+});
+
+test("a refused value sends nothing even when execute() would first read the insert id", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  // An INSERT through query() leaves the session's insert id unknown, so the
+  // next execute() of an INSERT reads it before sending the statement.
+  fakeCAS.queueResponse(buildDMLResponse(20, 1));
+  await adapter.query("INSERT INTO t VALUES (1)");
+  const sent = fakeCAS.sentPayloads.length;
+
+  await assert.rejects(
+    adapter.executePrepared("INSERT INTO t VALUES (?)", [Number.NaN]),
+    (error: QueryError) => /NaN and Infinity/.test((error.cause as Error).message),
+  );
+
+  assert.equal(fakeCAS.sentPayloads.length, sent);
+});
+
+test("SQL with a NUL is refused before a session is opened", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  fakeCAS._isConnected = false;
+
+  for (const run of [
+    () => adapter.queryPrepared("SELECT 1\0; DELETE FROM t"),
+    () => adapter.executePrepared("INSERT INTO t VALUES (1)\0", []),
+  ]) {
+    await assert.rejects(run(), (error: QueryError) =>
+      /null byte/.test((error.cause as Error).message),
+    );
+  }
+
+  assert.equal(fakeCAS.connectCalls, 0);
+  assert.deepEqual(fakeCAS.sentPayloads, []);
+});
+
+test("the values bound are the ones passed when the method was called", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  queuePreparedSelect(fakeCAS);
+  const params: QueryParam[] = [7];
+  // The statement only runs in a later turn, after this change to the array.
+  const prepared = adapter.queryPrepared("SELECT ? AS v", params);
+  params[0] = Number.NaN;
+
+  assert.deepEqual(await prepared, [{ v: 7 }]);
+
+  const execute = fakeCAS.sentPayloads.find((payload) => payload[0] === CASFunctionCode.EXECUTE);
+  assert.ok(execute);
+  assert.equal(execute.subarray(execute.length - 13).toString("hex"), "0000000108" + "00000004" + "00000007");
 });

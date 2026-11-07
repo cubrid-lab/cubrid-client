@@ -380,10 +380,7 @@ export function readQueryHandle(data: Buffer): number | null {
  * ends the transaction itself, so CAS_INFO stays IN_TRAN while the handle lives.
  */
 export function writePrepare(sql: string, casInfo: Buffer): { header: Buffer; payload: Buffer } {
-  // The CAS reads SQL up to the first NUL, so the rest would silently not run.
-  if (sql.includes("\0")) {
-    throw new Error("SQL text contains a null byte (0x00), which CUBRID cannot prepare");
-  }
+  assertPreparableSql(sql);
 
   const w = new PacketWriter(512);
   w.writeByte(CASFunctionCode.PREPARE);
@@ -394,6 +391,13 @@ export function writePrepare(sql: string, casInfo: Buffer): { header: Buffer; pa
   const payload = w.toBuffer();
   const header = PacketWriter.buildHeader(payload.length, casInfo);
   return { header, payload };
+}
+
+/** The CAS reads SQL up to the first NUL, so the rest would silently not run. */
+export function assertPreparableSql(sql: string): void {
+  if (sql.includes("\0")) {
+    throw new Error("SQL text contains a null byte (0x00), which CUBRID cannot prepare");
+  }
 }
 
 /** Parse PREPARE response. */

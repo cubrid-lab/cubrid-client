@@ -16,6 +16,7 @@ import {
   writeExecute,
   parseExecute,
   encodePreparedParams,
+  assertPreparableSql,
   readQueryHandle,
   MalformedReplyError,
   writeFetch,
@@ -164,13 +165,13 @@ export class NativeCubridAdapter implements DriverAdapter {
   ): Promise<QueryResult<T>> {
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
-    return this.inTurn(() => this.queryNow<T>(sql, params, issued, false));
+    return this.inTurn(() => this.queryNow<T>(sql, params, issued, undefined));
   }
 
   async execute(sql: string, params?: QueryParams): Promise<ExecuteResult> {
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
-    return this.inTurn(() => this.executeNow(sql, params, issued, false));
+    return this.inTurn(() => this.executeNow(sql, params, issued, undefined));
   }
 
   async queryPrepared<T extends QueryResultRow = QueryResultRow>(
@@ -184,22 +185,24 @@ export class NativeCubridAdapter implements DriverAdapter {
     sql: string,
     params?: QueryParams,
   ): Promise<QueryResult<T>> {
+    const binds = bindOrRefuse(sql, params, "Failed to execute CUBRID query.");
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
-    return this.inTurn(() => this.queryNow<T>(sql, params, issued, true));
+    return this.inTurn(() => this.queryNow<T>(sql, params, issued, binds));
   }
 
   async executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult> {
+    const binds = bindOrRefuse(sql, params, "Failed to execute CUBRID statement.");
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
-    return this.inTurn(() => this.executeNow(sql, params, issued, true));
+    return this.inTurn(() => this.executeNow(sql, params, issued, binds));
   }
 
   private async executeNow(
     sql: string,
     params: QueryParams | undefined,
     issued: IssuedOn,
-    prepared: boolean,
+    binds: PreparedBinds | undefined,
   ): Promise<ExecuteResult> {
     try {
       await this.readInsertIdBaseline(sql);
@@ -209,7 +212,7 @@ export class NativeCubridAdapter implements DriverAdapter {
         issued,
         (cas, result) => this.readExecuteResult(cas, result),
         true,
-        prepared,
+        binds,
       );
     } catch (error) {
       this.forgetInsertId();
@@ -223,10 +226,10 @@ export class NativeCubridAdapter implements DriverAdapter {
     sql: string,
     params: QueryParams | undefined,
     issued: IssuedOn,
-    prepared: boolean,
+    binds: PreparedBinds | undefined,
   ): Promise<QueryResult<T>> {
     try {
-      return await this.executeQuery<T>(sql, params, issued, prepared);
+      return await this.executeQuery<T>(sql, params, issued, binds);
     } catch (error) {
       // If the first transactional statement lost its session before the
       // post-response bind, remember that failed generation. A ping/reconnect
@@ -398,7 +401,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     sql: string,
     params: QueryParams | undefined,
     issued: IssuedOn,
-    prepared: boolean,
+    binds: PreparedBinds | undefined,
   ): Promise<QueryResult<T>> {
     const read = async (
       cas: CASConnection,
@@ -422,13 +425,15 @@ export class NativeCubridAdapter implements DriverAdapter {
       }
 
       if (result.columns.some(mayHoldLob)) {
-        await this.loadLobs(cas, generation, allRows);
+        // A prepared statement's transaction belongs to runStatement(), which
+        // commits it only once everything succeeded.
+        await this.loadLobs(cas, generation, allRows, binds === undefined);
       }
 
       return { rows: allRows as T[], columns: result.columns.map(toColumnInfo) };
     };
 
-    return this.runStatement(sql, params, issued, read, false, prepared);
+    return this.runStatement(sql, params, issued, read, false, binds);
   }
 
   /**
@@ -486,8 +491,8 @@ export class NativeCubridAdapter implements DriverAdapter {
    * reach a new session that holds no value. The statement is then committed with
    * END_TRAN, or rolled back if anything failed.
    *
-   * `prepared` sends PREPARE and EXECUTE with typed binds instead of SQL text
-   * holding the values. The handle belongs to this one call and is released
+   * `binds`, encoded when the call was made, sends PREPARE and EXECUTE with
+   * typed binds instead of SQL text holding the values. The handle belongs to this one call and is released
    * like any other, so it can never outlive its session or be reused. Prepared
    * statements always end by END_TRAN in autocommit mode, so a failed PREPARE,
    * which leaves the session in a transaction, is rolled back.
@@ -498,7 +503,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     issued: IssuedOn,
     use: (cas: CASConnection, result: PrepareAndExecuteResult) => Promise<R>,
     commitAfter = false,
-    prepared = false,
+    binds?: PreparedBinds,
   ): Promise<R> {
     const cas = this.getOrCreateCAS();
 
@@ -517,9 +522,6 @@ export class NativeCubridAdapter implements DriverAdapter {
       throw new Error("CASConnection is not connected");
     }
 
-    // Refused values must fail before anything is sent, so no session is opened.
-    const binds = prepared ? encodePreparedParams(params ?? []) : undefined;
-
     // Settle the session before binding: a CAS that has gone is replaced by the
     // next request, which could otherwise be a different session than the one the
     // backslash mode was measured on.
@@ -536,7 +538,7 @@ export class NativeCubridAdapter implements DriverAdapter {
           )
         : sql;
 
-    const deferCommit = (commitAfter || prepared) && this.autoCommit;
+    const deferCommit = (commitAfter || binds !== undefined) && this.autoCommit;
     const { header, payload } = binds
       ? writePrepare(sql, cas.casInfo)
       : writePrepareAndExecute(resolvedSql, this.autoCommit && !deferCommit, cas.casInfo);
@@ -987,6 +989,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     cas: CASConnection,
     generation: number,
     rows: Record<string, unknown>[],
+    endsReadTransaction: boolean,
   ): Promise<void> {
     const limit = this.config.maxLobBytes ?? DEFAULT_MAX_LOB_BYTES;
     const cells: Array<{ row: Record<string, unknown>; name: string; lob: LobLocator }> = [];
@@ -1019,7 +1022,7 @@ export class NativeCubridAdapter implements DriverAdapter {
       throw error;
     } finally {
       // An empty LOB sends no LOB_READ, and nothing may follow a damaged reply.
-      if (total > 0 && !replyDamaged) {
+      if (total > 0 && !replyDamaged && endsReadTransaction) {
         await this.endLobReadTransaction(cas, generation);
       }
     }
@@ -1105,6 +1108,21 @@ export class NativeCubridAdapter implements DriverAdapter {
     } catch {
       // Best-effort cleanup — ignore errors
     }
+  }
+}
+
+/**
+ * Checks the SQL and encodes the values when a prepared method is called, before
+ * it waits for its turn or sends anything: a refused statement must not read the
+ * insert id, open a session or be probed. The binds are a snapshot, so changing
+ * the array afterwards does not change what is sent.
+ */
+function bindOrRefuse(sql: string, params: QueryParams | undefined, message: string): PreparedBinds {
+  try {
+    assertPreparableSql(sql);
+    return encodePreparedParams(params ?? []);
+  } catch (error) {
+    throw mapError("query", error, message);
   }
 }
 

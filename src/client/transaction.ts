@@ -146,6 +146,24 @@ export class CallbackTransaction extends CubridTransaction {
     return this.track(() => super.execute(sql, params));
   }
 
+  override queryPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<T[]> {
+    return this.track(() => super.queryPrepared<T>(sql, params));
+  }
+
+  override queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>> {
+    return this.track(() => super.queryResultPrepared<T>(sql, params));
+  }
+
+  override executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult> {
+    return this.track(() => super.executePrepared(sql, params));
+  }
+
   override commit(): Promise<void> {
     return this.complete("commit");
   }
