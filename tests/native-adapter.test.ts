@@ -300,7 +300,14 @@ function buildDMLResponse(
  *   [is_reverse_index:int8] [is_reverse_unique:int8] [isForeignKey:int8] [is_shared:int8]
  */
 function buildSelectResponse(
-  columns: Array<{ name: string; type: number }>,
+  columns: Array<{
+    name: string;
+    type: number;
+    precision?: number;
+    scale?: number;
+    /** Sent as the wire is_non_null byte; NOT NULL unless `false`. */
+    notNull?: boolean;
+  }>,
   rows: Array<Array<string | null>>,
 ): Buffer {
   const parts: Buffer[] = [];
@@ -344,12 +351,12 @@ function buildSelectResponse(
 
     // scale (2 bytes)
     const cs = Buffer.alloc(2);
-    cs.writeInt16BE(0, 0);
+    cs.writeInt16BE(col.scale ?? 0, 0);
     parts.push(cs);
 
     // precision (4 bytes)
     const cp = Buffer.alloc(4);
-    cp.writeInt32BE(255, 0);
+    cp.writeInt32BE(col.precision ?? 255, 0);
     parts.push(cp);
 
     // name (length-prefixed, null-terminated)
@@ -373,8 +380,8 @@ function buildSelectResponse(
     parts.push(tl);
     parts.push(Buffer.from([0]));
 
-    // isNullable = 1
-    parts.push(Buffer.from([1]));
+    // is_non_null: 1 unless the column says it permits NULL
+    parts.push(Buffer.from([col.notNull === false ? 0 : 1]));
 
     // defaultValue = "" (1 byte null)
     const dl = Buffer.alloc(4);
@@ -2329,4 +2336,72 @@ test("only the server's -72 inside a transaction blocks what follows", async () 
   fakeCAS.queueResponse(buildServerErrorResponse(-72));
   await assert.rejects(adapter.query("INSERT INTO t VALUES (6)"), DeadlockError);
   await assertLaterStatementIsNotSent(adapter, fakeCAS);
+});
+
+// ---------------------------------------------------------------------------
+// queryResult() — column metadata
+// ---------------------------------------------------------------------------
+
+test("NativeCubridAdapter queryResult reports every column, duplicates included", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(
+    buildSelectResponse(
+      [
+        { name: "id", type: 2, precision: 20, notNull: true },
+        { name: "id", type: 2, precision: 30, notNull: false },
+        { name: "amount", type: 7, precision: 10, scale: 3, notNull: false },
+        { name: "mystery", type: 99, precision: 0, notNull: true },
+      ],
+      [["1", "2", "3", null]],
+    ),
+  );
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+
+  const result = await adapter.queryResult("SELECT a.id, b.id FROM a, b");
+
+  assert.deepEqual(result.columns, [
+    { name: "id", type: "VARCHAR", precision: 20, scale: 0, nullable: false },
+    { name: "id", type: "VARCHAR", precision: 30, scale: 0, nullable: true },
+    { name: "amount", type: "NUMERIC", precision: 10, scale: 3, nullable: true },
+    { name: "mystery", type: "UNKNOWN(99)", precision: 0, scale: 0, nullable: false },
+  ]);
+  // The row keeps the 1.x shape: one key per name, the last column wins.
+  assert.equal(result.rows[0]!.id, "2");
+});
+
+test("NativeCubridAdapter queryResult keeps the type of a column that holds only NULL", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(
+    buildSelectResponse([{ name: "v", type: 8, precision: 10, notNull: false }], [[null]]),
+  );
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+
+  const result = await adapter.queryResult("SELECT v FROM t");
+
+  assert.deepEqual(result.rows, [{ v: null }]);
+  assert.deepEqual(result.columns, [
+    { name: "v", type: "INT", precision: 10, scale: 0, nullable: true },
+  ]);
+});
+
+test("NativeCubridAdapter query still returns the bare row array", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(buildSelectResponse([{ name: "v", type: 2 }], [["a"], ["b"]]));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+
+  const rows = await adapter.query("SELECT v FROM t");
+
+  assert.ok(Array.isArray(rows));
+  assert.deepEqual(rows, [{ v: "a" }, { v: "b" }]);
+});
+
+test("NativeCubridAdapter queryResult of a statement without a result set has no columns", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(buildDMLResponse(20, 3));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+
+  assert.deepEqual(await adapter.queryResult("INSERT INTO t VALUES (1)"), {
+    rows: [],
+    columns: [],
+  });
 });

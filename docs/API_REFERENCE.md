@@ -23,9 +23,12 @@ Complete reference for every public export of `cubrid-client`.
   - [Queryable](#queryable)
   - [TransactionClient](#transactionclient-interface)
   - [TransactionCallback](#transactioncallback)
+  - [ResultTransactionClient](#resulttransactionclient)
   - [QueryParam](#queryparam)
   - [QueryParams](#queryparams)
   - [QueryResultRow](#queryresultrow)
+  - [QueryResult](#queryresult)
+  - [ColumnInfo](#columninfo)
 
 ---
 
@@ -144,17 +147,45 @@ await db.query("CREATE TABLE IF NOT EXISTS logs (id INT AUTO_INCREMENT, msg VARC
 
 ---
 
+#### `queryResult<T>(sql, params?)`
+
+Executes a SQL statement like `query()` and returns its rows together with the metadata of the columns that produced them.
+
+```ts
+async queryResult<T extends QueryResultRow = QueryResultRow>(
+  sql: string,
+  params?: QueryParams,
+): Promise<QueryResult<T>>
+```
+
+**Returns:** a [`QueryResult<T>`](#queryresult): `rows` is exactly what `query<T>()` returns, and `columns` describes every select-list column in order. `query()` itself is unchanged and still returns `T[]`.
+
+**Throws:** [`QueryError`](#queryerror) if execution fails, including when a custom `connectionFactory` connection has no `queryResult()` method.
+
+```ts
+const { rows, columns } = await db.queryResult(
+  "SELECT a.id, b.id, a.note FROM a JOIN b ON a.id = b.a_id",
+);
+// columns: [
+//   { name: "id", type: "INT", precision: 10, scale: 0, nullable: false },
+//   { name: "id", type: "INT", precision: 10, scale: 0, nullable: false },
+//   { name: "note", type: "VARCHAR", precision: 100, scale: 0, nullable: true },
+// ]
+```
+
+---
+
 #### `transaction<T>(callback)`
 
 Executes a callback within an isolated transactional connection. Commits on success, rolls back on failure.
 
 ```ts
-async transaction<T>(callback: TransactionCallback<T>): Promise<T>
+async transaction<T>(callback: TransactionCallback<T, ResultTransactionClient>): Promise<T>
 ```
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `callback` | [`TransactionCallback<T>`](#transactioncallback) | Async function receiving a [`TransactionClient`](#transactionclient-interface) |
+| `callback` | [`TransactionCallback<T, ResultTransactionClient>`](#transactioncallback) | Async function receiving a [`ResultTransactionClient`](#resulttransactionclient), a [`TransactionClient`](#transactionclient-interface) that also has `queryResult()`. A callback written against `TransactionClient` is still accepted. |
 
 **Returns:** `Promise<T>` — The return value of the callback.
 
@@ -311,7 +342,7 @@ try {
 A transaction-scoped client that delegates queries to the isolated transactional connection. You do **not** create this class directly — it is provided to you inside the `transaction()` callback.
 
 ```ts
-class CubridTransaction implements TransactionClient
+class CubridTransaction implements ResultTransactionClient
 ```
 
 ### Methods
@@ -588,6 +619,7 @@ import type {
   Queryable,
   TransactionClient,
   TransactionCallback,
+  ResultTransactionClient,
 } from "cubrid-client";
 
 import type { QueryParam, QueryParams } from "cubrid-client";
@@ -686,12 +718,18 @@ interface ConnectionLike {
     sql: string,
     params?: QueryParams,
   ): Promise<T[]>;
+  queryResult?<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>>;
   beginTransaction(): Promise<void>;
   commit(): Promise<void>;
   rollback(): Promise<void>;
   close(): Promise<void>;
 }
 ```
+
+`queryResult` is optional so existing custom adapters keep compiling. Calling `queryResult()` on a client or transaction fails when its connection does not provide it.
 
 ### Queryable
 
@@ -720,6 +758,19 @@ const users1 = await getUsers(db);
 const users2 = await db.transaction(async (tx) => getUsers(tx));
 ```
 
+### ResultQueryable
+
+Interface for any object that can return rows with their column metadata. `CubridClient` and `CubridTransaction` implement it. It is not part of `TransactionClient`, so 1.x code that implements that interface keeps compiling; see [`ResultTransactionClient`](#resulttransactionclient).
+
+```ts
+interface ResultQueryable {
+  queryResult<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>>;
+}
+```
+
 ### TransactionClient (Interface)
 
 Interface for the transaction-scoped client provided to `transaction()` callbacks.
@@ -736,7 +787,18 @@ interface TransactionClient extends Queryable {
 Type for the callback function passed to `transaction()`.
 
 ```ts
-type TransactionCallback<T> = (tx: TransactionClient) => Promise<T>;
+type TransactionCallback<
+  T,
+  Tx extends TransactionClient = TransactionClient,
+> = (tx: Tx) => Promise<T>;
+```
+
+### ResultTransactionClient
+
+The transaction client that `transaction()` passes to its callback: a `TransactionClient` that can also return column metadata.
+
+```ts
+interface ResultTransactionClient extends TransactionClient, ResultQueryable {}
 ```
 
 ### QueryParam
@@ -820,3 +882,41 @@ type Athlete = {
 const athletes = await db.query<Athlete>("SELECT * FROM athlete LIMIT 5");
 // athletes is Athlete[] — fully typed
 ```
+
+### QueryResult
+
+Rows together with the columns that produced them, as returned by `queryResult()`.
+
+```ts
+interface QueryResult<T extends QueryResultRow = QueryResultRow> {
+  rows: T[];
+  columns: ColumnInfo[];
+}
+```
+
+- `columns` has one entry for every select-list column, in order. A column that holds only NULL, or a query that returns no rows, still reports its type.
+- **Duplicate column names.** `SELECT a.id, b.id` gives two entries named `id` in `columns`. Each row object is keyed by name exactly as `query()` returns it, so only one value per name survives and the **last** column with that name wins. Alias the columns (`a.id AS a_id`) when you need every value; the repeated names in `columns` tell you when a collision happened.
+- A statement without a result set (INSERT, UPDATE, DELETE, DDL) returns `rows: []` and `columns: []`.
+
+### ColumnInfo
+
+One column of a `QueryResult`.
+
+```ts
+interface ColumnInfo {
+  name: string;
+  type: string;
+  elementType?: string;
+  precision: number;
+  scale: number;
+  nullable: boolean;
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `name` | The column label: its alias, or its name when it has none. |
+| `type` | The CUBRID type name the server reports, such as `INT`, `BIGINT`, `VARCHAR`, `CHAR`, `NUMERIC`, `DATETIME` or `NULL` (an untyped `NULL` literal), or `UNKNOWN(<id>)` for a wire type id this driver does not name. The name is the server's wire type, so a JSON column reports `VARCHAR` (see [TYPES.md](TYPES.md)). |
+| `elementType` | Set only for `SET`, `MULTISET` and `SEQUENCE`, which are the `type`. It is the declared element type, or `NULL` for a collection declared without one. |
+| `precision`, `scale` | The values the server reports. They depend on the type: `VARCHAR(20)` is precision 20, `NUMERIC(10,3)` is 10 and 3, `INT` is 10 and `DATETIME` is 23 and 3. Types without a meaningful size report `0`, and a `CHAR` expression such as a string literal can report `-1`. |
+| `nullable` | `false` only when the server reports the column as NOT NULL. It is `true` for a nullable table column, for the right side of an outer join and for expressions. |

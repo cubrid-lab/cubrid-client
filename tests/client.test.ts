@@ -902,6 +902,45 @@ test("client getServerVersion rejects when the connection cannot report a versio
   );
 });
 
+test("client queryResult returns the connection's rows and columns", async () => {
+  const expected = {
+    rows: [{ id: 1 }],
+    columns: [{ name: "id", type: "INT", precision: 10, scale: 0, nullable: false }],
+  };
+  const connection = Object.assign(new FakeConnection(), {
+    queryResult: (async () => expected) as NonNullable<ConnectionLike["queryResult"]>,
+  });
+  const client = createClient(baseOptions({ connectionFactory: () => connection }));
+
+  assert.deepEqual(await client.queryResult("SELECT id FROM t"), expected);
+});
+
+test("client queryResult fails with a QueryError when the connection lacks it", async () => {
+  const client = createClient(baseOptions({ connectionFactory: () => new FakeConnection() }));
+
+  await assert.rejects(
+    client.queryResult("SELECT 1"),
+    (error: unknown) => error instanceof QueryError && error.message === "Query failed.",
+  );
+});
+
+test("transaction queryResult delegates and reports a missing capability as TransactionError", async () => {
+  const withResult = Object.assign(new FakeConnection(), {
+    queryResult: (async () => ({ rows: [], columns: [] })) as NonNullable<ConnectionLike["queryResult"]>,
+  });
+  const ok = createClient(baseOptions({ connectionFactory: () => withResult }));
+  assert.deepEqual(await ok.transaction((tx) => tx.queryResult("SELECT 1")), {
+    rows: [],
+    columns: [],
+  });
+
+  const without = createClient(baseOptions({ connectionFactory: () => new FakeConnection() }));
+  await assert.rejects(
+    without.transaction((tx) => tx.queryResult("SELECT 1")),
+    (error: unknown) => error instanceof TransactionError,
+  );
+});
+
 test("client ping throws when connection has no ping method", async () => {
   const connection = new FakeConnection();
   const client = createClient(

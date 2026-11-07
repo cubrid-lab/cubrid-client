@@ -78,7 +78,7 @@ const client = createClient({ host: "localhost", database: "demodb", user: "dba"
 | Level | Event | Fields |
 |-------|-------|--------|
 | `info` | A connection was created (`operation: "connection"`) | `host`, `port`, `database` |
-| `debug` | `connect`, `query`, `beginTransaction`, `commit`, `rollback`, `close` or `ping` succeeded | `operation`, `durationMs`; `paramCount` and `rowCount` for `query` |
+| `debug` | `connect`, `query`, `queryResult`, `beginTransaction`, `commit`, `rollback`, `close` or `ping` succeeded | `operation`, `durationMs`; `paramCount` and `rowCount` for `query` |
 | `error` | The same operations failed | `operation`, `durationMs`, `errorName`; `paramCount` for `query` |
 | `error` | A connection could not be created (`operation: "connection"`; the original error is rethrown unchanged) | `operation`, `host`, `port`, `database`, `durationMs`, `errorName` |
 

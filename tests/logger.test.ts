@@ -125,6 +125,23 @@ test("a throwing or non-conforming logger never affects requests", async () => {
   assert.deepEqual(await client({}, fakeConnection()).query("SELECT 1"), [{ v: ROW_VALUE }]);
 });
 
+test("queryResult is logged with its row count and only when the connection supports it", async () => {
+  const { logger, entries } = recorder();
+  const withResult = {
+    ...fakeConnection(),
+    queryResult: (async () => ({
+      rows: [{ v: 1 }, { v: 2 }],
+      columns: [],
+    })) as NonNullable<ConnectionLike["queryResult"]>,
+  };
+  await client(logger, withResult).queryResult("SELECT v FROM t", [1]);
+  const last = entries.at(-1)?.fields;
+  assert.equal(last?.operation, "queryResult");
+  assert.equal(last?.rowCount, 2);
+  assert.equal(last?.paramCount, 1);
+  await assert.rejects(() => client(logger, fakeConnection()).queryResult("SELECT 1"));
+});
+
 test("ping is exposed only when the connection supports it", async () => {
   const { logger, entries } = recorder();
   const withPing = { ...fakeConnection(), ping: async () => "11.4" };
