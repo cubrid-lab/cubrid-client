@@ -11,22 +11,58 @@ convert a runtime value.
 | CUBRID wire type(s) | Current JavaScript value | Status / limitation |
 | --- | --- | --- |
 | CHAR, VARCHAR/STRING, NCHAR, VARNCHAR, ENUM | `string` | Decoded as null-terminated text; validate encoding against a live broker |
+| JSON | `string` | Raw JSON text, not parsed. This driver declares CAS protocol 7, and below protocol 8 the server sends JSON columns as VARCHAR (wire type 2), so wire type 34 does not arrive. Checked on 10.2, 11.0, 11.2 and 11.4; a parsed contract is tracked in [#111](https://github.com/cubrid-lab/cubrid-client/issues/111) |
 | SHORT, INTEGER | `number` | Parsed signed 16-bit / 32-bit integers |
 | BIGINT | `bigint` | Lossless signed 64-bit value; corrected by [#126](https://github.com/cubrid-lab/cubrid-client/pull/126); `JSON.stringify` needs explicit bigint conversion |
 | FLOAT, DOUBLE, MONETARY | `number` | IEEE-754 conversion may round decimal values |
 | NUMERIC | `string` | Decimal text retained without floating-point rounding; consumer chooses decimal library |
 | DATE, TIME, TIMESTAMP, DATETIME | `Date` | Parsed using the **local Node.js process timezone**; SQL DATETIME itself has no timezone, so this is not stable across zones ([#113](https://github.com/cubrid-lab/cubrid-client/issues/113)) |
-| BIT, VARBIT | `Buffer` | Binary bytes; verify bit-length/bit-order semantics per server version |
+| BIT, VARBIT | `Buffer` | Binary bytes; verify bit-length/bit-order semantics per server version. An empty `X''` currently returns `null`, the same as SQL NULL ([#173](https://github.com/cubrid-lab/cubrid-client/issues/173)) |
 | BLOB, CLOB | `Buffer` from the wire field | **Not established as full LOB content**; the field may be a locator rather than the object body ([#93](https://github.com/cubrid-lab/cubrid-client/issues/93), [#103](https://github.com/cubrid-lab/cubrid-client/issues/103)) |
 | SET, MULTISET, SEQUENCE | Array (`CollectionValue`) | See [collection columns](#collection-columns) |
-| OBJECT/OID, RESULTSET, JSON, timezone variants and unknown codes | Query rejects for unsupported non-NULL | Do not coerce unsupported data to `null`; future decoding tracked in [#111](https://github.com/cubrid-lab/cubrid-client/issues/111) |
-| SQL NULL | `null` | NULL is distinct from unsupported non-NULL values and a valid empty string |
+| OBJECT/OID (19), RESULTSET (20), TIMESTAMPTZ, TIMESTAMPLTZ, DATETIMETZ and DATETIMELTZ (29-32), and unknown codes | Query rejects, including for a zero-byte value | Never coerced to `null`; see [values that cannot be decoded](#values-that-cannot-be-decoded). Future decoding is tracked in [#111](https://github.com/cubrid-lab/cubrid-client/issues/111) |
+| SQL NULL | `null` | Sent as cell length `-1`. NULL is distinct from unsupported non-NULL values and from a valid empty string, which is `""` |
 
-For unsupported non-NULL values, the error includes column name and numeric
-CAS wire type. A value whose length disagrees with its cell also rejects the
-query, whatever its type, instead of shifting the following columns. Error
-handling does **not** introduce JSON or LOB support. See [#110](https://github.com/cubrid-lab/cubrid-client/issues/110)
-and the [independent protocol fixture plan](https://github.com/cubrid-lab/cubrid-client/issues/117).
+### Values that cannot be decoded
+
+A failed decode rejects the query with a `QueryError`. Its `cause` names the
+column, the numeric CAS wire type and the value size, for example
+`Failed to decode CUBRID column "tz" (wire type 29, 19 bytes)`. What happens to
+the connection depends on whether the server's reply can still be trusted:
+
+| Failure | Example | Connection afterwards |
+| --- | --- | --- |
+| **Unsupported value** in a reply that is otherwise intact | A TIMESTAMPTZ column | Stays open. The query handle is released, and an open transaction stays open for you to commit or roll back |
+| **Malformed reply** that contradicts its own structure | A length past the end of the reply, or a value that does not fill its cell | Dropped, because the next reply could not be trusted to line up. Nothing more is sent on it |
+
+The driver reads the rest of a reply before reporting an unsupported value, so
+damage anywhere in that reply is reported as malformed. The first unsupported
+column is the one named.
+
+After a malformed reply, the server discards the session:
+
+- An open transaction is **rolled back by the server**. `commit()` rejects
+  instead of reporting success, and `query()` rejects until `rollback()`
+  acknowledges the loss. `rollback()` itself rejects, then the adapter can be
+  used again.
+- In autocommit mode the next query opens a new session. The failed statement
+  may already have run and committed on the server, so verify its outcome before
+  retrying a write.
+
+A zero-byte value is never treated as SQL NULL, except for the
+[#173](https://github.com/cubrid-lab/cubrid-client/issues/173) case of BIT and
+VARBIT: the server counts the NUL of text and writes fixed-width types in full,
+so it has no other zero-byte encoding. A zero-byte value of another decodable
+type is a malformed reply.
+
+The driver can only reject what it receives. In some cases the server itself
+sends SQL NULL for a non-NULL value, such as a
+[mixed-type collection](#collection-columns) or a type its CAS cannot encode.
+Those are the same bytes as a genuine NULL and return `null`.
+
+Error handling does **not** introduce timezone, OBJECT or LOB decoding. See
+[#110](https://github.com/cubrid-lab/cubrid-client/issues/110) and the
+[independent protocol fixture plan](https://github.com/cubrid-lab/cubrid-client/issues/117).
 
 ## Collection columns
 

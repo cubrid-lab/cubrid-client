@@ -84,6 +84,18 @@ try {
 }
 ```
 
+### `QueryError` with `Failed to decode CUBRID column` in its cause
+
+The server sent a value this driver cannot decode. Log `error.cause.message`: it
+names the column and CAS wire type. `Unsupported CUBRID CAS value type 29` to `32`
+are the timezone-aware types, and `19` is an OBJECT reference. The connection and
+any open transaction stay usable, so cast the column in SQL, for example
+`CAST(created_at AS DATETIME)`, or select `TO_CHAR(created_at)`.
+
+If the cause is instead `Malformed CAS packet`, the reply was damaged and the
+connection was dropped, rolling back an open transaction. See
+[values that cannot be decoded](TYPES.md#values-that-cannot-be-decoded).
+
 ### DDL/DML statements return empty array
 
 This is **expected behavior**. `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, and other DDL/DML statements return `[]` because they don't produce result sets:

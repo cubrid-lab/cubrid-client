@@ -48,6 +48,43 @@ const COLLECTION_KIND_BY_FLAG: Readonly<Record<number, CUBRIDDataType>> = {
 };
 /** One element-type byte and an int32 element count. */
 const COLLECTION_HEADER_SIZE = 5;
+/** The response code and the int32 after it: every reply, even an error, has both. */
+const MIN_REPLY_SIZE = SIZE_INT * 2;
+
+/**
+ * A value this driver has no decoder for, in a reply that is otherwise intact:
+ * the whole reply was walked, so the session stays usable.
+ */
+export class UnsupportedValueError extends Error {
+  override name = "UnsupportedValueError";
+}
+
+/**
+ * A reply that contradicts its own structure. Nothing in it can be trusted,
+ * including the frame length that keeps the stream aligned on the next reply,
+ * so the caller must drop the session and must not send on it again.
+ */
+export class MalformedReplyError extends Error {
+  override name = "MalformedReplyError";
+}
+
+/** Run a reply decoder, reporting any failure that is not a known verdict as malformed. */
+function decodeReply<T>(decode: () => T): T {
+  try {
+    return decode();
+  } catch (error) {
+    if (error instanceof UnsupportedValueError || error instanceof MalformedReplyError) {
+      throw error;
+    }
+    throw new MalformedReplyError((error as Error).message, { cause: error });
+  }
+}
+
+function assertReplySize(data: Buffer): void {
+  if (data.length < MIN_REPLY_SIZE) {
+    throw new MalformedReplyError(`Malformed CAS packet: reply of ${data.length} bytes`);
+  }
+}
 
 export interface ColumnMeta {
   /** Column type. A collection column holds its kind: SET, MULTISET or SEQUENCE. */
@@ -207,6 +244,7 @@ export function parsePrepareAndExecute(
   data: Buffer,
   protoVersion: number,
 ): PrepareAndExecuteResult {
+  assertReplySize(data);
   const reader = new PacketReader(data);
   const responseCode = reader.parseInt();
 
@@ -216,7 +254,14 @@ export function parsePrepareAndExecute(
     throw new Error(`CUBRID query failed (${err.code}): ${err.message}`);
   }
 
-  const queryHandle = responseCode;
+  return decodeReply(() => readExecuteReply(reader, responseCode, protoVersion));
+}
+
+function readExecuteReply(
+  reader: PacketReader,
+  queryHandle: number,
+  protoVersion: number,
+): PrepareAndExecuteResult {
   reader.parseInt(); // result cache lifetime
   const statementType = reader.parseByte() as StatementType;
   const bindCount = reader.parseInt();
@@ -315,6 +360,7 @@ export function parseFetch(
   data: Buffer,
   columns: ColumnMeta[],
 ): FetchResult {
+  assertReplySize(data);
   const reader = new PacketReader(data);
   const responseCode = reader.parseInt();
 
@@ -328,13 +374,15 @@ export function parseFetch(
     throw new Error(`CUBRID fetch failed (${err.code}): ${err.message}`);
   }
 
-  const tupleCount = reader.parseInt();
-  const rows: Record<string, unknown>[] = [];
-  if (tupleCount > 0) {
-    parseRowData(reader, columns, tupleCount, rows, false);
-  }
+  return decodeReply(() => {
+    const tupleCount = reader.parseInt();
+    const rows: Record<string, unknown>[] = [];
+    if (tupleCount > 0) {
+      parseRowData(reader, columns, tupleCount, rows, false);
+    }
 
-  return { tupleCount, rows };
+    return { tupleCount, rows };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -861,6 +909,8 @@ function parseRowData(
   rows: Record<string, unknown>[],
   isCallType: boolean,
 ): void {
+  let unsupported: UnsupportedValueError | undefined;
+
   for (let t = 0; t < tupleCount; t++) {
     if (reader.remaining <= 0) break;
 
@@ -873,46 +923,61 @@ function parseRowData(
       let size = reader.parseInt();
       const column = columns[c]!;
       let colType = column.type;
+      const hasTypeHeader = isCallType || colType === CUBRIDDataType.NULL;
 
       // CAS writes SQL NULL as -1, and a collection cell always has its header.
-      if (size < -1 || (size === 0 && isCollectionType(colType))) {
+      if (size < -1 || (size === 0 && (isCollectionType(colType) || hasTypeHeader))) {
         throw new Error(
           `Malformed CAS packet: invalid cell length ${size} for column "${column.name}"`,
         );
       }
-      if (size <= 0) {
+      if (size === -1) {
         row[column.name] = null;
         continue;
       }
 
       // Special handling for CALL/SP or NULL type
-      if (isCallType || colType === CUBRIDDataType.NULL) {
+      if (hasTypeHeader) {
         colType = reader.parseUByte() as CUBRIDDataType;
         size--;
-        if (size <= 0) {
-          row[column.name] = null;
-          continue;
-        }
+      }
+
+      // An empty bit string is not SQL NULL, but is still returned as null (#173).
+      if (size === 0 && isBitType(colType)) {
+        row[column.name] = null;
+        continue;
       }
 
       const valueStart = reader.position;
       try {
-        row[column.name] = readValue(reader, colType, size);
+        const value = readValue(reader, colType, size);
         // A value that disagrees with its cell length would turn the bytes of
         // the following columns into the wrong values.
         assertExactLength(reader.position - valueStart, size);
+        // CAS counts the NUL of text and writes fixed widths in full, so a
+        // decodable zero-byte value is neither SQL NULL nor an empty value.
+        if (size === 0) {
+          throw new Error(`Malformed CAS packet: type ${colType} cannot be empty`);
+        }
+        row[column.name] = value;
       } catch (error) {
-        // Keep unsupported non-NULL values distinct from SQL NULL. Framed
-        // parsing ends here; the adapter's query-handle finally block cleans
-        // up the allocated handle on the owning CAS session.
-        throw new Error(
-          `Failed to decode CUBRID column "${column.name}" (wire type ${colType}, ${size} bytes)`,
-          { cause: error },
-        );
+        const message =
+          `Failed to decode CUBRID column "${column.name}" (wire type ${colType}, ${size} bytes)`;
+        if (!(error instanceof UnsupportedValueError)) {
+          throw new MalformedReplyError(message, { cause: error });
+        }
+        // Keep walking: the session is only safe to reuse if the rest of the
+        // reply holds together, and a later structural failure must win.
+        unsupported ??= new UnsupportedValueError(message, { cause: error });
+        reader.skip(valueStart + size - reader.position);
       }
     }
 
     rows.push(row);
+  }
+
+  if (unsupported) {
+    throw unsupported;
   }
 }
 
@@ -974,7 +1039,9 @@ function readValue(
     default:
       // Never turn an unsupported non-NULL wire value into SQL NULL:
       // callers would silently lose data and could persist the wrong result.
-      throw new Error(`Unsupported CUBRID CAS value type ${colType} (${size} bytes)`);
+      throw new UnsupportedValueError(
+        `Unsupported CUBRID CAS value type ${colType} (${size} bytes)`,
+      );
   }
 }
 
@@ -984,6 +1051,10 @@ function isCollectionType(colType: CUBRIDDataType): boolean {
     colType === CUBRIDDataType.MULTISET ||
     colType === CUBRIDDataType.SEQUENCE
   );
+}
+
+function isBitType(colType: CUBRIDDataType): boolean {
+  return colType === CUBRIDDataType.BIT || colType === CUBRIDDataType.VARBIT;
 }
 
 function assertExactLength(consumed: number, declared: number): void {
@@ -1037,10 +1108,7 @@ function readCollectionElement(
     return null;
   }
   // BIT and VARBIT are the only encodings that can be empty: text keeps its NUL.
-  if (
-    length === 0 &&
-    (elementType === CUBRIDDataType.BIT || elementType === CUBRIDDataType.VARBIT)
-  ) {
+  if (length === 0 && isBitType(elementType)) {
     return Buffer.alloc(0);
   }
   if (length <= 0) {
@@ -1051,7 +1119,7 @@ function readCollectionElement(
   // The payload is a file locator, not the LOB content (#93); do not hand a
   // server path to callers as if it were the element value.
   if (elementType === CUBRIDDataType.BLOB || elementType === CUBRIDDataType.CLOB) {
-    throw new Error(`Unsupported CUBRID collection element type ${elementType}`);
+    throw new UnsupportedValueError(`Unsupported CUBRID collection element type ${elementType}`);
   }
 
   const element = cell.subReader(length);

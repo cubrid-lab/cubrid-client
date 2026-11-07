@@ -15,6 +15,7 @@ import { createClient } from "../src/client/create-client.js";
 import { NativeCubridAdapter } from "../src/adapters/native.js";
 import { ConnectionError } from "../src/errors/connection-error.js";
 import { QueryError } from "../src/errors/query-error.js";
+import { TransactionError } from "../src/errors/transaction-error.js";
 import { CASFunctionCode } from "../src/protocol/constants.js";
 import { CASConnection } from "../src/protocol/connection.js";
 import {
@@ -785,6 +786,10 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
   describe("query handle release", () => {
     const TABLE = "integration_test_handles";
     const SELECT_ALL = `SELECT id, val FROM ${TABLE} ORDER BY id`;
+    // Only the last row has a TIMESTAMPTZ value, which has no decoder. Ascending
+    // order meets it in a FETCH reply, descending order in the first reply.
+    const UNSUPPORTED_IN_FETCH = `SELECT id, zoned FROM ${TABLE} ORDER BY id`;
+    const UNSUPPORTED_IN_FIRST_REPLY = `SELECT id, zoned FROM ${TABLE} ORDER BY id DESC`;
     const CAS_ER_SRV_HANDLE = -1006;
 
     /** Enough rows that the first response cannot carry them all. */
@@ -850,11 +855,17 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
 
       try {
         await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`);
-        await adapter.query(`CREATE TABLE ${TABLE} (id INT PRIMARY KEY, val VARCHAR(40))`);
+        await adapter.query(
+          `CREATE TABLE ${TABLE} (id INT PRIMARY KEY, val VARCHAR(40), zoned TIMESTAMPTZ)`,
+        );
         await adapter.beginTransaction();
         for (let id = 0; id < ROW_COUNT; id += 1) {
-          await adapter.query(`INSERT INTO ${TABLE} VALUES (${id}, 'row ${id}')`);
+          await adapter.query(`INSERT INTO ${TABLE} (id, val) VALUES (${id}, 'row ${id}')`);
         }
+        await adapter.query(
+          `UPDATE ${TABLE} SET zoned = TIMESTAMPTZ'2020-01-02 03:04:05 +09:00' ` +
+            `WHERE id = ${ROW_COUNT - 1}`,
+        );
         await adapter.commit();
 
         const trace = await open((_code, response) => response);
@@ -868,15 +879,16 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       }
     });
 
-    test("releases the handle after a FETCH decode failure inside a transaction", async () => {
-      const trace = await open(truncateFetch);
+    test("releases the handle after an unsupported FETCH value inside a transaction", async () => {
+      const trace = await open((_code, response) => response);
 
       try {
         await trace.adapter.beginTransaction();
         const generation = trace.cas.connectionGeneration;
 
-        await assert.rejects(trace.adapter.query(SELECT_ALL), QueryError);
+        await assert.rejects(trace.adapter.query(UNSUPPORTED_IN_FETCH), QueryError);
 
+        assert.ok(count(trace, CASFunctionCode.FETCH) > 0);
         assert.equal(count(trace, CASFunctionCode.CLOSE_REQ_HANDLE), 1);
         assert.equal(trace.cas.connectionGeneration, generation);
         assert.equal(await fetchCode(trace), CAS_ER_SRV_HANDLE);
@@ -887,13 +899,14 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     });
 
     test("releases the handle on its own session after an autocommit FETCH failure", async () => {
-      const trace = await open(truncateFetch);
+      const trace = await open((_code, response) => response);
 
       try {
         const generation = trace.cas.connectionGeneration;
 
-        await assert.rejects(trace.adapter.query(SELECT_ALL), QueryError);
+        await assert.rejects(trace.adapter.query(UNSUPPORTED_IN_FETCH), QueryError);
 
+        assert.ok(count(trace, CASFunctionCode.FETCH) > 0);
         // The broker has marked the CAS released by now, so anything that goes
         // through sendAndRecv() would reconnect and close nothing.
         assert.equal(count(trace, CASFunctionCode.CLOSE_REQ_HANDLE), 1);
@@ -904,13 +917,13 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       }
     });
 
-    test("releases the handle when the first response cannot be decoded", async () => {
-      const trace = await open(truncateExecute);
+    test("releases the handle when the first response holds an unsupported value", async () => {
+      const trace = await open((_code, response) => response);
 
       try {
         await trace.adapter.beginTransaction();
 
-        await assert.rejects(trace.adapter.query(SELECT_ALL), QueryError);
+        await assert.rejects(trace.adapter.query(UNSUPPORTED_IN_FIRST_REPLY), QueryError);
 
         assert.equal(count(trace, CASFunctionCode.CLOSE_REQ_HANDLE), 1);
         assert.equal(await fetchCode(trace), CAS_ER_SRV_HANDLE);
@@ -919,6 +932,51 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         await trace.adapter.close();
       }
     });
+
+    /** Whether a separate session sees the row, so only committed work counts. */
+    async function rowCommitted(id: number): Promise<boolean> {
+      const observer = new NativeCubridAdapter(TEST_CONFIG);
+      try {
+        return (await observer.query(`SELECT id FROM ${TABLE} WHERE id = ${id}`)).length === 1;
+      } finally {
+        await observer.close();
+      }
+    }
+
+    for (const [where, tamper] of [
+      ["FETCH", truncateFetch],
+      ["first", truncateExecute],
+    ] as const) {
+      test(`a malformed ${where} reply drops the session and the server undoes its work`, async () => {
+        const id = ROW_COUNT + (where === "FETCH" ? 1 : 2);
+        let armed = false;
+        const trace = await open((code, response) => (armed ? tamper(code, response) : response));
+
+        try {
+          await trace.adapter.beginTransaction();
+          await trace.adapter.query(`INSERT INTO ${TABLE} (id, val) VALUES (${id}, 'lost')`);
+          const closesBefore = count(trace, CASFunctionCode.CLOSE_REQ_HANDLE);
+          armed = true;
+
+          await assert.rejects(trace.adapter.query(SELECT_ALL), QueryError);
+
+          assert.equal(trace.cas.isConnected, false);
+          assert.equal(count(trace, CASFunctionCode.CLOSE_REQ_HANDLE), closesBefore);
+
+          // A later commit must not report success for work the server dropped.
+          armed = false;
+          await assert.rejects(trace.adapter.commit(), TransactionError);
+          assert.equal(await rowCommitted(id), false);
+
+          // rollback() acknowledges the loss, and the adapter then works again.
+          await assert.rejects(trace.adapter.rollback(), TransactionError);
+          const rows = await trace.adapter.query("SELECT 1 + 1 AS result");
+          assert.equal(rows[0]!.result, 2);
+        } finally {
+          await trace.adapter.close();
+        }
+      });
+    }
 
     test("attempts no release on a socket lost during FETCH, then recovers", async () => {
       const trace = await open((_code, response) => response);

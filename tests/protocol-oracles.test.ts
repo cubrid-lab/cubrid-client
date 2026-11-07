@@ -10,8 +10,10 @@ import assert from "node:assert/strict";
 import { CASFunctionCode, CUBRIDDataType, StatementType } from "../src/protocol/constants.js";
 import {
   encodeBindParams,
+  MalformedReplyError,
   parseFetch,
   parsePrepareAndExecute,
+  UnsupportedValueError,
   writeFetch,
 } from "../src/protocol/protocol.js";
 import { CAPTURED_FRAMES, type CapturedFrame } from "./fixtures/collection-frames.js";
@@ -134,6 +136,80 @@ test("genuine SQL NULL and a valid empty string are different", () => {
   const emptyRow = parsePrepareAndExecute(selectWire(2, Buffer.from([0])), 1);
   assert.equal(nullRow.rows[0]?.value, null);
   assert.equal(emptyRow.rows[0]?.value, "");
+});
+
+test("a captured TIMESTAMPTZ value rejects as unsupported, naming its column and wire type", () => {
+  assert.throws(
+    () => parsePrepareAndExecute(Buffer.from(CAPTURED_FRAMES.timestamptzValue.hex, "hex"), 7),
+    (error: Error) => {
+      assert.ok(error instanceof UnsupportedValueError);
+      assert.match(error.message, /column "tz" \(wire type 29, 19 bytes\)/);
+      return true;
+    },
+  );
+});
+
+test("a zero-byte value is null only for BIT and VARBIT, and never for another type", () => {
+  // The captured SELECT X'' has a size-0 cell. It stays null until #173 and keeps column t.
+  assert.deepEqual(
+    parsePrepareAndExecute(Buffer.from(CAPTURED_FRAMES.emptyBitValue.hex, "hex"), 7).rows,
+    [{ x: null, t: "after" }],
+  );
+  assert.equal(parsePrepareAndExecute(selectWire(5, Buffer.alloc(0)), 1).rows[0]?.value, null);
+
+  // No decoder: OBJECT, TIMESTAMPTZ, JSON and a code CCI does not define.
+  for (const type of [19, 29, 34, 99]) {
+    assert.throws(() => parsePrepareAndExecute(selectWire(type, Buffer.alloc(0)), 1), (error: Error) =>
+      error instanceof UnsupportedValueError && error.message.includes(`wire type ${type}, 0 bytes`));
+  }
+
+  // Decodable, but CAS counts the NUL of text and writes fixed widths in full.
+  for (const type of [2, 8, 21, 23]) {
+    assert.throws(() => parsePrepareAndExecute(selectWire(type, Buffer.alloc(0)), 1), (error: Error) =>
+      error instanceof MalformedReplyError &&
+      error.message.includes(`wire type ${type}, 0 bytes`) &&
+      // The reason is one step down the cause chain, not behind a repeated message.
+      !(error.cause as Error).message.startsWith("Failed to decode"));
+  }
+});
+
+test("a NULL-typed column never turns a typed cell without value bytes into null", () => {
+  // Cell of size 1 holding only the type header: the literal TIMESTAMPTZ code 29.
+  assert.throws(
+    () => parsePrepareAndExecute(selectWire(0, Buffer.from([29])), 1),
+    (error: Error) => error instanceof UnsupportedValueError && /wire type 29, 0 bytes/.test(error.message),
+  );
+  // Cell of size 0 has no room for the header, which must not come from the next bytes.
+  assert.throws(
+    () => parsePrepareAndExecute(selectWire(0, Buffer.alloc(0)), 1),
+    (error: Error) => error instanceof MalformedReplyError && /invalid cell length 0/.test(error.message),
+  );
+});
+
+test("an unsupported value whose length overruns the reply is malformed, not unsupported", () => {
+  const wire = selectWire(29, Buffer.from("01020304", "hex"));
+  assert.throws(
+    () => parsePrepareAndExecute(wire.subarray(0, -2), 1),
+    (error: Error) => error instanceof MalformedReplyError,
+  );
+});
+
+test("the first unsupported value is reported only once the whole reply holds together", () => {
+  const column = { type: 29, name: "tz" } as never;
+  const row = (...cells: Buffer[]): Buffer => Buffer.concat([i32(1), Buffer.alloc(8), ...cells]);
+  const value = Buffer.concat([i32(2), Buffer.from("0102", "hex")]);
+
+  const later = Buffer.concat([i32(3), Buffer.from("010203", "hex")]);
+
+  assert.throws(
+    () => parseFetch(Buffer.concat([i32(0), i32(2), row(value), row(later)]), [column]),
+    (error: Error) => error instanceof UnsupportedValueError && /, 2 bytes/.test(error.message),
+  );
+  // Row 2 declares a negative length that is not NULL.
+  assert.throws(
+    () => parseFetch(Buffer.concat([i32(0), i32(2), row(value), row(i32(-2))]), [column]),
+    (error: Error) => error instanceof MalformedReplyError,
+  );
 });
 
 test("truncated packets and literal FETCH error envelopes reject", () => {
@@ -304,6 +380,16 @@ test("a collection cell cannot read past its end into the next column", () => {
       assert.match(causeOf(error), /cannot read 4 bytes/);
       return true;
     },
+  );
+});
+
+test("a collection element without a decoder is unsupported and leaves the next column readable", () => {
+  // Cell: BLOB element type 23, one element of 4 bytes. It rejects the reply as
+  // unsupported, so the column after it was reached and found intact.
+  const cell = "0000000d" + "17" + "00000001" + "00000004" + "01020304";
+  assert.throws(
+    () => parsePrepareAndExecute(withCell(cell), 7),
+    (error: Error) => error instanceof UnsupportedValueError,
   );
 });
 

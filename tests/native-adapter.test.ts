@@ -10,6 +10,7 @@ import { QueryError } from "../src/errors/query-error.js";
 import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { TransactionError } from "../src/errors/transaction-error.js";
 import type { ClientConfig } from "../src/types/client.js";
+import { CAPTURED_FRAMES } from "./fixtures/collection-frames.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1403,32 +1404,115 @@ test("query handle: a FETCH rejected by the server still closes it", async () =>
   assert.equal(fakeCAS.isConnected, true);
 });
 
-test("query handle: a FETCH that cannot be decoded still closes it", async () => {
+/** The session a damaged reply arrived on is dropped, and nothing more is sent on it. */
+function assertSessionDiscarded(fakeCAS: FakeCASConnection): void {
+  assert.equal(fakeCAS.discardCalls, 1);
+  assert.equal(fakeCAS.isConnected, false);
+  assert.deepEqual(fakeCAS.closedHandles, []);
+}
+
+test("query handle: a malformed FETCH drops the session instead of closing it", async () => {
   const { adapter, fakeCAS } = createAdapterWithFakeCAS();
   fakeCAS.queueResponse(buildPartialSelectResponse(2));
   fakeCAS.queueResponse(buildTruncatedFetchResponse());
 
   await assertQueryFails(adapter, /Malformed CAS packet|out of range/i);
 
-  assert.deepEqual(fakeCAS.closedHandles, [QUERY_HANDLE]);
+  assertSessionDiscarded(fakeCAS);
 });
 
-test("query handle: inline rows that cannot be decoded still close it", async () => {
+test("query handle: malformed inline rows drop the session instead of closing it", async () => {
   const { adapter, fakeCAS } = createAdapterWithFakeCAS();
   fakeCAS.queueResponse(buildTruncatedSelectResponse());
 
   await assertQueryFails(adapter, /Malformed CAS packet|out of range/i);
 
-  assert.deepEqual(fakeCAS.closedHandles, [QUERY_HANDLE]);
+  assertSessionDiscarded(fakeCAS);
 });
 
-test("query handle: column metadata that cannot be decoded still closes it", async () => {
+test("query handle: malformed column metadata drops the session instead of closing it", async () => {
   const { adapter, fakeCAS } = createAdapterWithFakeCAS();
   fakeCAS.queueResponse(buildDMLResponse(20, 1).subarray(0, 12));
 
   await assertQueryFails(adapter, /out of range|outside/i, "INSERT INTO t VALUES (1)");
 
+  assertSessionDiscarded(fakeCAS);
+});
+
+test("a reply too short to hold a response code drops the session", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(Buffer.from("0000", "hex"));
+
+  await assertQueryFails(adapter, /reply of 2 bytes/);
+
+  assertSessionDiscarded(fakeCAS);
+});
+
+test("a malformed reply reconnects the next autocommit query on a new session", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(buildTruncatedSelectResponse());
+  await assertQueryFails(adapter, /Malformed CAS packet|out of range/i);
+
+  fakeCAS.queueResponse(buildSelectResponse([{ name: "id", type: 2 }], [["1"]]));
+
+  assert.deepEqual(await adapter.query("SELECT id FROM t"), [{ id: "1" }]);
+  assert.equal(fakeCAS.connectCalls, 1);
+});
+
+test("a malformed reply loses the open transaction instead of committing what follows", async () => {
+  const { adapter, fakeCAS } = await beginWithOneInsert();
+  fakeCAS.queueResponse(buildTruncatedSelectResponse());
+  await assertQueryFails(adapter, /Malformed CAS packet|out of range/i);
+  assert.equal(fakeCAS.discardCalls, 1);
+  fakeCAS.sentPayloads = [];
+
+  await assert.rejects(adapter.query("INSERT INTO t VALUES (2)"), /Failed to execute/);
+  await assert.rejects(adapter.commit(), TransactionError);
+
+  assert.equal(fakeCAS.connectCalls, 0);
+  assert.deepEqual(fakeCAS.sentPayloads, []);
+});
+
+test("a malformed reply cannot rebind a transaction on a replacement session", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (adapter as any).noBackslashEscapes = null;
+  await adapter.beginTransaction();
+  fakeCAS.queueResponse(buildTruncatedSelectResponse());
+
+  await assertQueryFails(adapter, /Malformed CAS packet|out of range/i, "UPDATE t SET a = ?");
+
+  assert.equal(fakeCAS.discardCalls, 1);
+  await assert.rejects(adapter.commit(), TransactionError);
+  assert.equal(fakeCAS.connectCalls, 0);
+});
+
+test("a zero-byte value without a decoder rejects, and the session stays open", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  // The captured TIMESTAMPTZ reply, with its 19-byte value (type 29) removed.
+  const value = "0000001307e4000100020003000400052b30393a303000";
+  const { hex } = CAPTURED_FRAMES.timestamptzValue;
+  assert.ok(hex.includes(value));
+  fakeCAS.queueResponse(Buffer.from(hex.replace(value, "00000000"), "hex"));
+
+  await assertQueryFails(adapter, /column "tz" \(wire type 29, 0 bytes\)/);
+
+  assert.equal(fakeCAS.discardCalls, 0);
+  assert.equal(fakeCAS.isConnected, true);
   assert.deepEqual(fakeCAS.closedHandles, [1]);
+});
+
+test("damage after an unsupported value still drops the session", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  const { hex } = CAPTURED_FRAMES.timestamptzValue;
+  // Column t follows the unsupported value and now claims more bytes than remain.
+  const tail = "0000000661667465720001";
+  assert.ok(hex.endsWith(tail));
+  fakeCAS.queueResponse(Buffer.from(hex.slice(0, -tail.length) + "7fffffff", "hex"));
+
+  await assertQueryFails(adapter, /cannot read 2147483647 bytes/);
+
+  assertSessionDiscarded(fakeCAS);
 });
 
 test("query handle: nothing is closed when the server returned no handle", async () => {
@@ -1511,23 +1595,23 @@ test("query handle: a transaction that lost its session closes nothing", async (
 test("query handle: a failed close does not mask the fetch failure", async () => {
   const { adapter, fakeCAS } = createAdapterWithFakeCAS();
   fakeCAS.queueResponse(buildPartialSelectResponse(2));
-  fakeCAS.queueResponse(buildTruncatedFetchResponse());
+  fakeCAS.queueResponse(buildErrorResponse(-495, "fetch rejected"));
   fakeCAS.queueExchangeFailure(new Error("close failed"));
 
-  await assertQueryFails(adapter, /Malformed CAS packet|out of range/i);
+  await assertQueryFails(adapter, /CUBRID fetch failed/);
 
   assert.deepEqual(fakeCAS.closedHandles, [QUERY_HANDLE]);
   assert.equal(fakeCAS.isConnected, false);
 });
 
 test("query handle: a close rejected by the server does not mask the failure", async () => {
-  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
-  fakeCAS.queueResponse(buildTruncatedSelectResponse());
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  fakeCAS.queueResponse(Buffer.from(CAPTURED_FRAMES.timestamptzValue.hex, "hex"));
   fakeCAS.queueResponse(buildErrorResponse(-1006, "invalid handle"));
 
-  await assertQueryFails(adapter, /Malformed CAS packet|out of range/i);
+  await assertQueryFails(adapter, /Unsupported CUBRID CAS value type 29/);
 
-  assert.deepEqual(fakeCAS.closedHandles, [QUERY_HANDLE]);
+  assert.deepEqual(fakeCAS.closedHandles, [1]);
   assert.equal(fakeCAS.isConnected, true);
 });
 
@@ -1542,7 +1626,7 @@ test("query handle: a successful query survives a failed close", async () => {
   assert.deepEqual(fakeCAS.closedHandles, [QUERY_HANDLE]);
 });
 
-test("query handle: a backslash probe that cannot be decoded still closes it", async () => {
+test("query handle: a malformed backslash probe drops the session instead of closing it", async () => {
   const { adapter, fakeCAS } = createAdapterWithFakeCAS();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (adapter as any).noBackslashEscapes = null;
@@ -1550,7 +1634,7 @@ test("query handle: a backslash probe that cannot be decoded still closes it", a
 
   await assertQueryFails(adapter, /Malformed CAS packet|out of range/i, "SELECT ?");
 
-  assert.deepEqual(fakeCAS.closedHandles, [QUERY_HANDLE]);
+  assertSessionDiscarded(fakeCAS);
 });
 
 // ---------------------------------------------------------------------------

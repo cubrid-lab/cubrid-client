@@ -671,14 +671,17 @@ type Tagged = { id: number; tags: CollectionValue | null };
 const rows = await db.query<Tagged>("SELECT id, tags FROM article");
 ```
 
-Unsupported non-NULL CUBRID wire values (including JSON types and unsupported
-collection elements that do not yet have a decoder) reject the query with a
-`QueryError` rather than silently appearing as SQL `null`. The underlying error
-identifies the column name and CAS type number. A cell or collection length that
-does not match its value also rejects, so a malformed length cannot shift the
-following columns. A genuine SQL NULL is still returned as `null`; an empty SQL
-string is still `""`. See [#111](https://github.com/cubrid-lab/cubrid-client/issues/111)
-for JSON/type coverage.
+Unsupported non-NULL CUBRID wire values (including timezone-aware, OBJECT and
+unsupported collection element values that do not yet have a decoder) reject the
+query with a `QueryError` rather than silently appearing as SQL `null`, and the
+connection stays usable. The error's `cause` identifies the column name and CAS
+type number. A cell or collection length that does not match its value also
+rejects, so a malformed length cannot shift the following columns; a malformed
+reply also drops the connection, which rolls back an open transaction. A genuine
+SQL NULL is still returned as `null`; an empty SQL string is still `""`. JSON
+columns return their text as a `string`. See
+[values that cannot be decoded](TYPES.md#values-that-cannot-be-decoded) and
+[#111](https://github.com/cubrid-lab/cubrid-client/issues/111) for type coverage.
 
 ### QueryParams
 
