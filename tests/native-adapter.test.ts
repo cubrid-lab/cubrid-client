@@ -3518,6 +3518,44 @@ test("stream LOB: a malformed LOB_READ reply retires the session and nothing fol
   assert.deepEqual(functionsSent(fakeCAS), [FC_PREPARE_AND_EXECUTE, FC_LOB_READ]);
 });
 
+test("stream LOB: a failed read in the last window still ends the read transaction", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  fakeCAS.queueResponse(lobReplyWithSizes([1n, 0n], [0n, 0n]));
+  fakeCAS.queueResponse(buildServerErrorResponse(-493));
+
+  await assert.rejects(() => adapter.stream(SELECT_LOBS).next(), QueryError);
+  assert.deepEqual(functionsSent(fakeCAS), [
+    FC_PREPARE_AND_EXECUTE,
+    FC_LOB_READ,
+    FC_END_TRAN,
+    FC_CLOSE_REQ_HANDLE,
+  ]);
+});
+
+test("stream LOB: abort after a partial reply stops subsequent reads and cleans up", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  const controller = new AbortController();
+  fakeCAS.queueResponse(lobSelectReply(200_000n, 0n));
+  fakeCAS.queueResponse(lobReadReply(Buffer.alloc(81_908)));
+  fakeCAS.onSendAndRecv = () => {
+    if (!controller.signal.aborted && fakeCAS.sentPayloads.at(-1)?.[0] === FC_LOB_READ) {
+      controller.abort(new Error("stop streamed LOB"));
+    }
+  };
+
+  await assert.rejects(
+    () => adapter.stream(SELECT_LOBS, undefined, { signal: controller.signal }).next(),
+    /stop streamed LOB/,
+  );
+  assert.deepEqual(lobReads(fakeCAS), [[0, 131072]]);
+  assert.deepEqual(functionsSent(fakeCAS), [
+    FC_PREPARE_AND_EXECUTE,
+    FC_LOB_READ,
+    FC_END_TRAN,
+    FC_CLOSE_REQ_HANDLE,
+  ]);
+});
+
 test("stream: the adapter checks its options and fetchSize config like the client", () => {
   assert.throws(() => new NativeCubridAdapter({ ...DEFAULT_CONFIG, fetchSize: 0 }), RangeError);
   const { adapter } = createAdapterWithFakeCAS();
