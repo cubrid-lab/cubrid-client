@@ -19,6 +19,10 @@ Use Node 22 as a recommended reproducible developer workstation baseline while c
 - Distinguish **setup ready**, **offline tests passed**, **real CUBRID integration passed** and **release artifact verified** as four distinct states. No passing prerequisite implies later states.
 - Avoid adding heavyweight per-PR jobs just to demonstrate setup. Reserve required live DB matrix and external consumer checks for relevant behavioral changes and final release candidates.
 
+## Node.js 18 compatibility invariant
+
+The Node 22 local development baseline does **not** change the `engines.node >=18` requirement for any 1.x release, including maintenance patches. [ADR 0006](0006-node-18-support-through-1x.md) records this decision; a minimum-runtime upgrade is a prospective **2.0** consideration, not an allowed 1.x setup optimization. Test packed ESM/CJS output with a Node 18 consumer independent of the Node 22 builder. The established [API stability schedule](../API_STABILITY.md#nodejs-support-schedule) also retains Node 20 throughout 1.x.
+
 ## Alternatives considered
 
 - **Rejected:** One shared global language/tool version and cross-language Makefile for every repo; violates Go, Cargo and Node-specific conventions.
