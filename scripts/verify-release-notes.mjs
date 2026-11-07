@@ -12,10 +12,11 @@ const errors = [];
 
 if (!existsSync(currentPath)) errors.push("Missing curated release notes for current version: " + currentPath);
 const files = readdirSync(noteDir).filter(name => /^v\d+\.\d+\.\d+\.md$/.test(name));
+const allVersions = files.map(name => name.slice(1, -3));
 for (const file of files) {
   const releaseVersion = file.slice(1, -3);
   const content = readFileSync(join(noteDir, file), "utf8");
-  for (const problem of validateCuratedNote(releaseVersion, content)) {
+  for (const problem of validateCuratedNote(releaseVersion, content, allVersions)) {
     errors.push(file + ": " + problem);
   }
 }
