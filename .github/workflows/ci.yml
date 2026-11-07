@@ -32,7 +32,7 @@ jobs:
           set -euo pipefail
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
             if git rev-parse --verify HEAD^2 >/dev/null 2>&1 && \
-               git -c core.quotePath=false diff --no-renames --name-only HEAD^1 HEAD > "$RUNNER_TEMP/changed-paths.txt"; then
+               git -c core.quotePath=false diff --no-renames --name-status HEAD^1 HEAD > "$RUNNER_TEMP/changed-paths.txt"; then
               :
             else
               echo "::warning::PR merge diff unavailable; running all validation"
@@ -45,7 +45,7 @@ jobs:
           {
             echo "### Validation impact"
             echo "Event: $EVENT_NAME"
-            echo 'Changed paths (empty means fail-closed for PRs):'
+            echo 'Changed paths and git statuses (empty means fail-closed for PRs):'
             echo '#### Changed files'
             cat "$RUNNER_TEMP/changed-paths.txt"
           } >> "$GITHUB_STEP_SUMMARY"
