@@ -51,18 +51,41 @@ In this benchmark shape, CUBRID is faster than MySQL in every tested TypeScript 
 
 - Reuse a single client/pool per process instead of reconnecting per request. An autocommit statement stays on the client's session; the client adds one CHECK_CAS round trip before it instead of opening a new session (see [Session Reuse](CONNECTION.md#session-reuse)).
 - Batch writes when possible to reduce CAS round-trips.
-- Use prepared statements for repeated query shapes.
 - Keep payload size lean by selecting only required columns.
 
 ```mermaid
 flowchart TD
     Start[Need lower latency] --> Pool{Connection reuse configured?}
     Pool -->|No| Reuse[Enable shared client/pool]
-    Pool -->|Yes| Prepare{Repeated SQL shape?}
-    Prepare -->|Yes| Stmt[Use prepared statements]
-    Prepare -->|No| Batch{Many small writes?}
+    Pool -->|Yes| Batch{Many small writes?}
     Batch -->|Yes| Group[Batch operations]
     Batch -->|No| Profile[Profile query plan and network]
+```
+
+## Prepared binding
+
+`queryPrepared()`, `queryResultPrepared()` and `executePrepared()` are not a
+speed feature. In autocommit mode one call sends four requests (PREPARE,
+EXECUTE, END_TRAN, then the handle release) where `query()` sends two, and
+nothing is reused between calls. Measured with `scripts/bench-prepared.ts` on
+CUBRID 11.4.6.1963 in Docker, 100 rounds per workload, each round running both
+paths in alternating order, on a shared host whose load average stayed above
+20:
+
+| Workload | Literal median | Prepared median | Literal p95 | Prepared p95 |
+| --- | ---: | ---: | ---: | ---: |
+| select by primary key | 1.47 ms | 1.90 ms | 3.55 ms | 6.79 ms |
+| select 1000 rows | 2.85 ms | 3.19 ms | 3.79 ms | 7.14 ms |
+| update by primary key | 50.11 ms | 50.07 ms | 147.83 ms | 108.55 ms |
+| insert one row | 170.81 ms | 180.74 ms | 524.95 ms | 641.64 ms |
+
+Reads cost about 0.3 to 0.4 ms more per call. Writes are dominated by the
+commit on this host, so the difference there is within its noise. Treat these
+as relative numbers from one loaded machine, not a capacity figure, and repeat
+the measurement on your own server:
+
+```bash
+CUBRID_TEST_PORT=33000 node --import tsx scripts/bench-prepared.ts 300
 ```
 
 ## Running Benchmarks

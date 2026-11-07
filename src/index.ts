@@ -31,6 +31,8 @@ export type {
   Executable,
   ExecutableTransactionClient,
   ExecuteResult,
+  PreparedQueryable,
+  PreparedTransactionClient,
   Queryable,
   ResultQueryable,
   ResultTransactionClient,

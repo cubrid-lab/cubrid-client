@@ -82,7 +82,11 @@ function decodeReply<T>(decode: () => T): T {
   try {
     return decode();
   } catch (error) {
-    if (error instanceof UnsupportedValueError || error instanceof MalformedReplyError) {
+    if (
+      error instanceof UnsupportedValueError ||
+      error instanceof MalformedReplyError ||
+      error instanceof CasReplyError
+    ) {
       throw error;
     }
     throw new MalformedReplyError((error as Error).message, { cause: error });
@@ -238,12 +242,16 @@ export function writePrepareAndExecute(
   return { header, payload };
 }
 
-export interface PrepareAndExecuteResult {
+export interface PrepareResult {
   queryHandle: number;
   statementType: StatementType;
+  /** Markers the server counted in the SQL, over every statement of a `a; b` string. */
   bindCount: number;
   columnCount: number;
   columns: ColumnMeta[];
+}
+
+export interface PrepareAndExecuteResult extends PrepareResult {
   totalTupleCount: number;
   /** One entry per statement the request ran; more than one for `a; b`. */
   resultInfos: ResultInfo[];
@@ -279,28 +287,63 @@ function readExecuteReply(
   queryHandle: number,
   protoVersion: number,
 ): PrepareAndExecuteResult {
+  const statement = readPrepareInfo(reader, queryHandle);
+  return readExecution(reader, statement, reader.parseInt(), protoVersion, false);
+}
+
+/** The statement description shared by PREPARE, PREPARE_AND_EXECUTE and a refreshed EXECUTE. */
+function readPrepareInfo(reader: PacketReader, queryHandle: number): PrepareResult {
   reader.parseInt(); // result cache lifetime
   const statementType = reader.parseByte() as StatementType;
   const bindCount = reader.parseInt();
   reader.parseByte(); // is_updatable
   const columnCount = reader.parseInt();
-
   const columns = parseColumnMetadata(reader, columnCount);
 
-  // Execute portion
-  const totalTupleCount = reader.parseInt();
+  return { queryHandle, statementType, bindCount, columnCount, columns };
+}
+
+/**
+ * The execute portion of a reply, after its total tuple count.
+ *
+ * `prepared` marks an EXECUTE reply. Only that reply can replace the statement
+ * description: the CAS sends a new one after a multi-statement string, before
+ * the shard id, and skipping it would misread everything behind it.
+ */
+function readExecution(
+  reader: PacketReader,
+  statement: PrepareResult,
+  totalTupleCount: number,
+  protoVersion: number,
+  prepared: boolean,
+): PrepareAndExecuteResult {
   reader.parseByte(); // cache_reusable
   const resultCount = reader.parseInt();
-  const resultInfos = parseResultInfos(reader, resultCount);
+  const resultInfos = parseResultInfos(reader, resultCount, prepared);
 
-  if (protoVersion > 1 && reader.remaining > 0) {
-    reader.parseByte(); // includes_column_info
+  // Both trailer fields are required by the protocol version. A reply cut off
+  // before them is malformed, never a success to commit. A PREPARE_AND_EXECUTE
+  // reply still skips a missing trailer, as it always has.
+  let current = statement;
+  if (protoVersion > 1 && (prepared || reader.remaining > 0)) {
+    const includesColumnInfo = reader.parseByte(); // includes_column_info
+    if (prepared) {
+      if (includesColumnInfo !== 0 && includesColumnInfo !== 1) {
+        throw new MalformedReplyError(
+          `Malformed CAS packet: column info flag ${includesColumnInfo}`,
+        );
+      }
+      if (includesColumnInfo === 1) {
+        current = readPrepareInfo(reader, statement.queryHandle);
+      }
+    }
   }
-  if (protoVersion > 4 && reader.remaining > 0) {
+  if (protoVersion > 4 && (prepared || reader.remaining > 0)) {
     reader.parseInt(); // shard_id
   }
 
   // Inline fetch (for SELECT statements)
+  const { columns, statementType } = current;
   const rows: Record<string, unknown>[] = [];
   if (statementType === StatementType.SELECT && reader.remaining > 0) {
     const fetchCode = reader.parseInt();
@@ -312,16 +355,7 @@ function readExecuteReply(
     }
   }
 
-  return {
-    queryHandle,
-    statementType,
-    bindCount,
-    columnCount,
-    columns,
-    totalTupleCount,
-    resultInfos,
-    rows,
-  };
+  return { ...current, totalTupleCount, resultInfos, rows };
 }
 
 /**
@@ -338,6 +372,113 @@ export function readQueryHandle(data: Buffer): number | null {
 
   const responseCode = data.readInt32BE(0);
   return responseCode >= 0 ? responseCode : null;
+}
+
+// ---------------------------------------------------------------------------
+// Prepare (FC=2) and Execute (FC=3)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build PREPARE request payload. The autocommit byte is always 0: the caller
+ * ends the transaction itself, so CAS_INFO stays IN_TRAN while the handle lives.
+ */
+export function writePrepare(sql: string, casInfo: Buffer): { header: Buffer; payload: Buffer } {
+  assertPreparableSql(sql);
+
+  const w = new PacketWriter(512);
+  w.writeByte(CASFunctionCode.PREPARE);
+  w.writeNullTermString(sql);
+  w.addByte(PREPARE_NORMAL);
+  w.addByte(0); // autocommit
+
+  const payload = w.toBuffer();
+  const header = PacketWriter.buildHeader(payload.length, casInfo);
+  return { header, payload };
+}
+
+/** The CAS reads SQL up to the first NUL, so the rest would silently not run. */
+export function assertPreparableSql(sql: string): void {
+  if (sql.includes("\0")) {
+    throw new Error("SQL text contains a null byte (0x00), which CUBRID cannot prepare");
+  }
+}
+
+/** Parse PREPARE response. */
+export function parsePrepare(data: Buffer): PrepareResult {
+  assertReplySize(data);
+  const reader = new PacketReader(data);
+  const responseCode = reader.parseInt();
+
+  if (responseCode < 0) {
+    const remaining = data.length - SIZE_INT;
+    const err = reader.readError(remaining);
+    throw new CasReplyError(
+      `CUBRID query failed (${err.code}): ${err.message}`,
+      responseCode,
+      err.code,
+    );
+  }
+
+  return decodeReply(() => readPrepareInfo(reader, responseCode));
+}
+
+/**
+ * Build EXECUTE request payload for a prepared handle.
+ *
+ * EXECUTE_QUERY_ALL matches PREPARE_AND_EXECUTE: with the plain flag the CAS
+ * runs only the first statement of `a; b` and reports success (seen on live
+ * brokers), so the later statements would be lost without an error.
+ */
+export function writeExecute(
+  statement: PrepareResult,
+  binds: PreparedBinds,
+  casInfo: Buffer,
+): { header: Buffer; payload: Buffer } {
+  const w = new PacketWriter(512 + binds.bytes.length);
+  w.writeByte(CASFunctionCode.EXECUTE);
+  w.addInt(statement.queryHandle);
+  w.addByte(EXECUTE_QUERY_ALL);
+  w.addInt(0); // max_col_size
+  w.addInt(0); // max_row_size
+  w.writeInt(0); // empty CALL-mode argument
+  w.addByte(statement.statementType === StatementType.SELECT ? 1 : 0); // inline fetch
+  w.addByte(0); // autocommit: see writePrepare()
+  w.addByte(0); // forward_only
+  w.writeInt(SIZE_LONG); // cache time length
+  w.writeInt(0); // cache time sec
+  w.writeInt(0); // cache time usec
+  w.addInt(0); // query timeout
+  w.writeBytes(binds.bytes);
+
+  const payload = w.toBuffer();
+  const header = PacketWriter.buildHeader(payload.length, casInfo);
+  return { header, payload };
+}
+
+/**
+ * Parse EXECUTE response. Its first int is the tuple count, not a handle: the
+ * handle stays the one PREPARE returned.
+ */
+export function parseExecute(
+  data: Buffer,
+  statement: PrepareResult,
+  protoVersion: number,
+): PrepareAndExecuteResult {
+  assertReplySize(data);
+  const reader = new PacketReader(data);
+  const responseCode = reader.parseInt();
+
+  if (responseCode < 0) {
+    const remaining = data.length - SIZE_INT;
+    const err = reader.readError(remaining);
+    throw new CasReplyError(
+      `CUBRID query failed (${err.code}): ${err.message}`,
+      responseCode,
+      err.code,
+    );
+  }
+
+  return decodeReply(() => readExecution(reader, statement, responseCode, protoVersion, true));
 }
 
 // ---------------------------------------------------------------------------
@@ -760,6 +901,150 @@ function encodeOneParam(w: PacketWriter, value: unknown): void {
 }
 
 // ---------------------------------------------------------------------------
+// Prepared bind encoding (EXECUTE)
+// ---------------------------------------------------------------------------
+
+export interface PreparedBinds {
+  count: number;
+  /** One length-prefixed type byte and one length-prefixed value per parameter. */
+  bytes: Buffer;
+}
+
+const INT32_MIN = -2147483648;
+const INT32_MAX = 2147483647;
+const INT64_MIN = -(2n ** 63n);
+const INT64_MAX = 2n ** 63n - 1n;
+/** NUMERIC holds 38 digits. */
+const NUMERIC_LIMIT = 10n ** 38n;
+const MIN_DATETIME_YEAR = 1;
+const MAX_DATETIME_YEAR = 9999;
+
+/**
+ * Encode parameters as typed EXECUTE binds, refusing before anything is sent
+ * every value the server would store wrongly or the literal path would refuse.
+ * Messages never contain the value.
+ */
+export function encodePreparedParams(params: readonly unknown[]): PreparedBinds {
+  const w = new PacketWriter(256);
+  for (const param of params) {
+    writePreparedParam(w, param);
+  }
+  return { count: params.length, bytes: Buffer.from(w.toBuffer()) };
+}
+
+function writePreparedParam(w: PacketWriter, value: unknown): void {
+  if (value === null || value === undefined) {
+    w.addByte(CUBRIDDataType.NULL);
+    w.addNull();
+    return;
+  }
+
+  if (typeof value === "boolean") {
+    // The literal path renders 1 or 0, which are INTEGER literals.
+    w.addByte(CUBRIDDataType.INT);
+    w.addInt(value ? 1 : 0);
+    return;
+  }
+
+  if (typeof value === "number") {
+    writePreparedNumber(w, value);
+    return;
+  }
+
+  if (typeof value === "bigint") {
+    writePreparedBigint(w, value);
+    return;
+  }
+
+  if (typeof value === "string") {
+    assertStorableText(value);
+    w.addByte(CUBRIDDataType.CHAR);
+    w.writeNullTermString(value);
+    return;
+  }
+
+  if (value instanceof Date) {
+    writePreparedDate(w, value);
+    return;
+  }
+
+  if (Buffer.isBuffer(value)) {
+    // X'' is valid SQL, but the CAS reads a zero-length bind as SQL NULL.
+    if (value.length === 0) {
+      throw new Error("an empty Buffer cannot be sent as a prepared parameter: it would be NULL");
+    }
+    w.addByte(CUBRIDDataType.VARBIT);
+    w.addBytes(value);
+    return;
+  }
+
+  throw new Error(`unsupported prepared parameter type: ${typeof value}`);
+}
+
+/**
+ * A number past the safe range goes as DOUBLE, the value it really is: its
+ * decimal text and the integer it is closest to can differ.
+ */
+function writePreparedNumber(w: PacketWriter, value: number): void {
+  // The broker stores NaN without complaint; the literal path gets a server error.
+  if (!Number.isFinite(value)) {
+    throw new Error("NaN and Infinity are not supported as a prepared parameter");
+  }
+
+  if (!Number.isSafeInteger(value)) {
+    w.addByte(CUBRIDDataType.DOUBLE);
+    w.addDouble(value);
+  } else if (value >= INT32_MIN && value <= INT32_MAX) {
+    w.addByte(CUBRIDDataType.INT);
+    w.addInt(value);
+  } else {
+    w.addByte(CUBRIDDataType.BIGINT);
+    w.addLong(BigInt(value));
+  }
+}
+
+function writePreparedBigint(w: PacketWriter, value: bigint): void {
+  if (value >= INT64_MIN && value <= INT64_MAX) {
+    w.addByte(CUBRIDDataType.BIGINT);
+    w.addLong(value);
+    return;
+  }
+
+  if (value <= -NUMERIC_LIMIT || value >= NUMERIC_LIMIT) {
+    throw new Error("bigint parameter needs more than 38 digits, which NUMERIC cannot hold");
+  }
+  // The CAS counts every character but the sign and the point as precision, so
+  // only plain integer digits are sent: no leading zero can use one up.
+  w.addByte(CUBRIDDataType.NUMERIC);
+  w.writeNullTermString(value.toString());
+}
+
+/**
+ * Always the 14-byte DATETIME layout, using UTC components as the literal path
+ * does. Only DATETIME is sent: JavaScript has no date-only or time-only value,
+ * and the CAS reads TIME at offset 6 without checking the length.
+ */
+function writePreparedDate(w: PacketWriter, value: Date): void {
+  const year = value.getUTCFullYear();
+  if (Number.isNaN(year)) {
+    throw new Error("an invalid Date cannot be sent as a prepared parameter");
+  }
+  if (year < MIN_DATETIME_YEAR || year > MAX_DATETIME_YEAR) {
+    throw new Error("Date parameter is outside the DATETIME years 0001 to 9999");
+  }
+
+  w.addByte(CUBRIDDataType.DATETIME);
+  w.writeInt(SIZE_DATETIME);
+  w.writeShort(year);
+  w.writeShort(value.getUTCMonth() + 1);
+  w.writeShort(value.getUTCDate());
+  w.writeShort(value.getUTCHours());
+  w.writeShort(value.getUTCMinutes());
+  w.writeShort(value.getUTCSeconds());
+  w.writeShort(value.getUTCMilliseconds());
+}
+
+// ---------------------------------------------------------------------------
 // Client-side SQL parameter interpolation
 // ---------------------------------------------------------------------------
 
@@ -949,12 +1234,7 @@ export function formatValue(value: unknown, noBackslashEscapes: boolean): string
  * (`X'..'`) encoding for values that may contain these bytes.
  */
 function escapeString(value: string, noBackslashEscapes: boolean): string {
-  if (value.includes("\0")) {
-    throw new Error("string parameter contains a null byte (0x00), which CUBRID cannot store in a string literal");
-  }
-  if (value.includes("\x1a")) {
-    throw new Error("string parameter contains a Ctrl-Z byte (0x1A), which has no safe CUBRID string-literal escape");
-  }
+  assertStorableText(value);
 
   if (noBackslashEscapes) {
     // Literal mode (CUBRID default): only the single quote is special.
@@ -968,6 +1248,16 @@ function escapeString(value: string, noBackslashEscapes: boolean): string {
     .replace(/\r/g, "\\\r")
     .replace(/\n/g, "\\\n");
   return `'${escaped}'`;
+}
+
+/** Text the literal path refuses, which the prepared path refuses too. */
+function assertStorableText(value: string): void {
+  if (value.includes("\0")) {
+    throw new Error("string parameter contains a null byte (0x00), which CUBRID cannot store in a string literal");
+  }
+  if (value.includes("\x1a")) {
+    throw new Error("string parameter contains a Ctrl-Z byte (0x1A), which has no safe CUBRID string-literal escape");
+  }
 }
 
 function formatDatetime(date: Date): string {
@@ -1119,10 +1409,17 @@ function parseRowData(
         continue;
       }
 
-      // Special handling for CALL/SP or NULL type
+      // Such a cell states its own type, in the layout of column metadata. This
+      // is what a bound `SELECT ?` returns: its column has no type at PREPARE.
       if (hasTypeHeader) {
-        colType = reader.parseUByte() as CUBRIDDataType;
-        size--;
+        const headerStart = reader.position;
+        colType = parseColumnType(reader).type;
+        size -= reader.position - headerStart;
+        if (size < 0) {
+          throw new Error(
+            `Malformed CAS packet: type header overruns the cell of column "${column.name}"`,
+          );
+        }
       }
 
       // An empty bit string is not SQL NULL: it is an empty Buffer (#173).
@@ -1488,11 +1785,17 @@ export interface ResultInfo {
   resultCount: number;
 }
 
-function parseResultInfos(reader: PacketReader, count: number): ResultInfo[] {
+function parseResultInfos(reader: PacketReader, count: number, prepared = false): ResultInfo[] {
   const infos: ResultInfo[] = [];
   for (let i = 0; i < count; i++) {
     const statementType = reader.parseByte() as StatementType;
     const resultCount = reader.parseInt();
+    // An EXECUTE reply can report one statement's failure in place of its result.
+    if (prepared && resultCount < 0) {
+      const code = reader.parseInt();
+      const message = reader.parseNullTermString(reader.parseInt());
+      throw new CasReplyError(`CUBRID query failed (${code}): ${message}`, resultCount, code);
+    }
     reader.parseBytes(SIZE_OID); // OID (8 bytes)
     reader.parseInt(); // cache time seconds
     reader.parseInt(); // cache time microseconds

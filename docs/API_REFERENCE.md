@@ -23,6 +23,8 @@ Complete reference for every public export of `cubrid-client`.
   - [Queryable](#queryable)
   - [Executable](#executable)
   - [ExecutableTransactionClient](#executabletransactionclient)
+  - [PreparedQueryable](#preparedqueryable)
+  - [PreparedTransactionClient](#preparedtransactionclient)
   - [ExecuteResult](#executeresult)
   - [TransactionClient](#transactionclient-interface)
   - [TransactionCallback](#transactioncallback)
@@ -207,13 +209,46 @@ What the server reports, checked on CUBRID 10.2, 11.0, 11.2 and 11.4 (the replie
 
 ---
 
+#### `queryPrepared<T>(sql, params?)`, `queryResultPrepared<T>(sql, params?)`, `executePrepared(sql, params?)`
+
+Opt-in server-side binding: the same results as `query()`, `queryResult()` and `execute()`, with the values sent as typed binds instead of SQL text.
+
+```ts
+async queryPrepared<T extends QueryResultRow = QueryResultRow>(
+  sql: string,
+  params?: QueryParams,
+): Promise<T[]>
+
+async queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
+  sql: string,
+  params?: QueryParams,
+): Promise<QueryResult<T>>
+
+async executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>
+```
+
+**Throws:** [`QueryError`](#queryerror) if execution fails, if a value is refused, if the number of values differs from the statement's markers, or if a custom `connectionFactory` connection does not provide the method. They never fall back to SQL literals.
+
+```ts
+const rows = await db.queryPrepared<{ id: number }>("SELECT id FROM users WHERE name = ?", [name]);
+const { affectedRows } = await db.executePrepared("UPDATE users SET name = ? WHERE id = ?", [name, 1]);
+```
+
+- **Types.** [Prepared binding](TYPES.md#prepared-binding) lists each JavaScript type, what is refused and how the result can differ from the literal path.
+- **Lifecycle.** Each call prepares, executes and releases its own handle, so a handle is never kept between calls or carried to another session. There is no reusable statement object.
+- **Autocommit.** The statement runs in a transaction of its own that ends with an explicit commit, or a rollback if anything failed.
+- **Cost.** A call takes more round trips than `query()`; see the [measurements](PERFORMANCE.md#prepared-binding). Do not expect it to be faster.
+
 #### `transaction<T>(callback)`
 
 Executes a callback within an isolated transactional connection. Commits on success, rolls back on failure.
 
 ```ts
 async transaction<T>(
-  callback: TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient>,
+  callback: TransactionCallback<
+    T,
+    ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient
+  >,
 ): Promise<T>
 ```
 
@@ -406,7 +441,8 @@ A transaction-scoped client that delegates queries to the isolated transactional
 The exported constructor stays available in 1.x for compatibility. An instance you construct yourself only forwards to the connection you gave it and has no lifecycle guards.
 
 ```ts
-class CubridTransaction implements ResultTransactionClient, ExecutableTransactionClient
+class CubridTransaction
+  implements ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient
 ```
 
 ### Methods
@@ -431,6 +467,12 @@ Same signature and behavior as [`CubridClient.execute()`](#executesql-params), b
 ```ts
 async execute(sql: string, params?: QueryParams): Promise<ExecuteResult>
 ```
+
+**Throws:** [`TransactionError`](#transactionerror) if execution fails.
+
+#### `queryPrepared<T>(sql, params?)`, `queryResultPrepared<T>(sql, params?)`, `executePrepared(sql, params?)`
+
+Same signatures and behavior as the [`CubridClient` methods](#querypreparedtsql-params-queryresultpreparedtsql-params-executepreparedsql-params), but run within the transaction's isolated connection. Nothing is committed until the transaction is.
 
 **Throws:** [`TransactionError`](#transactionerror) if execution fails.
 
@@ -903,6 +945,32 @@ The type `transaction()` passes to its callback and `CubridTransaction` implemen
 interface ExecutableTransactionClient extends TransactionClient, Executable {}
 ```
 
+### PreparedQueryable
+
+Interface for any object that can run a statement with [server-side binding](TYPES.md#prepared-binding). `CubridClient` and `CubridTransaction` implement it.
+
+```ts
+interface PreparedQueryable {
+  queryPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<T[]>;
+  queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>>;
+  executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+}
+```
+
+### PreparedTransactionClient
+
+A `TransactionClient` that can also bind on the server. It is a separate type so that code implementing `TransactionClient` keeps compiling.
+
+```ts
+interface PreparedTransactionClient extends TransactionClient, PreparedQueryable {}
+```
+
 ### TransactionCallback
 
 Type for the callback function passed to `transaction()`.
@@ -922,7 +990,7 @@ The transaction client that `transaction()` passes to its callback: a `Transacti
 interface ResultTransactionClient extends TransactionClient, ResultQueryable {}
 ```
 
-`CubridClient.transaction()` accepts a `TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient>`, so the callback's `tx` has `queryResult()` and `execute()`; a callback written against `TransactionClient` is still accepted.
+`CubridClient.transaction()` accepts a `TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient>`, so the callback's `tx` has `queryResult()` and `execute()`; a callback written against `TransactionClient` is still accepted.
 
 ### QueryParam
 
