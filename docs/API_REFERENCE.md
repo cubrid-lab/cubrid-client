@@ -113,6 +113,8 @@ async query<T extends QueryResultRow = QueryResultRow>(
 
 **Type Parameter:** `T` defaults to `QueryResultRow` (`Record<string, unknown>`). Pass a custom type for typed results.
 
+Queries issued at the same time, for example with `Promise.all`, run one at a time in the order issued and each returns exactly its own rows. See [Concurrent Statements on One Connection](CONNECTION.md#concurrent-statements-on-one-connection).
+
 ##### Examples
 
 ```ts
@@ -248,7 +250,7 @@ async rollback(): Promise<void>
 
 #### `close()`
 
-Closes the shared connection. After calling `close()`, the client can no longer execute queries. If no connection was opened, this is a no-op.
+Closes the shared connection after the statements issued before it have finished. After calling `close()`, the client can no longer execute queries. If no connection was opened, this is a no-op.
 
 ```ts
 async close(): Promise<void>
