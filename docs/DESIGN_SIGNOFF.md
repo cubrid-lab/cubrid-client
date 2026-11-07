@@ -16,6 +16,12 @@
 
 These are **not completed** merely because the files are written. If setup is blocked, fix or explicitly scope it in a separate reviewed task before claiming the design is ready for implementation.
 
+### Node.js 18 support — binding 1.x compatibility requirement
+
+- [ ] Preserve Node `>=18` across **every** `cubrid-client@1.x` version; the Node 22 development baseline is not a change to published runtime support.
+- [ ] Release-candidate tests import the **packed ESM/CJS artifact on Node 18**, with representative runtime assertions, and record real results rather than relying on Node 22 compilation.
+- [ ] Any future proposal to raise the runtime minimum is a **2.0 MAJOR** design/release decision with migration guidance; no 1.x workaround can quietly change it. See [ADR 0006](adr/0006-node-18-support-through-1x.md).
+
 ## Design-first gate
 
 Before implementation changes are treated as approved, establish each of the following in reviewed project documentation and link the evidence. Check only when genuinely resolved, not merely because this template exists.
