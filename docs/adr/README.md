@@ -8,6 +8,7 @@ ADRs preserve **why** a consequential technical or release decision was made, th
 | --- | --- | --- |
 | [0001](0001-release-governance.md) | Release, SemVer and compatibility governance | Proposed (codifying the existing 1.x rules) |
 | [0002](0002-database-correctness-evidence.md) | CUBRID correctness and failure-evidence requirements | Proposed |
+| [0003](0003-native-node-driver-boundaries.md) | Native Node.js CAS driver and ORM responsibility | Proposed (existing behavior recorded; not full support certification) |
 | [0004](0004-test-first-development.md) | TDD: design contract, Red–Green–Refactor and live-CUBRID verification | Proposed |
 
 The Node.js driver already has an established release process; these proposals record the rules without changing it.
