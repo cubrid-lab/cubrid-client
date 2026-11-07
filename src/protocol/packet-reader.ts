@@ -119,6 +119,20 @@ export class PacketReader {
   // Date/time readers
   // ---------------------------------------------------------------------------
 
+  /**
+   * Whether the next year, month and day int16s are all zero, the broker's
+   * zero date `0000-00-00`, without consuming them. The caller must know that
+   * at least those six bytes belong to the value being read.
+   */
+  peekZeroDate(): boolean {
+    for (let i = 0; i < 3; i++) {
+      if (this.buf.readInt16BE(this.offset + i * SIZE_SHORT) !== 0) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   /** Read 7 × int16 (DATETIME) and return a Date. */
   parseDatetime(): Date {
     const year = this.parseShort();

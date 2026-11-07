@@ -82,6 +82,11 @@ rather than importing the implementation enum as an oracle. It checks:
 - Distinguishing real SQL NULL, empty strings and unsupported non-NULL types,
   with the captured `timestamptzValue` reply, and rejecting a zero-byte value
   of any type except BIT and VARBIT.
+- The captured zero DATE, DATETIME and TIMESTAMP replies (all-zero fields, wire
+  types 13, 22 and 15 with sizes 6, 14 and 12, identical on 10.2, 11.0, 11.2 and
+  11.4) reject as unsupported instead of decoding to an 1899 `Date`. A zero date
+  element of a captured `SEQUENCE OF DATE` (10.2 and 11.4) takes the deferred
+  collection path: unsupported, unless the reply is also structurally damaged.
 - An unsupported value keeps the session only when the whole reply holds
   together; any structural failure is reported as malformed, which drops it.
 - Malformed/truncated packets and the negative FETCH error envelope.
