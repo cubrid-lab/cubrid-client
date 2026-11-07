@@ -963,9 +963,9 @@ function parseRowData(
         size--;
       }
 
-      // An empty bit string is not SQL NULL, but is still returned as null (#173).
+      // An empty bit string is not SQL NULL: it is an empty Buffer (#173).
       if (size === 0 && isBitType(colType)) {
-        row[column.name] = null;
+        row[column.name] = Buffer.alloc(0);
         continue;
       }
 

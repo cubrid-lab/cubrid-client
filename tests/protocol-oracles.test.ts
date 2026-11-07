@@ -170,13 +170,16 @@ test("captured zero dates reject as unsupported, naming the column and type, nev
   }
 });
 
-test("a zero-byte value is null only for BIT and VARBIT, and never for another type", () => {
-  // The captured SELECT X'' has a size-0 cell. It stays null until #173 and keeps column t.
+test("a zero-byte value is an empty Buffer only for BIT and VARBIT, and never for another type", () => {
+  // The captured SELECT X'' has a size-0 cell: an empty Buffer, not SQL NULL, and column t stays.
   assert.deepEqual(
     parsePrepareAndExecute(Buffer.from(CAPTURED_FRAMES.emptyBitValue.hex, "hex"), 7).rows,
-    [{ x: null, t: "after" }],
+    [{ x: Buffer.alloc(0), t: "after" }],
   );
-  assert.equal(parsePrepareAndExecute(selectWire(5, Buffer.alloc(0)), 1).rows[0]?.value, null);
+  for (const type of [5, 6]) {
+    assert.deepEqual(parsePrepareAndExecute(selectWire(type, Buffer.alloc(0)), 1).rows[0]?.value, Buffer.alloc(0));
+    assert.equal(parsePrepareAndExecute(selectWire(type, null), 1).rows[0]?.value, null);
+  }
 
   // No decoder: OBJECT, TIMESTAMPTZ, JSON and a code CCI does not define.
   for (const type of [19, 29, 34, 99]) {

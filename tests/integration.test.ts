@@ -840,6 +840,21 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       }
     });
 
+    test("an empty top-level BIT value is an empty Buffer and SQL NULL stays null", async () => {
+      const client = collectionClient();
+      try {
+        assert.deepEqual(
+          await client.query(
+            "SELECT X'' AS e, CAST(X'' AS BIT VARYING(8)) AS v, CAST(NULL AS BIT VARYING(8)) AS n, " +
+              "X'0f' AS b, 'after' AS t",
+          ),
+          [{ e: Buffer.alloc(0), v: Buffer.alloc(0), n: null, b: Buffer.from([0x0f]), t: "after" }],
+        );
+      } finally {
+        await client.close();
+      }
+    });
+
     test("nested collections decode recursively", async () => {
       const client = collectionClient();
       try {
