@@ -22,6 +22,12 @@ npm run api:check
 
 Run `npm run test:coverage` for offline coverage. `npm run check` runs type checking and offline coverage tests. The package uses Node's built-in test runner with `tsx`, `tsup`, TypeScript and `c8`; do not replace this with Vitest or run undocumented Biome commands. Current `CONTRIBUTING.md` still contains a historical `npx biome` instruction, but `package.json` does not declare Biome. Until it is reconciled, **do not claim the Biome command is part of the verified default setup**.
 
+## Node.js 18 consumer verification during 1.x
+
+**Policy:** Node 18 (and Node 20 per the established API schedule) remain supported for **all 1.x versions**, regardless of the Node 22 `.nvmrc` used to run development tools. A higher Node minimum is only a future **2.0 major** proposal; it must not slip into a 1.x patch or minor. See [ADR 0006](adr/0006-node-18-support-through-1x.md).
+
+For each 1.x release candidate, verify the **built/packed npm artifact** from a clean external Node 18 environment: ESM `import`, CommonJS `require`, relevant exported APIs, and supported dependency/runtime syntax. Run separate live CUBRID integration tests where applicable; Node 22 typecheck/build passing is **not** Node 18 consumer evidence. Record the Node version and test counts, and mark missing coverage as **unverified**.
+
 ## Real CUBRID integration (separate environment)
 
 `tests/integration.test.ts` exists; `npm run test:integration` invokes it. Without a reachable broker the default lane **may self-skip** real DB cases. An ordinary successful exit therefore does **not** prove a live CUBRID integration run.
