@@ -25,15 +25,18 @@ convert a runtime value.
 
 ### Values that cannot be decoded
 
-A failed decode rejects the query with a `QueryError`. Its `cause` names the
-column, the numeric CAS wire type and the value size, for example
+A failed decode rejects the query with a `QueryError`. Further down its `cause`
+chain is an error named `UnsupportedValueError` or `MalformedReplyError`, which
+[troubleshooting](TROUBLESHOOTING.md#queryerror-because-a-value-or-reply-could-not-be-decoded)
+shows how to find. When one cell failed, that error names the column, the numeric
+CAS wire type and the value size, for example
 `Failed to decode CUBRID column "tz" (wire type 29, 19 bytes)`. What happens to
 the connection depends on whether the server's reply can still be trusted:
 
 | Failure | Example | Connection afterwards |
 | --- | --- | --- |
-| **Unsupported value** in a reply that is otherwise intact | A TIMESTAMPTZ column | Stays open. The query handle is released, and an open transaction stays open for you to commit or roll back |
-| **Malformed reply** that contradicts its own structure | A length past the end of the reply, or a value that does not fill its cell | Dropped, because the next reply could not be trusted to line up. Nothing more is sent on it |
+| **Unsupported value** (`UnsupportedValueError`) in a reply that is otherwise intact | A TIMESTAMPTZ column | Stays open. The query handle is released, and an open transaction stays open for you to commit or roll back |
+| **Malformed reply** (`MalformedReplyError`) that contradicts its own structure | A length past the end of the reply, or a value that does not fill its cell | Dropped, because the next reply could not be trusted to line up. Nothing more is sent on it |
 
 The driver reads the rest of a reply, including every remaining and nested
 collection element, before reporting an unsupported value, so damage anywhere in
@@ -44,10 +47,12 @@ afterwards open a new session.
 
 After a malformed reply, the server discards the session:
 
-- An open transaction is **rolled back by the server**. `commit()` rejects
-  instead of reporting success, and `query()` rejects until `rollback()`
-  acknowledges the loss. `rollback()` itself rejects, then the adapter can be
-  used again.
+- An open transaction is **rolled back by the server**, and `query()` rejects
+  until you acknowledge the loss. Either `commit()` or `rollback()` does that.
+  Both reject with a `TransactionError`, and `commit()` never reports success.
+  Afterwards the next query opens a new session in **autocommit** mode, so call
+  `beginTransaction()` first if the work must stay in a transaction, and redo
+  the lost statements: none of them were committed.
 - In autocommit mode the next query opens a new session. The failed statement
   may already have run and committed on the server, so verify its outcome before
   retrying a write.

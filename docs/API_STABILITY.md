@@ -13,6 +13,9 @@ their documented runtime behavior, and the declarations distributed under
 - ESM `import` and CommonJS `require` behavior and the root package path.
 - Public method names, arguments, return values, Promise rejection behavior,
   connection and transaction ownership, and observable error classes.
+- The `name` values `UnsupportedValueError` and `MalformedReplyError` in the
+  `cause` chain of a `QueryError`. Those classes are not exported, so their
+  `name` is the contract for telling the two failures apart.
 - Public TypeScript interfaces, generics and overloads used by consumers.
   `query<T>()` describes a result type at compile time; **it does not validate
   returned database values at runtime**.

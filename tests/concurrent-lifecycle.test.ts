@@ -696,6 +696,19 @@ test("an INSERT waiting behind a malformed reply is not sent, and the next query
   });
 });
 
+test("db.query() exposes a malformed reply by its name further down the cause chain", { timeout: 10000 }, async () => {
+  await withClient(async (client, cas) => {
+    cas.malformExecuteOf = "a";
+
+    await assert.rejects(client.query(selectFor("a")), (error: Error) => {
+      assert.equal(error.name, "QueryError");
+      assert.equal((error.cause as Error).name, "QueryError");
+      assert.equal(((error.cause as Error).cause as Error).name, "MalformedReplyError");
+      return true;
+    });
+  });
+});
+
 test("a ping that reconnects does not release the INSERT queued behind a malformed reply", { timeout: 10000 }, async () => {
   await withClient(async (client, cas) => {
     await client.ping();

@@ -53,7 +53,8 @@ const MIN_REPLY_SIZE = SIZE_INT * 2;
 
 /**
  * A value this driver has no decoder for, in a reply that is otherwise intact:
- * the whole reply was walked, so the session stays usable.
+ * the whole reply was walked, so the session stays usable. Not exported: `name`
+ * is how callers recognize it, so it is public contract (docs/API_STABILITY.md).
  */
 export class UnsupportedValueError extends Error {
   override name = "UnsupportedValueError";
@@ -62,7 +63,8 @@ export class UnsupportedValueError extends Error {
 /**
  * A reply that contradicts its own structure. Nothing in it can be trusted,
  * including the frame length that keeps the stream aligned on the next reply,
- * so the caller must drop the session and must not send on it again.
+ * so the caller must drop the session and must not send on it again. Not
+ * exported: `name` is public contract, as for UnsupportedValueError.
  */
 export class MalformedReplyError extends Error {
   override name = "MalformedReplyError";

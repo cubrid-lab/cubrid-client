@@ -674,10 +674,13 @@ const rows = await db.query<Tagged>("SELECT id, tags FROM article");
 Unsupported non-NULL CUBRID wire values (including timezone-aware, OBJECT and
 unsupported collection element values that do not yet have a decoder) reject the
 query with a `QueryError` rather than silently appearing as SQL `null`, and the
-connection stays usable. The error's `cause` identifies the column name and CAS
-type number. A cell or collection length that does not match its value also
+connection stays usable. Its `cause` chain holds an error named
+`UnsupportedValueError`, which identifies the column name and CAS type number. A
+cell or collection length that does not match its value also
 rejects, so a malformed length cannot shift the following columns; a malformed
-reply also drops the connection, which rolls back an open transaction. A genuine
+reply also drops the connection, which rolls back an open transaction, and its
+chain holds an error named `MalformedReplyError`. Both `name` values are stable,
+although the classes are not exported. A genuine
 SQL NULL is still returned as `null`; an empty SQL string is still `""`. JSON
 columns return their text as a `string`. See
 [values that cannot be decoded](TYPES.md#values-that-cannot-be-decoded) and

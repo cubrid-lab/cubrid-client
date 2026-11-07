@@ -582,6 +582,25 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
   // Collections (#82)
   // -------------------------------------------------------------------------
 
+  test("db.query() exposes an unsupported value by its name further down the cause chain", async () => {
+    const client = createClient(TEST_CONFIG);
+    try {
+      await assert.rejects(
+        client.query("SELECT TIMESTAMPTZ'2020-01-02 03:04:05 +09:00' AS zoned"),
+        (error: Error) => {
+          const failure = ((error.cause as Error).cause as Error);
+          assert.equal(error.name, "QueryError");
+          assert.equal(failure.name, "UnsupportedValueError");
+          assert.match(failure.message, /column "zoned" \(wire type 29, /);
+          return true;
+        },
+      );
+      assert.deepEqual(await client.query("SELECT 1 AS one"), [{ one: 1 }]);
+    } finally {
+      await client.close();
+    }
+  });
+
   describe("collection columns", () => {
     const TABLE = "integration_collections";
     const collectionClient = () => createClient(TEST_CONFIG);
@@ -968,8 +987,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
           await assert.rejects(trace.adapter.commit(), TransactionError);
           assert.equal(await rowCommitted(id), false);
 
-          // rollback() acknowledges the loss, and the adapter then works again.
-          await assert.rejects(trace.adapter.rollback(), TransactionError);
+          // That rejected commit acknowledged the loss, so autocommit work resumes.
           const rows = await trace.adapter.query("SELECT 1 + 1 AS result");
           assert.equal(rows[0]!.result, 2);
         } finally {

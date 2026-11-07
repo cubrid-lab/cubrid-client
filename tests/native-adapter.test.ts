@@ -1473,6 +1473,22 @@ test("a malformed reply loses the open transaction instead of committing what fo
   assert.deepEqual(fakeCAS.sentPayloads, []);
 });
 
+for (const acknowledge of ["commit", "rollback"] as const) {
+  test(`a rejected ${acknowledge}() acknowledges the lost transaction, so autocommit resumes`, async () => {
+    const { adapter, fakeCAS } = await beginWithOneInsert();
+    fakeCAS.queueResponse(buildTruncatedSelectResponse());
+    await assertQueryFails(adapter, /Malformed CAS packet|out of range/i);
+
+    await assert.rejects(adapter[acknowledge](), TransactionError);
+    fakeCAS.queueResponse(buildSelectResponse([{ name: "id", type: 2 }], [["1"]]));
+
+    assert.deepEqual(await adapter.query("SELECT id FROM t"), [{ id: "1" }]);
+    assert.equal(fakeCAS.connectCalls, 1);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assert.equal((adapter as any).autoCommit, true);
+  });
+}
+
 test("a malformed reply cannot rebind a transaction on a replacement session", async () => {
   const { adapter, fakeCAS } = createAdapterWithFakeCAS();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
