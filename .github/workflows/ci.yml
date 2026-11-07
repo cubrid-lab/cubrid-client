@@ -6,8 +6,70 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
+  impact:
+    name: Classify changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      runtime: ${{ steps.scope.outputs.runtime }}
+      docs: ${{ steps.scope.outputs.docs }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Test CI impact policy
+        run: node --test scripts/test-ci-impact.mjs
+      - name: Select validation lanes
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            if git rev-parse --verify HEAD^2 >/dev/null 2>&1 && \
+               git -c core.quotePath=false diff --no-renames --name-status HEAD^1 HEAD > "$RUNNER_TEMP/changed-paths.txt"; then
+              :
+            else
+              echo "::warning::PR merge diff unavailable; running all validation"
+              : > "$RUNNER_TEMP/changed-paths.txt"
+            fi
+          else
+            : > "$RUNNER_TEMP/changed-paths.txt"
+          fi
+          node scripts/ci-impact.mjs "$EVENT_NAME" < "$RUNNER_TEMP/changed-paths.txt" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Validation impact"
+            echo "Event: $EVENT_NAME"
+            echo 'Changed paths and git statuses (empty means fail-closed for PRs):'
+            echo '#### Changed files'
+            cat "$RUNNER_TEMP/changed-paths.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  docs-check:
+    name: Documentation and release notes
+    needs: impact
+    if: ${{ always() && needs.impact.outputs.docs == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Validate release note format
+        run: node scripts/verify-release-notes.mjs --candidate
+      - name: Test CI impact classification
+        run: node --test scripts/test-ci-impact.mjs
+
   ci:
+    needs: impact
+    if: ${{ always() && (github.event_name != 'pull_request' || needs.impact.result != 'success' || needs.impact.outputs.runtime != 'false') }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -101,3 +163,35 @@ jobs:
           fi
           grep -q 'not ok.*literal CCI data-type IDs' "$RUNNER_TEMP/wire-mutant.log"
           echo "Confirmed: BIGINT = 26 is rejected by the independent protocol oracle"
+
+  ci-gate:
+    name: CI gate
+    if: always()
+    needs: [impact, docs-check, ci]
+    runs-on: ubuntu-latest
+    env:
+      EVENT_NAME: ${{ github.event_name }}
+      IMPACT_RESULT: ${{ needs.impact.result }}
+      RUNTIME: ${{ needs.impact.outputs.runtime }}
+      DOCS: ${{ needs.impact.outputs.docs }}
+      CI_RESULT: ${{ needs.ci.result }}
+      DOCS_RESULT: ${{ needs.docs-check.result }}
+    steps:
+      - name: Require all selected validation lanes
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$IMPACT_RESULT" == success ]] || { echo "::error::CI impact classification failed"; exit 1; }
+          if [[ "$EVENT_NAME" != pull_request || "$RUNTIME" != false ]]; then
+            [[ "$CI_RESULT" == success ]] || { echo "::error::Required runtime matrix: $CI_RESULT"; exit 1; }
+          elif [[ "$CI_RESULT" != skipped && "$CI_RESULT" != success ]]; then
+            echo "::error::Unexpected runtime result: $CI_RESULT"
+            exit 1
+          fi
+          if [[ "$DOCS" == true ]]; then
+            [[ "$DOCS_RESULT" == success ]] || { echo "::error::Required docs validation: $DOCS_RESULT"; exit 1; }
+          elif [[ "$DOCS_RESULT" != skipped && "$DOCS_RESULT" != success ]]; then
+            echo "::error::Unexpected docs result: $DOCS_RESULT"
+            exit 1
+          fi
+          echo "Selected validation completed: runtime=$RUNTIME docs=$DOCS"
