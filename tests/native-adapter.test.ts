@@ -305,6 +305,9 @@ function buildDMLResponse(
   ri.writeInt32BE(0, 17); // cache time microseconds
   parts.push(ri);
 
+  // includes_column_info = 0 and shard_id = 0, which protocol 7 always sends
+  parts.push(Buffer.alloc(1 + 4));
+
   return Buffer.concat(parts);
 }
 
@@ -3715,5 +3718,24 @@ test("a truncated EXECUTE reply in autocommit drops the session and never commit
 
     assert.equal(fakeCAS.discardCalls, 1);
     assert.deepEqual(endTranTypes(fakeCAS), []);
+  }
+});
+
+test("a truncated literal EXECUTE reply drops the session and never commits", async () => {
+  // An UPDATE of two rows, cut off before its shard id and before its column info flag too.
+  const update = buildDMLResponse(21, 2);
+  for (const run of [
+    (adapter: NativeCubridAdapter) => adapter.query("UPDATE t SET a = 1"),
+    (adapter: NativeCubridAdapter) => adapter.execute("UPDATE t SET a = 1"),
+  ]) {
+    for (const cut of [update.length - 4, update.length - 5]) {
+      const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+      fakeCAS.queueResponse(update.subarray(0, cut));
+
+      await assert.rejects(run(adapter), QueryError);
+
+      assert.equal(fakeCAS.discardCalls, 1);
+      assert.deepEqual(endTranTypes(fakeCAS), []);
+    }
   }
 });
