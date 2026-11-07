@@ -64,6 +64,8 @@ jobs:
           node-version: 22
       - name: Validate release note format
         run: node scripts/verify-release-notes.mjs --candidate
+      - name: Test release note formatting and attribution
+        run: node --test tests/release-notes-format.test.mjs
       - name: Test CI impact classification
         run: node --test scripts/test-ci-impact.mjs
 

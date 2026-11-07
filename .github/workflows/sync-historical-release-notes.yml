@@ -4,10 +4,10 @@ on:
   push:
     branches: [main]
     paths:
-      - "docs/releases/v1.0.0.md"
-      - "docs/releases/v1.1.0.md"
-      - "docs/releases/v1.2.0.md"
-      - "docs/releases/v1.3.0.md"
+      - "docs/releases/**"
+      - "scripts/verify-release-notes.mjs"
+      - "scripts/release-notes-format.mjs"
+      - "tests/release-notes-format.test.mjs"
       - ".github/workflows/sync-historical-release-notes.yml"
 
 permissions:
@@ -21,29 +21,28 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Validate curated release notes
-        run: node scripts/verify-release-notes.mjs --candidate
-      - name: Normalize v0.1.0 GitHub Release title
+      - name: Check all curated notes and attribution tests
+        run: |
+          set -euo pipefail
+          node --test tests/release-notes-format.test.mjs
+          node scripts/verify-release-notes.mjs --candidate
+      - name: Update existing published GitHub Release descriptions only
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+        shell: bash
         run: |
           set -euo pipefail
-          gh release view v0.1.0 --repo "$GH_REPO" > /dev/null
-          gh release edit v0.1.0 --repo "$GH_REPO" --title "cubrid-client v0.1.0"
-      - name: Update existing GitHub Release descriptions (not tags)
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          # Update existing published releases only; never create or change a tag.
-          for tag in v1.0.0 v1.1.0 v1.2.0 v1.3.0; do
-            file="docs/releases/${tag}.md"
-            test -s "$file"
-            gh release view "$tag" --repo "$GH_REPO" > /dev/null
+          for file in docs/releases/v*.md; do
+            tag=$(basename "$file" .md)
+            if ! gh release view "$tag" --repo "$GH_REPO" > /dev/null 2>&1; then
+              # v0.2.0 has a tag but no historical GitHub Release page.
+              # Do not create or re-tag a release just to synchronize notes.
+              echo "::notice::No existing GitHub Release for $tag; retained $file without publishing."
+              continue
+            fi
             gh release edit "$tag" --repo "$GH_REPO" \
               --title "cubrid-client $tag" \
               --notes-file "$file"
-            echo "Updated published GitHub Release notes for $tag"
+            echo "Synchronized existing published GitHub Release $tag"
           done
