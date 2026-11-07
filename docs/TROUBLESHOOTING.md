@@ -214,7 +214,9 @@ try {
 `error.kind` tells these causes apart: `deadlock`, `lock-timeout` or `connection-lost`.
 
 - **`deadlock`**: retry the whole transaction. With code `-72` the server already rolled it back, so if your callback catches that error and continues, its later `tx` statements reject, nothing is committed and `transaction()` rejects with that error. See [what happens after `-72`](API_REFERENCE.md#error-details).
-- **`lock-timeout`**: only the statement failed and the transaction is still open. CUBRID waits indefinitely by default. To limit the wait, run `SET TRANSACTION LOCK TIMEOUT <seconds>`, inside the transaction or before it. The setting lasts as long as the [session](CONNECTION.md#session-reuse), so a client that sets it once and is then given a new session goes back to the default. `db.transaction()` uses its own connection, so run it inside the callback there.
+- **`lock-timeout`**: only the statement failed and the transaction is still open. CUBRID waits indefinitely by default. To limit the wait, set [`lockTimeout`](CONNECTION.md#isolation-level-and-lock-timeout) in milliseconds, on the client or on one `transaction()` call. It holds on every session the client opens. `SET TRANSACTION LOCK TIMEOUT <seconds>` also works, but it lasts only as long as the [session](CONNECTION.md#session-reuse), and `db.transaction()` does not inherit it because it uses its own connection.
+
+An error with `code` `-1158` is not a lock timeout. Under `repeatable read` or `serializable`, a statement tried to change a row that someone else changed and committed after the transaction's first read. Only that statement failed and the transaction is still open. To apply the change on current data, retry the whole transaction. See [what each level does](CONNECTION.md#isolation-level-and-lock-timeout).
 
 ### Transaction auto-rollback
 

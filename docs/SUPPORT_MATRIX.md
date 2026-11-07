@@ -76,6 +76,15 @@ BLOB and CLOB reads are asserted the same way, against local `cubrid/cubrid` 10.
 several LOB_READ replies, a multibyte CLOB, the size limit and transaction
 behavior ([#93](https://github.com/cubrid-lab/cubrid-client/issues/93)).
 
+The `isolationLevel` and `lockTimeout` options are asserted the same way against
+local `cubrid/cubrid` 10.2, 11.0, 11.2 and 11.4 containers: the level read back from
+the server, what each level shows of a concurrent commit, the `-1158` conflict, write
+skew under `serializable`, lock waits in milliseconds, and the settings on a session
+that replaced a cut one ([#91](https://github.com/cubrid-lab/cubrid-client/issues/91)).
+Restoring after a broker restart, a killed CAS, a database server restart and a CAS
+taken by another client was measured by hand on the same versions; those events
+cannot be caused from the shared CI broker.
+
 ## Release-blocking coverage still needed
 
 - [#95](https://github.com/cubrid-lab/cubrid-client/issues/95):

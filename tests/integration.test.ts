@@ -2345,6 +2345,354 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     });
   });
 
+  describe("isolation level and lock timeout options", () => {
+    const TABLE = "cc_isolation";
+    type Runner = Pick<TransactionClient, "query">;
+
+    function casOf(adapter: NativeCubridAdapter): CASConnection {
+      return (adapter as unknown as { cas: CASConnection }).cas;
+    }
+
+    /** What the server says. Each read is a statement, so a transaction's snapshot starts here. */
+    async function serverSettings(runner: Runner): Promise<{ level: number; timeout: number }> {
+      await runner.query("GET TRANSACTION ISOLATION LEVEL TO cc_level");
+      await runner.query("GET TRANSACTION LOCK TIMEOUT TO cc_timeout");
+      // LEVEL is a reserved word, so the aliases avoid it.
+      const rows = await runner.query<{ lvl: number; wait_s: number }>(
+        "SELECT cc_level AS lvl, cc_timeout AS wait_s",
+      );
+      return { level: rows[0]!.lvl, timeout: rows[0]!.wait_s };
+    }
+
+    async function withTable(
+      rows: string,
+      run: (observer: NativeCubridAdapter) => Promise<void>,
+    ): Promise<void> {
+      const observer = new NativeCubridAdapter(TEST_CONFIG);
+      try {
+        await observer.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await observer.query(`CREATE TABLE ${TABLE} (id INT PRIMARY KEY, v INT)`);
+        await observer.query(`INSERT INTO ${TABLE} VALUES ${rows}`);
+        await run(observer);
+      } finally {
+        await observer.query(`DROP TABLE IF EXISTS ${TABLE}`).catch(() => {});
+        await observer.close();
+      }
+    }
+
+    /** A relay stands in for a CAS closing its socket, which a test cannot ask of a shared broker. */
+    async function withRelay(run: (port: number, cut: () => void) => Promise<void>): Promise<void> {
+      const sockets = new Set<Socket>();
+      const relay = createServer((client) => {
+        const upstream = netConnect(TEST_CONFIG.port, TEST_CONFIG.host);
+        for (const socket of [client, upstream]) {
+          sockets.add(socket);
+          socket.on("close", () => sockets.delete(socket));
+        }
+        client.on("error", () => upstream.destroy());
+        upstream.on("error", () => client.destroy());
+        client.pipe(upstream).pipe(client);
+      });
+      await new Promise<void>((resolve) => relay.listen(0, "127.0.0.1", resolve));
+      const { port } = relay.address() as { port: number };
+
+      try {
+        await run(port, () => {
+          for (const socket of sockets) {
+            socket.destroy();
+          }
+        });
+      } finally {
+        relay.close();
+      }
+    }
+
+    const LEVELS = [
+      { isolationLevel: "read committed", code: 4, seesConcurrentCommit: true },
+      { isolationLevel: "repeatable read", code: 5, seesConcurrentCommit: false },
+      { isolationLevel: "serializable", code: 6, seesConcurrentCommit: false },
+    ] as const;
+
+    for (const { isolationLevel, code, seesConcurrentCommit } of LEVELS) {
+      // `read committed` is the server's default, so each test also runs a client set
+      // to another level: a setting that was ignored would show there.
+      const other = code === 4 ? "serializable" : "read committed";
+      const otherCode = code === 4 ? 6 : 4;
+
+      test(`${isolationLevel} reads back as ${code} from the client and from transaction()`, async () => {
+        const client = createClient({ ...TEST_CONFIG, isolationLevel });
+        const mixed = createClient({ ...TEST_CONFIG, isolationLevel: other });
+
+        try {
+          assert.equal((await serverSettings(client)).level, code);
+          assert.equal(await client.transaction(async (tx) => (await serverSettings(tx)).level), code);
+          assert.equal((await serverSettings(mixed)).level, otherCode);
+          assert.equal(
+            await mixed.transaction(async (tx) => (await serverSettings(tx)).level, { isolationLevel }),
+            code,
+          );
+        } finally {
+          await client.close();
+          await mixed.close();
+        }
+      });
+
+      test(`${isolationLevel} ${seesConcurrentCommit ? "sees" : "hides"} a concurrent commit`, async () => {
+        const client = createClient({ ...TEST_CONFIG, isolationLevel: other });
+
+        try {
+          assert.equal((await serverSettings(client)).level, otherCode);
+          await withTable("(1, 0)", async (observer) => {
+            await client.transaction(
+              async (tx) => {
+                assert.equal((await serverSettings(tx)).level, code);
+                const first = await tx.query(`SELECT v, (SELECT COUNT(*) FROM ${TABLE}) AS n FROM ${TABLE} WHERE id = 1`);
+                await observer.query(`UPDATE ${TABLE} SET v = 1 WHERE id = 1`);
+                await observer.query(`INSERT INTO ${TABLE} VALUES (2, 0)`);
+                const second = await tx.query(`SELECT v, (SELECT COUNT(*) FROM ${TABLE}) AS n FROM ${TABLE} WHERE id = 1`);
+
+                assert.equal(first[0]!.v, 0);
+                assert.equal(second[0]!.v, seesConcurrentCommit ? 1 : 0);
+                assert.equal(Number(second[0]!.n), seesConcurrentCommit ? 2 : 1);
+              },
+              { isolationLevel },
+            );
+          });
+        } finally {
+          await client.close();
+        }
+      });
+    }
+
+    for (const { isolationLevel, code } of LEVELS.slice(1)) {
+      test(`${isolationLevel} reports -1158 for a row changed since its snapshot and stays open`, async () => {
+        const client = createClient(TEST_CONFIG);
+
+        try {
+          await withTable("(1, 0), (2, 0)", async (observer) => {
+            await client.transaction(
+              async (tx) => {
+                assert.equal((await serverSettings(tx)).level, code);
+                await tx.query(`SELECT v FROM ${TABLE}`);
+                await observer.query(`UPDATE ${TABLE} SET v = 5 WHERE id = 1`);
+
+                await assert.rejects(tx.query(`UPDATE ${TABLE} SET v = 6 WHERE id = 1`), (error: TransactionError) => {
+                  assert.ok(error instanceof TransactionError);
+                  assert.equal(error.code, -1158);
+                  assert.equal(error.kind, undefined);
+                  return true;
+                });
+
+                // Only that statement failed, so the transaction can go on and commit.
+                await tx.query(`UPDATE ${TABLE} SET v = 7 WHERE id = 2`);
+              },
+              { isolationLevel },
+            );
+
+            assert.deepEqual(await observer.query(`SELECT id, v FROM ${TABLE} ORDER BY id`), [
+              { id: 1, v: 5 },
+              { id: 2, v: 7 },
+            ]);
+          });
+        } finally {
+          await client.close();
+        }
+      });
+    }
+
+    test("serializable still lets two transactions commit a write skew", async () => {
+      const client = createClient({ ...TEST_CONFIG, isolationLevel: "serializable" });
+
+      try {
+        await withTable("(1, 0), (2, 0)", async (observer) => {
+          // Each transaction checks a total of 0 and changes a different row, so a
+          // truly serializable schedule could not commit both.
+          const guarded = (id: number) =>
+            `UPDATE ${TABLE} SET v = 1 WHERE id = ${id} AND (SELECT SUM(v) FROM ${TABLE}) = 0`;
+
+          await client.transaction(async (first) => {
+            assert.equal((await serverSettings(first)).level, 6);
+            await first.query(`SELECT v FROM ${TABLE}`);
+            await client.transaction(async (second) => {
+              await second.query(`SELECT v FROM ${TABLE}`);
+              await first.query(guarded(1));
+              await second.query(guarded(2));
+            });
+          });
+
+          assert.deepEqual(await observer.query(`SELECT id, v FROM ${TABLE} ORDER BY id`), [
+            { id: 1, v: 1 },
+            { id: 2, v: 1 },
+          ]);
+        });
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("a transaction's options end with it and leave the shared connection alone", async () => {
+      const client = createClient({ ...TEST_CONFIG, lockTimeout: 2000 });
+
+      try {
+        const inside = await client.transaction(async (tx) => serverSettings(tx), {
+          isolationLevel: "serializable",
+          lockTimeout: 0,
+        });
+        assert.deepEqual(inside, { level: 6, timeout: 0 });
+        assert.deepEqual(await serverSettings(client), { level: 4, timeout: 2 });
+        assert.deepEqual(await client.transaction(async (tx) => serverSettings(tx)), {
+          level: 4,
+          timeout: 2,
+        });
+      } finally {
+        await client.close();
+      }
+    });
+
+    // A limit that never reached the server would wait for the lock forever.
+    test("lockTimeout limits a blocked statement in milliseconds, and 0 does not wait", { timeout: 30_000 }, async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        await withTable("(1, 0)", async (observer) => {
+          await observer.beginTransaction();
+          await observer.query(`UPDATE ${TABLE} SET v = 1 WHERE id = 1`);
+
+          try {
+            for (const [lockTimeout, atLeast, under] of [
+              [0, 0, 150],
+              [300, 280, 3000],
+            ] as const) {
+              await client.transaction(
+                async (tx) => {
+                  const start = performance.now();
+                  await assert.rejects(
+                    tx.query(`UPDATE ${TABLE} SET v = 2 WHERE id = 1`),
+                    (error: TransactionError) => error.kind === "lock-timeout",
+                  );
+                  const elapsed = performance.now() - start;
+                  assert.ok(elapsed >= atLeast && elapsed < under, `waited ${elapsed} ms`);
+                },
+                { lockTimeout },
+              );
+            }
+          } finally {
+            await observer.rollback();
+          }
+        });
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("lockTimeout -1 overrides a finite client setting with an unlimited wait", async () => {
+      const client = createClient({ ...TEST_CONFIG, lockTimeout: 1000 });
+
+      try {
+        // -1 is also the server's default, so the finite setting must show first.
+        assert.equal((await serverSettings(client)).timeout, 1);
+        assert.equal(
+          (await client.transaction(async (tx) => serverSettings(tx), { lockTimeout: -1 })).timeout,
+          -1,
+        );
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("a replaced session gets the settings back before its first statement", async () => {
+      await withRelay(async (port, cut) => {
+        const adapter = new NativeCubridAdapter({
+          ...TEST_CONFIG,
+          port,
+          isolationLevel: "repeatable read",
+          lockTimeout: 1500,
+        });
+
+        try {
+          await adapter.connect();
+          const cas = casOf(adapter);
+          const generation = cas.connectionGeneration;
+          assert.deepEqual(await serverSettings(adapter), { level: 5, timeout: 1.5 });
+
+          cut();
+          assert.deepEqual(await serverSettings(adapter), { level: 5, timeout: 1.5 });
+          assert.equal(cas.connectionGeneration, generation + 1);
+        } finally {
+          await adapter.close();
+        }
+      });
+    });
+
+    test("a manual transaction after a replaced session runs under the restored settings", async () => {
+      await withTable("(1, 0)", async (observer) => {
+        await withRelay(async (port, cut) => {
+          const adapter = new NativeCubridAdapter({
+            ...TEST_CONFIG,
+            port,
+            isolationLevel: "repeatable read",
+          });
+
+          try {
+            await adapter.query("SELECT 1 FROM db_root");
+            const generation = casOf(adapter).connectionGeneration;
+            cut();
+
+            await adapter.beginTransaction();
+            const first = await adapter.query(`SELECT v FROM ${TABLE}`);
+            await observer.query(`UPDATE ${TABLE} SET v = 1 WHERE id = 1`);
+
+            assert.deepEqual(await adapter.query(`SELECT v FROM ${TABLE}`), first);
+            assert.equal(casOf(adapter).connectionGeneration, generation + 1);
+            await adapter.rollback();
+          } finally {
+            await adapter.close();
+          }
+        });
+      });
+    });
+
+    test("autocommit carries on across a replaced session that gets its settings back", async () => {
+      await withTable("(1, 0)", async (observer) => {
+        await withRelay(async (port, cut) => {
+          const adapter = new NativeCubridAdapter({ ...TEST_CONFIG, port, lockTimeout: 1000 });
+
+          try {
+            await adapter.query(`UPDATE ${TABLE} SET v = 1 WHERE id = 1`);
+            cut();
+            await adapter.query(`UPDATE ${TABLE} SET v = 2 WHERE id = 1`);
+
+            // The observer reads committed work only, so nothing here needed a commit().
+            assert.deepEqual(await observer.query(`SELECT v FROM ${TABLE}`), [{ v: 2 }]);
+            assert.equal((await serverSettings(adapter)).timeout, 1);
+          } finally {
+            await adapter.close();
+          }
+        });
+      });
+    });
+
+    test("setTransactionOptions changes the open session and is refused inside a transaction", async () => {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+
+      try {
+        await adapter.connect();
+        await adapter.setTransactionOptions({ isolationLevel: "serializable" });
+        assert.equal((await serverSettings(adapter)).level, 6);
+
+        await adapter.beginTransaction();
+        await assert.rejects(
+          adapter.setTransactionOptions({ isolationLevel: "read committed" }),
+          /inside a transaction/,
+        );
+        assert.equal((await serverSettings(adapter)).level, 6);
+        await adapter.rollback();
+      } finally {
+        await adapter.close();
+      }
+    });
+  });
+
   describe("server error details", () => {
     const PARENT = "cc_err_parent";
     const CHILD = "cc_err_child";

@@ -3366,3 +3366,87 @@ test("transaction() commits nothing after the session changed under the callback
   assert.equal(statementsSent(fakeCAS), 1);
   assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
 });
+
+// ---------------------------------------------------------------------------
+// Isolation level and lock timeout options
+// ---------------------------------------------------------------------------
+
+/** The parameters the adapter hands its next session. */
+function sessionParameters(adapter: NativeCubridAdapter): unknown {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (adapter as any).getOrCreateCAS().sessionParameters;
+}
+
+test("the adapter sends no session parameters unless a setting was given", () => {
+  assert.deepEqual(sessionParameters(new NativeCubridAdapter(DEFAULT_CONFIG)), []);
+});
+
+for (const [isolationLevel, code] of [
+  ["read committed", 4],
+  ["repeatable read", 5],
+  ["serializable", 6],
+] as const) {
+  test(`the adapter maps ${isolationLevel} to server level ${code}`, () => {
+    const adapter = new NativeCubridAdapter({ ...DEFAULT_CONFIG, isolationLevel });
+    assert.deepEqual(sessionParameters(adapter), [{ parameter: 1, value: code }]);
+  });
+}
+
+test("the adapter sends lockTimeout in milliseconds, keeping 0 and -1", () => {
+  for (const lockTimeout of [-1, 0, 1500]) {
+    const adapter = new NativeCubridAdapter({ ...DEFAULT_CONFIG, lockTimeout });
+    assert.deepEqual(sessionParameters(adapter), [{ parameter: 2, value: lockTimeout }]);
+  }
+});
+
+test("the adapter refuses invalid settings, because it is public and skips createClient()", async () => {
+  assert.throws(
+    () =>
+      new NativeCubridAdapter({
+        ...DEFAULT_CONFIG,
+        isolationLevel: "snapshot" as "serializable",
+      }),
+    RangeError,
+  );
+  assert.throws(() => new NativeCubridAdapter({ ...DEFAULT_CONFIG, lockTimeout: -2 }), RangeError);
+  await assert.rejects(
+    new NativeCubridAdapter(DEFAULT_CONFIG).setTransactionOptions({ lockTimeout: 0.5 }),
+    RangeError,
+  );
+});
+
+test("setTransactionOptions keeps what it is not given", async () => {
+  const adapter = new NativeCubridAdapter({ ...DEFAULT_CONFIG, lockTimeout: 2000 });
+
+  await adapter.setTransactionOptions({ isolationLevel: "serializable" });
+
+  assert.deepEqual(sessionParameters(adapter), [
+    { parameter: 1, value: 6 },
+    { parameter: 2, value: 2000 },
+  ]);
+});
+
+test("setTransactionOptions is refused inside a transaction and changes nothing", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, {
+    setSessionParameters: async () => {
+      throw new Error("must not be sent");
+    },
+  } as Partial<FakeCASConnection>);
+
+  await adapter.beginTransaction();
+  await assert.rejects(
+    adapter.setTransactionOptions({ isolationLevel: "serializable" }),
+    /inside a transaction/,
+  );
+
+  assert.equal(fakeCAS.sendAndRecvCalls, 0);
+});
+
+test("settings given after construction end with close(), so a reused adapter cannot inherit them", async () => {
+  const adapter = new NativeCubridAdapter({ ...DEFAULT_CONFIG, lockTimeout: 2000 });
+
+  await adapter.setTransactionOptions({ isolationLevel: "serializable", lockTimeout: 0 });
+  await adapter.close();
+
+  assert.deepEqual(sessionParameters(adapter), [{ parameter: 2, value: 2000 }]);
+});

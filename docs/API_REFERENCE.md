@@ -207,32 +207,35 @@ What the server reports, checked on CUBRID 10.2, 11.0, 11.2 and 11.4 (the replie
 
 ---
 
-#### `transaction<T>(callback)`
+#### `transaction<T>(callback, options?)`
 
 Executes a callback within an isolated transactional connection. Commits on success, rolls back on failure.
 
 ```ts
 async transaction<T>(
   callback: TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient>,
+  options?: TransactionOptions,
 ): Promise<T>
 ```
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `callback` | [`TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient>`](#transactioncallback) | Async function receiving a [`ResultTransactionClient`](#resulttransactionclient) (a [`TransactionClient`](#transactionclient-interface) that also has `queryResult()`) that is also an [`ExecutableTransactionClient`](#executabletransactionclient) (it also has `execute()`). A callback written against `TransactionClient` is still accepted. |
+| `options` | [`TransactionOptions`](#transactionoptions) | Optional `isolationLevel` and `lockTimeout` for this transaction only. Each one replaces the client's value, and the shared connection is not affected. They are applied before the transaction begins, so they cover all of it. See [Isolation Level and Lock Timeout](CONNECTION.md#isolation-level-and-lock-timeout) |
 
 **Returns:** `Promise<T>` — The return value of the callback.
 
-**Throws:** [`TransactionError`](#transactionerror) if the transaction fails, with the first failure in `cause`. See the [transaction lifecycle](#transaction-lifecycle) for the exceptions.
+**Throws:** [`TransactionError`](#transactionerror) if the transaction fails, with the first failure in `cause`. See the [transaction lifecycle](#transaction-lifecycle) for the exceptions. An invalid option rejects with a `RangeError` before any connection is opened. A setting the connection cannot apply rejects with a `TransactionError` before the callback runs.
 
 ##### How It Works
 
 1. A **new isolated connection** is created via `connectionFactory`.
-2. `beginTransaction()` is called on that connection.
-3. The `callback` receives a [`CubridTransaction`](#cubridtransaction) instance scoped to that connection.
-4. If the callback resolves successfully and has not completed the transaction itself, `commit()` is called once.
-5. If the callback throws, `rollback()` is called once unless the transaction is already complete, and the error is re-thrown as a `TransactionError` (a [`ReadTimeoutError`](#readtimeouterror) is re-thrown as-is).
-6. The isolated connection is **always closed**, regardless of outcome.
+2. The `isolationLevel` and `lockTimeout` in effect are applied to it, if any.
+3. `beginTransaction()` is called on that connection.
+4. The `callback` receives a [`CubridTransaction`](#cubridtransaction) instance scoped to that connection.
+5. If the callback resolves successfully and has not completed the transaction itself, `commit()` is called once.
+6. If the callback throws, `rollback()` is called once unless the transaction is already complete, and the error is re-thrown as a `TransactionError` (a [`ReadTimeoutError`](#readtimeouterror) is re-thrown as-is).
+7. The isolated connection is **always closed**, regardless of outcome.
 
 ##### Transaction lifecycle
 
@@ -700,8 +703,10 @@ import type {
   ExecutableTransactionClient,
   ExecuteResult,
   Queryable,
+  IsolationLevel,
   TransactionClient,
   TransactionCallback,
+  TransactionOptions,
   ResultTransactionClient,
 } from "cubrid-client";
 
@@ -723,6 +728,8 @@ interface ClientOptions {
   connectionTimeout?: number;
   readTimeout?: number;
   maxLobBytes?: number;
+  isolationLevel?: IsolationLevel;
+  lockTimeout?: number;
   maxConnectionRetryCount?: number;
   logger?: unknown;
   connectionFactory?: ConnectionFactory;
@@ -739,6 +746,8 @@ interface ClientOptions {
 | `connectionTimeout` | `number` | `undefined` | Connection timeout in milliseconds |
 | `readTimeout` | `number` | `undefined` | Milliseconds of server inactivity before a request fails with [`ReadTimeoutError`](#readtimeouterror) and the connection is discarded. `undefined` or `0` means no timeout for requests; the connect handshake then still gives up after 10 seconds of inactivity. Other values must be between 1 and 2147483647, or `createClient()` throws a `RangeError`. See [Read timeout](CONNECTION.md#read-timeout) |
 | `maxLobBytes` | `number` | `67108864` (64 MiB) | Largest total of BLOB and CLOB content, in bytes, one query may load. A query over it rejects with a `QueryError` before any content is read, and the connection stays usable. Must be a positive integer, or `createClient()` throws a `RangeError`. See [BLOB and CLOB columns](TYPES.md#blob-and-clob-columns) |
+| `isolationLevel` | [`IsolationLevel`](#isolationlevel) | Server default | Isolation level of every session this client opens, on the shared connection and on each `transaction()` connection, and restored on any session that replaces one. Any other value throws a `RangeError`. See [Isolation Level and Lock Timeout](CONNECTION.md#isolation-level-and-lock-timeout) |
+| `lockTimeout` | `number` | Server default | Longest a statement waits for a lock, in milliseconds, on every session this client opens. `0` does not wait and `-1` has no limit. Must be an integer from `-1` to `2147483647`, or `createClient()` throws a `RangeError`. See [Isolation Level and Lock Timeout](CONNECTION.md#isolation-level-and-lock-timeout) |
 | `maxConnectionRetryCount` | `number` | `undefined` | Retries after a failed first attempt to open the TCP connection to the broker (refused, unreachable, timed out). Non-negative integer, default `0`; anything else throws a `RangeError`. See [Connection retries](CONNECTION.md#connection-retries) |
 | `logger` | `unknown` (see `ClientLogger`) | `undefined` | Receives redacted diagnostics for connections, queries and transactions. See [Logging](CONNECTION.md#logging) |
 | `connectionFactory` | [`ConnectionFactory`](#connectionfactory) | Built-in `NativeCubridAdapter` | Custom factory for creating connections |
@@ -757,8 +766,29 @@ interface ClientConfig {
   connectionTimeout?: number | undefined;
   readTimeout?: number | undefined;
   maxLobBytes?: number | undefined;
+  isolationLevel?: IsolationLevel | undefined;
+  lockTimeout?: number | undefined;
   maxConnectionRetryCount?: number | undefined;
   logger?: unknown;
+}
+```
+
+### IsolationLevel
+
+```ts
+type IsolationLevel = "read committed" | "repeatable read" | "serializable";
+```
+
+These are the only levels CUBRID 10.2 to 11.4 accept. `serializable` still allows write skew. See [what each level does](CONNECTION.md#isolation-level-and-lock-timeout).
+
+### TransactionOptions
+
+The second argument of [`transaction()`](#transaction). An option left out keeps the client's value.
+
+```ts
+interface TransactionOptions {
+  isolationLevel?: IsolationLevel;
+  lockTimeout?: number;
 }
 ```
 
@@ -809,12 +839,15 @@ interface ConnectionLike {
     params?: QueryParams,
   ): Promise<QueryResult<T>>;
   execute?(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+  setTransactionOptions?(options: TransactionOptions): Promise<void>;
   beginTransaction(): Promise<void>;
   commit(): Promise<void>;
   rollback(): Promise<void>;
   close(): Promise<void>;
 }
 ```
+
+`setTransactionOptions` is optional too, but it decides whether settings work. The client calls it on a new connection before anything else when `isolationLevel` or `lockTimeout` is in effect, and only then. Without it such a client or transaction fails rather than running without the setting. An implementation must keep the setting on every session it opens, and `NativeCubridAdapter` does. Options it is not given keep their value. The built-in adapter rejects the call inside a transaction, because changing the level there would change the running transaction.
 
 `queryResult` and `execute` are optional so existing custom adapters keep compiling. Calling `queryResult()` or `execute()` on a client or transaction fails when its connection does not provide it.
 

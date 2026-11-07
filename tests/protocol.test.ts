@@ -32,6 +32,7 @@ import {
   parseFetch,
   writeCloseReqHandle,
   writeEndTran,
+  writeSetDbParameter,
   writeGetDbVersion,
   parseGetDbVersion,
   writeConClose,
@@ -705,6 +706,18 @@ test("writeCloseReqHandle builds valid request", () => {
 // ---------------------------------------------------------------------------
 // EndTran tests
 // ---------------------------------------------------------------------------
+
+test("writeSetDbParameter sends the code, then the parameter and value as length-prefixed ints", () => {
+  const casInfo = Buffer.from([0x01, 0x02, 0x03, 0x04]);
+  const { header, payload } = writeSetDbParameter(2, -1, casInfo);
+
+  assert.deepEqual(
+    payload,
+    Buffer.from([5, 0, 0, 0, 4, 0, 0, 0, 2, 0, 0, 0, 4, 0xff, 0xff, 0xff, 0xff]),
+  );
+  assert.equal(header.readInt32BE(0), payload.length);
+  assert.deepEqual(header.subarray(4), casInfo);
+});
 
 test("writeEndTran commit builds valid request", () => {
   const casInfo = Buffer.alloc(4);

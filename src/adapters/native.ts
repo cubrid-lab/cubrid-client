@@ -7,7 +7,11 @@
 
 import { TextDecoder } from "node:util";
 
-import { CASConnection, type CASConnectionConfig } from "../protocol/connection.js";
+import {
+  CASConnection,
+  type CASConnectionConfig,
+  type SessionParameter,
+} from "../protocol/connection.js";
 import {
   writePrepareAndExecute,
   parsePrepareAndExecute,
@@ -33,8 +37,10 @@ import {
 } from "../protocol/protocol.js";
 import {
   CUBRIDDataType,
+  DbParameter,
   DEFAULT_MAX_LOB_BYTES,
   EndTranType,
+  ISOLATION_LEVEL_CODES,
   LOB_READ_CHUNK_SIZE,
   StatementType,
   TYPE_NAMES,
@@ -45,9 +51,15 @@ import {
   type CasReplyError,
 } from "../errors/internal-errors.js";
 import { mapError } from "../internals/map-error.js";
-import { assertValidMaxLobBytes, assertValidRetryCount } from "../internals/normalize-config.js";
+import { TransactionError } from "../errors/transaction-error.js";
+import {
+  assertValidMaxLobBytes,
+  assertValidRetryCount,
+  assertValidTransactionOptions,
+  pickTransactionOptions,
+} from "../internals/normalize-config.js";
 import type { DriverAdapter } from "./base.js";
-import type { ClientConfig, ExecuteResult } from "../types/client.js";
+import type { ClientConfig, ExecuteResult, TransactionOptions } from "../types/client.js";
 import type { QueryParams } from "../types/query.js";
 import type { ColumnInfo, QueryResult, QueryResultRow } from "../types/result.js";
 
@@ -80,9 +92,24 @@ function needsBackslashMode(params: QueryParams): boolean {
   });
 }
 
+function toSessionParameters({ isolationLevel, lockTimeout }: TransactionOptions): SessionParameter[] {
+  return [
+    ...(isolationLevel === undefined
+      ? []
+      : [{ parameter: DbParameter.ISOLATION_LEVEL, value: ISOLATION_LEVEL_CODES[isolationLevel] }]),
+    ...(lockTimeout === undefined
+      ? []
+      : [{ parameter: DbParameter.LOCK_TIMEOUT, value: lockTimeout }]),
+  ];
+}
+
 export class NativeCubridAdapter implements DriverAdapter {
   private cas: CASConnection | null = null;
   private autoCommit = true;
+
+  /** What every session of this connection must hold. See setTransactionOptions(). */
+  private transactionOptions: TransactionOptions;
+
   /**
    * Server backslash-escaping mode, negotiated once per physical session via
    * `SELECT CHAR_LENGTH('\\')`. `null` until negotiated. `true` means the CUBRID
@@ -133,6 +160,8 @@ export class NativeCubridAdapter implements DriverAdapter {
   constructor(private readonly config: ClientConfig) {
     assertValidRetryCount(config.maxConnectionRetryCount);
     assertValidMaxLobBytes(config.maxLobBytes);
+    assertValidTransactionOptions(config);
+    this.transactionOptions = pickTransactionOptions(config);
   }
 
   async connect(): Promise<void> {
@@ -204,6 +233,35 @@ export class NativeCubridAdapter implements DriverAdapter {
       this.bindSessionLostByFirstStatement();
       this.recordTransactionAbort(error);
       throw mapError("query", error, "Failed to execute CUBRID query.");
+    }
+  }
+
+  /**
+   * Keep these settings on every session of this connection, in place of what was
+   * set before and leaving any option not given as it is. close() goes back to
+   * the configured values, so an adapter reused after a transaction inherits none.
+   *
+   * Refused inside a transaction: the server would apply it to the running
+   * transaction at once, so reads before and after it could follow different
+   * levels, while the caller believes the whole transaction ran under one.
+   */
+  async setTransactionOptions(options: TransactionOptions): Promise<void> {
+    assertValidTransactionOptions(options);
+    return this.inTurn(() => this.setTransactionOptionsNow(options));
+  }
+
+  private async setTransactionOptionsNow(options: TransactionOptions): Promise<void> {
+    if (!this.autoCommit) {
+      throw new TransactionError(
+        "Transaction options cannot change inside a transaction, so nothing was sent.",
+      );
+    }
+
+    try {
+      this.transactionOptions = { ...this.transactionOptions, ...pickTransactionOptions(options) };
+      await this.cas?.setSessionParameters(toSessionParameters(this.transactionOptions));
+    } catch (error) {
+      throw mapError("connection", error, "Failed to apply transaction options.");
     }
   }
 
@@ -292,6 +350,8 @@ export class NativeCubridAdapter implements DriverAdapter {
   }
 
   private async closeNow(): Promise<void> {
+    this.transactionOptions = pickTransactionOptions(this.config);
+
     if (!this.cas) {
       return;
     }
@@ -761,6 +821,7 @@ export class NativeCubridAdapter implements DriverAdapter {
         ...(this.config.readTimeout !== undefined && {
           readTimeout: this.config.readTimeout,
         }),
+        sessionParameters: toSessionParameters(this.transactionOptions),
         ...this.resolveSslConfig(),
       };
       this.cas = new CASConnection(casConfig);
