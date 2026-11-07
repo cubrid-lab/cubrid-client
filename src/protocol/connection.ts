@@ -259,11 +259,15 @@ export class CASConnection {
   }
 
   /**
-   * Drop the current session so the server discards its uncommitted work.
-   * Queued: serialized against in-flight requests.
+   * Drop the current session so the server discards its uncommitted work. The
+   * statement that led here has an unknown outcome, so it counts as a failed
+   * exchange. Queued: serialized against in-flight requests.
    */
   async discardSession(): Promise<void> {
-    return this.enqueue(async () => this.retireSocket());
+    return this.enqueue(async () => {
+      this._failedExchanges += 1;
+      this.retireSocket();
+    });
   }
 
   /**
@@ -363,8 +367,9 @@ export class CASConnection {
   }
 
   /**
-   * Requests whose outcome is unknown because their exchange failed, across
-   * every session. The generation cannot show this: it also changes on each
+   * Requests whose outcome is unknown because their exchange failed or their
+   * session was discarded, across every session. The generation cannot show
+   * this: it also changes on each
    * transparent reconnect. A failed connect sends no statement and is not counted.
    */
   get failedExchanges(): number {

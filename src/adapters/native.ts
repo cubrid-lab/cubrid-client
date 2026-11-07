@@ -10,6 +10,7 @@ import {
   writePrepareAndExecute,
   parsePrepareAndExecute,
   readQueryHandle,
+  MalformedReplyError,
   writeFetch,
   parseFetch,
   writeCloseReqHandle,
@@ -305,7 +306,8 @@ export class NativeCubridAdapter implements DriverAdapter {
   /**
    * Run `use`, then release the query handle held by `response` however `use`
    * ended. The handle is read first because decoding the response can fail
-   * after the server has already allocated it.
+   * after the server has already allocated it. A discarded session has no
+   * handle left to release, and closeQueryHandle() sends nothing on it.
    */
   private async withQueryHandle<R>(
     cas: CASConnection,
@@ -317,6 +319,14 @@ export class NativeCubridAdapter implements DriverAdapter {
 
     try {
       return await use();
+    } catch (error) {
+      // A damaged reply may not have ended where its frame said, so another
+      // request here could read stale bytes as its answer, or wait forever.
+      // The server rolls back the session's work and frees its handles.
+      if (error instanceof MalformedReplyError) {
+        await cas.discardSession();
+      }
+      throw error;
     } finally {
       if (queryHandle !== null) {
         await this.closeQueryHandle(cas, queryHandle, generation);

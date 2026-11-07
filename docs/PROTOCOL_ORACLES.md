@@ -59,6 +59,18 @@ The four brokers sent the same layout, with protocol version 7:
 - **A mixed-type collection** is sent as a NULL cell, or a NULL element when
   nested, the same bytes as a genuine NULL.
 
+## NULL and zero-byte cells
+
+- **SQL NULL** is cell length `-1` with no bytes
+  ([`dbval_to_net_buf`, `cas_execute.c` on `release/11.4` at `1df4af4`](https://github.com/CUBRID/cubrid/blob/1df4af4bca6416f2e5a7388ed066fb5b4ac651fe/src/broker/cas_execute.c#L5015-L5019)).
+- **Length `0`** comes only from `add_res_data_bytes`, which only BIT and VARBIT
+  use. `add_res_data_string` counts the NUL, so an empty string has length `1`.
+  The captured `emptyBitValue` frame shows this: `SELECT X''` has a size-0 cell.
+- **The default case of `dbval_to_net_buf`** writes `-1` for a type the CAS cannot
+  encode, so a client cannot detect that NULL.
+- **JSON** is sent as wire type `2` below protocol 8. This driver declares
+  protocol 7, so all four brokers described it as `85 02` in column metadata.
+
 ## Required regression checks
 
 `tests/protocol-oracles.test.ts` uses literal constants and packet bytes
@@ -67,7 +79,11 @@ rather than importing the implementation enum as an oracle. It checks:
 - The CCI type, SQL statement and CAS function IDs separately.
 - Positive and negative 64-bit BIGINT decode from fixed wire bytes.
 - BIGINT parameter encoding (`0000000915000000000000002a` for 42n).
-- Distinguishing real SQL NULL, empty strings and unsupported non-NULL types.
+- Distinguishing real SQL NULL, empty strings and unsupported non-NULL types,
+  with the captured `timestamptzValue` reply, and rejecting a zero-byte value
+  of any type except BIT and VARBIT.
+- An unsupported value keeps the session only when the whole reply holds
+  together; any structural failure is reported as malformed, which drops it.
 - Malformed/truncated packets and the negative FETCH error envelope.
 - SET, MULTISET and SEQUENCE decode from captured replies, including empty,
   NULL, repeated, nested and unsupported elements, and each malformed length

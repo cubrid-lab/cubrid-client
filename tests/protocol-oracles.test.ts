@@ -10,8 +10,10 @@ import assert from "node:assert/strict";
 import { CASFunctionCode, CUBRIDDataType, StatementType } from "../src/protocol/constants.js";
 import {
   encodeBindParams,
+  MalformedReplyError,
   parseFetch,
   parsePrepareAndExecute,
+  UnsupportedValueError,
   writeFetch,
 } from "../src/protocol/protocol.js";
 import { CAPTURED_FRAMES, type CapturedFrame } from "./fixtures/collection-frames.js";
@@ -134,6 +136,80 @@ test("genuine SQL NULL and a valid empty string are different", () => {
   const emptyRow = parsePrepareAndExecute(selectWire(2, Buffer.from([0])), 1);
   assert.equal(nullRow.rows[0]?.value, null);
   assert.equal(emptyRow.rows[0]?.value, "");
+});
+
+test("a captured TIMESTAMPTZ value rejects as unsupported, naming its column and wire type", () => {
+  assert.throws(
+    () => parsePrepareAndExecute(Buffer.from(CAPTURED_FRAMES.timestamptzValue.hex, "hex"), 7),
+    (error: Error) => {
+      assert.ok(error instanceof UnsupportedValueError);
+      assert.match(error.message, /column "tz" \(wire type 29, 19 bytes\)/);
+      return true;
+    },
+  );
+});
+
+test("a zero-byte value is null only for BIT and VARBIT, and never for another type", () => {
+  // The captured SELECT X'' has a size-0 cell. It stays null until #173 and keeps column t.
+  assert.deepEqual(
+    parsePrepareAndExecute(Buffer.from(CAPTURED_FRAMES.emptyBitValue.hex, "hex"), 7).rows,
+    [{ x: null, t: "after" }],
+  );
+  assert.equal(parsePrepareAndExecute(selectWire(5, Buffer.alloc(0)), 1).rows[0]?.value, null);
+
+  // No decoder: OBJECT, TIMESTAMPTZ, JSON and a code CCI does not define.
+  for (const type of [19, 29, 34, 99]) {
+    assert.throws(() => parsePrepareAndExecute(selectWire(type, Buffer.alloc(0)), 1), (error: Error) =>
+      error instanceof UnsupportedValueError && error.message.includes(`wire type ${type}, 0 bytes`));
+  }
+
+  // Decodable, but CAS counts the NUL of text and writes fixed widths in full.
+  for (const type of [2, 8, 21, 23]) {
+    assert.throws(() => parsePrepareAndExecute(selectWire(type, Buffer.alloc(0)), 1), (error: Error) =>
+      error instanceof MalformedReplyError &&
+      error.message.includes(`wire type ${type}, 0 bytes`) &&
+      // The reason is one step down the cause chain, not behind a repeated message.
+      !(error.cause as Error).message.startsWith("Failed to decode"));
+  }
+});
+
+test("a NULL-typed column never turns a typed cell without value bytes into null", () => {
+  // Cell of size 1 holding only the type header: the literal TIMESTAMPTZ code 29.
+  assert.throws(
+    () => parsePrepareAndExecute(selectWire(0, Buffer.from([29])), 1),
+    (error: Error) => error instanceof UnsupportedValueError && /wire type 29, 0 bytes/.test(error.message),
+  );
+  // Cell of size 0 has no room for the header, which must not come from the next bytes.
+  assert.throws(
+    () => parsePrepareAndExecute(selectWire(0, Buffer.alloc(0)), 1),
+    (error: Error) => error instanceof MalformedReplyError && /invalid cell length 0/.test(error.message),
+  );
+});
+
+test("an unsupported value whose length overruns the reply is malformed, not unsupported", () => {
+  const wire = selectWire(29, Buffer.from("01020304", "hex"));
+  assert.throws(
+    () => parsePrepareAndExecute(wire.subarray(0, -2), 1),
+    (error: Error) => error instanceof MalformedReplyError,
+  );
+});
+
+test("the first unsupported value is reported only once the whole reply holds together", () => {
+  const column = { type: 29, name: "tz" } as never;
+  const row = (...cells: Buffer[]): Buffer => Buffer.concat([i32(1), Buffer.alloc(8), ...cells]);
+  const value = Buffer.concat([i32(2), Buffer.from("0102", "hex")]);
+
+  const later = Buffer.concat([i32(3), Buffer.from("010203", "hex")]);
+
+  assert.throws(
+    () => parseFetch(Buffer.concat([i32(0), i32(2), row(value), row(later)]), [column]),
+    (error: Error) => error instanceof UnsupportedValueError && /, 2 bytes/.test(error.message),
+  );
+  // Row 2 declares a negative length that is not NULL.
+  assert.throws(
+    () => parseFetch(Buffer.concat([i32(0), i32(2), row(value), row(i32(-2))]), [column]),
+    (error: Error) => error instanceof MalformedReplyError,
+  );
 });
 
 test("truncated packets and literal FETCH error envelopes reject", () => {
@@ -304,6 +380,64 @@ test("a collection cell cannot read past its end into the next column", () => {
       assert.match(causeOf(error), /cannot read 4 bytes/);
       return true;
     },
+  );
+});
+
+test("a collection element without a decoder is unsupported and leaves the next column readable", () => {
+  // Cell: BLOB element type 23, one element of 4 bytes. It rejects the reply as
+  // unsupported, so the column after it was reached and found intact.
+  const cell = "0000000d" + "17" + "00000001" + "00000004" + "01020304";
+  assert.throws(
+    () => parsePrepareAndExecute(withCell(cell), 7),
+    (error: Error) => error instanceof UnsupportedValueError,
+  );
+});
+
+// One BLOB element (type 23) of 4 bytes, valid on its own, and a nested cell holding it.
+const BLOB_ELEMENT = "00000004" + "01020304";
+const NESTED_BLOB = "0000000d" + "17" + "00000001" + BLOB_ELEMENT;
+const NESTED_CLOB = "0000000d" + "18" + "00000001" + BLOB_ELEMENT;
+
+for (const [problem, cell, reason] of [
+  ["a length past the cell", "0000000d" + "17" + "00000001" + "00000005" + "01020304", /cannot read 5 bytes/],
+  ["a later element below NULL", "00000011" + "17" + "00000002" + BLOB_ELEMENT + "fffffffe", /invalid length -2/],
+  ["a later element with no length", "00000011" + "17" + "00000003" + BLOB_ELEMENT + "ffffffff", /element 2 has no length/],
+  ["a cell longer than its elements", "0000000f" + "17" + "00000001" + BLOB_ELEMENT + "0000", /uses 13 of its 15 bytes/],
+  ["a later element of a type without any decoder", "00000013" + "63" + "00000002" + "00000002" + "0102" + "00000005" + "01020304", /cannot read 5 bytes/],
+  // A SEQUENCE whose second nested cell has an int element claiming 5 of its 4 bytes.
+  ["damage in a later nested cell", "00000027" + "12" + "00000002" + NESTED_BLOB + "0000000d" + "08" + "00000001" + "00000005" + "00000001", /cannot read 5 bytes/],
+  // The unsupported element is itself nested, and the damage is in the outer cell.
+  ["damage after a nested unsupported cell", "0000001a" + "12" + "00000002" + NESTED_BLOB + "fffffffe", /invalid length -2/],
+] as const) {
+  test(`an unsupported collection element does not hide ${problem}`, () => {
+    assert.throws(
+      () => parsePrepareAndExecute(withCell(cell), 7),
+      (error: Error) => {
+        assert.ok(error instanceof MalformedReplyError);
+        assert.match(causeOf(error), reason);
+        return true;
+      },
+    );
+  });
+}
+
+test("a complete collection keeps its first unsupported element, and damage outranks it", () => {
+  // Two nested cells, BLOB (23) then CLOB (24).
+  const complete = "00000027" + "12" + "00000002" + NESTED_BLOB + NESTED_CLOB;
+  assert.throws(
+    () => parsePrepareAndExecute(withCell(complete), 7),
+    (error: Error) => {
+      assert.ok(error instanceof UnsupportedValueError);
+      assert.match(causeOf(error), /element type 23/);
+      return true;
+    },
+  );
+  // The same walk reaches the second cell: damage there outranks the first error.
+  const damaged = "00000027" + "12" + "00000002" + NESTED_BLOB +
+    "0000000d" + "18" + "00000001" + "00000005" + "01020304";
+  assert.throws(
+    () => parsePrepareAndExecute(withCell(damaged), 7),
+    (error: Error) => error instanceof MalformedReplyError,
   );
 });
 

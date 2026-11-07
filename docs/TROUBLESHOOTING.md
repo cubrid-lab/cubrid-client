@@ -84,6 +84,39 @@ try {
 }
 ```
 
+### `QueryError` because a value or reply could not be decoded
+
+A decode failure has two outcomes, and only one leaves the connection usable. To
+tell them apart, walk the `cause` chain for the error's `name`. Do not match
+message text, and do not stop at `error.cause`: `db.query()` wraps the failure in
+a second `QueryError`.
+
+```ts
+function decodeFailure(error: unknown): Error | undefined {
+  for (let current = error; current instanceof Error; current = current.cause) {
+    if (current.name === "UnsupportedValueError" || current.name === "MalformedReplyError") {
+      return current;
+    }
+  }
+  return undefined;
+}
+```
+
+The driver does not export these two classes, so test `name` and not
+`instanceof`. Both `name` values are a stable part of the 1.x
+[public contract](API_STABILITY.md).
+
+- **`UnsupportedValueError`**: the server sent a value this driver has no decoder
+  for. Its message names the column and CAS wire type: `29` to `32` are the
+  timezone-aware types, and `19` is an OBJECT reference. The connection and any
+  open transaction stay usable, so cast the column in SQL, for example
+  `CAST(created_at AS DATETIME)`, or select `TO_CHAR(created_at)`.
+- **`MalformedReplyError`**: the reply was damaged, so the connection was dropped
+  and the server rolled back any open transaction. Its message names the column
+  only when one cell failed. See
+  [values that cannot be decoded](TYPES.md#values-that-cannot-be-decoded) for how
+  to recover.
+
 ### DDL/DML statements return empty array
 
 This is **expected behavior**. `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, and other DDL/DML statements return `[]` because they don't produce result sets:
