@@ -167,24 +167,6 @@ export interface ResultQueryable {
 }
 
 /**
- * Outcome of a statement run with `execute()`.
- *
- * `affectedRows` is the number of rows an INSERT, UPDATE, DELETE or MERGE
- * changed, added over every statement of a multi-statement string. It is 0 for
- * DDL and SELECT, and 0 when an UPDATE or DELETE matched nothing.
- *
- * `lastInsertId` is set only when an INSERT ran and the session then holds a
- * new generated AUTO_INCREMENT value: a `number` while it is a safe integer and
- * a `bigint` beyond that, so no precision is lost. It is absent otherwise,
- * including when the value equals the one seen before the statement.
- */
-export interface ExecuteResult {
-  affectedRows: number;
-  lastInsertId?: number | bigint;
-}
-
-/** Runs a statement and reports its {@link ExecuteResult} instead of rows. */
-/**
  * Options of `stream()`.
  *
  * LOB limit: `maxLobBytes` applies to each row of a stream, not to the whole
