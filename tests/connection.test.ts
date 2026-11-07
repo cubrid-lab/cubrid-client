@@ -1160,6 +1160,63 @@ async function connectWithReadTimeout(port: number): Promise<CASConnection> {
   return cas;
 }
 
+test("an unset readTimeout still bounds a handshake the broker never answers, without a retry", { timeout: 20000 }, async () => {
+  let connections = 0;
+  const { server, port } = await createMockBroker((socket) => {
+    connections += 1;
+    socket.on("error", () => {});
+    socket.resume();
+  });
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port, maxConnectionRetryCount: 2 });
+    const started = Date.now();
+
+    await assert.rejects(cas.connect(), (error: unknown) => {
+      assert.ok(error instanceof ReadTimeoutError);
+      assert.equal(error.timeoutMs, 10_000);
+      return true;
+    });
+
+    assert.ok(Date.now() - started >= 9_900);
+    assert.equal(connections, 1);
+    assert.equal(cas.isConnected, false);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("the default handshake limit does not apply to later requests", async () => {
+  let serverSide: NetSocket | undefined;
+  const { server, port } = await brokerWith((socket) => {
+    serverSide = socket;
+  });
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+    await cas.connect();
+
+    const socket = Reflect.get(cas, "socket") as NetSocket & { timeout?: number };
+    assert.ok(!socket.timeout);
+
+    const request = cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+    const settled = request.then(
+      () => undefined,
+      () => undefined,
+    );
+    while (!serverSide) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(!socket.timeout);
+
+    serverSide.destroy();
+    await settled;
+    await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});
+
 test("readTimeout rejects and retires the socket when the server stops responding", { timeout: 5000 }, async () => {
   let serverSocketClosed: () => void = () => {};
   const closed = new Promise<void>((resolve) => {
