@@ -268,6 +268,63 @@ test("transaction commits on success and closes the dedicated connection", async
   assert.equal(transactional.closeCalls, 1);
 });
 
+test("scoped transaction keeps an unrelated concurrent query off its physical session", async () => {
+  const shared = new FakeConnection();
+  const scoped = new FakeConnection();
+  let connectionsCreated = 0;
+  const client = createClient(
+    baseOptions({
+      connectionFactory: () => {
+        connectionsCreated += 1;
+        return connectionsCreated === 1 ? shared : scoped;
+      },
+    }),
+  );
+
+  // Bind the ordinary API to its shared connection before starting a callback
+  // transaction. The scoped callback must receive a different connection.
+  await client.query("SELECT shared before");
+  let signalEntered!: () => void;
+  const entered = new Promise<void>((resolve) => { signalEntered = resolve; });
+  let releaseTransaction!: () => void;
+  const hold = new Promise<void>((resolve) => { releaseTransaction = resolve; });
+
+  const work = client.transaction(async (tx) => {
+    await tx.query("INSERT INTO ledger VALUES (1)");
+    signalEntered();
+    await hold;
+    await tx.query("INSERT INTO ledger VALUES (2)");
+  });
+
+  await entered;
+  try {
+    // This is a separate caller using the regular client during the
+    // transaction. Its query must not execute on the scoped connection.
+    await client.query("SELECT unrelated while transaction is open");
+    assert.deepEqual(
+      shared.queries.map(({ sql }) => sql),
+      ["SELECT shared before", "SELECT unrelated while transaction is open"],
+    );
+    assert.deepEqual(scoped.queries.map(({ sql }) => sql), ["INSERT INTO ledger VALUES (1)"]);
+    assert.equal(shared.beginCalls, 0);
+    assert.equal(shared.commitCalls, 0);
+    assert.equal(scoped.beginCalls, 1);
+    assert.equal(scoped.commitCalls, 0);
+  } finally {
+    releaseTransaction();
+  }
+
+  await work;
+  assert.deepEqual(
+    scoped.queries.map(({ sql }) => sql),
+    ["INSERT INTO ledger VALUES (1)", "INSERT INTO ledger VALUES (2)"],
+  );
+  assert.equal(scoped.commitCalls, 1);
+  assert.equal(scoped.closeCalls, 1);
+  assert.equal(connectionsCreated, 2);
+  await client.close();
+});
+
 test("transaction wraps callback failures in TransactionError", async () => {
   const connection = new FakeConnection();
   const client = createClient(
