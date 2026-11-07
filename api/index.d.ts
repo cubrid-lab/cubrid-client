@@ -116,7 +116,7 @@ type ClientLogLevel = "debug" | "info" | "error";
  * parameter values, row data, credentials or error messages.
  */
 interface ClientLogFields {
-    /** `connection`, `connect`, `query`, `queryResult`, `execute`, `queryPrepared`, `queryResultPrepared`, `executePrepared`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`. */
+    /** `connection`, `connect`, `query`, `queryResult`, `execute`, `queryPrepared`, `queryResultPrepared`, `executePrepared`, `stream`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`. */
     operation?: string;
     host?: string;
     port?: number;
@@ -125,7 +125,7 @@ interface ClientLogFields {
     durationMs?: number;
     /** Number of bound parameters of a `query`, not their values. */
     paramCount?: number;
-    /** Number of rows a successful `query` returned. */
+    /** Number of rows a successful `query` returned, or a `stream` handed to its consumer. */
     rowCount?: number;
     /**
      * Class of the error of a failed operation: one of this library's error
@@ -169,6 +169,8 @@ interface ClientConfig {
     readTimeout?: number | undefined;
     /** See {@link ClientOptions.maxLobBytes}. */
     maxLobBytes?: number | undefined;
+    /** See {@link ClientOptions.fetchSize}. */
+    fetchSize?: number | undefined;
     /** See {@link ClientOptions.isolationLevel}. */
     isolationLevel?: IsolationLevel | undefined;
     /** See {@link ClientOptions.lockTimeout}. */
@@ -198,6 +200,7 @@ interface ClientOptions {
      * in memory, so this bounds what a row of large objects can cost. A query over
      * the limit rejects with a `QueryError` before any content is read, and the
      * connection stays usable. Must be a positive integer. Default: 64 MiB.
+     * `stream()` applies the same limit to each row instead, see {@link StreamOptions}.
      */
     maxLobBytes?: number;
     /**
@@ -213,6 +216,14 @@ interface ClientOptions {
      * wait and `-1` has no limit. Unset leaves the server's default.
      */
     lockTimeout?: number;
+    /**
+     * Rows asked for in each FETCH by `query()`, `queryResult()` and `stream()`.
+     * CUBRID 10.2 to 11.4 ignore this number and answer every FETCH with about
+     * 16 KiB of rows, or one row when a row is larger, so it changes neither the
+     * round trips nor the memory used on those servers. Must be an integer from 1
+     * to 2147483647. Default: 100.
+     */
+    fetchSize?: number;
     maxConnectionRetryCount?: number;
     ssl?: boolean | ClientSSLOptions;
     /**
@@ -231,6 +242,39 @@ interface Queryable {
 /** Runs a statement and reports its rows with their column metadata. */
 interface ResultQueryable {
     queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
+}
+/**
+ * Options of `stream()`.
+ *
+ * LOB limit: `maxLobBytes` applies to each row of a stream, not to the whole
+ * result as in `query()`. A row's BLOB and CLOB content is read when that row is
+ * reached, so one row's content is the most a stream holds at once.
+ */
+interface StreamOptions {
+    /** Rows asked for in each FETCH. Default: {@link ClientOptions.fetchSize}. */
+    fetchSize?: number;
+    /**
+     * Stops the stream. The next read rejects with `signal.reason`, the query handle
+     * is released and the statement's turn ends, even if the consumer is not reading.
+     * A reply already awaited is not interrupted: the stream stops when it arrives,
+     * so `readTimeout` limits how long that takes. The session stays usable.
+     */
+    signal?: AbortSignal;
+    /**
+     * Milliseconds a statement issued on this connection waits while the consumer
+     * asks for no row, before it rejects with `kind: "stream-busy"`. Such a statement
+     * may be the consumer's own, which could never run. Other statements wait as long
+     * as the consumer keeps reading. 0 refuses them at once while the stream holds
+     * the connection. This limit cannot be disabled. Default: 5000.
+     */
+    consumerTimeout?: number;
+}
+/**
+ * Runs a statement and reads its rows one at a time, without holding the whole
+ * result in memory. See the `stream()` method of `CubridClient`.
+ */
+interface Streamable {
+    stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncIterable<T>;
 }
 /**
  * Outcome of a statement run with `execute()`.
@@ -325,6 +369,11 @@ interface ConnectionLike {
      * transaction fails, because running without the setting would hide that.
      */
     setTransactionOptions?(options: TransactionOptions): Promise<void>;
+    /**
+     * Optional so 1.x connection factories keep compiling. `stream()` on a client
+     * fails on its first read when its connection does not provide it.
+     */
+    stream?<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncIterable<T>;
     ping?(): Promise<string>;
 }
 type ConnectionFactory = (config: ClientConfig) => ConnectionLike | Promise<ConnectionLike>;
@@ -389,7 +438,7 @@ interface SchemaIndex {
     columns: SchemaIndexColumn[];
 }
 
-declare class CubridClient implements Queryable, ResultQueryable, Executable, PreparedQueryable {
+declare class CubridClient implements Queryable, ResultQueryable, Executable, PreparedQueryable, Streamable {
     private readonly config;
     private readonly connectionFactory;
     private sharedConnectionPromise;
@@ -402,6 +451,22 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
     queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
     queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
     executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+    /**
+     * Run a statement and read its rows one at a time with `for await`, holding at
+     * most one server reply of rows in memory. Nothing is sent before the first read.
+     *
+     * The open cursor holds this connection's turn until the rows run out or the
+     * stream closes. A `break`, a throw or a failed read closes it and releases the
+     * query handle; code that drives the iterator by hand must call `return()`.
+     * Statements issued on this client meanwhile wait, so one awaited inside the loop
+     * can never run: it rejects with `kind: "stream-busy"` after
+     * {@link StreamOptions.consumerTimeout}. Use `transaction()`, which has its own
+     * connection, or another client. See `docs/API_REFERENCE.md`.
+     *
+     * @throws RangeError at once when an option is invalid.
+     */
+    stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncGenerator<T, void, undefined>;
+    private streamRows;
     transaction<T>(callback: TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient>, options?: TransactionOptions): Promise<T>;
     beginTransaction(): Promise<void>;
     commit(): Promise<void>;
@@ -469,8 +534,10 @@ declare class CubridTransaction implements ResultTransactionClient, ExecutableTr
  * - `connection-lost`: the connection went away, or the server process died and
  *   took the transaction with it. The outcome of a request in flight is unknown.
  * - `read-timeout`: the client gave up waiting, see `ReadTimeoutError`.
+ * - `stream-busy`: the client refused a statement that waited behind a `stream()`
+ *   whose consumer stopped asking for rows. Nothing was sent.
  */
-type CubridErrorKind = "unique-violation" | "not-null-violation" | "foreign-key-violation" | "syntax" | "semantic" | "deadlock" | "lock-timeout" | "interrupted" | "authentication" | "connection-lost" | "read-timeout";
+type CubridErrorKind = "unique-violation" | "not-null-violation" | "foreign-key-violation" | "syntax" | "semantic" | "deadlock" | "lock-timeout" | "interrupted" | "authentication" | "connection-lost" | "read-timeout" | "stream-busy";
 interface CubridErrorDetails {
     /** Numeric error code of the CAS error reply. Absent for client-side failures. */
     code?: number;
@@ -618,16 +685,33 @@ declare class NativeCubridAdapter implements DriverAdapter {
      * statement cannot block the ones behind it.
      */
     private statementQueue;
+    /** Statements behind the running one, which a stalled stream can make refuse. */
+    private readonly waitingStatements;
+    /** Every stream between its first read and its end, so close() can stop them. */
+    private readonly openCursors;
+    /** The stream whose turn is waiting for its consumer to ask for more rows. */
+    private heldBy;
+    /** Timer of the next possible refusal. See watchHeldTurn(). */
+    private refusalTimer;
     constructor(config: ClientConfig);
     connect(): Promise<void>;
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
     queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
+    /**
+     * Reads a result one server reply at a time. See `CubridClient.stream()` for the
+     * contract. The statement is issued by the first read, like any other statement
+     * in the queue, and keeps its turn until it has released its query handle.
+     */
+    stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncGenerator<T, void, undefined>;
+    private streamRows;
     execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
     queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
     queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
     executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>;
     private executeNow;
     private queryNow;
+    private streamNow;
+    private queryFailure;
     /**
      * Keep these settings on every session of this connection, in place of what was
      * set before and leaving any option not given as it is. close() goes back to
@@ -666,6 +750,33 @@ declare class NativeCubridAdapter implements DriverAdapter {
      * never wait on its own turn. Waiting does not count towards readTimeout.
      */
     private inTurn;
+    private queueStatement;
+    /**
+     * Arms the timer that refuses statements stuck behind a held stream, at the
+     * earliest moment one of them could have waited `consumerTimeout` with no sign of
+     * the consumer. Reading only the timestamps here keeps a row's cost at one
+     * assignment: a consumer that is still reading just moves the deadline.
+     */
+    private watchHeldTurn;
+    /** Hands rows over and, while more can follow, waits for the consumer to ask for them. */
+    private offerRows;
+    /**
+     * Feeds a stream from an open cursor, one window at a time and only on demand.
+     *
+     * LOB content is read when the consumer reaches its row, so `maxLobBytes` limits
+     * one row and a stream holds one row's content, not a window's. Reads must not
+     * be followed by the END_TRAN that query() sends after them: in autocommit mode
+     * that would close this cursor (-1012), so it waits until the cursor is finished.
+     *
+     * An autocommit SELECT reports IN_TRAN until it reaches its last row, and closing
+     * its handle earlier does not end that transaction: on CUBRID 10.2 to 11.4 the
+     * session keeps its table lock, and its CAS, until the next statement. So a stream
+     * that stops early commits. It changed nothing unless the SQL text did, and an
+     * autocommit statement that ran is committed anyway.
+     */
+    private streamWindows;
+    /** An INSERT executed by a query path can invalidate the insert-ID baseline. */
+    private forgetInsertIdAfterQuery;
     private executeQuery;
     /**
      * Counts a statement's affected rows and, after an INSERT, asks for the
@@ -774,6 +885,8 @@ declare class NativeCubridAdapter implements DriverAdapter {
      */
     private negotiateBackslashEscapes;
     private fetchRemaining;
+    /** Sends one FETCH for the rows after the first `fetched`, and returns its rows. */
+    private fetchWindow;
     /**
      * Replace every LOB locator in `rows` with its content: a Buffer for a BLOB and
      * a string for a CLOB. A row never leaves the driver holding a locator.
@@ -788,6 +901,10 @@ declare class NativeCubridAdapter implements DriverAdapter {
      * costs no LOB transfer and no memory.
      */
     private loadLobs;
+    /** Loads one row of a stream and returns whether that sent a LOB_READ. See streamWindows(). */
+    private loadRowLobs;
+    /** Finds the LOB cells of `rows` and refuses them if their content is over the limit. */
+    private measureLobs;
     private readLob;
     /**
      * LOB_READ opens a transaction on the server, so an autocommit session is left
@@ -795,7 +912,7 @@ declare class NativeCubridAdapter implements DriverAdapter {
      * releasable: an idle client would keep its CAS. Nothing was changed, so this
      * only ends that. Inside a caller's transaction there is nothing to do.
      */
-    private endLobReadTransaction;
+    private endReadTransaction;
     /**
      * Best-effort release on the session that created the handle, so a cleanup
      * failure cannot replace the caller's own error. If that session is gone the
@@ -819,4 +936,4 @@ declare function buildWhere(conditions: Record<string, unknown>): {
     params: unknown[];
 };
 
-export { type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteResult, type IsolationLevel, LockTimeoutError, NativeCubridAdapter, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type TransactionCallback, type TransactionClient, TransactionError, type TransactionOptions, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, buildWhere, createClient, escapeIdentifier, parseConnectionString };
+export { type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteResult, type IsolationLevel, LockTimeoutError, NativeCubridAdapter, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type StreamOptions, type Streamable, type TransactionCallback, type TransactionClient, TransactionError, type TransactionOptions, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, buildWhere, createClient, escapeIdentifier, parseConnectionString };
