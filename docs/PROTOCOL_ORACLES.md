@@ -46,9 +46,41 @@ without AUTO_INCREMENT it still holds an earlier INSERT's value. The INSERT repl
 **Do not conflate a CCI type byte with a CAS function code.** The value 34
 is `CCI_U_TYPE_JSON` in the column-type domain and
 `CAS_FC_GET_GENERATED_KEYS` in the function-code domain. LOB API functions
-are 35–37, **not** column type identifiers or support for full BLOB/CLOB
-materialization. Older protocol v2 has a special legacy function-code
+are 35–37, **not** column type identifiers. Older protocol v2 has a special legacy function-code
 mapping; the fixtures use modern protocol expectations.
+
+## LOB wire format
+
+These facts were measured with a raw socket client, not with this driver's
+decoder, on the cubrid/cubrid 10.2, 11.0, 11.2 and 11.4 images with protocol
+version 7. All four behaved the same, and `tests/fixtures/lob-frames.ts` holds the
+captured bytes.
+
+- **A cell** is `[db_type: int32][size: int64][locator length: int32][locator]`,
+  not the content. `db_type` is 33 for BLOB and 34 for CLOB, unlike the column
+  types 23 and 24. The locator ends in a NUL counted in its length. An empty LOB
+  has size 0 and a locator; SQL NULL is the usual cell length -1.
+- **The locator text differs by version.** 10.2 to 11.2 send an absolute path,
+  `file:/var/lib/cubrid/testdb/lob/ces_429/...`. 11.4 sends one relative to the
+  LOB directory, `file:ces_429/...`. 11.2 and 11.4 prefix the table with `dba.`.
+  The driver treats it as opaque bytes.
+- **LOB_READ** (function 37) sends the whole cell with an int32 length, then an
+  int64 offset and an int32 length, each with its length prefix. The reply is an
+  int32 count and that many bytes; error replies use the usual `-2`, code and
+  message.
+- **One reply holds at most 81908 bytes** whatever was asked for, and reports the
+  shorter count. At or past the end of the file the count is 0 and the reply is
+  only those four bytes.
+- **Never send length 0.** It answers error -185, and every later request on that
+  session then fails with "Server no longer responding", until it is replaced.
+- **LOB_READ opens a transaction.** On a session whose last reply had
+  `CAS_INFO[0]` 0, the reply has 1, so an autocommit session stays reserved until
+  it is ended. The driver sends END_TRAN after reading.
+- **A locator is not bound to its session.** Any session can read a committed
+  file, also after the session that received the locator has closed. That is not
+  a guarantee to rely on: after a commit that deletes or updates the row, or a
+  rollback, the read fails with -1020, and a LOB built by a statement is already
+  gone when an autocommit reply arrives.
 
 ## Collection wire format
 
@@ -102,6 +134,8 @@ rather than importing the implementation enum as an oracle. It checks:
 - SET, MULTISET and SEQUENCE decode from captured replies, including empty,
   NULL, repeated, nested and unsupported elements, and each malformed length
   rejects for its stated reason.
+- BLOB and CLOB cells, LOB_READ requests and replies match captured bytes, and
+  each malformed cell or reply is rejected.
 
 A one-line mutation of `BIGINT = 21` to `26` must fail its literal
 expectations, instead of producing false-positive tests that use
@@ -111,8 +145,7 @@ The protocol test runs in the standard required Node.js CI and is
 independent of a database connection. Separate [live CUBRID
 validation](SUPPORT_MATRIX.md) exercises the current integration suite on
 actual server images; it does not guarantee that every SQL type and
-statement has been proven. Unsupported JSON decoding, LOB
-materialization, and full parity testing remain tracked in
-[#111](https://github.com/cubrid-lab/cubrid-client/issues/111),
-[#93](https://github.com/cubrid-lab/cubrid-client/issues/93), and
+statement has been proven. Unsupported JSON decoding and full parity testing
+remain tracked in
+[#111](https://github.com/cubrid-lab/cubrid-client/issues/111) and
 [#118](https://github.com/cubrid-lab/cubrid-client/issues/118).

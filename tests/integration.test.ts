@@ -2358,6 +2358,225 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
   });
 
   // -------------------------------------------------------------------------
+  // BLOB and CLOB content
+  // -------------------------------------------------------------------------
+
+  describe("BLOB and CLOB columns", () => {
+    const TABLE = "cc93_lob";
+
+    /** More than one LOB_READ reply holds, which is 81908 bytes on all four versions. */
+    const LARGE_BLOB = Buffer.alloc(250_000);
+    for (let i = 0; i < LARGE_BLOB.length; i++) {
+      LARGE_BLOB[i] = i % 251;
+    }
+    /** Three-byte characters after one ASCII byte, so a reply boundary splits one. */
+    const LARGE_CLOB = `x${"\ud55c".repeat(100_000)}`;
+
+    async function withLobTable(
+      use: (client: ReturnType<typeof createClient>) => Promise<void>,
+      options: { maxLobBytes?: number } = {},
+    ): Promise<void> {
+      const client = createClient({ ...TEST_CONFIG, ...options });
+      try {
+        await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await client.query(`CREATE TABLE ${TABLE} (id INT PRIMARY KEY, b BLOB, c CLOB)`);
+        await use(client);
+      } finally {
+        await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await client.close();
+      }
+    }
+
+    const causes = (error: unknown): string => {
+      const messages: string[] = [];
+      for (let e = error; e instanceof Error; e = e.cause) {
+        messages.push(`${e.name}: ${e.message}`);
+      }
+      return messages.join(" | ");
+    };
+
+    test("content, empty values and NULL read back as written", async () => {
+      await withLobTable(async (client) => {
+        await client.query(`INSERT INTO ${TABLE} VALUES (?, ?, ?)`, [
+          1,
+          Buffer.from([0, 1, 2, 255]),
+          "hello \ud55c\uae00",
+        ]);
+        await client.query(`INSERT INTO ${TABLE} VALUES (2, X'', '')`);
+        await client.query(`INSERT INTO ${TABLE} VALUES (3, NULL, NULL)`);
+
+        assert.deepEqual(await client.query(`SELECT id, b, c FROM ${TABLE} ORDER BY id`), [
+          { id: 1, b: Buffer.from([0, 1, 2, 255]), c: "hello \ud55c\uae00" },
+          { id: 2, b: Buffer.alloc(0), c: "" },
+          { id: 3, b: null, c: null },
+        ]);
+      });
+    });
+
+    test("content over several LOB_READ replies is complete, split characters included", async () => {
+      await withLobTable(async (client) => {
+        await client.query(`INSERT INTO ${TABLE} VALUES (?, ?, ?)`, [1, LARGE_BLOB, LARGE_CLOB]);
+
+        const [row] = await client.query<{ b: Buffer; c: string }>(
+          `SELECT b, c FROM ${TABLE}`,
+        );
+
+        assert.ok(LARGE_BLOB.equals(row!.b));
+        assert.equal(row!.c, LARGE_CLOB);
+      });
+    });
+
+    test("rows delivered by FETCH load too, and overlapping queries take their turns", async () => {
+      await withLobTable(async (client) => {
+        const rows = Array.from({ length: 150 }, (_, i) => `(${i}, X'0a', 'v${i}')`);
+        await client.query(`INSERT INTO ${TABLE} VALUES ${rows.join(",")}`);
+
+        const results = await Promise.all(
+          [0, 1, 2, 3].map(() => client.query<{ id: number; c: string }>(
+            `SELECT id, b, c FROM ${TABLE} ORDER BY id`,
+          )),
+        );
+
+        for (const result of results) {
+          assert.equal(result.length, 150);
+          assert.deepEqual(result[149], { id: 149, b: Buffer.from([10]), c: "v149" });
+        }
+      });
+    });
+
+    test("over the limit, the query rejects by name and the connection stays usable", async () => {
+      await withLobTable(async (client) => {
+        await client.query(`INSERT INTO ${TABLE} VALUES (1, ?, 'short')`, [LARGE_BLOB]);
+
+        await assert.rejects(
+          () => client.query(`SELECT b FROM ${TABLE}`),
+          (error: Error) => {
+            assert.ok(error instanceof QueryError);
+            assert.match(
+              causes(error),
+              /UnsupportedValueError: CUBRID column "b" .* 250000 bytes, over the maxLobBytes limit of 100000/,
+            );
+            return true;
+          },
+        );
+
+        // Under the limit on the same connection, in the same table.
+        assert.deepEqual(await client.query(`SELECT c FROM ${TABLE}`), [{ c: "short" }]);
+      }, { maxLobBytes: 100_000 });
+    });
+
+    test("over the limit in a transaction, the transaction stays open", async () => {
+      await withLobTable(async (client) => {
+        await client.transaction(async (tx) => {
+          await tx.query(`INSERT INTO ${TABLE} VALUES (1, X'0102', 'kept')`);
+          await assert.rejects(() => tx.query(`SELECT b FROM ${TABLE}`), TransactionError);
+          await tx.query(`INSERT INTO ${TABLE} VALUES (2, NULL, 'too')`);
+        });
+
+        // Both rows committed; `c` is left out because it is over this client's limit.
+        assert.deepEqual(await client.query(`SELECT id FROM ${TABLE} ORDER BY id`), [
+          { id: 1 },
+          { id: 2 },
+        ]);
+      }, { maxLobBytes: 1 });
+    });
+
+    test("a transaction reads its own uncommitted row, and a rollback removes it", async () => {
+      await withLobTable(async (client) => {
+        // Read inside and asserted outside: a failed assertion in the callback
+        // would itself roll back and look like the planned failure.
+        let seen: unknown;
+        await assert.rejects(
+          () => client.transaction(async (tx) => {
+            await tx.query(`INSERT INTO ${TABLE} VALUES (1, X'0a0b', 'uncommitted')`);
+            seen = await tx.query(`SELECT b, c FROM ${TABLE}`);
+            throw new Error("roll it back");
+          }),
+          TransactionError,
+        );
+
+        assert.deepEqual(seen, [{ b: Buffer.from([10, 11]), c: "uncommitted" }]);
+        assert.deepEqual(await client.query(`SELECT b FROM ${TABLE}`), []);
+      });
+    });
+
+    test("a LOB made by the statement reads in a transaction, not after autocommit removed it", async () => {
+      await withLobTable(async (client) => {
+        await client.transaction(async (tx) => {
+          assert.deepEqual(await tx.query("SELECT CHAR_TO_CLOB('temp') AS c"), [{ c: "temp" }]);
+        });
+
+        // The temporary file is already deleted when the autocommit reply arrives.
+        await assert.rejects(
+          () => client.query("SELECT CHAR_TO_CLOB('temp') AS c"),
+          (error: Error) => {
+            assert.ok(error instanceof QueryError);
+            assert.match(causes(error), /CUBRID LOB read failed \(-1020\)/);
+            return true;
+          },
+        );
+        assert.deepEqual(await client.query("SELECT 'after' AS t"), [{ t: "after" }]);
+      });
+    });
+
+    test("a CLOB that is not UTF-8 rejects by name and CLOB_TO_CHAR still reads it", async () => {
+      await withLobTable(async (client) => {
+        // The test databases use the iso88591 charset, where CHR(233) is one byte.
+        await client.query(`INSERT INTO ${TABLE} VALUES (1, NULL, CHAR_TO_CLOB(CHR(233)))`);
+
+        await assert.rejects(
+          () => client.query(`SELECT c FROM ${TABLE}`),
+          (error: Error) => {
+            assert.match(causes(error), /UnsupportedValueError: CUBRID CLOB column "c" is not valid UTF-8/);
+            return true;
+          },
+        );
+
+        const [row] = await client.query<{ text: string }>(
+          `SELECT CLOB_TO_CHAR(c) AS text FROM ${TABLE}`,
+        );
+        assert.equal(typeof row!.text, "string");
+      });
+    });
+
+    test("columns aliased __proto__ stay ordinary columns, LOBs included", async () => {
+      await withLobTable(async (client) => {
+        await client.query(`INSERT INTO ${TABLE} VALUES (1, X'0a0b', 'c')`);
+
+        const [lob] = await client.query(`SELECT b AS "__proto__" FROM ${TABLE}`);
+        const [scalar] = await client.query(`SELECT 7 AS "__proto__", 'after' AS t`);
+        const [nullValue] = await client.query(`SELECT NULL AS "__proto__", 'after' AS t`);
+
+        assert.deepEqual(Object.getOwnPropertyDescriptor(lob, "__proto__")?.value, Buffer.from([10, 11]));
+        assert.equal(Object.getOwnPropertyDescriptor(scalar, "__proto__")?.value, 7);
+        assert.equal(Object.getOwnPropertyDescriptor(nullValue, "__proto__")?.value, null);
+        assert.deepEqual(Object.keys(nullValue!), ["__proto__", "t"]);
+        for (const row of [lob, scalar, nullValue]) {
+          assert.equal(Object.getPrototypeOf(row), Object.prototype);
+        }
+      });
+    });
+
+    test("an autocommit read does not leave the session in a transaction", async () => {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+      try {
+        await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await adapter.query(`CREATE TABLE ${TABLE} (id INT PRIMARY KEY, b BLOB, c CLOB)`);
+        await adapter.query(`INSERT INTO ${TABLE} VALUES (1, X'0a', 'c')`);
+
+        assert.deepEqual(await adapter.query(`SELECT b FROM ${TABLE}`), [{ b: Buffer.from([10]) }]);
+
+        // CAS_INFO[0] is 1 while a transaction is open, and LOB_READ opens one.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        assert.equal((adapter as any).cas.casInfo[0], 0);
+      } finally {
+        await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await adapter.close();
+      }
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // Close behavior
   // -------------------------------------------------------------------------
 

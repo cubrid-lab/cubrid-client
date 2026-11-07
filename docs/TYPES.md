@@ -18,7 +18,8 @@ convert a runtime value.
 | NUMERIC | `string` | Decimal text retained without floating-point rounding; consumer chooses decimal library |
 | DATE, TIME, TIMESTAMP, DATETIME | `Date` | Parsed using the **local Node.js process timezone**; SQL DATETIME itself has no timezone, so this is not stable across zones ([#113](https://github.com/cubrid-lab/cubrid-client/issues/113)). The zero date `0000-00-00` of DATE, DATETIME and TIMESTAMP has no `Date`, so the query rejects; see [zero dates](#zero-dates) |
 | BIT, VARBIT | `Buffer` | Binary bytes; verify bit-length/bit-order semantics per server version. An empty `X''` returns an empty `Buffer`, distinct from SQL NULL |
-| BLOB, CLOB | `Buffer` from the wire field | **Not established as full LOB content**; the field may be a locator rather than the object body ([#93](https://github.com/cubrid-lab/cubrid-client/issues/93), [#103](https://github.com/cubrid-lab/cubrid-client/issues/103)) |
+| BLOB | `Buffer` | Complete content, loaded by the query. See [BLOB and CLOB columns](#blob-and-clob-columns) |
+| CLOB | `string` | Complete content decoded as UTF-8, loaded by the query. See [BLOB and CLOB columns](#blob-and-clob-columns) |
 | SET, MULTISET, SEQUENCE | Array (`CollectionValue`) | See [collection columns](#collection-columns) |
 | OBJECT/OID (19), RESULTSET (20), TIMESTAMPTZ, TIMESTAMPLTZ, DATETIMETZ and DATETIMELTZ (29-32), and unknown codes | Query rejects, including for a zero-byte value | Never coerced to `null`; see [values that cannot be decoded](#values-that-cannot-be-decoded). Future decoding is tracked in [#111](https://github.com/cubrid-lab/cubrid-client/issues/111) |
 | SQL NULL | `null` | Sent as cell length `-1`. NULL is distinct from unsupported non-NULL values and from a valid empty string, which is `""` |
@@ -84,9 +85,67 @@ sends SQL NULL for a non-NULL value, such as a
 [mixed-type collection](#collection-columns) or a type its CAS cannot encode.
 Those are the same bytes as a genuine NULL and return `null`.
 
-Error handling does **not** introduce timezone, OBJECT or LOB decoding. See
+Error handling does **not** introduce timezone or OBJECT decoding. See
 [#110](https://github.com/cubrid-lab/cubrid-client/issues/110) and the
 [independent protocol fixture plan](https://github.com/cubrid-lab/cubrid-client/issues/117).
+
+## BLOB and CLOB columns
+
+The server does not send LOB content in a row. A cell holds the content's size and
+a locator that names a file on the server. `query()` reads that file before it
+returns, so a BLOB column is a complete `Buffer` and a CLOB column a complete
+`string`, and there is nothing to open, keep or close. Locators never reach your
+code.
+
+| Stored value | BLOB | CLOB |
+| --- | --- | --- |
+| Content | `Buffer` | `string` |
+| Empty (`X''`, `''`) | Empty `Buffer` | `""` |
+| SQL NULL | `null` | `null` |
+
+Those results and everything below were checked on CUBRID 10.2, 11.0, 11.2 and
+11.4.
+
+**The size limit.** All the content of one query must fit in `maxLobBytes`, 64 MiB
+by default, counted across its rows and columns:
+
+```ts
+const db = createClient({ host, database, user, maxLobBytes: 512 * 1024 * 1024 });
+```
+
+A query over the limit rejects before any content is read, with an
+`UnsupportedValueError` naming the column that crossed it, and the connection and
+any open transaction stay usable. Raise the limit, select fewer rows, or leave the
+LOB column out. The limit counts bytes, including the bytes of a multibyte CLOB.
+
+**Cost.** Every non-empty LOB takes at least one request after the query, and one
+per 81908 bytes, the most the server sends at once. Select LOB columns only when
+you need them: `SELECT *` on such a table now transfers the content. `readTimeout`
+applies to each of those requests and not to the whole read.
+
+**Why no streaming handle.** A locator does not stay readable. After a commit that
+deletes or updates the row, or a rollback, the file is gone and reading it fails
+with error -1020, and the protocol has no request that holds a file or releases
+one. So the driver reads within the query's own turn and keeps nothing afterwards.
+Concurrent statements on the connection wait for those reads. A row deleted by
+another session between the `SELECT` and its read can still fail with -1020; run
+the query again.
+
+**Limitations:**
+
+- **A LOB built by the statement needs a transaction.** `SELECT CHAR_TO_CLOB('a')`
+  makes a temporary file, and in autocommit mode the server deletes it before the
+  reply arrives, so the query rejects with -1020. Run it in a transaction. A LOB
+  stored in a table is not affected.
+- **A CLOB must be valid UTF-8.** The driver has no charset option, and the server
+  stores CLOB bytes without converting them. Other bytes reject with an
+  `UnsupportedValueError` rather than being silently replaced. `CLOB_TO_CHAR(c)`
+  returns such a value through the ordinary text path, which substitutes U+FFFD for
+  invalid bytes.
+- **BLOB and CLOB collection elements** still reject the query.
+- **Writing** through a LOB handle is tracked in
+  [#103](https://github.com/cubrid-lab/cubrid-client/issues/103). A `Buffer` or
+  `string` parameter already stores content as a SQL literal.
 
 ## Collection columns
 
@@ -129,9 +188,9 @@ Not supported:
 - **Elements without a decoder reject the query**, naming the column and CAS wire
   type. That covers OBJECT/OID and the timezone types
   ([#111](https://github.com/cubrid-lab/cubrid-client/issues/111)), and BLOB/CLOB,
-  whose elements hold a server file locator rather than the content
-  ([#93](https://github.com/cubrid-lab/cubrid-client/issues/93)). The connection
-  stays usable afterwards.
+  whose elements hold a server file locator rather than the content, and which
+  [BLOB and CLOB columns](#blob-and-clob-columns) only loads for a whole column.
+  The connection stays usable afterwards.
 - **Collection parameters are not implemented.** `QueryParam` has no array type;
   write collection values as SQL literals.
 
@@ -166,8 +225,6 @@ for current method contracts.
   type; explicitly validate results that cross trust boundaries.
 - Do not use local-time `Date` decoding as a canonical UTC conversion until
   [#113](https://github.com/cubrid-lab/cubrid-client/issues/113) is resolved.
-- A returned `Buffer` from a BLOB/CLOB wire field is **not** established as
-  the LOB contents. Keep full LOB read/write unsupported until validated.
 - The required live broker/version and round-trip evidence is tracked in
   [#95](https://github.com/cubrid-lab/cubrid-client/issues/95).
 

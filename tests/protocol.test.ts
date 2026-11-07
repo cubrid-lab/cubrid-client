@@ -1510,28 +1510,6 @@ test("parsePrepareAndExecute SELECT with BIT/VARBIT column returns Buffer", () =
   assert.deepEqual([...(result.rows[0]!.val as Buffer)], [0xDE, 0xAD, 0xBE, 0xEF]);
 });
 
-test("parsePrepareAndExecute SELECT with BLOB column returns Buffer", () => {
-  const data = Buffer.from([0x01, 0x02, 0x03]);
-  const buf = buildSelectResponseForTypes(
-    [{ name: "val", type: CUBRIDDataType.BLOB }],
-    [[{ type: CUBRIDDataType.BLOB, data }]],
-  );
-  const result = parsePrepareAndExecute(buf, 1);
-  assert.equal(result.rows.length, 1);
-  assert.ok(Buffer.isBuffer(result.rows[0]!.val));
-});
-
-test("parsePrepareAndExecute SELECT with CLOB column returns Buffer", () => {
-  const data = Buffer.from("clob-content", "utf-8");
-  const buf = buildSelectResponseForTypes(
-    [{ name: "val", type: CUBRIDDataType.CLOB }],
-    [[{ type: CUBRIDDataType.CLOB, data }]],
-  );
-  const result = parsePrepareAndExecute(buf, 1);
-  assert.equal(result.rows.length, 1);
-  assert.ok(Buffer.isBuffer(result.rows[0]!.val));
-});
-
 test("parsePrepareAndExecute SELECT with VARBIT column returns Buffer", () => {
   const data = Buffer.from([0xFF]);
   const buf = buildSelectResponseForTypes(

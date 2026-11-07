@@ -116,6 +116,17 @@ test("normalizeConfig keeps a valid readTimeout", () => {
   assert.equal(normalizeConfig({ ...baseOptions(), readTimeout: 0 }).readTimeout, 0);
 });
 
+test("normalizeConfig keeps a valid maxLobBytes and adds none by default", () => {
+  assert.equal(normalizeConfig({ ...baseOptions(), maxLobBytes: 1024 }).maxLobBytes, 1024);
+  assert.ok(!("maxLobBytes" in normalizeConfig(baseOptions())));
+});
+
+for (const maxLobBytes of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 53]) {
+  test(`createClient rejects maxLobBytes ${maxLobBytes}`, () => {
+    assert.throws(() => createClient({ ...baseOptions(), maxLobBytes }), RangeError);
+  });
+}
+
 for (const readTimeout of [-1, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31]) {
   test(`createClient rejects readTimeout ${readTimeout}`, () => {
     assert.throws(() => createClient({ ...baseOptions(), readTimeout }), RangeError);

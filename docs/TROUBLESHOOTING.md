@@ -118,11 +118,27 @@ The driver does not export these two classes, so test `name` and not
   or DATETIME holds the zero date, which has no JavaScript `Date`; use
   `TO_CHAR(created_at)` or `CASE WHEN created_at = DATETIME'0000-00-00 00:00:00'
   THEN NULL ELSE created_at END`.
+  BLOB and CLOB columns raise it too when a query is over `maxLobBytes` or a CLOB
+  is not UTF-8; see [BLOB and CLOB columns](TYPES.md#blob-and-clob-columns).
 - **`MalformedReplyError`**: the reply was damaged, so the connection was dropped
   and the server rolled back any open transaction. Its message names the column
   only when one cell failed. See
   [values that cannot be decoded](TYPES.md#values-that-cannot-be-decoded) for how
   to recover.
+
+### `QueryError` with `CUBRID LOB read failed (-1020)`
+
+The server no longer has the file behind a BLOB or CLOB value. There are two usual
+causes:
+
+- The statement built the LOB, as in `SELECT CHAR_TO_CLOB('a')`, in autocommit
+  mode. The server deletes that temporary file before it replies, so run the
+  statement in a transaction.
+- Another session deleted or updated the row and committed after your `SELECT`
+  returned its rows and before the driver read the value. Run the query again.
+
+The connection stays usable. See
+[BLOB and CLOB columns](TYPES.md#blob-and-clob-columns).
 
 ### DDL/DML statements return empty array
 

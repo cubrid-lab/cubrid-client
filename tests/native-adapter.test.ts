@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type Server, type Socket as NetSocket } from "node:net";
+import { inspect } from "node:util";
 
 import { NativeCubridAdapter } from "../src/adapters/native.js";
 import { CubridClient } from "../src/client/client.js";
@@ -12,6 +13,7 @@ import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { TransactionError } from "../src/errors/transaction-error.js";
 import type { ClientConfig } from "../src/types/client.js";
 import { CAPTURED_FRAMES } from "./fixtures/collection-frames.js";
+import { LOB_FRAMES, LOB_READ_REPLY_LIMIT } from "./fixtures/lob-frames.js";
 import { DML_FRAMES, LAST_INSERT_ID_FRAMES } from "./fixtures/dml-frames.js";
 import { writePrepareAndExecute } from "../src/protocol/protocol.js";
 
@@ -2696,4 +2698,390 @@ test("an autocommit execute does not commit after a structurally invalid id repl
   assert.equal(sentCodes(fakeCAS).includes(END_TRAN) && fakeCAS.sentPayloads.some(
     (payload) => payload[0] === END_TRAN && payload[payload.length - 1] === COMMIT), false);
   assert.equal(fakeCAS.discardCalls, 1);
+});
+
+// ---------------------------------------------------------------------------
+// BLOB and CLOB content
+// ---------------------------------------------------------------------------
+
+const FC_END_TRAN = 1;
+const FC_CLOSE_REQ_HANDLE = 6;
+const FC_LOB_READ = 37;
+const FC_PREPARE_AND_EXECUTE = 41;
+const SELECT_LOBS = LOB_FRAMES.selectRows.sql;
+
+/** The captured three-row reply, with row 1's cell sizes replaced when a test needs more. */
+function lobSelectReply(blobSize = 3n, clobSize = 2n): Buffer {
+  const reply = Buffer.from(LOB_FRAMES.selectRows.hex, "hex");
+  reply.writeBigInt64BE(blobSize, reply.indexOf(Buffer.from("00000021", "hex")) + 4);
+  reply.writeBigInt64BE(clobSize, reply.indexOf(Buffer.from("00000022", "hex")) + 4);
+  return reply;
+}
+
+function lobReadReply(content: Buffer): Buffer {
+  const count = Buffer.alloc(4);
+  count.writeInt32BE(content.length, 0);
+  return Buffer.concat([count, content]);
+}
+
+function lobAdapter(config: Partial<ClientConfig> = {}) {
+  return createAdapterWithFakeCAS({ ...DEFAULT_CONFIG, ...config }, { _protoVersion: 7 });
+}
+
+/** The CAS function of every request sent, in order. */
+function functionsSent(fakeCAS: FakeCASConnection): number[] {
+  return fakeCAS.sentPayloads.map((payload) => payload[0]!);
+}
+
+/** Offset and length of every LOB_READ, read from the end of the request. */
+function lobReads(fakeCAS: FakeCASConnection): Array<[number, number]> {
+  return fakeCAS.sentPayloads
+    .filter((payload) => payload[0] === FC_LOB_READ)
+    .map((payload) => [
+      Number(payload.readBigInt64BE(payload.length - 16)),
+      payload.readInt32BE(payload.length - 4),
+    ]);
+}
+
+/** Queue the replies of a server that sends `content` in replies of its own maximum size. */
+function queueLobChunks(fakeCAS: FakeCASConnection, content: Buffer): void {
+  for (let offset = 0; offset < content.length; offset += LOB_READ_REPLY_LIMIT) {
+    fakeCAS.queueResponse(lobReadReply(content.subarray(offset, offset + LOB_READ_REPLY_LIMIT)));
+  }
+}
+
+test("LOB: a query returns content, never the locator, and ends the read transaction", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  fakeCAS.queueResponse(lobSelectReply());
+  fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readBlobReply, "hex"));
+  fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readClobReply, "hex"));
+
+  const rows = await adapter.query(SELECT_LOBS);
+
+  assert.deepEqual(rows, [
+    { id: 1, b: Buffer.from([1, 2, 3]), c: "hi" },
+    { id: 2, b: Buffer.alloc(0), c: "" },
+    { id: 3, b: null, c: null },
+  ]);
+  assert.ok(!inspect(rows, { depth: null }).includes("file:"));
+  // Row 2 is empty and row 3 is NULL, so neither asks the server for anything.
+  // The handle is released after the reads, which need the query to be open.
+  assert.deepEqual(functionsSent(fakeCAS), [
+    FC_PREPARE_AND_EXECUTE,
+    FC_LOB_READ,
+    FC_LOB_READ,
+    FC_END_TRAN,
+    FC_CLOSE_REQ_HANDLE,
+  ]);
+});
+
+test("LOB: only empty and NULL values need no LOB_READ and no transaction end", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  fakeCAS.queueResponse(lobSelectReply(0n, 0n));
+
+  const rows = await adapter.query(SELECT_LOBS);
+
+  assert.deepEqual(rows[0], { id: 1, b: Buffer.alloc(0), c: "" });
+  assert.deepEqual(functionsSent(fakeCAS), [FC_PREPARE_AND_EXECUTE, FC_CLOSE_REQ_HANDLE]);
+});
+
+test("LOB: a BLOB spanning several replies is reassembled from the offsets the server reached", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  const content = Buffer.alloc(200_000);
+  for (let i = 0; i < content.length; i++) {
+    content[i] = i % 251;
+  }
+  fakeCAS.queueResponse(lobSelectReply(BigInt(content.length), 0n));
+  queueLobChunks(fakeCAS, content);
+
+  const rows = await adapter.query(SELECT_LOBS);
+
+  assert.ok(content.equals(rows[0]!.b as Buffer));
+  assert.deepEqual(lobReads(fakeCAS), [
+    [0, 131072],
+    [81908, 118092],
+    [163816, 36184],
+  ]);
+});
+
+test("LOB: a multibyte character split between two replies stays one character", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  // 81908 is not a multiple of 3, so the first reply ends inside a character.
+  const text = "\ud55c".repeat(50_000);
+  const content = Buffer.from(text, "utf-8");
+  fakeCAS.queueResponse(lobSelectReply(0n, BigInt(content.length)));
+  queueLobChunks(fakeCAS, content);
+
+  const rows = await adapter.query(SELECT_LOBS);
+
+  assert.equal(rows[0]!.c, text);
+});
+
+test("LOB: a CLOB keeps a leading byte order mark as content", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  fakeCAS.queueResponse(lobSelectReply(0n, 4n));
+  fakeCAS.queueResponse(lobReadReply(Buffer.from("efbbbf41", "hex")));
+
+  const rows = await adapter.query(SELECT_LOBS);
+
+  assert.equal(rows[0]!.c, "\ufeffA");
+});
+
+test("LOB: a CLOB that is not UTF-8 rejects instead of being replaced, and the session stays", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  fakeCAS.queueResponse(lobSelectReply(0n, 2n));
+  fakeCAS.queueResponse(lobReadReply(Buffer.from("ffa1", "hex")));
+
+  await assertQueryFails(adapter, /column "c" is not valid UTF-8/, SELECT_LOBS);
+
+  assert.equal(fakeCAS.isConnected, true);
+  assert.deepEqual(fakeCAS.closedHandles, [1]);
+});
+
+test("LOB: maxLobBytes covers the whole query and refuses it before reading anything", async () => {
+  const { adapter, fakeCAS } = lobAdapter({ maxLobBytes: 4 });
+  fakeCAS.queueResponse(lobSelectReply());
+
+  await assert.rejects(
+    () => adapter.query(SELECT_LOBS),
+    (error: Error) => {
+      assert.ok(error instanceof QueryError);
+      assert.equal((error.cause as Error).name, "UnsupportedValueError");
+      assert.match(
+        (error.cause as Error).message,
+        /column "c" takes this query's LOB content to 5 bytes, over the maxLobBytes limit of 4/,
+      );
+      return true;
+    },
+  );
+
+  assert.deepEqual(functionsSent(fakeCAS), [FC_PREPARE_AND_EXECUTE, FC_CLOSE_REQ_HANDLE]);
+  assert.equal(fakeCAS.discardCalls, 0);
+  assert.equal(fakeCAS.isConnected, true);
+});
+
+test("LOB: content of exactly maxLobBytes loads", async () => {
+  const { adapter, fakeCAS } = lobAdapter({ maxLobBytes: 5 });
+  fakeCAS.queueResponse(lobSelectReply());
+  fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readBlobReply, "hex"));
+  fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readClobReply, "hex"));
+
+  const rows = await adapter.query(SELECT_LOBS);
+
+  assert.equal(rows[0]!.c, "hi");
+});
+
+test("LOB: the default limit is 64 MiB", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  fakeCAS.queueResponse(lobSelectReply(64n * 1024n * 1024n + 1n, 0n));
+
+  await assertQueryFails(adapter, /over the maxLobBytes limit of 67108864/, SELECT_LOBS);
+  assert.deepEqual(lobReads(fakeCAS), []);
+});
+
+test("LOB: inside a transaction the read leaves the caller's transaction open", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  await adapter.beginTransaction();
+  fakeCAS.queueResponse(lobSelectReply());
+  fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readBlobReply, "hex"));
+  fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readClobReply, "hex"));
+
+  await adapter.query(SELECT_LOBS);
+
+  assert.deepEqual(functionsSent(fakeCAS), [
+    FC_PREPARE_AND_EXECUTE,
+    FC_LOB_READ,
+    FC_LOB_READ,
+    FC_CLOSE_REQ_HANDLE,
+  ]);
+});
+
+test("LOB: a statement issued during a read waits for the reads and the handle release", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  fakeCAS.queueResponse(lobSelectReply());
+  fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readBlobReply, "hex"));
+  fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readClobReply, "hex"));
+  fakeCAS.queueResponse(buildSimpleResponse(0)); // END_TRAN
+  fakeCAS.queueResponse(buildSimpleResponse(0)); // CLOSE_REQ_HANDLE
+  fakeCAS.queueResponse(buildDMLResponse(20, 1));
+
+  await Promise.all([adapter.query(SELECT_LOBS), adapter.query("INSERT INTO t VALUES (1)")]);
+
+  assert.deepEqual(functionsSent(fakeCAS).slice(0, 6), [
+    FC_PREPARE_AND_EXECUTE,
+    FC_LOB_READ,
+    FC_LOB_READ,
+    FC_END_TRAN,
+    FC_CLOSE_REQ_HANDLE,
+    FC_PREPARE_AND_EXECUTE,
+  ]);
+});
+
+test("LOB: a file the server no longer has rejects with its error and keeps the session", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  fakeCAS.queueResponse(lobSelectReply());
+  fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.fileNotFoundReply, "hex"));
+
+  await assertQueryFails(adapter, /CUBRID LOB read failed \(-1020\)/, SELECT_LOBS);
+
+  assert.equal(fakeCAS.discardCalls, 0);
+  assert.deepEqual(functionsSent(fakeCAS), [
+    FC_PREPARE_AND_EXECUTE,
+    FC_LOB_READ,
+    FC_END_TRAN,
+    FC_CLOSE_REQ_HANDLE,
+  ]);
+});
+
+test("LOB: a file shorter than its declared size rejects instead of returning part of it", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  fakeCAS.queueResponse(lobSelectReply(5n, 0n));
+  fakeCAS.queueResponse(lobReadReply(Buffer.from("0102", "hex")));
+  fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readAtEndReply, "hex"));
+
+  await assertQueryFails(adapter, /column "b" holds 2 of its declared 5 LOB bytes/, SELECT_LOBS);
+
+  assert.equal(fakeCAS.isConnected, true);
+});
+
+test("LOB: a damaged LOB_READ reply drops the session and nothing more is sent on it", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  fakeCAS.queueResponse(lobSelectReply());
+  fakeCAS.queueResponse(Buffer.from("00000003" + "0102", "hex"));
+
+  await assertQueryFails(adapter, /LOB read of 3 bytes reported 3 and carried 2/, SELECT_LOBS);
+
+  assertSessionDiscarded(fakeCAS);
+  assert.deepEqual(functionsSent(fakeCAS), [FC_PREPARE_AND_EXECUTE, FC_LOB_READ]);
+});
+
+test("LOB: a failed exchange during a read sends nothing more", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  fakeCAS.queueResponse(lobSelectReply());
+  fakeCAS.queueExchangeFailure(new Error("Connection closed while reading"));
+
+  await assertQueryFails(adapter, /Connection closed while reading/, SELECT_LOBS);
+
+  assert.deepEqual(functionsSent(fakeCAS), [FC_PREPARE_AND_EXECUTE, FC_LOB_READ]);
+});
+
+test("LOB: reads never move to another session", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  fakeCAS.queueResponse(lobSelectReply());
+  fakeCAS.sendAndRecvOnSession = async () => null;
+
+  await assertQueryFails(adapter, /CASConnection is not connected/, SELECT_LOBS);
+
+  assert.deepEqual(functionsSent(fakeCAS), [FC_PREPARE_AND_EXECUTE]);
+});
+
+/** The captured reply with BLOB column `b` renamed by a SQL alias. */
+function lobSelectReplyWithBlobAlias(alias: string): Buffer {
+  const reply = lobSelectReply();
+  const nameField = reply.indexOf(Buffer.from("000000026200", "hex"));
+  const name = Buffer.from(`${alias}\0`, "utf-8");
+  const length = Buffer.alloc(4);
+  length.writeInt32BE(name.length, 0);
+  return Buffer.concat([reply.subarray(0, nameField), length, name, reply.subarray(nameField + 6)]);
+}
+
+/** The captured reply with row 1's BLOB cell replaced by a cell holding `locator`. */
+function lobSelectReplyWithLocator(size: bigint, locatorLength: number, locator: Buffer): Buffer {
+  const reply = lobSelectReply();
+  const cell = reply.indexOf(Buffer.from("00000021", "hex"));
+  const header = Buffer.alloc(20);
+  header.writeInt32BE(16 + locator.length, 0);
+  header.writeInt32BE(33, 4);
+  header.writeBigInt64BE(size, 8);
+  header.writeInt32BE(locatorLength, 16);
+  return Buffer.concat([
+    reply.subarray(0, cell - 4),
+    header,
+    locator,
+    reply.subarray(cell + 16 + reply.readInt32BE(cell + 12)),
+  ]);
+}
+
+test("LOB: a column aliased __proto__ loads as an own column, not as the row's prototype", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  fakeCAS.queueResponse(lobSelectReplyWithBlobAlias("__proto__"));
+  fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readBlobReply, "hex"));
+  fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readClobReply, "hex"));
+
+  const rows = await adapter.query(SELECT_LOBS);
+
+  assert.deepEqual(Object.keys(rows[0]!), ["id", "__proto__", "c"]);
+  assert.deepEqual(
+    Object.getOwnPropertyDescriptor(rows[0], "__proto__")?.value,
+    Buffer.from([1, 2, 3]),
+  );
+  assert.equal(Object.getPrototypeOf(rows[0]), Object.prototype);
+  assert.ok(!inspect(rows, { depth: null, showHidden: true }).includes("file:"));
+});
+
+test("LOB: a column aliased __proto__ counts against maxLobBytes", async () => {
+  const { adapter, fakeCAS } = lobAdapter({ maxLobBytes: 2 });
+  fakeCAS.queueResponse(lobSelectReplyWithBlobAlias("__proto__"));
+
+  await assertQueryFails(adapter, /column "__proto__" takes this query's LOB content to 3 bytes/, SELECT_LOBS);
+
+  assert.deepEqual(lobReads(fakeCAS), []);
+});
+
+for (const [name, reply] of [
+  ["two bytes", Buffer.from("0000", "hex")],
+  ["a server error", buildErrorResponse(-495, "end of transaction refused")],
+] as const) {
+  test(`LOB: END_TRAN answered with ${name} keeps the rows and drops the session`, async () => {
+    const { adapter, fakeCAS } = lobAdapter();
+    fakeCAS.queueResponse(lobSelectReply());
+    fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readBlobReply, "hex"));
+    fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readClobReply, "hex"));
+    fakeCAS.queueResponse(reply);
+
+    const rows = await adapter.query(SELECT_LOBS);
+
+    assert.equal(rows[0]!.c, "hi");
+    assertSessionDiscarded(fakeCAS);
+    assert.deepEqual(functionsSent(fakeCAS), [
+      FC_PREPARE_AND_EXECUTE,
+      FC_LOB_READ,
+      FC_LOB_READ,
+      FC_END_TRAN,
+    ]);
+  });
+}
+
+for (const [name, reply] of [
+  ["an empty locator", () => lobSelectReplyWithLocator(0n, 0, Buffer.alloc(0))],
+  ["a locator without its NUL", () => lobSelectReplyWithLocator(3n, 4, Buffer.from("file"))],
+] as const) {
+  test(`LOB: a cell with ${name} drops the session before any read`, async () => {
+    const { adapter, fakeCAS } = lobAdapter();
+    fakeCAS.queueResponse(reply());
+
+    await assertQueryFails(adapter, /has no NUL/, SELECT_LOBS);
+
+    assertSessionDiscarded(fakeCAS);
+    assert.deepEqual(lobReads(fakeCAS), []);
+  });
+}
+
+for (const maxLobBytes of [Number.NaN, 0, -1, 1.5]) {
+  test(`LOB: the public adapter rejects maxLobBytes ${maxLobBytes}, which skips normalizeConfig`, () => {
+    assert.throws(() => new NativeCubridAdapter({ ...DEFAULT_CONFIG, maxLobBytes }), RangeError);
+  });
+}
+
+test("LOB: queryResult() returns content too, never the locator", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  fakeCAS.queueResponse(lobSelectReply());
+  fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readBlobReply, "hex"));
+  fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readClobReply, "hex"));
+
+  const { rows, columns } = await adapter.queryResult(SELECT_LOBS);
+
+  assert.deepEqual(rows[0], { id: 1, b: Buffer.from([1, 2, 3]), c: "hi" });
+  assert.deepEqual(columns.map((column) => column.type), ["INT", "BLOB", "CLOB"]);
+  assert.ok(!inspect(rows, { depth: null }).includes("file:"));
 });
