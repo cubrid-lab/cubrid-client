@@ -2224,6 +2224,26 @@ test("beginTransaction() cannot hide -72 before it is acknowledged", async () =>
   await adapter.query("INSERT INTO t VALUES ('d')");
 });
 
+test("beginTransaction() cannot hide -72 that answered the first statement's backslash probe", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (adapter as any).noBackslashEscapes = null;
+  await adapter.beginTransaction();
+  fakeCAS.queueResponse(buildServerErrorResponse(-72));
+  await assert.rejects(adapter.query("INSERT INTO t VALUES (?)", ["a\\b"]), DeadlockError);
+
+  await assert.rejects(adapter.beginTransaction(), (error: unknown) => {
+    assert.ok(error instanceof TransactionError);
+    assert.equal(error.code, -72);
+    return true;
+  });
+  await assertLaterStatementIsNotSent(adapter, fakeCAS);
+
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+  await adapter.rollback();
+  await adapter.beginTransaction();
+});
+
 test("-72 on a FETCH ends the transaction like -72 on the statement", async () => {
   const { adapter, fakeCAS } = await beginWithOneInsert();
   fakeCAS.queueResponse(buildPartialSelectResponse(2));

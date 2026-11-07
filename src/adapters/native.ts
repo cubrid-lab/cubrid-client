@@ -142,8 +142,9 @@ export class NativeCubridAdapter implements DriverAdapter {
       const cas = this.getOrCreateCAS();
 
       // Starting over here would hide that acknowledged statements are gone.
-      // rollback() acknowledges the loss and clears this state.
-      if (this.transactionGeneration !== null) {
+      // rollback() acknowledges the loss and clears this state. An abort has no
+      // generation yet when it answered the backslash probe of the first statement.
+      if (this.transactionGeneration !== null || this.transactionAbort !== null) {
         this.assertTransactionSession(cas);
       }
 
