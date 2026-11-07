@@ -10,7 +10,7 @@
  */
 import test, { describe, after } from "node:test";
 import assert from "node:assert/strict";
-import { createServer, connect as netConnect, type Server } from "node:net";
+import { createServer, connect as netConnect, type Server, type Socket } from "node:net";
 
 import { createClient } from "../src/client/create-client.js";
 import { NativeCubridAdapter } from "../src/adapters/native.js";
@@ -1586,6 +1586,15 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         if (response) {
           sent.push(payload[0]!);
         }
+        return response && tamper(payload[0]!, response);
+      };
+
+      const releaseOnSession = cas.releaseOnSession.bind(cas);
+      cas.releaseOnSession = async (generation, header, payload) => {
+        const response = await releaseOnSession(generation, header, payload);
+        if (response) {
+          sent.push(payload[0]!);
+        }
         return response;
       };
 
@@ -1667,8 +1676,8 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         await assert.rejects(trace.adapter.query(UNSUPPORTED_IN_FETCH), QueryError);
 
         assert.ok(count(trace, CASFunctionCode.FETCH) > 0);
-        // The broker has marked the CAS released by now, so anything that goes
-        // through sendAndRecv() would reconnect and close nothing.
+        // The transaction has ended by now. A new session would accept the
+        // release and close nothing, and fetchCode() below shows this one did.
         assert.equal(count(trace, CASFunctionCode.CLOSE_REQ_HANDLE), 1);
         assert.equal(trace.cas.connectionGeneration, generation);
         assert.equal(await fetchCode(trace), CAS_ER_SRV_HANDLE);
@@ -1740,12 +1749,12 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     test("attempts no release on a socket lost during FETCH, then recovers", async () => {
       const trace = await open((_code, response) => response);
       const internals = trace.cas as unknown as { socket: { destroy(): void } };
-      const sendAndRecv = trace.cas.sendAndRecv;
-      trace.cas.sendAndRecv = async (header, payload) => {
+      const sendAndRecvOnSession = trace.cas.sendAndRecvOnSession;
+      trace.cas.sendAndRecvOnSession = async (generation, header, payload) => {
         if (payload[0] === CASFunctionCode.FETCH) {
           internals.socket.destroy();
         }
-        return sendAndRecv(header, payload);
+        return sendAndRecvOnSession(generation, header, payload);
       };
 
       try {
@@ -1815,10 +1824,10 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
           const adapter = new NativeCubridAdapter(config);
           await adapter.connect();
           const cas = (adapter as unknown as { cas: CASConnection }).cas;
-          const sendAndRecv = cas.sendAndRecv.bind(cas);
-          cas.sendAndRecv = (header, payload) => {
+          const sendAndRecvOnSession = cas.sendAndRecvOnSession.bind(cas);
+          cas.sendAndRecvOnSession = (generation, header, payload) => {
             fetches += payload[0] === CASFunctionCode.FETCH ? 1 : 0;
-            return sendAndRecv(header, payload);
+            return sendAndRecvOnSession(generation, header, payload);
           };
           return adapter;
         },
@@ -1998,7 +2007,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         await cas.connect();
         const generation = cas.connectionGeneration;
 
-        // sendAndRecvOnSession() because sendAndRecv() would reconnect once
+        // sendAndRecvOnSession() because sendAndRecv() would send CHECK_CAS once
         // CAS_INFO reports the transaction ended, which is the moment of interest.
         const exchange = async (request: { header: Buffer; payload: Buffer }): Promise<Buffer> => {
           const response = await cas.sendAndRecvOnSession(
@@ -2143,6 +2152,199 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
   // Structured server errors: each of these failures really happens on the server
   // -------------------------------------------------------------------------
 
+  describe("autocommit statements on one session", () => {
+    const TABLE = "cc_keep_session";
+
+    function casOf(adapter: NativeCubridAdapter): CASConnection {
+      return (adapter as unknown as { cas: CASConnection }).cas;
+    }
+
+    test("consecutive autocommit statements share one session and its state", async () => {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+      await adapter.connect();
+      const cas = casOf(adapter);
+      const generation = cas.connectionGeneration;
+      const sessionId = cas.sessionId;
+
+      try {
+        await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await adapter.query("SET @cc_keep_session = 171");
+        await adapter.query(`CREATE TABLE ${TABLE} (id INT PRIMARY KEY)`);
+        await adapter.query(`INSERT INTO ${TABLE} VALUES (1)`);
+        await assert.rejects(adapter.query(`INSERT INTO ${TABLE} VALUES (1)`), ConstraintError);
+        await adapter.query(`UPDATE ${TABLE} SET id = 2`);
+        await adapter.ping();
+        assert.deepEqual(await adapter.query(`SELECT id FROM ${TABLE}`), [{ id: 2 }]);
+        await adapter.beginTransaction();
+        await adapter.query(`DELETE FROM ${TABLE}`);
+        await adapter.commit();
+        assert.deepEqual(await adapter.query(`SELECT id FROM ${TABLE}`), []);
+
+        // A variable is lost with its session, so this shows the server agrees.
+        assert.deepEqual(await adapter.query("SELECT CAST(@cc_keep_session AS INT) AS kept"), [
+          { kept: 171 },
+        ]);
+        assert.equal(cas.connectionGeneration, generation);
+        assert.equal(cas.sessionId, sessionId);
+      } finally {
+        await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`).catch(() => {});
+        await adapter.close();
+      }
+    });
+
+    test("a large autocommit SELECT and the statements after it share one session", async () => {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+      await adapter.connect();
+      const cas = casOf(adapter);
+      const generation = cas.connectionGeneration;
+
+      try {
+        await adapter.query("SELECT 1 FROM db_root");
+        const rows = await adapter.query("SELECT a.class_name FROM db_class a, db_class b LIMIT 500");
+        assert.equal(rows.length, 500);
+        await adapter.query("SELECT 1 FROM db_root");
+        await adapter.query("SELECT 1 FROM db_root");
+        assert.equal(cas.connectionGeneration, generation);
+      } finally {
+        await adapter.close();
+      }
+    });
+
+    test("a lock timeout set in autocommit applies to a later transaction", async () => {
+      const holder = new NativeCubridAdapter(TEST_CONFIG);
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+      await holder.connect();
+      await adapter.connect();
+      let release: NodeJS.Timeout | undefined;
+
+      try {
+        await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await adapter.query(`CREATE TABLE ${TABLE} (id INT PRIMARY KEY, n INT)`);
+        await adapter.query(`INSERT INTO ${TABLE} VALUES (1, 0)`);
+
+        await holder.beginTransaction();
+        await holder.query(`UPDATE ${TABLE} SET n = 1 WHERE id = 1`);
+
+        await adapter.query("SET TRANSACTION LOCK TIMEOUT 1");
+        await adapter.beginTransaction();
+
+        // The lock is freed in time for a statement that ignored the setting to
+        // finish, so the test ends either way and that statement fails it.
+        release = setTimeout(() => void holder.rollback(), 6000);
+        await assert.rejects(
+          adapter.query(`UPDATE ${TABLE} SET n = 2 WHERE id = 1`),
+          LockTimeoutError,
+        );
+      } finally {
+        clearTimeout(release);
+        await adapter.rollback().catch(() => {});
+        await holder.rollback().catch(() => {});
+        await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`).catch(() => {});
+        await adapter.close();
+        await holder.close();
+      }
+    });
+
+    test("execute() on a kept session never reports a value left by an earlier statement", async () => {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+      await adapter.connect();
+      const cas = casOf(adapter);
+      const keyed = `${TABLE}_keyed`;
+      const plain = `${TABLE}_plain`;
+      const insertPlain = `INSERT INTO ${plain} VALUES (1)`;
+      const insertKeyed = `INSERT INTO ${keyed} (n) VALUES (1)`;
+
+      try {
+        await adapter.query(`DROP TABLE IF EXISTS ${keyed}`);
+        await adapter.query(`DROP TABLE IF EXISTS ${plain}`);
+        await adapter.query(`CREATE TABLE ${keyed} (id INT AUTO_INCREMENT(100, 1) PRIMARY KEY, n INT)`);
+        await adapter.query(`CREATE TABLE ${plain} (n INT)`);
+        const generation = cas.connectionGeneration;
+
+        assert.deepEqual(await adapter.execute(insertKeyed), { affectedRows: 1, lastInsertId: 100 });
+        assert.deepEqual(await adapter.execute(insertPlain), { affectedRows: 1 });
+
+        await adapter.query(insertKeyed);
+        assert.deepEqual(await adapter.execute(insertPlain), { affectedRows: 1 });
+
+        await adapter.beginTransaction();
+        assert.deepEqual(await adapter.execute(insertKeyed), { affectedRows: 1, lastInsertId: 102 });
+        await adapter.rollback();
+        assert.deepEqual(await adapter.execute(insertPlain), { affectedRows: 1 });
+
+        await adapter.beginTransaction();
+        assert.deepEqual(await adapter.execute(insertKeyed), { affectedRows: 1, lastInsertId: 103 });
+        await adapter.commit();
+        await adapter.beginTransaction();
+        assert.deepEqual(await adapter.execute(insertPlain), { affectedRows: 1 });
+        await adapter.commit();
+
+        await assert.rejects(adapter.execute(`INSERT INTO ${keyed} (id, n) VALUES (103, 1)`), ConstraintError);
+        assert.deepEqual(await adapter.execute(insertPlain), { affectedRows: 1 });
+
+        await adapter.query(`REPLACE INTO ${keyed} (n) VALUES (1)`);
+        assert.deepEqual(await adapter.execute(insertPlain), { affectedRows: 1 });
+        assert.deepEqual(await adapter.execute(insertKeyed), { affectedRows: 1, lastInsertId: 105 });
+
+        assert.equal(cas.connectionGeneration, generation);
+      } finally {
+        await adapter.rollback().catch(() => {});
+        await adapter.query(`DROP TABLE IF EXISTS ${keyed}`).catch(() => {});
+        await adapter.query(`DROP TABLE IF EXISTS ${plain}`).catch(() => {});
+        await adapter.close();
+      }
+    });
+
+    test("a session cut after an autocommit statement is replaced without running SQL twice", async () => {
+      // A relay stands in for a CAS closing its socket, which a test cannot ask
+      // of a shared broker.
+      const sockets = new Set<Socket>();
+      const relay = createServer((client) => {
+        const upstream = netConnect(TEST_CONFIG.port, TEST_CONFIG.host);
+        for (const socket of [client, upstream]) {
+          sockets.add(socket);
+          socket.on("close", () => sockets.delete(socket));
+        }
+        client.on("error", () => upstream.destroy());
+        upstream.on("error", () => client.destroy());
+        client.pipe(upstream).pipe(client);
+      });
+      await new Promise<void>((resolve) => relay.listen(0, "127.0.0.1", resolve));
+      const { port } = relay.address() as { port: number };
+      const adapter = new NativeCubridAdapter({ ...TEST_CONFIG, port });
+      const observer = new NativeCubridAdapter(TEST_CONFIG);
+
+      try {
+        await adapter.connect();
+        await observer.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await observer.query(`CREATE TABLE ${TABLE} (id INT AUTO_INCREMENT PRIMARY KEY, n INT)`);
+
+        const cas = casOf(adapter);
+        const generation = cas.connectionGeneration;
+        await adapter.query(`INSERT INTO ${TABLE} (n) VALUES (1)`);
+        await adapter.query(`INSERT INTO ${TABLE} (n) VALUES (2)`);
+        assert.equal(cas.connectionGeneration, generation);
+
+        for (const socket of sockets) {
+          socket.destroy();
+        }
+        await adapter.query(`INSERT INTO ${TABLE} (n) VALUES (3)`);
+
+        assert.equal(cas.connectionGeneration, generation + 1);
+        assert.deepEqual(await observer.query(`SELECT n FROM ${TABLE} ORDER BY n`), [
+          { n: 1 },
+          { n: 2 },
+          { n: 3 },
+        ]);
+      } finally {
+        await observer.query(`DROP TABLE IF EXISTS ${TABLE}`).catch(() => {});
+        await observer.close();
+        await adapter.close();
+        relay.close();
+      }
+    });
+  });
+
   describe("server error details", () => {
     const PARENT = "cc_err_parent";
     const CHILD = "cc_err_child";
@@ -2178,8 +2380,6 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
 
     /**
      * Makes each adapter wait for the row the other has already locked.
-     * SET TRANSACTION LOCK TIMEOUT runs inside the transaction because, sent in
-     * autocommit before beginTransaction(), a later statement still waited forever.
      */
     async function deadlock(
       first: NativeCubridAdapter,

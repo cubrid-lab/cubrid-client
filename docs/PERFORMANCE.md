@@ -49,7 +49,7 @@ In this benchmark shape, CUBRID is faster than MySQL in every tested TypeScript 
 
 ## Optimization Tips
 
-- Reuse a single client/pool per process instead of reconnecting per request.
+- Reuse a single client/pool per process instead of reconnecting per request. An autocommit statement stays on the client's session; the client adds one CHECK_CAS round trip before it instead of opening a new session (see [Session Reuse](CONNECTION.md#session-reuse)).
 - Batch writes when possible to reduce CAS round-trips.
 - Use prepared statements for repeated query shapes.
 - Keep payload size lean by selecting only required columns.

@@ -169,9 +169,9 @@ export class CubridClient implements Queryable, ResultQueryable, Executable {
   }
 
   /**
-   * Return the CUBRID server version, for example `11.4.6.1963`. It is the same
-   * single GET_DB_VERSION request as `ping()` and shares its transaction and
-   * reconnect behavior; only the failure message differs.
+   * Return the CUBRID server version, for example `11.4.6.1963`. It sends the
+   * same requests as `ping()` and shares its transaction and reconnect behavior;
+   * only the failure message differs.
    */
   async getServerVersion(): Promise<string> {
     try {
