@@ -47,6 +47,37 @@ observable outcome (for example, an error instead of a fabricated SQL
 `null`). Document the bug, tests, and migration impact, and classify
 the SemVer impact explicitly instead of assuming every fix is harmless.
 
+### Transaction callback guards
+
+The `tx` passed to a `transaction()` callback now allows exactly one terminal
+outcome ([#109](https://github.com/cubrid-lab/cubrid-client/issues/109)). No API
+was removed: `TransactionClient` is unchanged, `tx.commit()` and `tx.rollback()`
+still work, and `CubridTransaction` keeps its constructor. `TransactionError`
+gains the optional `rollbackError` and `closeError` properties. This is a
+correctness repair, because the affected calls could silently break atomicity:
+
+| Inside a callback | Before | Now | Migration |
+| --- | --- | --- | --- |
+| `tx.query()`, `tx.queryResult()` or `tx.execute()` after `tx.commit()` or `tx.rollback()` | Ran in **autocommit** and persisted on its own | Rejects with `TransactionError` | Run it before completing, or on `db.query()` |
+| Second `tx.commit()` or `tx.rollback()` | Sent another END_TRAN to the server | Rejects with `TransactionError` | Complete once; remove the duplicate call |
+| `tx.rollback()`, then resolve | Client sent a commit afterwards | No commit; resolves with the value | None |
+| Swallowed `tx.commit()` failure, then resolve | Client committed again | Rolls back once and rejects | Handle the failure or let it propagate |
+| Swallowed `tx.rollback()` failure, then resolve | Client **committed** | Rejects without a commit | Handle the failure or let it propagate |
+| `tx` used after `transaction()` settled | The built-in adapter opened a new session and ran the statement in **autocommit** | Rejects with `TransactionError` | Await all work inside the callback |
+| A query not awaited by the callback fails while the commit waits for it | Client committed the rest, with an unhandled rejection | Rolls back and rejects `transaction()` | Await every statement; catch the error if the transaction may continue |
+| Close fails after another failure | Close error replaced the original | `cause` is the original, `closeError` is set | Read `cause` |
+| `beginTransaction()` fails | Rollback attempted anyway | No rollback is sent | None |
+| `db.transaction()` after `db.close()` | Opened a new connection and ran the callback | Rejects with `TransactionError` and opens no connection | Start the transaction before closing, or create a new client |
+
+Code that completes a transaction once and then returns or throws keeps working.
+A failure the callback awaited and handled still commits. A query that was not
+awaited and rejected before the callback's last `await` resumed cannot be
+detected and does not stop the commit.
+A `CubridTransaction` you construct yourself keeps forwarding every call: only
+the instance `transaction()` creates is guarded. Removing `commit()` and
+`rollback()` from the callback's `tx`, if ever wanted, would be a MAJOR change
+under the policy above.
+
 ## Node.js, TypeScript and distribution
 
 - **Current runtime declaration:** `engines.node >=18` in

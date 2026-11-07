@@ -11,7 +11,11 @@ import { ConnectionError } from "../src/errors/connection-error.js";
 import { DeadlockError, QueryError } from "../src/errors/query-error.js";
 import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { TransactionError } from "../src/errors/transaction-error.js";
-import type { ClientConfig } from "../src/types/client.js";
+import type {
+  ClientConfig,
+  ExecutableTransactionClient,
+  ResultTransactionClient,
+} from "../src/types/client.js";
 import { CAPTURED_FRAMES } from "./fixtures/collection-frames.js";
 import { LOB_FRAMES, LOB_READ_REPLY_LIMIT } from "./fixtures/lob-frames.js";
 import { DML_FRAMES, LAST_INSERT_ID_FRAMES } from "./fixtures/dml-frames.js";
@@ -3084,4 +3088,159 @@ test("LOB: queryResult() returns content too, never the locator", async () => {
   assert.deepEqual(rows[0], { id: 1, b: Buffer.from([1, 2, 3]), c: "hi" });
   assert.deepEqual(columns.map((column) => column.type), ["INT", "BLOB", "CLOB"]);
   assert.ok(!inspect(rows, { depth: null }).includes("file:"));
+});
+
+// ---------------------------------------------------------------------------
+// transaction() over a transaction the server rolled back on its own
+// ---------------------------------------------------------------------------
+
+/** The adapter is inside no transaction yet; transaction() begins it. */
+function transactionOverFakeCAS() {
+  const created = createAdapterWithFakeCAS();
+  const client = createClient({
+    host: DEFAULT_CONFIG.host,
+    database: DEFAULT_CONFIG.database,
+    user: DEFAULT_CONFIG.user,
+    connectionFactory: () => created.adapter,
+  });
+  return { ...created, client };
+}
+
+function rejectsWithAbort(error: unknown): boolean {
+  assert.ok(error instanceof TransactionError);
+  assert.equal(error.code, -72);
+  assert.equal(error.origin, "server");
+  assert.equal(error.kind, "deadlock");
+  return true;
+}
+
+function statementsSent(fakeCAS: FakeCASConnection): number {
+  return fakeCAS.sentPayloads.filter(
+    (payload) => payload[0] === CASFunctionCode.PREPARE_AND_EXECUTE,
+  ).length;
+}
+
+const TRANSACTION_STATEMENTS: Array<
+  [string, (tx: ResultTransactionClient & ExecutableTransactionClient) => Promise<unknown>]
+> = [
+  ["query", (tx) => tx.query("INSERT INTO t VALUES ('a')")],
+  ["queryResult", (tx) => tx.queryResult("INSERT INTO t VALUES ('a')")],
+  ["execute", (tx) => tx.execute("INSERT INTO t VALUES ('a')")],
+];
+
+for (const [statement, run] of TRANSACTION_STATEMENTS) {
+  test(`transaction() rolls back once when tx.${statement} gets -72 and the callback rethrows`, async () => {
+    const { client, fakeCAS } = transactionOverFakeCAS();
+    fakeCAS.queueResponse(buildServerErrorResponse(-72));
+    fakeCAS.queueResponse(buildSimpleResponse(0));
+
+    await assert.rejects(
+      client.transaction((tx) => run(tx)),
+      rejectsWithAbort,
+    );
+
+    assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+    assert.equal(fakeCAS.connectCalls, 0);
+  });
+
+  test(`transaction() rolls back once when the callback swallows -72 from tx.${statement}`, async () => {
+    const { client, fakeCAS } = transactionOverFakeCAS();
+    fakeCAS.queueResponse(buildServerErrorResponse(-72));
+    fakeCAS.queueResponse(buildSimpleResponse(0));
+
+    await assert.rejects(
+      client.transaction(async (tx) => {
+        await assert.rejects(run(tx), TransactionError);
+        return "must not be returned";
+      }),
+      rejectsWithAbort,
+    );
+
+    assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+  });
+}
+
+test("transaction() sends nothing behind -72 in a Promise.all, then rolls back once", async () => {
+  const { client, fakeCAS } = transactionOverFakeCAS();
+  fakeCAS.queueResponse(buildServerErrorResponse(-72));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+
+  await assert.rejects(
+    client.transaction((tx) =>
+      Promise.all([
+        tx.query("INSERT INTO t VALUES ('a')"),
+        tx.execute("INSERT INTO t VALUES ('b')"),
+        tx.queryResult("SELECT 1"),
+      ]),
+    ),
+    rejectsWithAbort,
+  );
+
+  assert.equal(statementsSent(fakeCAS), 1);
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+});
+
+test("a manual tx.rollback() after -72 is the only outcome of transaction()", async () => {
+  const { client, fakeCAS } = transactionOverFakeCAS();
+  fakeCAS.queueResponse(buildServerErrorResponse(-72));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+
+  const result = await client.transaction(async (tx) => {
+    await assert.rejects(tx.query("INSERT INTO t VALUES ('a')"), TransactionError);
+    await tx.rollback();
+    await assert.rejects(tx.commit(), TransactionError);
+    return "retry later";
+  });
+
+  assert.equal(result, "retry later");
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+});
+
+test("a manual tx.commit() after -72 rejects and sends no COMMIT", async () => {
+  const { client, fakeCAS } = transactionOverFakeCAS();
+  fakeCAS.queueResponse(buildServerErrorResponse(-72));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+
+  await assert.rejects(
+    client.transaction(async (tx) => {
+      await assert.rejects(tx.query("INSERT INTO t VALUES ('a')"), TransactionError);
+      await tx.commit();
+    }),
+    rejectsWithAbort,
+  );
+
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+});
+
+test("transaction() keeps -72 from the COMMIT reply and still ends with one rollback", async () => {
+  const { client, fakeCAS } = transactionOverFakeCAS();
+  fakeCAS.queueResponse(buildServerErrorResponse(-72));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+
+  await assert.rejects(client.transaction(async () => "lost"), rejectsWithAbort);
+
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.COMMIT, EndTranType.ROLLBACK]);
+});
+
+test("transaction() commits nothing after the session changed under the callback", async () => {
+  const { client, fakeCAS } = transactionOverFakeCAS();
+  fakeCAS.queueResponse(buildDMLResponse(20, 1));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+
+  await assert.rejects(
+    client.transaction(async (tx) => {
+      await tx.query("INSERT INTO t VALUES ('a')");
+      fakeCAS.connectionGeneration += 1;
+      await assert.rejects(tx.execute("INSERT INTO t VALUES ('b')"), TransactionError);
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof TransactionError);
+      assert.equal(error.kind, "connection-lost");
+      return true;
+    },
+  );
+
+  assert.equal(statementsSent(fakeCAS), 1);
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
 });

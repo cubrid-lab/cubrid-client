@@ -9,7 +9,7 @@
 2. `client/client.ts`
    Owns shared connection lifecycle and public query API.
 3. `client/transaction.ts`
-   Owns transaction-scoped query and commit/rollback flow.
+   Owns transaction-scoped queries and the single commit or rollback of a callback transaction.
 4. `adapters/native.ts`
    Default `NativeCubridAdapter` — implements CAS binary protocol directly over TCP.
 5. `internals/*`

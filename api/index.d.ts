@@ -316,6 +316,14 @@ interface TransactionError extends Readonly<CubridErrorDetails> {
 }
 declare class TransactionError extends Error {
     name: string;
+    /**
+     * Set by `CubridClient.transaction()` when rolling back also failed. `cause`
+     * still holds the failure that started it. The connection is closed
+     * afterwards, so the server discards the uncommitted work either way.
+     */
+    rollbackError?: Error;
+    /** Set by `CubridClient.transaction()` when closing its connection also failed. */
+    closeError?: Error;
     constructor(message: string, options?: CubridErrorOptions);
 }
 

@@ -26,6 +26,7 @@ import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { TransactionError } from "../src/errors/transaction-error.js";
 import { CASFunctionCode } from "../src/protocol/constants.js";
 import { CASConnection } from "../src/protocol/connection.js";
+import type { TransactionClient } from "../src/types/client.js";
 import {
   parseFetch,
   parsePrepareAndExecute,
@@ -579,6 +580,338 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     } finally {
       await client.close();
     }
+  });
+
+  // -------------------------------------------------------------------------
+  // Transaction callback lifecycle: one terminal outcome, nothing after it
+  // -------------------------------------------------------------------------
+
+  describe("transaction callback lifecycle", () => {
+    const table = "tx_lifecycle_test_native";
+
+    /**
+     * A real adapter that counts END_TRAN requests. Failure switches stand in
+     * for faults a live broker will not produce on demand; the injected
+     * rollback and commit never reach the server, so what the assertions read
+     * back is what the server really kept.
+     */
+    class ObservedAdapter extends NativeCubridAdapter {
+      commits = 0;
+      rollbacks = 0;
+      failCommit = false;
+      failRollback = false;
+      failClose = false;
+
+      override async commit(): Promise<void> {
+        this.commits += 1;
+        if (this.failCommit) {
+          throw new Error("injected commit failure");
+        }
+        await super.commit();
+      }
+
+      override async rollback(): Promise<void> {
+        this.rollbacks += 1;
+        if (this.failRollback) {
+          throw new Error("injected rollback failure");
+        }
+        await super.rollback();
+      }
+
+      override async close(): Promise<void> {
+        await super.close();
+        if (this.failClose) {
+          throw new Error("injected close failure");
+        }
+      }
+    }
+
+    async function withObservedClient(
+      run: (
+        client: ReturnType<typeof createClient>,
+        observed: ObservedAdapter,
+        insertedValues: () => Promise<string[]>,
+      ) => Promise<void>,
+      configure: (adapter: ObservedAdapter) => void = () => undefined,
+    ): Promise<void> {
+      const setup = createClient(TEST_CONFIG);
+      const observed = new ObservedAdapter(TEST_CONFIG);
+      configure(observed);
+      const client = createClient({ ...TEST_CONFIG, connectionFactory: () => observed });
+
+      const insertedValues = async () => {
+        const rows = await setup.query<{ val: string }>(`SELECT val FROM ${table} ORDER BY id`);
+        return rows.map((row) => row.val);
+      };
+
+      try {
+        await setup.query(`DROP TABLE IF EXISTS ${table}`);
+        await setup.query(
+          `CREATE TABLE ${table} (id INT AUTO_INCREMENT PRIMARY KEY, val VARCHAR(50))`,
+        );
+        await run(client, observed, insertedValues);
+      } finally {
+        await setup.query(`DROP TABLE IF EXISTS ${table}`);
+        await setup.close();
+      }
+    }
+
+    const insert = (value: string) => `INSERT INTO ${table} (val) VALUES ('${value}')`;
+
+    test("manual commit is the only commit and later statements cannot autocommit", async () => {
+      await withObservedClient(async (client, observed, insertedValues) => {
+        const result = await client.transaction(async (tx) => {
+          await tx.query(insert("before commit"));
+          await tx.commit();
+          await assert.rejects(tx.query(insert("after commit")), TransactionError);
+          await assert.rejects(tx.commit(), TransactionError);
+          await assert.rejects(tx.rollback(), TransactionError);
+          return "ok";
+        });
+
+        assert.equal(result, "ok");
+        assert.equal(observed.commits, 1);
+        assert.equal(observed.rollbacks, 0);
+        assert.deepEqual(await insertedValues(), ["before commit"]);
+      });
+    });
+
+    test("manual rollback stops the automatic commit", async () => {
+      await withObservedClient(async (client, observed, insertedValues) => {
+        const result = await client.transaction(async (tx) => {
+          await tx.query(insert("rolled back"));
+          await tx.rollback();
+          await assert.rejects(tx.query(insert("after rollback")), TransactionError);
+          return "declined";
+        });
+
+        assert.equal(result, "declined");
+        assert.equal(observed.commits, 0);
+        assert.equal(observed.rollbacks, 1);
+        assert.deepEqual(await insertedValues(), []);
+      });
+    });
+
+    test("an error after manual commit rejects and the commit stands", async () => {
+      await withObservedClient(async (client, observed, insertedValues) => {
+        await assert.rejects(
+          client.transaction(async (tx) => {
+            await tx.query(insert("kept"));
+            await tx.commit();
+            throw new Error("after commit");
+          }),
+          (error: Error) => error instanceof TransactionError && error.cause instanceof Error,
+        );
+
+        assert.equal(observed.rollbacks, 0);
+        assert.deepEqual(await insertedValues(), ["kept"]);
+      });
+    });
+
+    test("a tx kept after transaction() returned cannot write", async () => {
+      await withObservedClient(async (client, _observed, insertedValues) => {
+        let leaked: TransactionClient | undefined;
+
+        await client.transaction(async (tx) => {
+          leaked = tx;
+          await tx.query(insert("committed"));
+        });
+
+        assert.ok(leaked);
+        await assert.rejects(leaked.query(insert("leaked")), TransactionError);
+        assert.deepEqual(await insertedValues(), ["committed"]);
+      });
+    });
+
+    test("a bound query the callback did not await still lands inside the transaction", async () => {
+      await withObservedClient(async (client, observed, insertedValues) => {
+        // The first bound query on a connection waits for the backslash-mode
+        // probe, so its statement would otherwise follow the automatic commit.
+        await client.transaction(async (tx) => {
+          void tx.query(`INSERT INTO ${table} (val) VALUES (?)`, ["not awaited"]);
+        });
+
+        assert.equal(observed.commits, 1);
+        assert.deepEqual(await insertedValues(), ["not awaited"]);
+      });
+    });
+
+    test("a query that fails unawaited rolls back the rest of the transaction", async () => {
+      await withObservedClient(async (client, observed, insertedValues) => {
+        await assert.rejects(
+          client.transaction(async (tx) => {
+            await tx.query(insert("must not persist"));
+            void tx.query("INSERT INTO tx_lifecycle_no_such_table (val) VALUES ('x')");
+          }),
+          TransactionError,
+        );
+
+        assert.equal(observed.commits, 0);
+        assert.equal(observed.rollbacks, 1);
+        assert.deepEqual(await insertedValues(), []);
+      });
+    });
+
+    test("Promise.all of bound statements commits all of them through the queue", async () => {
+      await withObservedClient(async (client, observed, insertedValues) => {
+        const values = ["one", "two", "three", "four", "five"];
+
+        await client.transaction((tx) =>
+          Promise.all(
+            values.map((value) => tx.query(`INSERT INTO ${table} (val) VALUES (?)`, [value])),
+          ),
+        );
+
+        assert.equal(observed.commits, 1);
+        assert.equal(observed.rollbacks, 0);
+        assert.deepEqual(await insertedValues(), values);
+      });
+    });
+
+    test("Promise.all of query, queryResult and execute commits all of them once", async () => {
+      await withObservedClient(async (client, observed, insertedValues) => {
+        await client.transaction((tx) =>
+          Promise.all([
+            tx.query(insert("one")),
+            tx.queryResult(insert("two")),
+            tx.execute(insert("three")),
+          ]),
+        );
+
+        assert.equal(observed.commits, 1);
+        assert.equal(observed.rollbacks, 0);
+        assert.deepEqual(await insertedValues(), ["one", "two", "three"]);
+      });
+    });
+
+    test("an execute() the callback did not await lands inside the transaction", async () => {
+      await withObservedClient(async (client, observed, insertedValues) => {
+        await client.transaction(async (tx) => {
+          void tx.execute(`INSERT INTO ${table} (val) VALUES (?)`, ["not awaited"]);
+        });
+
+        assert.equal(observed.commits, 1);
+        assert.deepEqual(await insertedValues(), ["not awaited"]);
+      });
+    });
+
+    test("an execute() that fails unawaited rolls back the rest of the transaction", async () => {
+      await withObservedClient(async (client, observed, insertedValues) => {
+        await assert.rejects(
+          client.transaction(async (tx) => {
+            await tx.query(insert("kept out"));
+            void tx.execute("INSERT INTO tx_lifecycle_no_such_table (val) VALUES ('x')");
+          }),
+          TransactionError,
+        );
+
+        assert.equal(observed.commits, 0);
+        assert.equal(observed.rollbacks, 1);
+        assert.deepEqual(await insertedValues(), []);
+      });
+    });
+
+    test("execute() and queryResult() after a manual commit reject and write nothing", async () => {
+      await withObservedClient(async (client, observed, insertedValues) => {
+        await client.transaction(async (tx) => {
+          await tx.execute(insert("committed"));
+          await tx.commit();
+          await assert.rejects(tx.execute(insert("late execute")), TransactionError);
+          await assert.rejects(tx.queryResult(insert("late queryResult")), TransactionError);
+        });
+
+        assert.equal(observed.commits, 1);
+        assert.deepEqual(await insertedValues(), ["committed"]);
+      });
+    });
+
+    test("Promise.all with a failing statement rolls back the statements queued with it", async () => {
+      await withObservedClient(async (client, observed, insertedValues) => {
+        await assert.rejects(
+          client.transaction((tx) =>
+            Promise.all([
+              tx.query(insert("before the failure")),
+              tx.query("INSERT INTO tx_lifecycle_no_such_table (val) VALUES ('x')"),
+              tx.query(insert("after the failure")),
+            ]),
+          ),
+          TransactionError,
+        );
+
+        assert.equal(observed.commits, 0);
+        assert.equal(observed.rollbacks, 1);
+        assert.deepEqual(await insertedValues(), []);
+      });
+    });
+
+    test("a failed commit rolls back on the server and keeps its cause", async () => {
+      await withObservedClient(
+        async (client, observed, insertedValues) => {
+          await assert.rejects(
+            client.transaction(async (tx) => {
+              await tx.query(insert("not committed"));
+            }),
+            (error: Error) =>
+              error instanceof TransactionError &&
+              (error.cause as Error).message === "injected commit failure",
+          );
+
+          assert.equal(observed.commits, 1);
+          assert.equal(observed.rollbacks, 1);
+          assert.deepEqual(await insertedValues(), []);
+        },
+        (adapter) => {
+          adapter.failCommit = true;
+        },
+      );
+    });
+
+    test("rollback and close failures keep the original error and discard the work", async () => {
+      await withObservedClient(
+        async (client, observed, insertedValues) => {
+          const original = new Error("original");
+
+          await assert.rejects(
+            client.transaction(async (tx) => {
+              await tx.query(insert("never committed"));
+              throw original;
+            }),
+            (error: Error) =>
+              error instanceof TransactionError &&
+              error.cause === original &&
+              error.rollbackError?.message === "injected rollback failure" &&
+              error.closeError?.message === "injected close failure",
+          );
+
+          assert.equal(observed.commits, 0);
+          assert.equal(observed.rollbacks, 1);
+          assert.deepEqual(await insertedValues(), []);
+        },
+        (adapter) => {
+          adapter.failRollback = true;
+          adapter.failClose = true;
+        },
+      );
+    });
+
+    test("a close failure after commit rejects but the commit is durable", async () => {
+      await withObservedClient(
+        async (client, observed, insertedValues) => {
+          await assert.rejects(
+            client.transaction(async (tx) => {
+              await tx.query(insert("durable"));
+            }),
+            (error: Error) => error.message === "injected close failure",
+          );
+
+          assert.equal(observed.commits, 1);
+          assert.deepEqual(await insertedValues(), ["durable"]);
+        },
+        (adapter) => {
+          adapter.failClose = true;
+        },
+      );
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -2037,6 +2370,56 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
           await victim.commit();
 
           assert.deepEqual(await committedRows(), [earlierRow]);
+        });
+        await removeRows();
+      });
+
+      test("a transaction() callback that swallows -72 rejects and commits nothing", async () => {
+        await withAdapters(async (first, second) => {
+          let bothHoldLocks: () => void = () => undefined;
+          let arrived = 0;
+          const locksHeld = new Promise<void>((resolve) => {
+            bothHoldLocks = resolve;
+          });
+
+          // Each callback writes a row, locks its own row, then asks for the other's.
+          const contend = (adapter: NativeCubridAdapter, own: number, other: number, row: number) =>
+            createClient({ ...TEST_CONFIG, connectionFactory: () => adapter }).transaction(
+              async (tx) => {
+                await tx.execute(`INSERT INTO ${ROWS} VALUES (${row}, 'row${row}', 0)`);
+                await tx.execute(`UPDATE ${ROWS} SET n = n + 1 WHERE id = ${own}`);
+                arrived += 1;
+                if (arrived === 2) {
+                  bothHoldLocks();
+                }
+                await locksHeld;
+                await new Promise((resolve) => setTimeout(resolve, own === 1 ? 0 : 200));
+
+                const updated = await tx
+                  .execute(`UPDATE ${ROWS} SET n = n + 1 WHERE id = ${other}`)
+                  .then(
+                    () => true,
+                    () => false,
+                  );
+
+                // The survivor gives its work back, so only the victim's outcome is tested.
+                if (updated) {
+                  await tx.rollback();
+                }
+              },
+            );
+
+          const results = await Promise.allSettled([
+            contend(first, 1, 2, FIRST_ROW),
+            contend(second, 2, 1, SECOND_ROW),
+          ]);
+          const failures = rejections(results);
+
+          assert.equal(failures.length, 1);
+          assert.ok(failures[0] instanceof TransactionError);
+          assert.equal(failures[0].code, -72);
+          assert.equal(failures[0].kind, "deadlock");
+          assert.deepEqual(await committedRows(), []);
         });
         await removeRows();
       });
