@@ -420,7 +420,7 @@ graph TD
     Src --> ClientModule[client - CubridClient CubridTransaction createClient]
     Src --> Adapters[adapters - ConnectionLike and NativeCubridAdapter]
     Src --> Errors[errors - ConnectionError QueryError TransactionError and subclasses]
-    Src --> Internals[internals - mapError mapResult normalizeConfig]
+    Src --> Internals[internals - mapError normalizeConfig]
     Src --> Types[types - TypeScript interfaces and aliases]
 ```
 
