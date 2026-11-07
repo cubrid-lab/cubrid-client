@@ -3,6 +3,16 @@ import type { ClientConfig, ClientOptions } from "../types/client.js";
 /** Largest delay Node.js timers support. */
 const MAX_READ_TIMEOUT = 2 ** 31 - 1;
 
+/**
+ * NaN or Infinity would retry forever, so the adapter, which is public and skips
+ * normalizeConfig(), checks this too.
+ */
+export function assertValidRetryCount(count: number | undefined): void {
+  if (count !== undefined && !(Number.isInteger(count) && count >= 0)) {
+    throw new RangeError("maxConnectionRetryCount must be a non-negative integer.");
+  }
+}
+
 export function normalizeConfig(options: ClientOptions): ClientConfig {
   const { readTimeout } = options;
 
@@ -16,14 +26,7 @@ export function normalizeConfig(options: ClientOptions): ClientConfig {
     );
   }
 
-  const { maxConnectionRetryCount } = options;
-
-  if (
-    maxConnectionRetryCount !== undefined &&
-    !(Number.isInteger(maxConnectionRetryCount) && maxConnectionRetryCount >= 0)
-  ) {
-    throw new RangeError("maxConnectionRetryCount must be a non-negative integer.");
-  }
+  assertValidRetryCount(options.maxConnectionRetryCount);
 
   return {
     host: options.host,

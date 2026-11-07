@@ -23,6 +23,7 @@ import {
 import { EndTranType, StatementType } from "../protocol/constants.js";
 import { ConnectionLostError } from "../errors/internal-errors.js";
 import { mapError } from "../internals/map-error.js";
+import { assertValidRetryCount } from "../internals/normalize-config.js";
 import type { DriverAdapter } from "./base.js";
 import type { ClientConfig } from "../types/client.js";
 import type { QueryParams } from "../types/query.js";
@@ -80,7 +81,9 @@ export class NativeCubridAdapter implements DriverAdapter {
    */
   private statementQueue: Promise<void> = Promise.resolve();
 
-  constructor(private readonly config: ClientConfig) {}
+  constructor(private readonly config: ClientConfig) {
+    assertValidRetryCount(config.maxConnectionRetryCount);
+  }
 
   async connect(): Promise<void> {
     const cas = this.getOrCreateCAS();

@@ -94,7 +94,7 @@ contract.
 
 ## Connection retries
 
-`maxConnectionRetryCount` is the number of retries after a failed first attempt to open the TCP connection to the broker or CAS: connection refused, host unreachable, or `connectionTimeout` expired. It defaults to `0` (no retry) and must be a non-negative integer, or `createClient()` throws a `RangeError`. Delays between attempts double from 100 ms up to 2 s, so the total wait is bounded by `maxConnectionRetryCount` times 2 s plus the connection timeouts.
+`maxConnectionRetryCount` is the number of retries after a failed first attempt to open the TCP connection to the broker or CAS: connection refused, host unreachable, or `connectionTimeout` expired. It defaults to `0` (no retry) and must be a non-negative integer, or `createClient()` throws a `RangeError`. Delays between attempts double from 100 ms up to 2 s, so the cumulative backoff is at most `maxConnectionRetryCount` times 2 s. That is not a bound on the total time to connect: `connectionTimeout` stops applying once the TCP connection is open, so a broker that accepts the connection and then never answers the handshake, the OpenDatabase reply or the TLS handshake waits indefinitely unless `readTimeout` is set. Set `readTimeout` to bound that.
 
 ```ts
 const client = createClient({
@@ -113,7 +113,7 @@ Only that step is retried. A retry never runs SQL again and never replays a requ
 - A request or transaction that fails after it was sent is not retried.
 - There is no fallback to another host.
 
-When every attempt fails, the `ConnectionError` carries the last failure as `cause`.
+When every attempt fails, the last failure is kept as the innermost `cause`. The outer error depends on the operation that triggered the connection: `client.query()` rejects with a `QueryError`, `client.transaction()` and the transaction methods with a `TransactionError`, and `client.ping()` with a `ConnectionError`. Read `error.cause` (and its `cause`) for the `Failed to connect to host:port` error.
 
 ## Read timeout
 

@@ -1683,10 +1683,16 @@ test("CASConnection connect — retries a refused connection until the broker is
 });
 
 test("CASConnection connect — a refused connection is not retried by default", async () => {
-  const cas = new CASConnection({ ...DEFAULT_CONFIG, port: await closedPort() });
-  const started = Date.now();
-  await assert.rejects(() => cas.connect(), /Failed to connect/);
-  assert.ok(Date.now() - started < 90, "no backoff delay without retries");
+  const { counter, ready } = countingBroker(await closedPort());
+  const { server, port } = await ready;
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+    await assert.rejects(() => cas.connect(), /Failed to connect/);
+    assert.equal(counter.connections, 1);
+  } finally {
+    await closeServer(server);
+  }
 });
 
 test("CASConnection connect — retries stop after the configured count", async () => {
