@@ -17,7 +17,7 @@ convert a runtime value.
 | FLOAT, DOUBLE, MONETARY | `number` | IEEE-754 conversion may round decimal values |
 | NUMERIC | `string` | Decimal text retained without floating-point rounding; consumer chooses decimal library |
 | DATE, TIME, TIMESTAMP, DATETIME | `Date` | Parsed using the **local Node.js process timezone**; SQL DATETIME itself has no timezone, so this is not stable across zones ([#113](https://github.com/cubrid-lab/cubrid-client/issues/113)). The zero date `0000-00-00` of DATE, DATETIME and TIMESTAMP has no `Date`, so the query rejects; see [zero dates](#zero-dates) |
-| BIT, VARBIT | `Buffer` | Binary bytes; verify bit-length/bit-order semantics per server version. An empty `X''` currently returns `null`, the same as SQL NULL ([#173](https://github.com/cubrid-lab/cubrid-client/issues/173)) |
+| BIT, VARBIT | `Buffer` | Binary bytes; verify bit-length/bit-order semantics per server version. An empty `X''` returns an empty `Buffer`, distinct from SQL NULL |
 | BLOB, CLOB | `Buffer` from the wire field | **Not established as full LOB content**; the field may be a locator rather than the object body ([#93](https://github.com/cubrid-lab/cubrid-client/issues/93), [#103](https://github.com/cubrid-lab/cubrid-client/issues/103)) |
 | SET, MULTISET, SEQUENCE | Array (`CollectionValue`) | See [collection columns](#collection-columns) |
 | OBJECT/OID (19), RESULTSET (20), TIMESTAMPTZ, TIMESTAMPLTZ, DATETIMETZ and DATETIMELTZ (29-32), and unknown codes | Query rejects, including for a zero-byte value | Never coerced to `null`; see [values that cannot be decoded](#values-that-cannot-be-decoded). Future decoding is tracked in [#111](https://github.com/cubrid-lab/cubrid-client/issues/111) |
@@ -57,11 +57,10 @@ After a malformed reply, the server discards the session:
   may already have run and committed on the server, so verify its outcome before
   retrying a write.
 
-A zero-byte value is never treated as SQL NULL, except for the
-[#173](https://github.com/cubrid-lab/cubrid-client/issues/173) case of BIT and
-VARBIT: the server counts the NUL of text and writes fixed-width types in full,
-so it has no other zero-byte encoding. A zero-byte value of another decodable
-type is a malformed reply.
+A zero-byte value is never treated as SQL NULL. A top-level empty BIT or VARBIT
+value is an empty `Buffer`, as inside a collection: the server counts the NUL of
+text and writes fixed-width types in full, so it has no other zero-byte
+encoding. A zero-byte value of another decodable type is a malformed reply.
 
 ### Zero dates
 
