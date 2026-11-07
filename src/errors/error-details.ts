@@ -15,6 +15,8 @@
  * - `connection-lost`: the connection went away, or the server process died and
  *   took the transaction with it. The outcome of a request in flight is unknown.
  * - `read-timeout`: the client gave up waiting, see `ReadTimeoutError`.
+ * - `stream-busy`: the client refused a statement that waited behind a `stream()`
+ *   whose consumer stopped asking for rows. Nothing was sent.
  */
 export type CubridErrorKind =
   | "unique-violation"
@@ -27,7 +29,8 @@ export type CubridErrorKind =
   | "interrupted"
   | "authentication"
   | "connection-lost"
-  | "read-timeout";
+  | "read-timeout"
+  | "stream-busy";
 
 export interface CubridErrorDetails {
   /** Numeric error code of the CAS error reply. Absent for client-side failures. */

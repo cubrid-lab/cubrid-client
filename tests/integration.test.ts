@@ -8,9 +8,11 @@
  *
  * Run:  npm run test:integration
  */
-import test, { describe, after } from "node:test";
+import test, { describe, after, before } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, connect as netConnect, type Server, type Socket } from "node:net";
+import { setFlagsFromString } from "node:v8";
+import { runInNewContext } from "node:vm";
 
 import { createClient } from "../src/client/create-client.js";
 import { NativeCubridAdapter } from "../src/adapters/native.js";
@@ -3437,5 +3439,302 @@ describe("Integration: maxConnectionRetryCount", { skip: !available }, () => {
       await client.close();
       server.close();
     }
+  });
+});
+
+describe("stream()", { skip: !available }, () => {
+  const TABLE = "cc87_stream";
+  /** Several server replies of rows, which hold about 16 KiB each. */
+  const ROWS = 2000;
+  const PADDING = "x".repeat(200);
+
+  async function fillTable(client: ReturnType<typeof createClient>, rows: number): Promise<void> {
+    await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+    await client.query(`CREATE TABLE ${TABLE} (id INT PRIMARY KEY, pad VARCHAR(2000), b BLOB)`);
+    await client.query(
+      `INSERT INTO ${TABLE} (id, pad) SELECT ROWNUM, '${PADDING}' ` +
+        `FROM db_attribute a, db_attribute b, db_attribute c LIMIT ${rows}`,
+    );
+  }
+
+  before(async () => {
+    const client = createClient(TEST_CONFIG);
+    await fillTable(client, ROWS);
+    await client.close();
+  });
+
+  after(async () => {
+    const client = createClient(TEST_CONFIG);
+    await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+    await client.close();
+  });
+
+  async function withStreamTable(
+    use: (client: ReturnType<typeof createClient>) => Promise<void>,
+    options: { maxLobBytes?: number } = {},
+  ): Promise<void> {
+    const client = createClient({ ...TEST_CONFIG, ...options });
+    try {
+      await use(client);
+    } finally {
+      await client.close().catch(() => {});
+    }
+  }
+
+  /** A lock conflict fails fast here, instead of waiting for the server's default. */
+  async function assertTableUnlocked(): Promise<void> {
+    const other = createClient(TEST_CONFIG);
+    const ddl = other.transaction(async (tx) => {
+      await tx.query("SET TRANSACTION LOCK TIMEOUT 3");
+      await tx.query(`ALTER TABLE ${TABLE} ADD COLUMN probe${Date.now()} INT`);
+    });
+    try {
+      await ddl;
+    } finally {
+      await other.close();
+    }
+  }
+
+  test("reads the same rows as query() across several replies, in order", async () => {
+    await withStreamTable(async (client) => {
+      const sql = `SELECT id, pad FROM ${TABLE} WHERE id > ? ORDER BY id`;
+      const rows: unknown[] = [];
+
+      for await (const row of client.stream(sql, [10])) {
+        rows.push(row);
+      }
+
+      assert.equal(rows.length, ROWS - 10);
+      assert.deepEqual(rows, await client.query(sql, [10]));
+    });
+  });
+
+  test("the server answers FETCH by reply size, so fetchSize 1 still reads many rows per FETCH", async () => {
+    let fetches = 0;
+    const client = createClient({
+      ...TEST_CONFIG,
+      connectionFactory: async (config) => {
+        const adapter = new NativeCubridAdapter(config);
+        await adapter.connect();
+        const cas = (adapter as unknown as { cas: CASConnection }).cas;
+        const sendAndRecvOnSession = cas.sendAndRecvOnSession.bind(cas);
+        cas.sendAndRecvOnSession = (generation, header, payload) => {
+          fetches += payload[0] === CASFunctionCode.FETCH ? 1 : 0;
+          return sendAndRecvOnSession(generation, header, payload);
+        };
+        return adapter;
+      },
+    });
+
+    try {
+      let read = 0;
+      for await (const row of client.stream(`SELECT id, pad FROM ${TABLE}`, undefined, {
+        fetchSize: 1,
+      })) {
+        assert.ok(row);
+        read += 1;
+      }
+
+      assert.equal(read, ROWS);
+      // About 16 KiB of 200-byte rows per reply: dozens of rows, not one, per FETCH.
+      assert.ok(fetches > 0 && fetches < ROWS / 20, `${fetches} FETCHes for ${ROWS} rows`);
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("a break releases the handle and the table lock of the autocommit transaction", async () => {
+    await withStreamTable(async (client) => {
+      for await (const row of client.stream(`SELECT id FROM ${TABLE} ORDER BY id`)) {
+        assert.ok(row);
+        break;
+      }
+
+      await assertTableUnlocked();
+      assert.deepEqual(await client.query("SELECT 1 AS one FROM db_root"), [{ one: 1 }]);
+    });
+  });
+
+  test("a throw from the loop body releases the table lock too", async () => {
+    await withStreamTable(async (client) => {
+      const failure = new Error("the consumer failed");
+
+      await assert.rejects(async () => {
+        for await (const row of client.stream(`SELECT id FROM ${TABLE} ORDER BY id`)) {
+          assert.ok(row);
+          throw failure;
+        }
+      }, (error) => error === failure);
+
+      await assertTableUnlocked();
+    });
+  });
+
+  test("an abort releases the table lock while the consumer is away", async () => {
+    await withStreamTable(async (client) => {
+      const controller = new AbortController();
+      const rows = client.stream(`SELECT id FROM ${TABLE} ORDER BY id`, undefined, {
+        signal: controller.signal,
+      });
+      await rows.next();
+
+      controller.abort();
+      await client.ping();
+
+      await assertTableUnlocked();
+      await assert.rejects(() => rows.next(), { name: "AbortError" });
+    });
+  });
+
+  test("a live cursor keeps its turn, so no statement closes it with -1012", async () => {
+    await withStreamTable(async (client) => {
+      let read = 0;
+      const others: Array<Promise<unknown>> = [];
+
+      for await (const row of client.stream(`SELECT id FROM ${TABLE} ORDER BY id`)) {
+        read += 1;
+        assert.equal(row.id, read);
+        if (read % 400 === 1) {
+          others.push(client.ping(), client.query("SELECT 1 AS one FROM db_root"));
+        }
+      }
+
+      await Promise.all(others);
+      assert.equal(read, ROWS);
+    });
+  });
+
+  test("a query awaited inside the loop rejects, and the connection keeps working", async () => {
+    await withStreamTable(async (client) => {
+      await assert.rejects(async () => {
+        for await (const row of client.stream(`SELECT id FROM ${TABLE}`, undefined, {
+          consumerTimeout: 50,
+        })) {
+          await client.query(`SELECT ${String(row.id)} AS id FROM db_root`);
+        }
+      }, (error: QueryError) => error instanceof QueryError && error.kind === "stream-busy");
+
+      await assertTableUnlocked();
+      assert.deepEqual(await client.query("SELECT 1 AS one FROM db_root"), [{ one: 1 }]);
+    });
+  });
+
+  test("transaction() can run inside the loop, on its own connection", async () => {
+    await withStreamTable(async (client) => {
+      const counts: unknown[] = [];
+
+      for await (const row of client.stream(`SELECT id FROM ${TABLE} ORDER BY id`)) {
+        if (row.id === 5) {
+          counts.push(await client.transaction((tx) => tx.query("SELECT 1 AS one FROM db_root")));
+        }
+      }
+
+      assert.deepEqual(counts, [[{ one: 1 }]]);
+    });
+  });
+
+  test("inside a transaction, a break leaves its work open for the commit", async () => {
+    await withStreamTable(async (client) => {
+      await client.beginTransaction();
+      await client.query(`UPDATE ${TABLE} SET pad = 'changed' WHERE id = 1`);
+
+      for await (const row of client.stream(`SELECT id, pad FROM ${TABLE} ORDER BY id`)) {
+        assert.equal(row.pad, "changed");
+        break;
+      }
+
+      await client.rollback();
+      assert.deepEqual(await client.query(`SELECT pad FROM ${TABLE} WHERE id = 1`), [
+        { pad: PADDING },
+      ]);
+    });
+  });
+
+  test("LOB content across several replies, without the read closing the cursor", async () => {
+    await withStreamTable(async (client) => {
+      await client.query(`UPDATE ${TABLE} SET b = BIT_TO_BLOB(X'0102') WHERE id <= 500`);
+      let read = 0;
+
+      for await (const row of client.stream(`SELECT id, b FROM ${TABLE} WHERE id <= 500 ORDER BY id`)) {
+        read += 1;
+        assert.equal(row.id, read);
+        assert.deepEqual(row.b, Buffer.from([1, 2]));
+      }
+
+      assert.equal(read, 500);
+      await assertTableUnlocked();
+    });
+  });
+
+  test("maxLobBytes limits one row, and a row over it fails with the connection usable", async () => {
+    await withStreamTable(async (client) => {
+      await client.query(`UPDATE ${TABLE} SET b = BIT_TO_BLOB(X'0102') WHERE id <= 500`);
+      await client.query(`UPDATE ${TABLE} SET b = BIT_TO_BLOB(X'010203') WHERE id = 5`);
+      const sql = `SELECT id, b FROM ${TABLE} WHERE id <= 5 ORDER BY id`;
+      await assert.rejects(() => client.query(sql), QueryError);
+      let read = 0;
+
+      await assert.rejects(async () => {
+        for await (const row of client.stream(sql)) {
+          assert.ok(row);
+          read += 1;
+        }
+      }, (error: QueryError) => (error.cause as Error).cause instanceof Error);
+
+      assert.equal(read, 4);
+      await assertTableUnlocked();
+      assert.deepEqual(await client.query("SELECT 1 AS one FROM db_root"), [{ one: 1 }]);
+    }, { maxLobBytes: 2 });
+  });
+
+  test("a break after LOB reads releases the table lock", async () => {
+    await withStreamTable(async (client) => {
+      await client.query(`UPDATE ${TABLE} SET b = BIT_TO_BLOB(X'0102') WHERE id <= 500`);
+
+      for await (const row of client.stream(`SELECT id, b FROM ${TABLE} ORDER BY id`)) {
+        assert.deepEqual(row.b, Buffer.from([1, 2]));
+        break;
+      }
+
+      await assertTableUnlocked();
+    });
+  });
+
+  test("a failed statement rejects the first read and the connection keeps working", async () => {
+    await withStreamTable(async (client) => {
+      await assert.rejects(() => client.stream("SELECT nope FROM nowhere").next(), QueryError);
+      assert.deepEqual(await client.query("SELECT 1 AS one FROM db_root"), [{ one: 1 }]);
+    });
+  });
+
+  test("memory stays bounded on a result much larger than the limit asserted", async () => {
+    setFlagsFromString("--expose-gc");
+    const collectGarbage = runInNewContext("gc") as () => void;
+    const LARGE = 200_000;
+    const WIDE = "y".repeat(1000);
+    const HEAP_GROWTH_LIMIT = 16 * 1024 * 1024;
+
+    await withStreamTable(async (client) => {
+      await fillTable(client, LARGE);
+      await client.query(`UPDATE ${TABLE} SET pad = '${WIDE}'`);
+      collectGarbage();
+      const baseline = process.memoryUsage().heapUsed;
+      let peak = 0;
+      let read = 0;
+      let bytes = 0;
+
+      for await (const row of client.stream(`SELECT id, pad FROM ${TABLE}`)) {
+        read += 1;
+        bytes += String(row.pad).length;
+        if (read % 20_000 === 0) {
+          collectGarbage();
+          peak = Math.max(peak, process.memoryUsage().heapUsed - baseline);
+        }
+      }
+
+      assert.equal(read, LARGE);
+      assert.ok(bytes > 10 * HEAP_GROWTH_LIMIT);
+      assert.ok(peak < HEAP_GROWTH_LIMIT, `heap grew by ${peak} bytes`);
+    });
   });
 });

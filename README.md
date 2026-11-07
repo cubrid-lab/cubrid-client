@@ -106,6 +106,24 @@ const { rows, columns } = await db.queryResult("SELECT code, name FROM athlete L
 
 `columns` lists every select-list column, so a repeated name such as `SELECT a.id, b.id` appears twice there; each row object still has one key per name, and the last column wins. See [`QueryResult`](docs/API_REFERENCE.md#queryresult).
 
+## Streaming Large Results
+
+`query()` returns all rows in one array. `stream()` reads them as they are needed, holding one server reply of rows at a time:
+
+```ts
+for await (const row of db.stream<{ id: number; name: string }>(
+  "SELECT id, name FROM athlete WHERE nation_code = ?",
+  ["KOR"],
+)) {
+  await send(row);
+  if (done(row)) {
+    break; // Closes the server cursor. So do a thrown error and a failed read.
+  }
+}
+```
+
+An open stream holds its connection. Other statements on the same client wait until it ends, so **do not await `db.query()` inside the loop**: it rejects with `kind: "stream-busy"` after 5 seconds instead of hanging. Use `db.transaction()`, which has its own connection, or a second client. See [`stream()`](docs/API_REFERENCE.md#streamtsql-params-options) for cancellation, timeouts and LOB columns.
+
 ## Typed Queries
 
 Use TypeScript generics to get fully typed query results:
@@ -361,11 +379,16 @@ Creates a client instance. Connection is established lazily on first query.
 | `maxConnectionRetryCount` | `number` | `0` | Retries after a failed TCP connect to the broker (see [Connection retries](docs/CONNECTION.md#connection-retries)) |
 | `readTimeout` | `number` | — | Fail a query after this many ms with no activity from the server (see [Read timeout](docs/CONNECTION.md#read-timeout)). Unset means no timeout for queries; the connect handshake still gives up after 10 s |
 | `maxLobBytes` | `number` | 64 MiB | Most BLOB and CLOB content one query may load, in bytes. A query over it rejects (see [BLOB and CLOB columns](docs/TYPES.md#blob-and-clob-columns)) |
+| `fetchSize` | `number` | `100` | Rows requested per FETCH. CUBRID 10.2 to 11.4 ignore it and send about 16 KiB per reply (see [`fetchSize`](docs/API_REFERENCE.md#clientoptions)) |
 | `ssl` | `boolean \| ClientSSLOptions` | `false` | Enable TLS. `true` for defaults, or an object for cert/verification control (see [TLS/SSL](#tlsssl)) |
 
 ### `client.query<T>(sql, params?): Promise<T[]>`
 
 Executes SQL and returns typed row objects. DDL/DML statements return `[]`. BLOB columns return a complete `Buffer` and CLOB columns a complete `string`.
+
+### `client.stream<T>(sql, params?, options?): AsyncGenerator<T>`
+
+Reads a result row by row with `for await`, with bounded memory. See [Streaming Large Results](#streaming-large-results).
 
 ### `client.transaction<T>(callback): Promise<T>`
 

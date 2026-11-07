@@ -332,3 +332,79 @@ test("logger reports execute without SQL, parameters or the insert id", async ()
   assert.equal(logged.includes(SQL_LITERAL), false);
   assert.equal(logged.includes(PARAM), false);
 });
+
+function streamingConnection(fail?: Error): ConnectionLike {
+  return {
+    ...fakeConnection(),
+    async *stream<T extends Record<string, unknown>>() {
+      yield { v: ROW_VALUE } as unknown as T;
+      if (fail) {
+        throw fail;
+      }
+      yield { v: ROW_VALUE } as unknown as T;
+    },
+  };
+}
+
+function streamEvents(entries: Entry[]): Entry[] {
+  return entries.filter(({ fields }) => fields.operation === "stream");
+}
+
+test("a stream is logged once, redacted, with the rows handed over", async () => {
+  const { logger, entries } = recorder();
+  const db = client(logger, streamingConnection());
+
+  for await (const row of db.stream("SELECT 'literal-in-sql'", [PARAM])) {
+    assert.deepEqual(row, { v: ROW_VALUE });
+  }
+
+  assert.deepEqual(
+    streamEvents(entries).map(({ level, fields: { durationMs, ...fields } }) => [level, fields]),
+    [["debug", { operation: "stream", paramCount: 1, rowCount: 2 }]],
+  );
+  const logged = JSON.stringify(entries);
+  for (const secret of [PARAM, ROW_VALUE, SQL_LITERAL]) {
+    assert.equal(logged.includes(secret), false);
+  }
+});
+
+test("a stream closed early is logged as a success with the rows it read", async () => {
+  const { logger, entries } = recorder();
+  const db = client(logger, streamingConnection());
+
+  for await (const row of db.stream("SELECT 1")) {
+    assert.ok(row);
+    break;
+  }
+
+  const [event] = streamEvents(entries);
+  assert.equal(event?.level, "debug");
+  assert.equal(event?.fields.rowCount, 1);
+});
+
+test("a failed stream is logged as an error without its message", async () => {
+  const { logger, entries } = recorder();
+  const db = client(logger, streamingConnection(new QueryError("secret text")));
+
+  await assert.rejects(async () => {
+    for await (const row of db.stream("SELECT 1")) {
+      assert.ok(row);
+    }
+  }, QueryError);
+
+  const events = streamEvents(entries);
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.level, "error");
+  assert.equal(events[0]?.fields.errorName, "QueryError");
+  assert.equal(JSON.stringify(entries).includes("secret text"), false);
+});
+
+test("stream is exposed only when the connection supports it, and checks its options at once", async () => {
+  const { logger } = recorder();
+
+  await assert.rejects(() => client(logger, fakeConnection()).stream("SELECT 1").next(), QueryError);
+  assert.throws(
+    () => client(logger, streamingConnection()).stream("SELECT 1", undefined, { fetchSize: 0 }),
+    RangeError,
+  );
+});

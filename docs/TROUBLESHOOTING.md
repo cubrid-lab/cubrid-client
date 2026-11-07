@@ -216,6 +216,14 @@ try {
 - **`deadlock`**: retry the whole transaction. With code `-72` the server already rolled it back, so if your callback catches that error and continues, its later `tx` statements reject, nothing is committed and `transaction()` rejects with that error. See [what happens after `-72`](API_REFERENCE.md#error-details).
 - **`lock-timeout`**: only the statement failed and the transaction is still open. CUBRID waits indefinitely by default. To limit the wait, run `SET TRANSACTION LOCK TIMEOUT <seconds>`, inside the transaction or before it. The setting lasts as long as the [session](CONNECTION.md#session-reuse), so a client that sets it once and is then given a new session goes back to the default. `db.transaction()` uses its own connection, so run it inside the callback there.
 
+### A statement rejects with `kind: "stream-busy"`
+
+The statement waited behind an open [`stream()`](API_REFERENCE.md#streamtsql-params-options) on the same client, and the code reading that stream asked for no row for `consumerTimeout` milliseconds (5000 by default). Nothing was sent, and the stream still works.
+
+- **The statement is awaited inside the `for await` loop.** It could never run, because the stream ends only after the loop goes on. Use `db.transaction()`, which has its own connection, or a second client.
+- **The stream was left open.** A manual `next()` loop must call `return()`. `for await` does this on its own.
+- **The consumer is slow and other code uses the same client.** Raise `consumerTimeout`, or give the stream a client of its own.
+
 ### Transaction auto-rollback
 
 When `db.transaction()` throws, the transaction is **automatically rolled back** before the error propagates. You don't need to catch and rollback manually:

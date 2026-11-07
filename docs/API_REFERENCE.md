@@ -22,6 +22,8 @@ Complete reference for every public export of `cubrid-client`.
   - [ConnectionLike](#connectionlike)
   - [Queryable](#queryable)
   - [Executable](#executable)
+  - [Streamable](#streamable)
+  - [StreamOptions](#streamoptions)
   - [ExecutableTransactionClient](#executabletransactionclient)
   - [ExecuteResult](#executeresult)
   - [TransactionClient](#transactionclient-interface)
@@ -206,6 +208,70 @@ What the server reports, checked on CUBRID 10.2, 11.0, 11.2 and 11.4 (the replie
 - Statements issued at the same time still run one at a time, in the order issued, whether they use `query()` or `execute()`.
 
 ---
+
+#### `stream<T>(sql, params?, options?)`
+
+Runs a statement and reads its rows one at a time, without holding the whole result in memory.
+
+```ts
+stream<T extends QueryResultRow = QueryResultRow>(
+  sql: string,
+  params?: QueryParams,
+  options?: StreamOptions,
+): AsyncGenerator<T, void, undefined>
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `sql` | `string` | — | SQL statement. Use `?` for parameter placeholders. |
+| `params` | [`QueryParams`](#queryparams) | `undefined` | Positional parameter values |
+| `options` | [`StreamOptions`](#streamoptions) | `undefined` | `fetchSize`, `signal` and `consumerTimeout` |
+
+**Throws:** `RangeError` at once for an invalid option. Everything else rejects the read that met it: [`QueryError`](#queryerror) for a failed statement or FETCH, [`ReadTimeoutError`](#readtimeouterror) after `readTimeout`, and `signal.reason`, unchanged, after an abort. Rows that arrived before a failure are delivered first.
+
+```ts
+for await (const row of db.stream<{ id: number }>("SELECT id FROM orders", [], {
+  signal: AbortSignal.timeout(60_000),
+})) {
+  await process(row);
+}
+```
+
+Nothing is sent until the first read, which queues the statement like any other. A statement that is not a SELECT runs and yields no rows. Only the first statement of a multi-statement string yields rows, as in `query()`.
+
+**Memory.** The driver holds one server reply of rows and sends the next FETCH only when the consumer has read that reply, so a slow consumer slows the server down rather than filling memory. A reply holds about 16 KiB of rows, or one row when a row is larger. Reading 1,000,000 rows (477 MiB of column data) grew the heap by 0.9 MiB, against 560 MiB for `query()`; see [Performance](PERFORMANCE.md#streaming-memory).
+
+**The connection is held until the stream ends.** On CUBRID 10.2 to 11.4 a statement that ends a transaction closes every other cursor on the session, so an open stream [keeps its turn](CONNECTION.md#concurrent-statements-on-one-connection) until its last reply has arrived or it is closed. Statements issued on this client meanwhile wait. Once the last reply has arrived the turn is released, while the consumer may still be reading those rows.
+
+**Do not await a statement of the same client inside the loop.** The statement waits for the stream and the stream waits for the loop, so neither could ever finish. The driver cannot tell that statement from unrelated code on the connection, so it applies a limit: a statement rejects with `kind: "stream-busy"` once the consumer has asked for no row for `consumerTimeout` milliseconds, 5000 by default, while the statement waits. It sends nothing, it has the class it would otherwise fail with, and the stream stays usable.
+
+```ts
+// Wrong: rejects with kind "stream-busy" on any result larger than one reply.
+for await (const order of db.stream("SELECT id FROM orders")) {
+  await db.query("SELECT * FROM lines WHERE order_id = ?", [order.id]);
+}
+
+// Right: transaction() has its own connection. So does a second client.
+for await (const order of db.stream("SELECT id FROM orders")) {
+  await db.transaction((tx) => tx.query("SELECT * FROM lines WHERE order_id = ?", [order.id]));
+}
+```
+
+That first loop can work on a small result, because the turn is released with the last reply. Do not rely on it. A consumer that pauses for longer than `consumerTimeout` while unrelated code issues statements causes the same rejection; raise the limit, or give streams a client of their own.
+
+**Closing.** `break`, `return` and a throw from the loop body close the stream, and so does a failed read. The query handle is released, and in autocommit mode the transaction the SELECT opened is ended too, because closing the handle alone leaves its table lock held. Inside a transaction opened with [`beginTransaction()`](#begintransaction) the stream takes part in it, and the transaction stays open. Code that drives the iterator by hand must call `return()`; until then later statements get `stream-busy`. [`close()`](#close) ends an open stream, whose next read rejects.
+
+**Aborting.** `signal` stops the stream even while the consumer is not reading: the handle is released and the turn ends at once, and the next read rejects with `signal.reason`, dropping any rows still held. A stream that waits for its turn is never sent. A reply already awaited cannot be interrupted, so the read rejects when it arrives, and `readTimeout` limits that wait. The session stays usable.
+
+**Timeouts.** `readTimeout` applies to each request of the stream and discards the connection like any other read timeout. Time the consumer spends between reads does not count. For a limit on the whole stream use `AbortSignal.timeout()`.
+
+**Errors keep their usual meaning.** A malformed reply drops the session. A `-72` from a FETCH marks the transaction as [rolled back](#error-details) and later statements reject until you acknowledge it. An error from a decoded value or a server error leaves the session usable.
+
+**BLOB and CLOB columns.** `maxLobBytes` applies to **each row**, not to the whole result as in `query()`. Content is read when its row is reached, so a stream holds one row's content at a time and a result larger than the limit can be read in full. A row over the limit rejects when it is reached. See [BLOB and CLOB columns](TYPES.md#blob-and-clob-columns).
+
+**While a stream is open** the server keeps a transaction open for it, in autocommit mode too. Its shared table lock blocks DDL on those tables, and the session keeps its CAS. Keep slow work out of the loop if other clients need them.
+
+`stream()` is not available on the `tx` of a `transaction()` callback. [`TransactionClient`](#transactionclient-interface) is unchanged.
 
 #### `transaction<T>(callback)`
 
@@ -653,6 +719,7 @@ Failures detected by the client have a `kind` but no `code` or `origin`:
 |--------|---------------|
 | `connection-lost` | The socket closed, or the session that held the transaction is gone. The outcome of a request that was in flight is unknown |
 | `read-timeout` | [`ReadTimeoutError`](#readtimeouterror): the client stopped waiting for a response. A server lock wait that expires is `lock-timeout` instead |
+| `stream-busy` | A statement waited behind a [`stream()`](#streamtsql-params-options) whose consumer asked for no row for `consumerTimeout`. Nothing was sent. Often the statement was awaited inside the loop that reads the stream |
 
 After any `deadlock`, roll back and retry the transaction from its start.
 
@@ -723,6 +790,7 @@ interface ClientOptions {
   connectionTimeout?: number;
   readTimeout?: number;
   maxLobBytes?: number;
+  fetchSize?: number;
   maxConnectionRetryCount?: number;
   logger?: unknown;
   connectionFactory?: ConnectionFactory;
@@ -739,6 +807,7 @@ interface ClientOptions {
 | `connectionTimeout` | `number` | `undefined` | Connection timeout in milliseconds |
 | `readTimeout` | `number` | `undefined` | Milliseconds of server inactivity before a request fails with [`ReadTimeoutError`](#readtimeouterror) and the connection is discarded. `undefined` or `0` means no timeout for requests; the connect handshake then still gives up after 10 seconds of inactivity. Other values must be between 1 and 2147483647, or `createClient()` throws a `RangeError`. See [Read timeout](CONNECTION.md#read-timeout) |
 | `maxLobBytes` | `number` | `67108864` (64 MiB) | Largest total of BLOB and CLOB content, in bytes, one query may load. A query over it rejects with a `QueryError` before any content is read, and the connection stays usable. Must be a positive integer, or `createClient()` throws a `RangeError`. See [BLOB and CLOB columns](TYPES.md#blob-and-clob-columns) |
+| `fetchSize` | `number` | `100` | Rows requested in each FETCH by `query()`, `queryResult()` and `stream()`. **CUBRID 10.2, 11.0, 11.2 and 11.4 ignore this number** and answer every FETCH with about 16 KiB of rows, or one row when a row is larger, so on those servers it changes neither round trips nor memory. Must be an integer from 1 to 2147483647, or `createClient()` throws a `RangeError` |
 | `maxConnectionRetryCount` | `number` | `undefined` | Retries after a failed first attempt to open the TCP connection to the broker (refused, unreachable, timed out). Non-negative integer, default `0`; anything else throws a `RangeError`. See [Connection retries](CONNECTION.md#connection-retries) |
 | `logger` | `unknown` (see `ClientLogger`) | `undefined` | Receives redacted diagnostics for connections, queries and transactions. See [Logging](CONNECTION.md#logging) |
 | `connectionFactory` | [`ConnectionFactory`](#connectionfactory) | Built-in `NativeCubridAdapter` | Custom factory for creating connections |
@@ -809,6 +878,11 @@ interface ConnectionLike {
     params?: QueryParams,
   ): Promise<QueryResult<T>>;
   execute?(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+  stream?<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+    options?: StreamOptions,
+  ): AsyncIterable<T>;
   beginTransaction(): Promise<void>;
   commit(): Promise<void>;
   rollback(): Promise<void>;
@@ -816,7 +890,7 @@ interface ConnectionLike {
 }
 ```
 
-`queryResult` and `execute` are optional so existing custom adapters keep compiling. Calling `queryResult()` or `execute()` on a client or transaction fails when its connection does not provide it.
+`queryResult`, `execute` and `stream` are optional so existing custom adapters keep compiling. Calling `queryResult()` or `execute()` on a client or transaction fails when its connection does not provide it, and so does the first read of `stream()`.
 
 ### Queryable
 
@@ -867,6 +941,38 @@ interface Executable {
   execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
 }
 ```
+
+### Streamable
+
+Interface for any object that can read a result row by row. `CubridClient` implements it. `TransactionClient` does not extend it.
+
+```ts
+interface Streamable {
+  stream<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+    options?: StreamOptions,
+  ): AsyncIterable<T>;
+}
+```
+
+### StreamOptions
+
+Options of [`stream()`](#streamtsql-params-options).
+
+```ts
+interface StreamOptions {
+  fetchSize?: number;
+  signal?: AbortSignal;
+  consumerTimeout?: number;
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `fetchSize` | `number` | The client's [`fetchSize`](#clientoptions) | Rows requested in each FETCH, ignored by CUBRID 10.2 to 11.4 |
+| `signal` | `AbortSignal` | `undefined` | Stops the stream. The next read rejects with `signal.reason` |
+| `consumerTimeout` | `number` | `5000` | Milliseconds a statement issued on this connection waits while the consumer asks for no row, before it rejects with `kind: "stream-busy"`. A consumer that keeps reading is never timed out, however long the stream takes. `0` refuses such statements at once. An integer from 0 to 2147483647; this limit cannot be disabled |
 
 ### ExecuteResult
 

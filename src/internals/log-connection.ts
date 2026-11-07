@@ -14,6 +14,7 @@ import type {
   ConnectionFactory,
   ConnectionLike,
   ExecuteResult,
+  StreamOptions,
 } from "../types/client.js";
 import type { QueryParams } from "../types/query.js";
 import type { QueryResult, QueryResultRow } from "../types/result.js";
@@ -162,6 +163,40 @@ export function withLogging(factory: ConnectionFactory, logger: unknown): Connec
     if (execute) {
       wrapped.execute = (sql: string, params?: QueryParams): Promise<ExecuteResult> =>
         timed("execute", { paramCount: params?.length ?? 0 }, () => execute(sql, params));
+    }
+    const stream = inner.stream?.bind(inner);
+    if (stream) {
+      wrapped.stream = <T extends QueryResultRow = QueryResultRow>(
+        sql: string,
+        params?: QueryParams,
+        options?: StreamOptions,
+      ): AsyncIterable<T> => {
+        const rows = stream<T>(sql, params, options);
+        return (async function* (): AsyncGenerator<T, void, undefined> {
+          const fields = { operation: "stream", paramCount: params?.length ?? 0 };
+          const start = performance.now();
+          let rowCount = 0;
+          let failure: { errorName: string } | undefined;
+
+          try {
+            for await (const row of rows) {
+              rowCount += 1;
+              yield row;
+            }
+          } catch (error) {
+            failure = { errorName: errorName(error) };
+            throw error;
+          } finally {
+            // An early break reaches only this block, and it is a success too.
+            const durationMs = Math.round(performance.now() - start);
+            if (failure) {
+              emit("error", "cubrid-client: stream failed", { ...fields, durationMs, ...failure });
+            } else {
+              emit("debug", "cubrid-client: stream succeeded", { ...fields, durationMs, rowCount });
+            }
+          }
+        })();
+      };
     }
     const ping = inner.ping?.bind(inner);
     if (ping) {

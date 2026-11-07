@@ -34,6 +34,8 @@ export type {
   Queryable,
   ResultQueryable,
   ResultTransactionClient,
+  Streamable,
+  StreamOptions,
   TransactionCallback,
   TransactionClient,
 } from "./types/client.js";

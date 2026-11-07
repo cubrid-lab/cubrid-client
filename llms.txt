@@ -9,6 +9,7 @@ Key facts:
 - Connect: `createClient({ host: "localhost", port: 33000, database: "demodb", user: "dba" })`
 - Query: `await db.query<User>("SELECT * FROM users WHERE id = ?", [1])`
 - Transactions: `await db.transaction(async (tx) => { await tx.query(...) })`
+- Large results: `for await (const row of db.stream<User>("SELECT * FROM users")) { ... }` holds one server reply at a time; a statement awaited on the same client inside the loop rejects with `kind: "stream-busy"`, so use `db.transaction()` or another client there
 - Collections: SET, MULTISET and SEQUENCE columns return JavaScript arrays (`CollectionValue`); `{1,'a'}`-style mixed-type collections arrive from the server as SQL NULL
 - A callback transaction has one outcome: `tx` rejects with `TransactionError` once it is committed or rolled back; `error.cause` keeps the original failure, with cleanup failures on `error.rollbackError` and `error.closeError`
 - Error classes: `ConnectionError`, `QueryError`, `TransactionError`, `ReadTimeoutError`; `ConstraintError`, `SqlSyntaxError`, `DeadlockError` and `LockTimeoutError` extend `QueryError`

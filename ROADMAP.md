@@ -57,11 +57,10 @@ criteria are verified and which are still pending real broker tests.
 - Transaction configuration and server version:
   [#91](https://github.com/cubrid-lab/cubrid-client/issues/91),
   [#102](https://github.com/cubrid-lab/cubrid-client/issues/102).
-- Pooling, batching, streaming and schema inspection after handle ownership
+- Pooling, batching and schema inspection after handle ownership
   and lifecycle testing:
   [#92](https://github.com/cubrid-lab/cubrid-client/issues/92),
   [#86](https://github.com/cubrid-lab/cubrid-client/issues/86),
-  [#87](https://github.com/cubrid-lab/cubrid-client/issues/87),
   [#94](https://github.com/cubrid-lab/cubrid-client/issues/94).
 
 ## Compatibility and release policy
