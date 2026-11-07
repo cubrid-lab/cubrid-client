@@ -12,6 +12,7 @@ ADRs preserve **why** a consequential technical or release decision was made, th
 | [0004](0004-test-first-development.md) | TDD: design contract, Red–Green–Refactor and live-CUBRID verification | Proposed |
 | [0005](0005-development-setup.md) | Reproducible language-native developer setup and verification | Proposed |
 | [0006](0006-node-18-support-through-1x.md) | Retain Node.js 18 consumer support throughout 1.x; consider removal no earlier than 2.0 | Proposed |
+| [0007](0007-manual-transaction-ownership.md) | Manual transaction owner identity and safe concurrent Node clients | Proposed — manual API still unsafe for shared concurrent calls |
 
 The Node.js driver already has an established release process; these proposals record the rules without changing it.
 
