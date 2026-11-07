@@ -1070,7 +1070,10 @@ function assertExactLength(consumed: number, declared: number): void {
  * collection sends type 0, and a bare `SET` column declares no element type.
  *
  * Every read is bounded to the cell, so a wrong length rejects the query and can
- * never consume the following columns.
+ * never consume the following columns. An unsupported element does not stop the
+ * walk: the reply is only intact if every remaining and nested element fits, so
+ * a structural failure wins and a complete collection reports the first
+ * unsupported element.
  */
 function readCollection(reader: PacketReader, size: number): unknown[] {
   const cell = reader.subReader(size);
@@ -1089,13 +1092,24 @@ function readCollection(reader: PacketReader, size: number): unknown[] {
   }
 
   const values: unknown[] = [];
+  let unsupported: UnsupportedValueError | undefined;
   for (let i = 0; i < count; i++) {
     if (cell.remaining < SIZE_INT) {
       throw new Error(`Malformed CAS packet: collection element ${i} has no length`);
     }
-    values.push(readCollectionElement(cell, elementType, cell.parseInt()));
+    try {
+      values.push(readCollectionElement(cell, elementType, cell.parseInt()));
+    } catch (error) {
+      if (!(error instanceof UnsupportedValueError)) {
+        throw error;
+      }
+      unsupported ??= error;
+    }
   }
   assertExactLength(size - cell.remaining, size);
+  if (unsupported) {
+    throw unsupported;
+  }
   return values;
 }
 
@@ -1116,13 +1130,15 @@ function readCollectionElement(
       `Malformed CAS packet: invalid length ${length} for collection element type ${elementType}`,
     );
   }
+  // Taken first: the cell must move past this element and a length that
+  // overruns it must be structural, whichever way the element is then handled.
+  const element = cell.subReader(length);
   // The payload is a file locator, not the LOB content (#93); do not hand a
   // server path to callers as if it were the element value.
   if (elementType === CUBRIDDataType.BLOB || elementType === CUBRIDDataType.CLOB) {
     throw new UnsupportedValueError(`Unsupported CUBRID collection element type ${elementType}`);
   }
 
-  const element = cell.subReader(length);
   const value = readValue(element, elementType, length);
   assertExactLength(length - element.remaining, length);
   return value;

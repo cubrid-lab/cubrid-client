@@ -393,6 +393,54 @@ test("a collection element without a decoder is unsupported and leaves the next 
   );
 });
 
+// One BLOB element (type 23) of 4 bytes, valid on its own, and a nested cell holding it.
+const BLOB_ELEMENT = "00000004" + "01020304";
+const NESTED_BLOB = "0000000d" + "17" + "00000001" + BLOB_ELEMENT;
+const NESTED_CLOB = "0000000d" + "18" + "00000001" + BLOB_ELEMENT;
+
+for (const [problem, cell, reason] of [
+  ["a length past the cell", "0000000d" + "17" + "00000001" + "00000005" + "01020304", /cannot read 5 bytes/],
+  ["a later element below NULL", "00000011" + "17" + "00000002" + BLOB_ELEMENT + "fffffffe", /invalid length -2/],
+  ["a later element with no length", "00000011" + "17" + "00000003" + BLOB_ELEMENT + "ffffffff", /element 2 has no length/],
+  ["a cell longer than its elements", "0000000f" + "17" + "00000001" + BLOB_ELEMENT + "0000", /uses 13 of its 15 bytes/],
+  ["a later element of a type without any decoder", "00000013" + "63" + "00000002" + "00000002" + "0102" + "00000005" + "01020304", /cannot read 5 bytes/],
+  // A SEQUENCE whose second nested cell has an int element claiming 5 of its 4 bytes.
+  ["damage in a later nested cell", "00000027" + "12" + "00000002" + NESTED_BLOB + "0000000d" + "08" + "00000001" + "00000005" + "00000001", /cannot read 5 bytes/],
+  // The unsupported element is itself nested, and the damage is in the outer cell.
+  ["damage after a nested unsupported cell", "0000001a" + "12" + "00000002" + NESTED_BLOB + "fffffffe", /invalid length -2/],
+] as const) {
+  test(`an unsupported collection element does not hide ${problem}`, () => {
+    assert.throws(
+      () => parsePrepareAndExecute(withCell(cell), 7),
+      (error: Error) => {
+        assert.ok(error instanceof MalformedReplyError);
+        assert.match(causeOf(error), reason);
+        return true;
+      },
+    );
+  });
+}
+
+test("a complete collection keeps its first unsupported element, and damage outranks it", () => {
+  // Two nested cells, BLOB (23) then CLOB (24).
+  const complete = "00000027" + "12" + "00000002" + NESTED_BLOB + NESTED_CLOB;
+  assert.throws(
+    () => parsePrepareAndExecute(withCell(complete), 7),
+    (error: Error) => {
+      assert.ok(error instanceof UnsupportedValueError);
+      assert.match(causeOf(error), /element type 23/);
+      return true;
+    },
+  );
+  // The same walk reaches the second cell: damage there outranks the first error.
+  const damaged = "00000027" + "12" + "00000002" + NESTED_BLOB +
+    "0000000d" + "18" + "00000001" + "00000005" + "01020304";
+  assert.throws(
+    () => parsePrepareAndExecute(withCell(damaged), 7),
+    (error: Error) => error instanceof MalformedReplyError,
+  );
+});
+
 test("a nested collection with a malformed inner length rejects", () => {
   const { hex } = CAPTURED_FRAMES.nestedSequence;
   // Second element of {{},{1}}: its int32 element claims 5 bytes in a 4-byte payload.

@@ -35,9 +35,12 @@ the connection depends on whether the server's reply can still be trusted:
 | **Unsupported value** in a reply that is otherwise intact | A TIMESTAMPTZ column | Stays open. The query handle is released, and an open transaction stays open for you to commit or roll back |
 | **Malformed reply** that contradicts its own structure | A length past the end of the reply, or a value that does not fill its cell | Dropped, because the next reply could not be trusted to line up. Nothing more is sent on it |
 
-The driver reads the rest of a reply before reporting an unsupported value, so
-damage anywhere in that reply is reported as malformed. The first unsupported
-column is the one named.
+The driver reads the rest of a reply, including every remaining and nested
+collection element, before reporting an unsupported value, so damage anywhere in
+that reply is reported as malformed. The first unsupported column is the one
+named. Queries already waiting behind a malformed reply reject without being
+sent, because the statement before them has an unknown outcome; queries issued
+afterwards open a new session.
 
 After a malformed reply, the server discards the session:
 

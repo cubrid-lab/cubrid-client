@@ -150,6 +150,8 @@ class FakeCas {
   stallAtExecuteOf: string | null = null;
   /** Answer CHECK_CAS as a CAS does once its database server is gone. */
   failCheckCas = false;
+  /** Answer this owner's next SELECT with a reply that stops mid-header. */
+  malformExecuteOf: string | null = null;
   /** Close this many incoming connections before their handshake. */
   refuseConnections = 0;
 
@@ -307,6 +309,14 @@ class FakeCas {
 
     if (owner !== undefined && owner === this.stallAtExecuteOf) {
       this.stallAtExecuteOf = null;
+      return;
+    }
+
+    if (owner !== undefined && owner === this.malformExecuteOf) {
+      this.malformExecuteOf = null;
+      // A handle and a statement type, then the reply stops mid-header.
+      const truncated = Buffer.concat([int32(1), int32(0), Buffer.from([STATEMENT_SELECT])]);
+      this.replyWithStatus(session, truncated);
       return;
     }
 
@@ -657,6 +667,47 @@ test("a ping that reconnects does not release the INSERT queued behind a lost so
     ]);
 
     assert.equal(lost.status, "rejected");
+    assert.equal(health.status, "fulfilled");
+    assert.equal(queued.status, "rejected");
+    const executions = cas.of(CASFunctionCode.PREPARE_AND_EXECUTE);
+    assert.deepEqual(executions.map((request) => request.owner), ["a"]);
+  });
+});
+
+test("an INSERT waiting behind a malformed reply is not sent, and the next query recovers", { timeout: 10000 }, async () => {
+  await withClient(async (client, cas) => {
+    await client.ping();
+    cas.malformExecuteOf = "a";
+
+    const [malformed, queued] = await Promise.allSettled([
+      client.query(selectFor("a")),
+      client.query("INSERT INTO items VALUES (1)"),
+    ]);
+
+    assert.equal(malformed.status, "rejected");
+    assert.equal(queued.status, "rejected");
+    const sent = (): (string | undefined)[] =>
+      cas.of(CASFunctionCode.PREPARE_AND_EXECUTE).map((request) => request.owner);
+    assert.deepEqual(sent(), ["a"]);
+    assert.equal(cas.of(CASFunctionCode.CLOSE_REQ_HANDLE).length, 0);
+
+    assert.deepEqual(await client.query(selectFor("b")), rowsOf("b"));
+    assert.deepEqual(sent(), ["a", "b"]);
+  });
+});
+
+test("a ping that reconnects does not release the INSERT queued behind a malformed reply", { timeout: 10000 }, async () => {
+  await withClient(async (client, cas) => {
+    await client.ping();
+    cas.malformExecuteOf = "a";
+
+    const [malformed, health, queued] = await Promise.allSettled([
+      client.query(selectFor("a")),
+      client.ping(),
+      client.query("INSERT INTO items VALUES (1)"),
+    ]);
+
+    assert.equal(malformed.status, "rejected");
     assert.equal(health.status, "fulfilled");
     assert.equal(queued.status, "rejected");
     const executions = cas.of(CASFunctionCode.PREPARE_AND_EXECUTE);
