@@ -345,6 +345,32 @@ test("a zero date element rejects as unsupported, and structural damage still wi
   );
 });
 
+test("an all-zero value of the wrong width is malformed, not a zero date", () => {
+  // Only DATE 6, DATETIME 14 and TIMESTAMP 12 bytes can be the zero date. Any other
+  // width contradicts its cell, so the reply is malformed and the session is dropped.
+  for (const [wireType, size] of [[22, 6], [15, 6], [13, 7], [13, 14], [15, 14]] as const) {
+    assert.throws(
+      () => parsePrepareAndExecute(selectWire(wireType, Buffer.alloc(size)), 1),
+      (error: Error) => error instanceof MalformedReplyError,
+      `wire type ${wireType}, ${size} zero bytes`,
+    );
+  }
+});
+
+test("a zero-filled element of the wrong width in a collection is malformed", () => {
+  // The captured SEQUENCE OF DATE reduced to its one six-byte zero element (cell
+  // size 15, count 1) and retyped as DATETIME (22): six zero bytes are not a 14-byte
+  // DATETIME. A second, valid element would hide this, so the cell holds only the zero.
+  const { hex } = CAPTURED_FRAMES.zeroDateElement;
+  const cell = "190d00000002" + "00000006000000000000" + "0000000607e400010002";
+  const retyped = "0f1600000001" + "00000006000000000000";
+  assert.equal(hex.split(cell).length, 2);
+  assert.throws(
+    () => parsePrepareAndExecute(Buffer.from(hex.replace(cell, retyped), "hex"), 7),
+    (error: Error) => error instanceof MalformedReplyError,
+  );
+});
+
 test("parseFetch decodes collections with the metadata of the executed query", () => {
   const { columns } = decodeFrame(CAPTURED_FRAMES.tableRows);
   const cell = (hex: string): Buffer => Buffer.from(hex, "hex");
