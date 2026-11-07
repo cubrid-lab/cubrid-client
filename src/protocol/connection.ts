@@ -22,6 +22,8 @@ import {
   parseOpenDatabase,
   writeGetDbVersion,
   parseGetDbVersion,
+  writeCheckCas,
+  parseCheckCas,
   type OpenDatabaseResult,
 } from "./protocol.js";
 
@@ -321,11 +323,22 @@ export class CASConnection {
   private static readonly CAS_INFO_STATUS_INACTIVE = 0;
 
   /**
-   * Send GET_DB_VERSION to verify the connection is alive.
+   * Verify the connection is alive.
    * Returns the server version string on success, throws on failure.
+   *
+   * GET_DB_VERSION with its autocommit byte set commits the session, and that
+   * commit is what notices a stopped database server: with the byte clear, the
+   * CAS still reports its version. So an open transaction clears the byte and
+   * proves liveness with CHECK_CAS first. CHECK_CAS cannot replace GET_DB_VERSION
+   * because its reply has no body, so no version.
    */
-  async ping(): Promise<string> {
-    const { header, payload } = writeGetDbVersion(true, this._casInfo);
+  async ping(inTransaction: boolean): Promise<string> {
+    if (inTransaction) {
+      const { header, payload } = writeCheckCas(this._casInfo);
+      parseCheckCas(await this.sendAndRecv(header, payload));
+    }
+
+    const { header, payload } = writeGetDbVersion(!inTransaction, this._casInfo);
     const response = await this.sendAndRecv(header, payload);
     return parseGetDbVersion(response);
   }

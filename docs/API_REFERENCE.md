@@ -248,6 +248,22 @@ async rollback(): Promise<void>
 
 ---
 
+#### `ping()`
+
+Checks that the connection and its database server are alive, and returns the server version. It opens the shared connection if needed.
+
+```ts
+async ping(): Promise<string>
+```
+
+Inside a manual transaction a ping leaves the transaction open: the work before it can still be committed or rolled back. Outside a transaction it sends a commit, which ends the session's empty transaction and closes nothing the client still needs, because statements on one connection run [one at a time](CONNECTION.md#concurrent-statements-on-one-connection).
+
+**Returns:** The server version, for example `11.4.6.1963`.
+
+**Throws:** [`ConnectionError`](#connectionerror) if the health check fails. If it fails inside a transaction, treat that transaction as lost.
+
+---
+
 #### `close()`
 
 Closes the shared connection after the statements issued before it have finished. After calling `close()`, the client can no longer execute queries. If no connection was opened, this is a no-op.

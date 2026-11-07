@@ -368,6 +368,26 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     }
   });
 
+  test("a ping inside a transaction leaves its row to rollback()", async () => {
+    const client = createClient(TEST_CONFIG);
+
+    try {
+      await client.query("DROP TABLE IF EXISTS tx_ping_test_native");
+      await client.query("CREATE TABLE tx_ping_test_native (val VARCHAR(50))");
+
+      await client.beginTransaction();
+      await client.query("INSERT INTO tx_ping_test_native (val) VALUES ('rolled back')");
+      assert.match(await client.ping(), /^\d+\.\d+/);
+      await client.rollback();
+
+      assert.deepEqual(await client.query("SELECT val FROM tx_ping_test_native"), []);
+
+      await client.query("DROP TABLE tx_ping_test_native");
+    } finally {
+      await client.close();
+    }
+  });
+
   test("transaction rollback", async () => {
     const client = createClient(TEST_CONFIG);
 
@@ -1267,7 +1287,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
 
         try {
           const survivor = await execute(selectGroup(0), true);
-          await cas.ping();
+          await cas.ping(false);
 
           await assert.rejects(fetch(survivor, survivor.rows.length), /\(-1012\)/);
         } finally {

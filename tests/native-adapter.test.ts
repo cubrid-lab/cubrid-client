@@ -1819,7 +1819,8 @@ test("client.transaction surfaces a timeout and still closes", { timeout: 5000 }
 
 test("ping after a first-statement timeout cannot give the transaction a new session", { timeout: 5000 }, async () => {
   const version = Buffer.concat([buildSimpleResponse(0), Buffer.from("11.4.0\0")]);
-  const { server, port, requests } = await createScriptedCas([[STALL], [version]]);
+  const checkCasOk = Buffer.alloc(0);
+  const { server, port, requests } = await createScriptedCas([[STALL], [checkCasOk, version]]);
   const client = clientFor(port);
 
   try {
@@ -1834,8 +1835,8 @@ test("ping after a first-statement timeout cannot give the transaction a new ses
     });
     await assert.rejects(client.commit(), TransactionError);
 
-    // Only the ping reached the new session: no statement and no COMMIT.
-    assert.deepEqual(requests, [1, 1]);
+    // Only the ping's two requests reached the new session: no statement and no COMMIT.
+    assert.deepEqual(requests, [1, 2]);
   } finally {
     await client.close();
     await closeStub(server);
