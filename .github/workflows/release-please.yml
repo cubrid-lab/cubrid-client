@@ -17,8 +17,8 @@ jobs:
         with:
           persist-credentials: false
 
-      # Release Please otherwise proposes v1.3.0 from the same historical
-      # commits while v1.2.0 is merged but still awaiting its tag/npm publish.
+      # A GitHub Release alone does not establish npm publication. The exact
+      # current version must exist in both registries before proposing another.
       - name: Wait for the current published version before proposing the next
         id: current-version
         env:
@@ -28,10 +28,13 @@ jobs:
         run: |
           set -euo pipefail
           version=$(node -p "require('./package.json').version")
-          if gh release view "v$version" --repo "$GH_REPO" >/dev/null 2>&1; then
+          if ! gh release view "v$version" --repo "$GH_REPO" >/dev/null 2>&1; then
+            echo "::notice::v$version has no GitHub Release; do not generate the next release PR."
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          elif node scripts/verify-npm-version.mjs "$version"; then
             echo "released=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::v$version has not been published on GitHub yet; do not generate the next release PR."
+            echo "::warning::Exact npm version $version is absent or unverified; do not generate a newer Release PR. Recover the existing immutable version first."
             echo "released=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Propose version, lockfile and changelog in a Release PR
