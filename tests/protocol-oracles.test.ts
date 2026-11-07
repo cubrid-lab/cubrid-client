@@ -1097,3 +1097,22 @@ test("captured PREPARE and EXECUTE server errors keep their codes", () => {
     (error: Error & { code?: number }) => error.code === -494,
   );
 });
+
+/** An EXECUTE reply to an UPDATE of two rows: the result record, the column info flag, the shard id. */
+const EXECUTE_UPDATE =
+  "00000002" + "00" + "00000001" + "16" + "00000002" + "0000000000000000" + "00000000" + "00000000" +
+  "00" + "fffffffe";
+
+test("an EXECUTE reply cut off before its column info flag or shard id is malformed", () => {
+  const statement = parsePrepare(frame(PREPARED_FRAMES.prepareUntypedMarker));
+  assert.deepEqual(parseExecute(frame(EXECUTE_UPDATE), statement, 7).resultInfos, [
+    { statementType: 22, resultCount: 2 },
+  ]);
+
+  for (const cut of [EXECUTE_UPDATE.length - 10, EXECUTE_UPDATE.length - 8]) {
+    assert.throws(
+      () => parseExecute(frame(EXECUTE_UPDATE.slice(0, cut)), statement, 7),
+      MalformedReplyError,
+    );
+  }
+});

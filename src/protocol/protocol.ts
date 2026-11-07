@@ -321,8 +321,11 @@ function readExecution(
   const resultCount = reader.parseInt();
   const resultInfos = parseResultInfos(reader, resultCount, prepared);
 
+  // Both trailer fields are required by the protocol version. A reply cut off
+  // before them is malformed, never a success to commit. A PREPARE_AND_EXECUTE
+  // reply still skips a missing trailer, as it always has.
   let current = statement;
-  if (protoVersion > 1 && reader.remaining > 0) {
+  if (protoVersion > 1 && (prepared || reader.remaining > 0)) {
     const includesColumnInfo = reader.parseByte(); // includes_column_info
     if (prepared) {
       if (includesColumnInfo !== 0 && includesColumnInfo !== 1) {
@@ -335,7 +338,7 @@ function readExecution(
       }
     }
   }
-  if (protoVersion > 4 && reader.remaining > 0) {
+  if (protoVersion > 4 && (prepared || reader.remaining > 0)) {
     reader.parseInt(); // shard_id
   }
 

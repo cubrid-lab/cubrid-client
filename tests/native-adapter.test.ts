@@ -3702,3 +3702,18 @@ test("the values bound are the ones passed when the method was called", async ()
   assert.ok(execute);
   assert.equal(execute.subarray(execute.length - 13).toString("hex"), "0000000108" + "00000004" + "00000007");
 });
+
+test("a truncated EXECUTE reply in autocommit drops the session and never commits", async () => {
+  // An UPDATE of two rows, cut off after its result record and after its column info flag.
+  const update = "00000002000000000116000000020000000000000000000000000000000000fffffffe";
+  for (const cut of [update.length - 10, update.length - 8]) {
+    const { adapter, fakeCAS } = createPreparedAdapter();
+    fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.prepareUntypedMarker));
+    fakeCAS.queueResponse(preparedReply(update.slice(0, cut)));
+
+    await assert.rejects(adapter.executePrepared("UPDATE t SET a = ?", [7]), QueryError);
+
+    assert.equal(fakeCAS.discardCalls, 1);
+    assert.deepEqual(endTranTypes(fakeCAS), []);
+  }
+});
