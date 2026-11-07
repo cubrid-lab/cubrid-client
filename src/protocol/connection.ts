@@ -107,6 +107,19 @@ export class CASConnection {
     return this.enqueue(() => this.connectUnlocked());
   }
 
+  /**
+   * Open a session if there is none, and replace one the broker has released
+   * (CAS_INFO status 0). sendAndRecv() would do the same on its next request;
+   * calling this first lets the caller learn which session that request will
+   * run on, so anything it measures on that session is not stale when sent.
+   */
+  async ensureSession(): Promise<void> {
+    return this.enqueue(async () => {
+      await this.checkReconnectUnlocked();
+      await this.connectUnlocked();
+    });
+  }
+
   /** Unlocked connect body. MUST only be called from within the queue. */
   private async connectUnlocked(): Promise<void> {
     if (this.connected) {
