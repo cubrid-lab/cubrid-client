@@ -70,6 +70,7 @@ export const enum CASFunctionCode {
   GET_DB_VERSION = 15,
   EXECUTE_BATCH = 20,
   CON_CLOSE = 31,
+  CHECK_CAS = 32,
   GET_LAST_INSERT_ID = 40,
   PREPARE_AND_EXECUTE = 41,
 }

@@ -418,6 +418,26 @@ export function writeConClose(
 }
 
 // ---------------------------------------------------------------------------
+// CheckCas (FC=32)
+// ---------------------------------------------------------------------------
+
+export function writeCheckCas(casInfo: Buffer): { header: Buffer; payload: Buffer } {
+  const w = new PacketWriter(8);
+  w.writeByte(CASFunctionCode.CHECK_CAS);
+
+  const payload = w.toBuffer();
+  const header = PacketWriter.buildHeader(payload.length, casInfo);
+  return { header, payload };
+}
+
+/** A live CAS answers with no body at all; a failure has the usual error layout. */
+export function parseCheckCas(data: Buffer): void {
+  if (data.length > 0) {
+    parseSimpleResponse(data);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Simple response parser (for EndTran, CloseReqHandle, etc.)
 // ---------------------------------------------------------------------------
 

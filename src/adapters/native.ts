@@ -209,7 +209,7 @@ export class NativeCubridAdapter implements DriverAdapter {
         await cas.connect();
       }
 
-      return await cas.ping();
+      return await cas.ping(!this.autoCommit);
     } catch (error) {
       throw mapError("connection", error, "Health check failed.");
     }
