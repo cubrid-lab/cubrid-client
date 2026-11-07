@@ -1,17 +1,12 @@
-# Engineering invariants learned from the Python CUBRID projects
+# Engineering invariants for the Node.js CUBRID client
 
-> **Status:** Engineering review checklist and test-design requirements, not evidence that this repository already passes them. Adopted from verified scenarios in [pycubrid](https://github.com/cubrid-lab/pycubrid) and [sqlalchemy-cubrid](https://github.com/cubrid-lab/sqlalchemy-cubrid), with language-native adaptation. Review together with this repository's release policy before claiming stable support.
+> **Status:** Proposed engineering review checklist and test-design requirements for `cubrid-client`, not evidence that the current implementation already satisfies every check. Review it alongside this repository's API and release policies.
 
 ## Why these invariants exist
 
-The Python driver and SQLAlchemy dialect revealed that a passing query or green offline suite is not enough. Bugs occurred around transaction boundaries, CAS session replacement, stale handles, partial fetches, value fidelity, state transitions, unsupported SQL and skipped live tests. They also established reusable **methods**: protocol fixtures, modeled lifecycle tests, JDBC/driver differential cases, explicit failure modes, catalog/DDL tests, and candidate-SHA evidence. **Do not port Python API shapes, source code, or version rules into another language.**
+This package implements a Node.js/TypeScript client for the CUBRID CAS protocol. The correctness of query and transaction outcomes, session and handle lifetimes, value conversion, protocol parsing, and error handling cannot be inferred from a successful query or an offline unit suite alone.
 
-Useful concrete sources:
-- [pycubrid CAS reconnect architecture](https://github.com/cubrid-lab/pycubrid/blob/main/docs/ARCHITECTURE.md#cas-reconnection), [session persistence tests](https://github.com/cubrid-lab/pycubrid/blob/main/tests/test_cas_session_persistence.py), [cursor ownership tests](https://github.com/cubrid-lab/pycubrid/blob/main/tests/test_autocommit_handle_ownership.py)
-- [pycubrid connection state-machine tests](https://github.com/cubrid-lab/pycubrid/blob/main/tests/test_connection_state_machine.py), [official-driver differential cases](https://github.com/cubrid-lab/pycubrid/blob/main/tests/test_official_differential.py)
-- [SQLAlchemy CUBRID architecture](https://github.com/cubrid-lab/sqlalchemy-cubrid/blob/main/docs/ARCHITECTURE.md), [transactional DDL tests](https://github.com/cubrid-lab/sqlalchemy-cubrid/blob/main/test/test_transactional_ddl.py), [live integration gate tests](https://github.com/cubrid-lab/sqlalchemy-cubrid/blob/main/test/test_integration_gate.py), [release-note formatting](https://github.com/cubrid-lab/sqlalchemy-cubrid/blob/main/docs/RELEASE_NOTES_STYLE.md)
-
-**Evidence rule:** the Python code/tests are counterexamples and research references, not proof of the corresponding Go, Rust or TypeScript behavior. Every native implementation must demonstrate its own actual behavior on a real CUBRID server.
+Repository-specific starting points are [API stability](API_STABILITY.md), [release policy](RELEASE_PROCESS.md), the implemented client APIs, and existing protocol and integration tests. Each claimed behavior requires evidence against this package and, where server behavior matters, an actual CUBRID instance. An official JDBC connector can be an independent semantic reference, not a source of implementation or release dependencies.
 
 ## TypeScript/Node.js CUBRID driver invariants
 
@@ -20,7 +15,7 @@ Useful concrete sources:
 3. **Promise and transaction outcomes:** reject on failed begin, commit, rollback, close, unawaited query failure and use-after-commit/rollback. Preserve the original cause plus cleanup failures; never convert a failed transaction into a successful result. Parallel users of one connection must not join another callback's manual transaction.
 4. **Data fidelity:** treat undocumented/unsupported non-NULL server types as explicit unsupported values, not fabricated SQL NULL. Keep BIGINT/DECIMAL precision, signedness, dates/timezone assumptions, binary/LOB and collections explicit. Separate `query()` row semantics from `execute()` command metadata; generated IDs are only as reliable as the actual driver contract.
 5. **Protocol hardening:** test truncated/oversized frames, malformed headers, unexpected function codes, charset/escape-mode negotiation and partial FETCH. Reject invalid input before unbounded allocation. Do not expose credentials in logs, error messages or CI artifacts.
-6. **Independent verification:** compare claims against official JDBC and pycubrid on the *same* DB/version with typed results and transaction outcomes, not by copying APIs. Distinguish agreement, known intentional differences, and unverified claims.
+6. **Independent verification:** compare selected claims against official JDBC on the *same* DB/version with typed results and transaction outcomes, not by copying APIs. Distinguish agreement, known intentional differences, and unverified claims.
 
 ## Concrete checks for each driver PR
 
@@ -36,7 +31,7 @@ Useful concrete sources:
 
 - [#214: autocommit cleanup after partial fetch](https://github.com/cubrid-lab/cubrid-client/issues/214)
 - [#112: manual transaction isolation](https://github.com/cubrid-lab/cubrid-client/issues/112)
-- [#118: JDBC and pycubrid semantic comparison](https://github.com/cubrid-lab/cubrid-client/issues/118)
+- [#118: semantic comparison and verification](https://github.com/cubrid-lab/cubrid-client/issues/118)
 - [#120: release evidence gate](https://github.com/cubrid-lab/cubrid-client/issues/120)
 - [#150: AbortSignal/query cancellation](https://github.com/cubrid-lab/cubrid-client/issues/150)
 - [#189: verify npm publication](https://github.com/cubrid-lab/cubrid-client/issues/189)
