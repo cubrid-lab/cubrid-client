@@ -40,6 +40,13 @@ npm run build
 
 ---
 
+
+## CUBRID correctness and regression evidence
+
+For changes to CUBRID protocol, connection lifecycle, error handling, results, native SQL, ORM migrations, supported versions or releases, read [this repository's engineering invariants](docs/ENGINEERING_INVARIANTS.md) **before** implementation and review. The checks are adapted from the real bugs and tests of `pycubrid` and `sqlalchemy-cubrid`, not a Python API port. In the pull request, describe the behavioral invariant affected, the normal and failure cases tested, and which checks were offline, real CUBRID or independently compared with JDBC. State the exact CUBRID/runtime/driver versions and test outcomes when claiming database compatibility. **Do not mark tests as passed when they were skipped, missing or never executed.**
+
+For documentation-only or nonbehavioral changes, explain why a database run is unnecessary rather than manufacturing an integration result. The final **release candidate** still follows the repository's full live-CUBRID release gate, separate from ordinary PR path optimization. These expectations supplement, and do not weaken, the established review/CI rules.
+
 ## Running Tests
 
 ### Unit Tests
