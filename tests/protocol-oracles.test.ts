@@ -10,16 +10,22 @@ import assert from "node:assert/strict";
 import { CASFunctionCode, CUBRIDDataType, StatementType } from "../src/protocol/constants.js";
 import {
   encodeBindParams,
+  encodePreparedParams,
   LobLocator,
   MalformedReplyError,
+  parseExecute,
   parseFetch,
+  parsePrepare,
   parseLobRead,
   parsePrepareAndExecute,
   UnsupportedValueError,
+  writeExecute,
   writeFetch,
+  writePrepare,
   writeLobRead,
 } from "../src/protocol/protocol.js";
 import { CAPTURED_FRAMES, type CapturedFrame } from "./fixtures/collection-frames.js";
+import { PREPARED_FRAMES } from "./fixtures/dml-frames.js";
 import { LOB_FRAMES } from "./fixtures/lob-frames.js";
 import { ZONED_FRAMES } from "./fixtures/zoned-frames.js";
 import { ZonedDateTime } from "../src/types/zoned-date-time.js";
@@ -904,5 +910,190 @@ test("a damaged zero zoned value is malformed, never an unsupported value, in a 
   assert.throws(
     () => parsePrepareAndExecute(selectWire(18, element(intact, 29)), 1),
     (error: Error) => error instanceof UnsupportedValueError,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Prepared binding: literal request bytes and captured replies
+// ---------------------------------------------------------------------------
+
+const frame = (hex: string): Buffer => Buffer.from(hex, "hex");
+const bindHex = (value: unknown): string => encodePreparedParams([value]).bytes.toString("hex");
+const CAS_INFO = Buffer.from("01ffffff", "hex");
+
+test("PREPARE sends function code 2, the SQL with its NUL, flag 0 and autocommit 0", () => {
+  const { header, payload } = writePrepare("SELECT 1", CAS_INFO);
+  assert.equal(
+    payload.toString("hex"),
+    "02" + "00000009" + "53454c4543542031" + "00" + "0000000100" + "0000000100",
+  );
+  assert.equal(header.toString("hex"), "00000018" + "01ffffff");
+});
+
+test("PREPARE refuses SQL with a NUL, which would cut the statement short", () => {
+  assert.throws(() => writePrepare("SELECT 1\0; DROP TABLE t", CAS_INFO), /null byte/);
+});
+
+test("EXECUTE sends the ten fixed arguments, then each type and value", () => {
+  const statement = parsePrepare(frame(PREPARED_FRAMES.prepareUntypedMarker));
+  const { payload } = writeExecute(statement, encodePreparedParams([7]), CAS_INFO);
+  assert.equal(
+    payload.toString("hex"),
+    "03" +
+      "00000004" + "00000001" + // handle
+      "00000001" + "02" + // EXECUTE_QUERY_ALL, so `a; b` runs both statements
+      "00000004" + "00000000" + // max_col_size
+      "00000004" + "00000000" + // max_row_size
+      "00000000" + // empty CALL-mode argument
+      "00000001" + "01" + // inline fetch of a SELECT
+      "00000001" + "00" + // autocommit
+      "00000001" + "00" + // forward_only
+      "00000008" + "00000000" + "00000000" + // cache time
+      "00000004" + "00000000" + // query timeout
+      "00000001" + "08" + "00000004" + "00000007", // INT 7
+  );
+});
+
+test("EXECUTE asks for no inline fetch unless the statement is a SELECT", () => {
+  const statement = {
+    ...parsePrepare(frame(PREPARED_FRAMES.prepareUntypedMarker)),
+    statementType: 20 as StatementType,
+  };
+  const { payload } = writeExecute(statement, encodePreparedParams([]), CAS_INFO);
+  assert.equal(payload.subarray(34, 39).toString("hex"), "0000000100");
+});
+
+test("prepared binds have literal type bytes and layouts", () => {
+  for (const [value, expected] of [
+    [null, "0000000100" + "00000000"],
+    [undefined, "0000000100" + "00000000"],
+    [true, "0000000108" + "00000004" + "00000001"],
+    [false, "0000000108" + "00000004" + "00000000"],
+    [-0, "0000000108" + "00000004" + "00000000"],
+    [2147483647, "0000000108" + "00000004" + "7fffffff"],
+    [2147483648, "0000000115" + "00000008" + "0000000080000000"],
+    [Number.MAX_SAFE_INTEGER, "0000000115" + "00000008" + "001fffffffffffff"],
+    [Number.MAX_SAFE_INTEGER + 1, "000000010c" + "00000008" + "4340000000000000"],
+    [1.5, "000000010c" + "00000008" + "3ff8000000000000"],
+    [9223372036854775807n, "0000000115" + "00000008" + "7fffffffffffffff"],
+    [-9223372036854775808n, "0000000115" + "00000008" + "8000000000000000"],
+    [9223372036854775808n, "0000000107" + "00000014" + "39323233333732303336383534373735383038" + "00"],
+    ["ab", "0000000101" + "00000003" + "6162" + "00"],
+    ["", "0000000101" + "00000001" + "00"],
+    ["\ud55c", "0000000101" + "00000004" + "ed959c" + "00"],
+    [Buffer.from([0xab, 0xcd]), "0000000106" + "00000002" + "abcd"],
+    [
+      new Date(Date.UTC(2024, 1, 29, 13, 45, 56, 789)),
+      "0000000116" + "0000000e" + "07e8" + "0002" + "001d" + "000d" + "002d" + "0038" + "0315",
+    ],
+  ] as const) {
+    assert.equal(bindHex(value), expected);
+  }
+});
+
+test("values that cannot be sent safely are refused without echoing them", () => {
+  for (const [value, message] of [
+    [Number.NaN, /NaN and Infinity/],
+    [Number.POSITIVE_INFINITY, /NaN and Infinity/],
+    [Number.NEGATIVE_INFINITY, /NaN and Infinity/],
+    [Buffer.alloc(0), /empty Buffer/],
+    ["secret\0", /null byte/],
+    ["secret\x1a", /Ctrl-Z/],
+    [10n ** 38n, /38 digits/],
+    [-(10n ** 38n), /38 digits/],
+    [new Date(Number.NaN), /invalid Date/],
+    [new Date("0000-06-01T00:00:00Z"), /0001 to 9999/],
+    [new Date("+010000-01-01T00:00:00Z"), /0001 to 9999/],
+    [{ secret: 1 }, /unsupported prepared parameter type/],
+    [new Uint8Array([1]), /unsupported prepared parameter type/],
+  ] as const) {
+    assert.throws(
+      () => encodePreparedParams([value]),
+      (error: Error) => message.test(error.message) && !error.message.includes("secret"),
+    );
+  }
+});
+
+test("the largest bigint NUMERIC can hold is sent as its 38 digits", () => {
+  const largest = 10n ** 38n - 1n;
+  assert.equal(bindHex(largest).slice(10, 18), "00000027");
+  assert.equal(bindHex(-largest).slice(10, 18), "00000028");
+});
+
+test("a captured PREPARE reply gives the handle, the type and the server's bind count", () => {
+  const statement = parsePrepare(frame(PREPARED_FRAMES.prepareUntypedMarker));
+  assert.equal(statement.queryHandle, 1);
+  assert.equal(statement.statementType, 21);
+  assert.equal(statement.bindCount, 1);
+  assert.equal(statement.columns[0]?.name, "v");
+  assert.equal(statement.columns[0]?.type, 0);
+});
+
+test("the two-byte type header of an untyped column's cell is decoded", () => {
+  const statement = parsePrepare(frame(PREPARED_FRAMES.prepareUntypedMarker));
+  const read = (hex: string): unknown => parseExecute(frame(hex), statement, 7).rows[0]?.v;
+  assert.equal(read(PREPARED_FRAMES.executeUntypedInt), 7);
+  assert.equal(read(PREPARED_FRAMES.executeUntypedText), "ab");
+  assert.equal(read(PREPARED_FRAMES.executeUntypedText102), "ab");
+  assert.equal(read(PREPARED_FRAMES.executeUntypedNull), null);
+});
+
+test("a type header longer than its cell is malformed", () => {
+  const statement = parsePrepare(frame(PREPARED_FRAMES.prepareUntypedMarker));
+  // The size says 1 but the header takes 2, and the error names the column.
+  const hex = PREPARED_FRAMES.executeUntypedInt.replace(
+    "0000000683080000000701",
+    "00000001" + "8363" + "00000000",
+  );
+  assert.throws(
+    () => parseExecute(frame(hex), statement, 7),
+    (error: Error) => error instanceof MalformedReplyError && /overruns the cell of column "v"/.test(error.message),
+  );
+});
+
+test("an EXECUTE reply handle stays PREPARE's, not its leading tuple count", () => {
+  const statement = { ...parsePrepare(frame(PREPARED_FRAMES.prepareUntypedMarker)), queryHandle: 9 };
+  const result = parseExecute(frame(PREPARED_FRAMES.executeUntypedInt), statement, 7);
+  assert.equal(result.queryHandle, 9);
+  assert.equal(result.totalTupleCount, 1);
+});
+
+test("the statement description refreshed by EXECUTE is read before the shard id", () => {
+  const statement = parsePrepare(frame(PREPARED_FRAMES.prepareMultiSelect));
+  const result = parseExecute(frame(PREPARED_FRAMES.executeMultiSelect), statement, 7);
+  assert.equal(result.resultInfos.length, 2);
+  assert.deepEqual(result.rows, [{ a: 1 }]);
+});
+
+test("an impossible column info flag in an EXECUTE reply is malformed", () => {
+  const statement = parsePrepare(frame(PREPARED_FRAMES.prepareUntypedMarker));
+  const hex = PREPARED_FRAMES.executeUntypedInt.replace(
+    "000000000000000000000000000000" + "00fffffffe",
+    "000000000000000000000000000000" + "02fffffffe",
+  );
+  assert.throws(() => parseExecute(frame(hex), statement, 7), MalformedReplyError);
+});
+
+test("a statement failure inside an EXECUTE reply is the server's error", () => {
+  const statement = parsePrepare(frame(PREPARED_FRAMES.prepareUntypedMarker));
+  const wire = Buffer.concat([
+    i32(1), Buffer.from([0]), i32(1), Buffer.from([20]), i32(-2),
+    i32(-670), i32(4), Buffer.from("dup\0"),
+  ]);
+  assert.throws(
+    () => parseExecute(wire, statement, 7),
+    (error: Error & { code?: number }) => error.code === -670 && error.message.includes("dup"),
+  );
+});
+
+test("captured PREPARE and EXECUTE server errors keep their codes", () => {
+  const statement = parsePrepare(frame(PREPARED_FRAMES.prepareUntypedMarker));
+  assert.throws(
+    () => parsePrepare(frame(PREPARED_FRAMES.prepareSyntaxError)),
+    (error: Error & { code?: number }) => error.code === -493,
+  );
+  assert.throws(
+    () => parseExecute(frame(PREPARED_FRAMES.executeCoercionError), statement, 7),
+    (error: Error & { code?: number }) => error.code === -494,
   );
 });

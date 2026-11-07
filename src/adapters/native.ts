@@ -11,6 +11,11 @@ import { CASConnection, type CASConnectionConfig } from "../protocol/connection.
 import {
   writePrepareAndExecute,
   parsePrepareAndExecute,
+  writePrepare,
+  parsePrepare,
+  writeExecute,
+  parseExecute,
+  encodePreparedParams,
   readQueryHandle,
   MalformedReplyError,
   writeFetch,
@@ -30,6 +35,7 @@ import {
   writeGetLastInsertId,
   parseGetLastInsertId,
   type PrepareAndExecuteResult,
+  type PreparedBinds,
 } from "../protocol/protocol.js";
 import {
   CUBRIDDataType,
@@ -158,19 +164,42 @@ export class NativeCubridAdapter implements DriverAdapter {
   ): Promise<QueryResult<T>> {
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
-    return this.inTurn(() => this.queryNow<T>(sql, params, issued));
+    return this.inTurn(() => this.queryNow<T>(sql, params, issued, false));
   }
 
   async execute(sql: string, params?: QueryParams): Promise<ExecuteResult> {
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
-    return this.inTurn(() => this.executeNow(sql, params, issued));
+    return this.inTurn(() => this.executeNow(sql, params, issued, false));
+  }
+
+  async queryPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<T[]> {
+    return (await this.queryResultPrepared<T>(sql, params)).rows;
+  }
+
+  async queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>> {
+    const cas = this.getOrCreateCAS();
+    const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
+    return this.inTurn(() => this.queryNow<T>(sql, params, issued, true));
+  }
+
+  async executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult> {
+    const cas = this.getOrCreateCAS();
+    const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
+    return this.inTurn(() => this.executeNow(sql, params, issued, true));
   }
 
   private async executeNow(
     sql: string,
     params: QueryParams | undefined,
     issued: IssuedOn,
+    prepared: boolean,
   ): Promise<ExecuteResult> {
     try {
       await this.readInsertIdBaseline(sql);
@@ -180,6 +209,7 @@ export class NativeCubridAdapter implements DriverAdapter {
         issued,
         (cas, result) => this.readExecuteResult(cas, result),
         true,
+        prepared,
       );
     } catch (error) {
       this.forgetInsertId();
@@ -193,9 +223,10 @@ export class NativeCubridAdapter implements DriverAdapter {
     sql: string,
     params: QueryParams | undefined,
     issued: IssuedOn,
+    prepared: boolean,
   ): Promise<QueryResult<T>> {
     try {
-      return await this.executeQuery<T>(sql, params, issued);
+      return await this.executeQuery<T>(sql, params, issued, prepared);
     } catch (error) {
       // If the first transactional statement lost its session before the
       // post-response bind, remember that failed generation. A ping/reconnect
@@ -367,8 +398,12 @@ export class NativeCubridAdapter implements DriverAdapter {
     sql: string,
     params: QueryParams | undefined,
     issued: IssuedOn,
+    prepared: boolean,
   ): Promise<QueryResult<T>> {
-    return this.runStatement(sql, params, issued, async (cas, result) => {
+    const read = async (
+      cas: CASConnection,
+      result: PrepareAndExecuteResult,
+    ): Promise<QueryResult<T>> => {
       // This may generate a value that nobody reads, so a later execute() on this
       // session could not tell it from its own.
       if (result.resultInfos.some((info) => info.statementType !== StatementType.SELECT)) {
@@ -391,7 +426,9 @@ export class NativeCubridAdapter implements DriverAdapter {
       }
 
       return { rows: allRows as T[], columns: result.columns.map(toColumnInfo) };
-    });
+    };
+
+    return this.runStatement(sql, params, issued, read, false, prepared);
   }
 
   /**
@@ -448,6 +485,12 @@ export class NativeCubridAdapter implements DriverAdapter {
    * commit lets the CAS go, so a question asked after the autocommit flag could
    * reach a new session that holds no value. The statement is then committed with
    * END_TRAN, or rolled back if anything failed.
+   *
+   * `prepared` sends PREPARE and EXECUTE with typed binds instead of SQL text
+   * holding the values. The handle belongs to this one call and is released
+   * like any other, so it can never outlive its session or be reused. Prepared
+   * statements always end by END_TRAN in autocommit mode, so a failed PREPARE,
+   * which leaves the session in a transaction, is rolled back.
    */
   private async runStatement<R>(
     sql: string,
@@ -455,6 +498,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     issued: IssuedOn,
     use: (cas: CASConnection, result: PrepareAndExecuteResult) => Promise<R>,
     commitAfter = false,
+    prepared = false,
   ): Promise<R> {
     const cas = this.getOrCreateCAS();
 
@@ -473,6 +517,9 @@ export class NativeCubridAdapter implements DriverAdapter {
       throw new Error("CASConnection is not connected");
     }
 
+    // Refused values must fail before anything is sent, so no session is opened.
+    const binds = prepared ? encodePreparedParams(params ?? []) : undefined;
+
     // Settle the session before binding: a CAS that has gone is replaced by the
     // next request, which could otherwise be a different session than the one the
     // backslash mode was measured on.
@@ -481,7 +528,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     // Only a backslash, CR or LF is escaped differently by the two modes, so any
     // other parameters bind the same on every session and skip the probe.
     const resolvedSql =
-      params && params.length > 0
+      !binds && params && params.length > 0
         ? interpolateParams(
             sql,
             params,
@@ -489,12 +536,10 @@ export class NativeCubridAdapter implements DriverAdapter {
           )
         : sql;
 
-    const deferCommit = commitAfter && this.autoCommit;
-    const { header, payload } = writePrepareAndExecute(
-      resolvedSql,
-      this.autoCommit && !deferCommit,
-      cas.casInfo,
-    );
+    const deferCommit = (commitAfter || prepared) && this.autoCommit;
+    const { header, payload } = binds
+      ? writePrepare(sql, cas.casInfo)
+      : writePrepareAndExecute(resolvedSql, this.autoCommit && !deferCommit, cas.casInfo);
 
     // Before the first statement a ping may truthfully report OUT_TRAN.
     if (!this.autoCommit && this.transactionGeneration === null) {
@@ -511,10 +556,9 @@ export class NativeCubridAdapter implements DriverAdapter {
       const finished = await this.withQueryHandle(cas, responsePayload, async () => {
         await this.bindTransactionSession(cas);
 
-        const result: PrepareAndExecuteResult = parsePrepareAndExecute(
-          responsePayload,
-          cas.protoVersion,
-        );
+        const result: PrepareAndExecuteResult = binds
+          ? await this.executeHandle(cas, responsePayload, binds, generation)
+          : parsePrepareAndExecute(responsePayload, cas.protoVersion);
 
         const value = await use(cas, result);
         if (deferCommit) {
@@ -538,6 +582,43 @@ export class NativeCubridAdapter implements DriverAdapter {
       }
       throw error;
     }
+  }
+
+  /**
+   * Sends EXECUTE for the handle in a PREPARE reply. It must reach the session
+   * that prepared it: on any other session the same number is another statement
+   * or nothing. The CAS ignores extra values and the literal path ignores extra
+   * parameters, so the count is checked against the server's here.
+   */
+  private async executeHandle(
+    cas: CASConnection,
+    prepareReply: Buffer,
+    binds: PreparedBinds,
+    generation: number,
+  ): Promise<PrepareAndExecuteResult> {
+    const statement = parsePrepare(prepareReply);
+    if (statement.bindCount !== binds.count) {
+      throw new Error(
+        `Parameter count mismatch: the statement has ${statement.bindCount} markers, got ${binds.count} values`,
+      );
+    }
+
+    const { header, payload } = writeExecute(statement, binds, cas.casInfo);
+    const reply = await this.exchangeOnSession(cas, generation, header, payload);
+    return parseExecute(reply, statement, cas.protoVersion);
+  }
+
+  private async exchangeOnSession(
+    cas: CASConnection,
+    generation: number,
+    header: Buffer,
+    payload: Buffer,
+  ): Promise<Buffer> {
+    const reply = await cas.sendAndRecvOnSession(generation, header, payload);
+    if (!reply) {
+      throw new ConnectionLostError("Connection lost before the prepared statement finished");
+    }
+    return reply;
   }
 
   /** Ends the transaction of a statement run by runStatement(commitAfter), on its own session. */

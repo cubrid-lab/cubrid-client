@@ -262,9 +262,9 @@ Not supported:
 
 ## Sending JavaScript parameters
 
-The existing public `query(sql, params)` method renders values into SQL text
-**client-side**. It is not a server-side prepared-statement binding API;
-native opt-in binding is a separate proposal ([#85](https://github.com/cubrid-lab/cubrid-client/issues/85)).
+The public `query(sql, params)` method renders values into SQL text
+**client-side**. It is not a server-side prepared-statement binding API; that
+is the opt-in [`queryPrepared()` family](#prepared-binding) below.
 The SQL literal escaping rules depend on the server's `no_backslash_escapes`
 setting, negotiated on each physical session: a reconnect measures it again
 before a string containing a backslash, CR or LF is bound on the new session.
@@ -280,10 +280,58 @@ Other parameters render the same in both modes and are sent without that probe.
 | `Buffer` | Hexadecimal binary literal `X'...'`; not a promise of native BLOB/CLOB write support |
 | `null` | SQL `NULL` |
 
-The module also defines an internal binary encoder. It is **not** the active
-binding path used by `query(sql, params)`; do not infer active server-side
-prepared statements from its presence. Check [the API reference](API_REFERENCE.md)
-for current method contracts.
+The module also defines an older internal binary encoder, `encodeBindParams()`.
+Nothing uses it, and its layout is not the one EXECUTE reads: prepared binding
+has its own encoder. Check [the API reference](API_REFERENCE.md) for current
+method contracts.
+
+### Prepared binding
+
+`queryPrepared()`, `queryResultPrepared()` and `executePrepared()` send the SQL
+with its `?` markers in a PREPARE request and the values as typed binds in an
+EXECUTE request, so a value never becomes SQL text and no backslash probe is
+needed. They are opt-in: `query()`, `queryResult()` and `execute()` keep
+rendering SQL literals.
+
+| JavaScript parameter | Bind type | Notes |
+| --- | --- | --- |
+| `null`, `undefined` | NULL | |
+| `boolean` | INT `1` or `0` | The same value as the literal path |
+| `number`, safe integer | INT, or BIGINT past 32 bits | `-0` is `0` |
+| `number`, any other finite value | DOUBLE | The exact IEEE-754 value |
+| `number`, `NaN` or an infinity | Refused | The broker would store it |
+| `bigint` | BIGINT, or NUMERIC past 64 bits | Plain digits; more than 38 digits is refused |
+| `string` | CHAR | UTF-8; NUL and Ctrl-Z are refused, as on the literal path |
+| `Date` | DATETIME | **UTC components**, as on the literal path. Years outside 0001 to 9999 and an invalid `Date` are refused |
+| `Buffer` | VARBIT | An empty `Buffer` is refused: the broker reads it as SQL NULL |
+| Anything else | Refused | The literal path would stringify it |
+
+A refused value rejects with a `QueryError` before anything is sent, and the
+error never contains the value.
+
+How the result differs from the literal path for the same statement:
+
+- **Parameter count.** The number of values must equal the server's marker
+  count. Extra values reject; the literal path ignores them.
+- **Fractions.** The literal path sends `1.5` as a NUMERIC literal, so
+  `SELECT ?` returns the string `"1.5"`; here it returns the number `1.5`. The
+  value stored in a DOUBLE column is exact, where a NUMERIC literal can round
+  the last digit.
+- **A fraction bound to a TIME column is stored rounded to seconds.** `1.5`
+  becomes `00:00:02`, where the literal path gets `-494` from the server. The
+  driver cannot refuse it, because it does not know the column's type. Bind a
+  `Date`, or a string, to a TIME column.
+- **Integers past `Number.MAX_SAFE_INTEGER`.** `2 ** 60` stores exactly that
+  value in a BIGINT column; the literal path stores its shortened decimal text
+  `1152921504606847000`. In a VARCHAR column it appears as
+  `1.152921504606847e+18`. Use a `bigint`.
+- **Empty `Buffer`.** Refused here; the literal path sends `X''`.
+- **Error codes.** A value that does not fit the column fails at EXECUTE. The
+  message names the host variable and not the value, and a value that does not
+  fit an ENUM column reports `-181` rather than `-494`.
+
+An NCHAR column accepts text on neither path. Multi-statement strings run every
+statement on both paths, and the markers of all the statements count together.
 
 ## Cautions
 

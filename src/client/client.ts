@@ -8,6 +8,8 @@ import type {
   Executable,
   ExecutableTransactionClient,
   ExecuteResult,
+  PreparedQueryable,
+  PreparedTransactionClient,
   Queryable,
   ResultQueryable,
   ResultTransactionClient,
@@ -16,7 +18,7 @@ import type {
 import type { QueryParams } from "../types/query.js";
 import type { QueryResult, QueryResultRow } from "../types/result.js";
 
-export class CubridClient implements Queryable, ResultQueryable, Executable {
+export class CubridClient implements Queryable, ResultQueryable, Executable, PreparedQueryable {
   private sharedConnectionPromise: Promise<ConnectionLike> | undefined;
   private closed = false;
 
@@ -64,8 +66,53 @@ export class CubridClient implements Queryable, ResultQueryable, Executable {
     }
   }
 
+  async queryPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<T[]> {
+    try {
+      const connection = await this.getSharedConnection();
+      if (!connection.queryPrepared) {
+        throw new Error("Underlying connection does not support queryPrepared.");
+      }
+      return await connection.queryPrepared<T>(sql, params);
+    } catch (error) {
+      throw mapError("query", error, "Query failed.");
+    }
+  }
+
+  async queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>> {
+    try {
+      const connection = await this.getSharedConnection();
+      if (!connection.queryResultPrepared) {
+        throw new Error("Underlying connection does not support queryResultPrepared.");
+      }
+      return await connection.queryResultPrepared<T>(sql, params);
+    } catch (error) {
+      throw mapError("query", error, "Query failed.");
+    }
+  }
+
+  async executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult> {
+    try {
+      const connection = await this.getSharedConnection();
+      if (!connection.executePrepared) {
+        throw new Error("Underlying connection does not support executePrepared.");
+      }
+      return await connection.executePrepared(sql, params);
+    } catch (error) {
+      throw mapError("query", error, "Statement failed.");
+    }
+  }
+
   async transaction<T>(
-    callback: TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient>,
+    callback: TransactionCallback<
+      T,
+      ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient
+    >,
   ): Promise<T> {
     if (this.closed) {
       throw mapError("transaction", new Error("Client is closed."), "Transaction failed.");

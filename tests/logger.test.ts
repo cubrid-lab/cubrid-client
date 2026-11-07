@@ -332,3 +332,35 @@ test("logger reports execute without SQL, parameters or the insert id", async ()
   assert.equal(logged.includes(SQL_LITERAL), false);
   assert.equal(logged.includes(PARAM), false);
 });
+
+test("logger reports the prepared methods without SQL, parameters or rows", async () => {
+  const { logger, entries } = recorder();
+  const connection = fakeConnection();
+  connection.queryPrepared = async <T>() => [{ v: ROW_VALUE }] as unknown as T[];
+  connection.queryResultPrepared = async <T>() => ({
+    rows: [{ v: ROW_VALUE }] as unknown as T[],
+    columns: [],
+  });
+  connection.executePrepared = async () => ({ affectedRows: 5, lastInsertId: 99 });
+  const c = client(logger, connection);
+  const sql = `SELECT '${SQL_LITERAL}', ?`;
+
+  await c.queryPrepared(sql, [PARAM]);
+  await c.queryResultPrepared(sql, [PARAM]);
+  await c.executePrepared(sql, [PARAM]);
+
+  for (const [operation, rowCount] of [
+    ["queryPrepared", 1],
+    ["queryResultPrepared", 1],
+    ["executePrepared", undefined],
+  ] as const) {
+    const entry = entries.find((e) => e.fields.operation === operation);
+    assert.ok(entry);
+    assert.equal(entry.fields.paramCount, 1);
+    assert.equal(entry.fields.rowCount, rowCount);
+  }
+  const logged = JSON.stringify(entries);
+  assert.equal(logged.includes(SQL_LITERAL), false);
+  assert.equal(logged.includes(PARAM), false);
+  assert.equal(logged.includes(ROW_VALUE), false);
+});

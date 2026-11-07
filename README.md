@@ -166,6 +166,20 @@ const { affectedRows, lastInsertId } = await db.execute(
 [`execute()`](docs/API_REFERENCE.md#executesql-params) for what the server
 reports for multi-row and multi-statement inserts.
 
+### Server-side prepared binding
+
+`query()` and `execute()` render parameters into SQL text. To send them as typed
+binds instead, use `queryPrepared()`, `queryResultPrepared()` or
+`executePrepared()`, on the client or on a transaction:
+
+```ts
+const rows = await db.queryPrepared("SELECT id FROM users WHERE name = ?", [name]);
+```
+
+It is opt-in, takes more round trips than `query()` and has no reusable statement
+object. See [prepared binding](docs/TYPES.md#prepared-binding) for the type
+mapping, the values it refuses and where results differ.
+
 ### Date parameters are serialized in UTC
 
 `Date` parameters are rendered as a `DATETIME'YYYY-MM-DD HH:MM:SS.mmm'`
