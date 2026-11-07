@@ -1,0 +1,70 @@
+name: Diagnose npm publisher authorization
+
+# Read-only check for GitHub environment NPM_TOKEN and registry ownership.
+# Never create a release, publish a tarball, or expose the token or username.
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/verify-npm-publisher.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-npm-publisher:
+    name: Verify registry token authenticates as a cubrid-client maintainer
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: npm-publish
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Check authenticated npm identity and package ownership without publishing
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${NODE_AUTH_TOKEN:-}" ]]; then
+            echo "::error::NPM_TOKEN is empty or missing in the npm-publish environment/repository secrets."
+            exit 1
+          fi
+          if ! npm whoami --registry=https://registry.npmjs.org/ > "$RUNNER_TEMP/npm-user" 2> "$RUNNER_TEMP/npm-whoami-errors"; then
+            echo "::error::NPM_TOKEN does not authenticate with the public npm registry (npm whoami failed). Check token validity, expiration and registry."
+            exit 1
+          fi
+          if ! npm view cubrid-client maintainers --json > "$RUNNER_TEMP/maintainers.json"; then
+            echo "::error::Unable to read the public cubrid-client package maintainer list."
+            exit 1
+          fi
+          node - "$RUNNER_TEMP/npm-user" "$RUNNER_TEMP/maintainers.json" <<'NODE'
+          const fs = require("node:fs");
+          const account = fs.readFileSync(process.argv[2], "utf8").trim();
+          const maintainers = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
+          const rows = Array.isArray(maintainers) ? maintainers : [maintainers];
+          const names = rows.map((item) => typeof item === "string" ? item : item?.name).filter(Boolean);
+          if (names.length === 0) {
+            console.error("::error::Public npm registry returned an empty maintainer list.");
+            process.exit(1);
+          }
+          if (!names.includes(account)) {
+            console.error("::error::NPM_TOKEN authenticates, but its account is not listed as a cubrid-client package maintainer. A package owner must grant publish access or supply an authorized token.");
+            process.exit(1);
+          }
+          console.log("Authenticated npm token belongs to a listed cubrid-client maintainer.");
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, "npm registry authentication succeeded and the token account is listed as a cubrid-client maintainer. This does not verify token-level publish scope or 2FA restrictions.\n");
+          NODE
+      - name: Check whether tagged release is visible on npm
+        shell: bash
+        run: |
+          set -euo pipefail
+          published=$(npm view cubrid-client@1.2.0 version 2>/dev/null || true)
+          if [[ "$published" == "1.2.0" ]]; then
+            echo "cubrid-client@1.2.0 is already published." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "cubrid-client@1.2.0 is not published. Recover with the existing v1.2.0 immutable tag only after valid authorization is configured." >> "$GITHUB_STEP_SUMMARY"
+          fi
