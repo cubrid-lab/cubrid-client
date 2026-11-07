@@ -14,6 +14,7 @@ import {
   parsePrepareAndExecute,
   writeFetch,
 } from "../src/protocol/protocol.js";
+import { CAPTURED_FRAMES, type CapturedFrame } from "./fixtures/collection-frames.js";
 
 const i32 = (value: number): Buffer => {
   const b = Buffer.alloc(4);
@@ -140,4 +141,207 @@ test("truncated packets and literal FETCH error envelopes reject", () => {
   assert.throws(() => parsePrepareAndExecute(truncated, 1));
   const badFetch = Buffer.concat([i32(-1), i32(-10006), Buffer.from("invalid handle\0")]);
   assert.throws(() => parseFetch(badFetch, []), /CUBRID fetch failed/);
+});
+
+// ---------------------------------------------------------------------------
+// Collections, from replies captured on live brokers (#82)
+// ---------------------------------------------------------------------------
+
+const decodeFrame = (frame: CapturedFrame) =>
+  parsePrepareAndExecute(Buffer.from(frame.hex, "hex"), 7);
+
+const firstValue = (frame: CapturedFrame): { c: unknown; t: unknown } => {
+  const row = decodeFrame(frame).rows[0];
+  assert.ok(row);
+  return { c: row.c, t: row.t };
+};
+
+for (const [name, frame] of [
+  ["11.4", CAPTURED_FRAMES.tableRows],
+  ["10.2", CAPTURED_FRAMES.tableRowsOn10_2],
+] as const) {
+  test(`CUBRID ${name} collection rows decode without shifting the next column`, () => {
+    const result = decodeFrame(frame);
+
+    // Literal CCI ids: SET 16, MULTISET 17, SEQUENCE 18 over INT 8, STRING 2, BIGINT 21.
+    assert.deepEqual(
+      result.columns.map((column) => [column.name, column.type, column.elementType]),
+      [
+        ["id", 8, undefined],
+        ["s", 16, 8],
+        ["m", 17, 2],
+        ["q", 18, 21],
+        ["tail_col", 2, undefined],
+      ],
+    );
+    assert.deepEqual(result.rows, [
+      // Inserted as {3,1,2,2}, {'b','a','b'} and {30000000000,1,1}: the server
+      // sorts and deduplicates the SET, sorts the MULTISET and keeps the SEQUENCE.
+      { id: 1, s: [1, 2, 3], m: ["a", "b", "b"], q: [30000000000n, 1n, 1n], tail_col: "after1" },
+      { id: 2, s: [], m: [], q: [], tail_col: "after2" },
+      { id: 3, s: null, m: null, q: null, tail_col: "after3" },
+      { id: 4, s: [null], m: ["x", null], q: [null, 5n, null], tail_col: "after4" },
+    ]);
+  });
+}
+
+test("captured collection edge cases decode to their documented values", () => {
+  const cases: Array<[CapturedFrame, unknown]> = [
+    [CAPTURED_FRAMES.setDeduplicated, [1, 2]],
+    [CAPTURED_FRAMES.allNullSet, [null, null]],
+    [CAPTURED_FRAMES.nestedSequence, [[], [1]]],
+    [CAPTURED_FRAMES.nullBesideNested, [null, [1]]],
+    [CAPTURED_FRAMES.emptyVarbitElement, [Buffer.alloc(0)]],
+    [CAPTURED_FRAMES.emptyStringElement, [""]],
+    [CAPTURED_FRAMES.doubleElements, [1.5, 2.5]],
+    [CAPTURED_FRAMES.datetimeElement, [new Date(2024, 0, 2, 3, 4, 5, 678)]],
+    [CAPTURED_FRAMES.enumElements, ["a", "b"]],
+  ];
+  for (const [frame, expected] of cases) {
+    assert.deepEqual(firstValue(frame), { c: expected, t: "after" }, frame.sql);
+  }
+});
+
+test("the server sends a mixed-type collection as SQL NULL, also inside a collection", () => {
+  // The broker replaces the value before the driver sees it: cell length -1 and
+  // element length -1, the same bytes as a genuine NULL.
+  assert.deepEqual(firstValue(CAPTURED_FRAMES.mixedSequence), { c: null, t: "after" });
+  assert.deepEqual(firstValue(CAPTURED_FRAMES.nestedMixedInner), { c: [null, [2]], t: "after" });
+});
+
+test("unsupported collection elements reject and name the column", () => {
+  for (const [frame, wireType] of [
+    [CAPTURED_FRAMES.datetimetzElement, 31],
+    [CAPTURED_FRAMES.blobElement, 23],
+    [CAPTURED_FRAMES.objectElement, 19],
+  ] as const) {
+    assert.throws(
+      () => decodeFrame(frame),
+      (error: Error) =>
+        error.message.includes('column "c" (wire type 18') &&
+        (error.cause as Error).message.includes(`type ${wireType}`),
+      frame.sql,
+    );
+  }
+});
+
+test("parseFetch decodes collections with the metadata of the executed query", () => {
+  const { columns } = decodeFrame(CAPTURED_FRAMES.tableRows);
+  const cell = (hex: string): Buffer => Buffer.from(hex, "hex");
+  const text = Buffer.from("fetch\0");
+  const fetched = parseFetch(
+    Buffer.concat([
+      i32(0), i32(1),
+      i32(5), Buffer.alloc(8),
+      i32(4), cell("00000005"),
+      i32(13), cell("08000000010000000400000007"),
+      i32(5), cell("0000000000"),
+      i32(-1),
+      i32(text.length), text,
+    ]),
+    columns,
+  );
+  assert.deepEqual(fetched.rows, [{ id: 5, s: [7], m: [], q: null, tail_col: "fetch" }]);
+});
+
+// The captured SET cell of CAST({1,2,2} AS SET OF INT): cell length 0x15, type 8,
+// count 2, then two int32 elements. The value 'after' of column t follows it.
+const SET_CELL = "00000015" + "08" + "00000002" + "00000004" + "00000001" + "00000004" + "00000002";
+
+const withCell = (replacement: string): Buffer => {
+  const { hex } = CAPTURED_FRAMES.setDeduplicated;
+  assert.ok(hex.includes(SET_CELL));
+  return Buffer.from(hex.replace(SET_CELL, replacement), "hex");
+};
+
+test("the unmodified captured cell decodes, proving the malformed cases below start valid", () => {
+  assert.deepEqual(parsePrepareAndExecute(withCell(SET_CELL), 7).rows, [{ c: [1, 2], t: "after" }]);
+});
+
+const causeOf = (error: Error): string =>
+  error.cause instanceof Error ? causeOf(error.cause) : error.message;
+
+for (const [problem, cell, reason] of [
+  // Lengths: the 21-byte cell of the valid case with one field changed.
+  ["an element length past the cell", "00000015080000000200000004000000010000000500000002", /cannot read 5 bytes/],
+  ["an element length past the packet", "00000015080000000200000004000000017fffffff00000002", /cannot read 2147483647 bytes/],
+  ["a negative element length below NULL", "0000001508000000020000000400000001fffffffe00000002", /invalid length -2/],
+  ["a zero length on a type that cannot be empty", "00000015080000000200000004000000010000000000000002", /invalid length 0/],
+  ["a count that exceeds the cell", "00000015087fffffff00000004000000010000000400000002", /count 2147483647/],
+  ["a count larger than the elements", "00000015080000000300000004000000010000000400000002", /element 2 has no length/],
+  ["a count smaller than the elements", "00000015080000000100000004000000010000000400000002", /uses 13 of its 21 bytes/],
+  ["a negative count", "0000001508ffffffff00000004000000010000000400000002", /count -1/],
+  ["a non-NULL element without an element type", "00000015000000000200000004000000010000000400000002", /Unsupported CUBRID CAS value type 0/],
+  // Element payloads that disagree with their type, in a cell of the right size.
+  ["an int element shorter than its type", "0000001308000000020000000400000001000000020000", /bounds|out of range/],
+  ["an int element longer than its type", "00000016080000000200000004000000010000000500000000" + "02", /uses 4 of its 5 bytes/],
+  // Cell lengths.
+  ["a cell longer than its elements", "00000019080000000200000004000000010000000400000002ffffffff", /uses 21 of its 25 bytes/],
+  ["a cell shorter than its header", "000000040800000002", /has no header/],
+  ["a zero-length collection cell", "00000000", /invalid cell length 0/],
+  ["a cell length below NULL", "fffffffe", /invalid cell length -2/],
+  ["a cell length past the packet", "7fffffff", /cannot read 2147483647 bytes/],
+] as const) {
+  test(`a collection with ${problem} rejects instead of shifting the next column`, () => {
+    assert.throws(
+      () => parsePrepareAndExecute(withCell(cell), 7),
+      (error: Error) => {
+        assert.match(causeOf(error), reason);
+        return true;
+      },
+    );
+  });
+}
+
+test("a collection cell cannot read past its end into the next column", () => {
+  // An 11-byte cell whose only int32 element claims 4 bytes when 2 remain in the
+  // cell. The bytes of column t follow, so an unbounded read would take them.
+  const cell = "0000000b" + "08" + "00000001" + "00000004" + "0001";
+  assert.throws(
+    () => parsePrepareAndExecute(withCell(cell), 7),
+    (error: Error) => {
+      assert.ok(error.message.includes('column "c"'));
+      assert.match(causeOf(error), /cannot read 4 bytes/);
+      return true;
+    },
+  );
+});
+
+test("a nested collection with a malformed inner length rejects", () => {
+  const { hex } = CAPTURED_FRAMES.nestedSequence;
+  // Second element of {{},{1}}: its int32 element claims 5 bytes in a 4-byte payload.
+  const inner = "0000000d08000000010000000400000001";
+  assert.ok(hex.includes(inner));
+  const damaged = hex.replace(inner, "0000000d08000000010000000500000001");
+  assert.throws(() => parsePrepareAndExecute(Buffer.from(damaged, "hex"), 7));
+});
+
+test("very deep nesting rejects instead of crashing the process", () => {
+  const depth = 200_000;
+  const levelSize = 9; // element type, count and the inner element's length
+  const body = Buffer.alloc(depth * levelSize);
+  for (let level = 0; level < depth; level++) {
+    const offset = level * levelSize;
+    body[offset] = 18;
+    body.writeInt32BE(1, offset + 1);
+    body.writeInt32BE(body.length - offset - levelSize, offset + 5);
+  }
+  assert.throws(() => parseFetch(
+    Buffer.concat([i32(0), i32(1), i32(1), Buffer.alloc(8), i32(body.length), body]),
+    [{ ...decodeFrame(CAPTURED_FRAMES.setDeduplicated).columns[0]!, type: CUBRIDDataType.SEQUENCE }],
+  ));
+});
+
+test("a scalar value that disagrees with its cell length rejects", () => {
+  // An int column declares 3 bytes: reading 4 would consume the next cell's first byte.
+  const wire = selectWire(8, Buffer.from("000000", "hex"));
+  assert.throws(() => parsePrepareAndExecute(Buffer.concat([wire, Buffer.alloc(4)]), 1), /Failed to decode/);
+  // The same for a bigint column that declares more than its 8 bytes.
+  const long = selectWire(21, Buffer.from("000000000000002a00", "hex"));
+  assert.throws(() => parsePrepareAndExecute(long, 1), /Failed to decode/);
+});
+
+test("a NULL cell keeps an ordinary one-byte metadata type intact", () => {
+  assert.equal(parsePrepareAndExecute(selectWire(34, null), 1).columns[0]?.type, 34);
+  assert.equal(parsePrepareAndExecute(selectWire(34, null), 1).columns[0]?.elementType, undefined);
 });

@@ -39,8 +39,25 @@ import {
 // Column metadata (shared between prepare and execute results)
 // ---------------------------------------------------------------------------
 
+/** Bits of the first metadata type byte that name a collection kind. */
+const COLLECTION_KIND_MASK = 0x60;
+const COLLECTION_KIND_BY_FLAG: Readonly<Record<number, CUBRIDDataType>> = {
+  0x20: CUBRIDDataType.SET,
+  0x40: CUBRIDDataType.MULTISET,
+  0x60: CUBRIDDataType.SEQUENCE,
+};
+/** One element-type byte and an int32 element count. */
+const COLLECTION_HEADER_SIZE = 5;
+
 export interface ColumnMeta {
+  /** Column type. A collection column holds its kind: SET, MULTISET or SEQUENCE. */
   type: CUBRIDDataType;
+  /**
+   * Declared element type of a collection column; undefined for other columns.
+   * It is NULL (0) for a collection without one domain, such as a bare `SET`,
+   * and each cell states the element type its values actually use.
+   */
+  elementType?: CUBRIDDataType;
   scale: number;
   precision: number;
   name: string;
@@ -738,6 +755,27 @@ function formatDatetime(date: Date): string {
 // Column metadata parser
 // ---------------------------------------------------------------------------
 
+/**
+ * Read a column's type. Bit 0x80 of the first byte announces a second byte that
+ * holds the type; the first byte then carries the collection kind in bits 0x60
+ * and the charset in its low bits, so the kind must be kept from it before the
+ * second byte is read as the element type. CUBRID 10.2-11.4 send 0xa0 0x08 for
+ * SET OF INT and 0xc3 0x02 for MULTISET OF VARCHAR.
+ */
+function parseColumnType(reader: PacketReader): {
+  type: CUBRIDDataType;
+  elementType?: CUBRIDDataType;
+} {
+  const first = reader.parseUByte();
+  if ((first & 0x80) === 0) {
+    return { type: first as CUBRIDDataType };
+  }
+
+  const wireType = reader.parseUByte() as CUBRIDDataType;
+  const kind = COLLECTION_KIND_BY_FLAG[first & COLLECTION_KIND_MASK];
+  return kind === undefined ? { type: wireType } : { type: kind, elementType: wireType };
+}
+
 function parseColumnMetadata(
   reader: PacketReader,
   count: number,
@@ -745,13 +783,7 @@ function parseColumnMetadata(
   const columns: ColumnMeta[] = [];
 
   for (let i = 0; i < count; i++) {
-    const legacyType = reader.parseUByte();
-    let colType: CUBRIDDataType;
-    if ((legacyType & 0x80) !== 0) {
-      colType = reader.parseUByte() as CUBRIDDataType;
-    } else {
-      colType = legacyType as CUBRIDDataType;
-    }
+    const { type, elementType } = parseColumnType(reader);
 
     const scale = reader.parseShort();
     const precision = reader.parseInt();
@@ -779,7 +811,8 @@ function parseColumnMetadata(
     reader.parseByte(); // is_shared (ignored)
 
     columns.push({
-      type: colType,
+      type,
+      ...(elementType === undefined ? {} : { elementType }),
       scale,
       precision,
       name,
@@ -818,26 +851,36 @@ function parseRowData(
 
     for (let c = 0; c < columns.length; c++) {
       let size = reader.parseInt();
+      const column = columns[c]!;
+      let colType = column.type;
+
+      // CAS writes SQL NULL as -1, and a collection cell always has its header.
+      if (size < -1 || (size === 0 && isCollectionType(colType))) {
+        throw new Error(
+          `Malformed CAS packet: invalid cell length ${size} for column "${column.name}"`,
+        );
+      }
       if (size <= 0) {
-        row[columns[c]!.name] = null;
+        row[column.name] = null;
         continue;
       }
-
-      let colType = columns[c]!.type;
 
       // Special handling for CALL/SP or NULL type
       if (isCallType || colType === CUBRIDDataType.NULL) {
         colType = reader.parseUByte() as CUBRIDDataType;
         size--;
         if (size <= 0) {
-          row[columns[c]!.name] = null;
+          row[column.name] = null;
           continue;
         }
       }
 
-      const column = columns[c]!;
+      const valueStart = reader.position;
       try {
         row[column.name] = readValue(reader, colType, size);
+        // A value that disagrees with its cell length would turn the bytes of
+        // the following columns into the wrong values.
+        assertExactLength(reader.position - valueStart, size);
       } catch (error) {
         // Keep unsupported non-NULL values distinct from SQL NULL. Framed
         // parsing ends here; the adapter's query-handle finally block cleans
@@ -902,12 +945,99 @@ function readValue(
     case CUBRIDDataType.CLOB:
       return reader.parseBytes(size);
 
+    case CUBRIDDataType.SET:
+    case CUBRIDDataType.MULTISET:
+    case CUBRIDDataType.SEQUENCE:
+      return readCollection(reader, size);
+
     case CUBRIDDataType.NULL:
     default:
       // Never turn an unsupported non-NULL wire value into SQL NULL:
       // callers would silently lose data and could persist the wrong result.
       throw new Error(`Unsupported CUBRID CAS value type ${colType} (${size} bytes)`);
   }
+}
+
+function isCollectionType(colType: CUBRIDDataType): boolean {
+  return (
+    colType === CUBRIDDataType.SET ||
+    colType === CUBRIDDataType.MULTISET ||
+    colType === CUBRIDDataType.SEQUENCE
+  );
+}
+
+function assertExactLength(consumed: number, declared: number): void {
+  if (consumed !== declared) {
+    throw new Error(`Malformed CAS packet: value uses ${consumed} of its ${declared} bytes`);
+  }
+}
+
+/**
+ * Decode one collection cell: an element-type byte, an int32 element count, then
+ * an int32 length and the payload of each element. The cell states the element
+ * type itself, so it decides over the column metadata: an empty or all-NULL
+ * collection sends type 0, and a bare `SET` column declares no element type.
+ *
+ * Every read is bounded to the cell, so a wrong length rejects the query and can
+ * never consume the following columns.
+ */
+function readCollection(reader: PacketReader, size: number): unknown[] {
+  const cell = reader.subReader(size);
+  if (size < COLLECTION_HEADER_SIZE) {
+    throw new Error(`Malformed CAS packet: collection cell of ${size} bytes has no header`);
+  }
+
+  const elementType = cell.parseUByte() as CUBRIDDataType;
+  const count = cell.parseInt();
+  // Each element has at least a length word; check that before looping on a
+  // count that only the sender vouches for.
+  if (count < 0 || count * SIZE_INT > cell.remaining) {
+    throw new Error(
+      `Malformed CAS packet: collection count ${count} does not fit ${cell.remaining} bytes`,
+    );
+  }
+
+  const values: unknown[] = [];
+  for (let i = 0; i < count; i++) {
+    if (cell.remaining < SIZE_INT) {
+      throw new Error(`Malformed CAS packet: collection element ${i} has no length`);
+    }
+    values.push(readCollectionElement(cell, elementType, cell.parseInt()));
+  }
+  assertExactLength(size - cell.remaining, size);
+  return values;
+}
+
+function readCollectionElement(
+  cell: PacketReader,
+  elementType: CUBRIDDataType,
+  length: number,
+): unknown {
+  if (length === -1) {
+    return null;
+  }
+  // BIT and VARBIT are the only encodings that can be empty: text keeps its NUL.
+  if (
+    length === 0 &&
+    (elementType === CUBRIDDataType.BIT || elementType === CUBRIDDataType.VARBIT)
+  ) {
+    return Buffer.alloc(0);
+  }
+  if (length <= 0) {
+    throw new Error(
+      `Malformed CAS packet: invalid length ${length} for collection element type ${elementType}`,
+    );
+  }
+  // The payload is a file locator, not the LOB content (#93); do not hand a
+  // server path to callers as if it were the element value.
+  if (elementType === CUBRIDDataType.BLOB || elementType === CUBRIDDataType.CLOB) {
+    throw new Error(`Unsupported CUBRID collection element type ${elementType}`);
+  }
+
+  const element = cell.subReader(length);
+  const value = readValue(element, elementType, length);
+  assertExactLength(length - element.remaining, length);
+  return value;
 }
 
 // ---------------------------------------------------------------------------

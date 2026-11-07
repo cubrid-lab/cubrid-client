@@ -13,7 +13,13 @@ historical CUBRID Node.js driver:
 The pinned commit above is an independent reference for numeric constants;
 it is **not** evidence of complete CUBRID 10.2–11.4 behavioral compatibility
 for JSON, LOB, collections or protocol extensions. The live matrix validates
-the actual 23 integration cases per server separately.
+the actual integration cases per server separately.
+
+[`tests/fixtures/collection-frames.ts`](../tests/fixtures/collection-frames.ts)
+is a second, separate oracle: complete replies captured from live 10.2, 11.0,
+11.2 and 11.4 brokers with a raw socket client, stored as hexadecimal literals.
+The offline tests replace single fields in those frames to build the malformed
+cases.
 
 ## Separate numeric domains
 
@@ -35,6 +41,24 @@ are 35–37, **not** column type identifiers or support for full BLOB/CLOB
 materialization. Older protocol v2 has a special legacy function-code
 mapping; the fixtures use modern protocol expectations.
 
+## Collection wire format
+
+The four brokers sent the same layout, with protocol version 7:
+
+- **Column metadata** is two bytes. The first holds `0x80`, the collection kind in
+  bits `0x60` (SET `0x20`, MULTISET `0x40`, SEQUENCE `0x60`) and the charset in its
+  low bits. The second is the element type: `a0 08` is SET OF INT and `c3 02` is
+  MULTISET OF VARCHAR. A collection without one domain has element type `00`.
+- **A cell** is `[element type: 1 byte][count: int32]` followed by
+  `[length: int32][payload]` for each element. `08 00000001 00000004 00000007` is
+  `{7}`. An empty collection is `00 00000000`. The cell's element type decides
+  over the metadata; it is `00` when every element is NULL.
+- **A NULL element** has length `-1` and no payload. Only BIT and VARBIT use
+  length `0`, for an empty value; an empty string has length `1`, its NUL.
+- **A nested collection** is an element whose payload is a complete cell.
+- **A mixed-type collection** is sent as a NULL cell, or a NULL element when
+  nested, the same bytes as a genuine NULL.
+
 ## Required regression checks
 
 `tests/protocol-oracles.test.ts` uses literal constants and packet bytes
@@ -45,6 +69,9 @@ rather than importing the implementation enum as an oracle. It checks:
 - BIGINT parameter encoding (`0000000915000000000000002a` for 42n).
 - Distinguishing real SQL NULL, empty strings and unsupported non-NULL types.
 - Malformed/truncated packets and the negative FETCH error envelope.
+- SET, MULTISET and SEQUENCE decode from captured replies, including empty,
+  NULL, repeated, nested and unsupported elements, and each malformed length
+  rejects for its stated reason.
 
 A one-line mutation of `BIGINT = 21` to `26` must fail its literal
 expectations, instead of producing false-positive tests that use
@@ -54,9 +81,8 @@ The protocol test runs in the standard required Node.js CI and is
 independent of a database connection. Separate [live CUBRID
 validation](SUPPORT_MATRIX.md) exercises the current integration suite on
 actual server images; it does not guarantee that every SQL type and
-statement has been proven. Unsupported collection/JSON decoding, LOB
+statement has been proven. Unsupported JSON decoding, LOB
 materialization, and full parity testing remain tracked in
-[#82](https://github.com/cubrid-lab/cubrid-client/issues/82),
 [#111](https://github.com/cubrid-lab/cubrid-client/issues/111),
 [#93](https://github.com/cubrid-lab/cubrid-client/issues/93), and
 [#118](https://github.com/cubrid-lab/cubrid-client/issues/118).

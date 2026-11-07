@@ -49,10 +49,16 @@ fault-injection test. A separately required
 now verifies **3/3 tests with 0 skips**: a trusted CA/hostname-verified SQL
 query, rejection of the untrusted self-signed certificate, and rejection
 of a wrong hostname even with the correct CA. It does **not** establish TLS
-compatibility on every database version, or independent collection/JSON/LOB
+compatibility on every database version, or independent JSON/LOB
 coverage. Do not equate these 23 tests
 with production-ready certification. See [#95](https://github.com/cubrid-lab/cubrid-client/issues/95)
 and the [release gate](https://github.com/cubrid-lab/cubrid-client/issues/120).
+
+The integration suite now also asserts decoded SET, MULTISET and SEQUENCE values:
+29/29 passed with 0 skipped against local `cubrid/cubrid` 10.2, 11.0, 11.2 and
+11.4 containers when that decoder was added
+([#82](https://github.com/cubrid-lab/cubrid-client/issues/82)). The table above
+records the earlier CI runs and has not been re-recorded with these cases.
 
 ## Release-blocking coverage still needed
 
