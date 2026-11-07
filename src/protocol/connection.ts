@@ -30,6 +30,8 @@ import {
 
 const RETRY_BASE_DELAY_MS = 100;
 const RETRY_MAX_DELAY_MS = 2000;
+/** Handshake inactivity limit when `readTimeout` is unset. Later requests are not limited by it. */
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
 
 /** The TCP connection could not be opened; no byte was sent, so a retry is safe. */
 class SocketConnectError extends Error {}
@@ -54,7 +56,9 @@ export interface CASConnectionConfig {
    * many milliseconds. Measures inactivity, not total time, so a large response
    * that keeps arriving is not cut off. The clock only runs while this
    * connection is using the socket: not while idle, and not while a request
-   * waits in the queue. Undefined or 0 disables it.
+   * waits in the queue. Undefined or 0 disables it for requests; the
+   * connection handshake (broker exchange, TLS, OpenDatabase) then still gives
+   * up after 10 seconds of inactivity.
    */
   readTimeout?: number;
   /**
@@ -96,6 +100,7 @@ export class CASConnection {
   private receiveBuffer: Buffer = Buffer.alloc(0);
   private _connectionGeneration = 0;
   private _failedExchanges = 0;
+  private inHandshake = false;
 
   /**
    * Per-instance FIFO serialization queue. Public entry points that mutate
@@ -159,6 +164,7 @@ export class CASConnection {
     }
 
     this.socketDead = false;
+    this.inHandshake = true;
 
     // Step 1: Connect to broker and send ClientInfoExchange
     const brokerSocket = await this.createSocket(this.config.host, this.config.port);
@@ -213,6 +219,8 @@ export class CASConnection {
       this.socket = null;
       this.receiveBuffer = Buffer.alloc(0);
       throw error;
+    } finally {
+      this.inHandshake = false;
     }
   }
 
@@ -603,9 +611,10 @@ export class CASConnection {
    * abandoned operation is only released when the socket closes.
    */
   private async withReadTimeout<T>(socket: Socket, operation: Promise<T>): Promise<T> {
-    const readTimeout = this.config.readTimeout;
+    const readTimeout =
+      this.config.readTimeout || (this.inHandshake ? DEFAULT_HANDSHAKE_TIMEOUT_MS : undefined);
 
-    if (readTimeout === undefined || readTimeout === 0) {
+    if (readTimeout === undefined) {
       return operation;
     }
 

@@ -94,7 +94,7 @@ contract.
 
 ## Connection retries
 
-`maxConnectionRetryCount` is the number of retries after a failed first attempt to open the TCP connection to the broker or CAS: connection refused, host unreachable, or `connectionTimeout` expired. It defaults to `0` (no retry) and must be a non-negative integer, or `createClient()` throws a `RangeError`. Delays between attempts double from 100 ms up to 2 s, so the cumulative backoff is at most `maxConnectionRetryCount` times 2 s. That is not a bound on the total time to connect: `connectionTimeout` stops applying once the TCP connection is open, so a broker that accepts the connection and then never answers the handshake, the OpenDatabase reply or the TLS handshake waits indefinitely unless `readTimeout` is set. Set `readTimeout` to bound that.
+`maxConnectionRetryCount` is the number of retries after a failed first attempt to open the TCP connection to the broker or CAS: connection refused, host unreachable, or `connectionTimeout` expired. It defaults to `0` (no retry) and must be a non-negative integer, or `createClient()` throws a `RangeError`. Delays between attempts double from 100 ms up to 2 s, so the cumulative backoff is at most `maxConnectionRetryCount` times 2 s. That is not a bound on the total time to connect: `connectionTimeout` stops applying once the TCP connection is open. From then on a broker that never answers the handshake, the OpenDatabase reply or the TLS handshake is bounded by `readTimeout`, or by a 10-second inactivity limit when `readTimeout` is unset (see [Read timeout](#read-timeout)). Such a failure is not retried.
 
 ```ts
 const client = createClient({
@@ -117,7 +117,7 @@ When every attempt fails, the last failure is kept as the innermost `cause`. The
 
 ## Read timeout
 
-`connectionTimeout` only covers opening the TCP connection. Without `readTimeout`, a query waits for as long as the server stays silent, and so does everything queued behind it on that connection. Set `readTimeout` to fail instead:
+`connectionTimeout` only covers opening the TCP connection. Without `readTimeout`, the connect handshake gives up after 10 seconds of server inactivity (see below), but a query waits for as long as the server stays silent, and so does everything queued behind it on that connection. Set `readTimeout` to fail instead:
 
 ```ts
 const db = createClient({
@@ -133,6 +133,8 @@ const db = createClient({
 - waiting for each response, including the time the server spends executing the statement. Set it above your slowest expected statement.
 - sending each request. A request the server has stopped reading fails too. Progress here is only visible as the operating system's send buffer drains, so a very short timeout can fail a large request sent over a slow link. With `ssl` on, progress is not visible at all: each request must finish sending within `readTimeout`.
 - each read during connect and reconnect, and the TLS handshake when `ssl` is on.
+
+**The connect handshake has a default limit.** When `readTimeout` is unset (or `0`), the broker handshake, the TLS handshake and the OpenDatabase exchange still fail with a `ReadTimeoutError` after 10 seconds of server inactivity, so `connect()` and the queries behind it cannot wait forever on a silent broker. That default applies only to the handshake and never to later requests. A set `readTimeout` replaces it, so use a larger value to allow a slower handshake. A handshake timeout is not retried by `maxConnectionRetryCount`.
 
 It does not run while the connection is idle, or while a request waits its turn behind another one. A caller at the back of the queue only starts its own clock when its request is sent.
 
