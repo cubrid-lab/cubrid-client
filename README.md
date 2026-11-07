@@ -87,6 +87,14 @@ result and input mapping, including `BIGINT` as `bigint`, decimal `NUMERIC`
 as `string`, SET/MULTISET/SEQUENCE collections as arrays, and values
 that cannot be decoded. The [roadmap](ROADMAP.md) tracks work that has **not** been released.
 
+## Server Version
+
+`getServerVersion()` returns the CUBRID server version string, for example for a compatibility check. It is the same single request as `ping()`, so it never ends an open transaction.
+
+```ts
+const version = await db.getServerVersion(); // "11.4.6.1963"
+```
+
 ## Typed Queries
 
 Use TypeScript generics to get fully typed query results:

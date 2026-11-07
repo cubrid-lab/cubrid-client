@@ -863,6 +863,45 @@ test("client ping wraps error as ConnectionError", async () => {
   );
 });
 
+test("client getServerVersion returns the connection's version string with one request", async () => {
+  const connection = new FakeConnection();
+  let pings = 0;
+  connection.ping = async () => {
+    pings += 1;
+    return "11.2.9.0866";
+  };
+  const client = createClient(baseOptions({ connectionFactory: () => connection }));
+
+  assert.equal(await client.getServerVersion(), "11.2.9.0866");
+  assert.equal(pings, 1);
+});
+
+test("client getServerVersion wraps a failure as ConnectionError", async () => {
+  const connection = new FakeConnection();
+  connection.ping = async () => {
+    throw new Error("version failed");
+  };
+  const client = createClient(baseOptions({ connectionFactory: () => connection }));
+
+  await assert.rejects(
+    client.getServerVersion(),
+    (error: unknown) =>
+      error instanceof ConnectionError &&
+      error.message === "Failed to get the server version.",
+  );
+});
+
+test("client getServerVersion rejects when the connection cannot report a version", async () => {
+  const client = createClient(baseOptions({ connectionFactory: () => new FakeConnection() }));
+
+  await assert.rejects(
+    client.getServerVersion(),
+    (error: unknown) =>
+      error instanceof ConnectionError &&
+      error.message === "Failed to get the server version.",
+  );
+});
+
 test("client ping throws when connection has no ping method", async () => {
   const connection = new FakeConnection();
   const client = createClient(
