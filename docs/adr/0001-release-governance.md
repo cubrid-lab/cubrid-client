@@ -15,6 +15,10 @@ Use existing Node.js 1.x SemVer commitments; breaking observable API or Node run
 
 Applicable SemVer classification: a compatible bug/security fix is generally PATCH, an additive feature MINOR, and an incompatible public behavior or supported-environment change requires a reviewed breaking release (under current 0.x rules, commonly the next 0.y.0; at 1.x+ a MAJOR). Changes to SQL generation, data types, migrations or transactions can be compatibility-breaking without exported-type changes. A release candidate must have a reviewed version and notes, a final immutable commit, actual live CUBRID evidence when database behavior is claimed, and verified published artifacts. Keep omitted/failed checks visible; never invent approval or successful publication.
 
+## Node.js runtime support through 1.x
+
+The existing [API stability policy](../API_STABILITY.md#nodejs-support-schedule) retains Node 18 and Node 20 for **every** 1.x release. No 1.x MINOR/PATCH may raise `engines.node` above 18. Any future proposal to drop Node 18 is reserved for a reviewed **2.0 major** with migration notes, and is not automatically scheduled. See [ADR 0006](0006-node-18-support-through-1x.md). A Node 22 development toolchain is separate from the **Node 18 packed-package consumer validation** required to protect the support promise.
+
 ## Alternatives considered
 
 - **Rejected:** Existing Node runtime/API promises matter more than copying the Python project's 28-day notice or equating a GitHub tag with registry availability.
