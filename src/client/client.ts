@@ -1,5 +1,6 @@
-import { CubridTransaction } from "./transaction.js";
-import { mapError } from "../internals/map-error.js";
+import { CallbackTransaction } from "./transaction.js";
+import { TransactionError } from "../errors/transaction-error.js";
+import { mapError, toError } from "../internals/map-error.js";
 import type {
   ClientConfig,
   ConnectionFactory,
@@ -66,24 +67,48 @@ export class CubridClient implements Queryable, ResultQueryable, Executable {
   async transaction<T>(
     callback: TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient>,
   ): Promise<T> {
+    if (this.closed) {
+      throw mapError("transaction", new Error("Client is closed."), "Transaction failed.");
+    }
+
     const connection = await this.connectionFactory(this.config);
-    const transaction = new CubridTransaction(connection);
+    let transaction: CallbackTransaction | undefined;
+    let failed = false;
+    let details: TransactionError | undefined;
 
     try {
       await connection.beginTransaction();
+      transaction = new CallbackTransaction(connection);
       const result = await callback(transaction);
-      await transaction.commit();
+      await transaction.finish();
       return result;
     } catch (error) {
-      try {
-        await transaction.rollback();
-      } catch {
-        // Preserve the original transaction error.
+      failed = true;
+      await transaction?.abort();
+      const failure = mapError("transaction", error, "Transaction failed.");
+
+      // mapError returns a ReadTimeoutError unchanged, and that object is not ours to modify.
+      if (failure instanceof TransactionError) {
+        details = failure;
+
+        if (transaction?.rollbackFailure) {
+          details.rollbackError = transaction.rollbackFailure;
+        }
       }
 
-      throw mapError("transaction", error, "Transaction failed.");
+      throw failure;
     } finally {
-      await connection.close();
+      try {
+        await connection.close();
+      } catch (closeError) {
+        if (!failed) {
+          throw closeError;
+        }
+
+        if (details) {
+          details.closeError = toError(closeError);
+        }
+      }
     }
   }
 

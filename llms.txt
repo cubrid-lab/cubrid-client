@@ -10,6 +10,7 @@ Key facts:
 - Query: `await db.query<User>("SELECT * FROM users WHERE id = ?", [1])`
 - Transactions: `await db.transaction(async (tx) => { await tx.query(...) })`
 - Collections: SET, MULTISET and SEQUENCE columns return JavaScript arrays (`CollectionValue`); `{1,'a'}`-style mixed-type collections arrive from the server as SQL NULL
+- A callback transaction has one outcome: `tx` rejects with `TransactionError` once it is committed or rolled back; `error.cause` keeps the original failure, with cleanup failures on `error.rollbackError` and `error.closeError`
 - Error classes: `ConnectionError`, `QueryError`, `TransactionError`, `ReadTimeoutError`; `ConstraintError`, `SqlSyntaxError`, `DeadlockError` and `LockTimeoutError` extend `QueryError`
 - Error details: `code` (numeric server code), `origin`, `kind` and optional `sqlState`
 - ESM and CommonJS output

@@ -211,7 +211,7 @@ try {
 
 `error.kind` tells these causes apart: `deadlock`, `lock-timeout` or `connection-lost`.
 
-- **`deadlock`**: retry the whole transaction. With code `-72` the server already rolled it back, so if your callback catches that error and continues, its later `tx.query()` calls reject and nothing is committed. See [what happens after `-72`](API_REFERENCE.md#error-details).
+- **`deadlock`**: retry the whole transaction. With code `-72` the server already rolled it back, so if your callback catches that error and continues, its later `tx` statements reject, nothing is committed and `transaction()` rejects with that error. See [what happens after `-72`](API_REFERENCE.md#error-details).
 - **`lock-timeout`**: only the statement failed and the transaction is still open. CUBRID waits indefinitely by default. To limit the wait, run `SET TRANSACTION LOCK TIMEOUT <seconds>` inside the transaction.
 
 ### Transaction auto-rollback
@@ -230,6 +230,43 @@ try {
   // error.cause.message === "Business logic failed"
 }
 ```
+
+### `TransactionError: Transaction has already been committed`
+
+A `tx` was used after its transaction ended. The same applies to `Transaction has already been rolled back`, `Transaction has already failed` and `Transaction is already completing`. The call sent nothing to the server. Common causes:
+
+- `tx.commit()` or `tx.rollback()` was called twice, or a `catch` block rolls back after a commit that succeeded.
+- A query runs after `tx.commit()`. Move it before the commit, or run it on `db.query()` if it belongs outside the transaction.
+- `tx` was kept past the end of the callback, for example in a timer or an un-awaited promise. Await all of the work inside the callback.
+
+### A transaction failed because of a query the callback did not await
+
+If a `tx.query()`, `tx.queryResult()` or `tx.execute()` is still running when the commit starts and then fails, nothing is committed and `transaction()` rejects with that failure as `cause`. Await every statement, and catch the error at that point if the transaction may continue. The client cannot see a query that was not awaited and rejected before the callback's last `await` resumed, so the commit goes ahead in that case. See the [transaction lifecycle](API_REFERENCE.md#transaction-lifecycle).
+
+### The rollback or close failed as well
+
+`error.cause` is always the failure that ended the transaction. Check `error.rollbackError` and `error.closeError` for what went wrong during cleanup:
+
+```ts
+try {
+  await db.transaction(work);
+} catch (error) {
+  if (error instanceof TransactionError) {
+    console.error("Transaction failed:", error.cause);
+    if (error.rollbackError) console.error("Rollback also failed:", error.rollbackError);
+    if (error.closeError) console.error("Close also failed:", error.closeError);
+  }
+}
+```
+
+### `transaction()` rejected but the data was committed
+
+Two situations leave committed data behind a rejection, so check before retrying:
+
+- The callback called `tx.commit()` and then threw. A commit cannot be rolled back.
+- The commit succeeded and only closing the connection failed. `transaction()` then rejects with the close error, a `ConnectionError` from the built-in adapter.
+
+A [read timeout](CONNECTION.md#read-timeout) during the commit leaves the outcome unknown as well.
 
 ### Manual transaction left open
 

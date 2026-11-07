@@ -16,7 +16,7 @@ type ErrorKind = "connection" | "query" | "transaction";
 
 export function mapError(kind: ErrorKind, error: unknown, message: string): Error {
   // Kept as-is at every layer so callers can test for it without unwrapping.
-  if (error instanceof ReadTimeoutError) {
+  if (isInstance(error, ReadTimeoutError)) {
     return error;
   }
 
@@ -61,7 +61,7 @@ function findErrorDetails(error: Error): CubridErrorDetails {
   const seen = new Set<unknown>();
   let current: unknown = error;
 
-  while (current instanceof Error && !seen.has(current)) {
+  while (isInstance(current, Error) && !seen.has(current)) {
     seen.add(current);
 
     if (
@@ -84,10 +84,25 @@ function findErrorDetails(error: Error): CubridErrorDetails {
   return {};
 }
 
-function toError(error: unknown): Error {
-  if (error instanceof Error) {
+/** `instanceof` throws for a revoked proxy, and callers may throw any value. */
+function isInstance<T>(value: unknown, type: abstract new (...args: never[]) => T): value is T {
+  try {
+    return value instanceof type;
+  } catch {
+    return false;
+  }
+}
+
+export function toError(error: unknown): Error {
+  if (isInstance(error, Error)) {
     return error;
   }
 
-  return new Error(String(error));
+  try {
+    return new Error(String(error));
+  } catch {
+    // String() throws for values such as Object.create(null) or a revoked proxy,
+    // and this runs while a transaction still has a connection to close.
+    return new Error("Non-Error value that cannot be converted to a string.", { cause: error });
+  }
 }

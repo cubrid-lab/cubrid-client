@@ -213,6 +213,36 @@ await db.transaction(async (tx) => {
 // If any query throws, everything is rolled back automatically.
 ```
 
+The callback owns one transaction with exactly one outcome. You normally do not
+call `tx.commit()` or `tx.rollback()`, but both remain available, for example to
+decline a change without treating it as an error. The client then skips its own
+commit or rollback and still returns the callback's value:
+
+```ts
+const placed = await db.transaction(async (tx) => {
+  const [stock] = await tx.query<{ qty: number }>(
+    "SELECT qty FROM inventory WHERE item = ?",
+    ["Widget"],
+  );
+  if (!stock || stock.qty < 1) {
+    await tx.rollback();
+    return false;
+  }
+  await tx.query("INSERT INTO orders (item, qty) VALUES (?, ?)", ["Widget", 1]);
+  return true;
+});
+```
+
+Once the transaction is complete, `tx.query()`, `tx.queryResult()`, `tx.execute()`,
+`tx.commit()` and `tx.rollback()` reject with `TransactionError` and send nothing
+to the server. If the rollback or
+the connection close also fails, `error.cause` stays the original failure and the
+later ones are on `error.rollbackError` and `error.closeError`. Await every
+statement: one that is still running when the commit starts and then fails
+rolls the transaction back. See the
+[transaction lifecycle](docs/API_REFERENCE.md#transaction-lifecycle) for every
+outcome and the [compatibility notes](docs/API_STABILITY.md#transaction-callback-guards).
+
 ### Manual
 
 For fine-grained control on the shared connection:
@@ -339,7 +369,7 @@ Executes SQL and returns typed row objects. DDL/DML statements return `[]`. BLOB
 
 ### `client.transaction<T>(callback): Promise<T>`
 
-Runs `callback` in an isolated transaction with auto commit/rollback.
+Runs `callback` in an isolated transaction with exactly one commit or rollback.
 
 ### `client.beginTransaction(): Promise<void>`
 

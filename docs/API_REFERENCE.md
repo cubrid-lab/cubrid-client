@@ -223,16 +223,44 @@ async transaction<T>(
 
 **Returns:** `Promise<T>` — The return value of the callback.
 
-**Throws:** [`TransactionError`](#transactionerror) if the transaction or rollback fails.
+**Throws:** [`TransactionError`](#transactionerror) if the transaction fails, with the first failure in `cause`. See the [transaction lifecycle](#transaction-lifecycle) for the exceptions.
 
 ##### How It Works
 
 1. A **new isolated connection** is created via `connectionFactory`.
 2. `beginTransaction()` is called on that connection.
 3. The `callback` receives a [`CubridTransaction`](#cubridtransaction) instance scoped to that connection.
-4. If the callback resolves successfully, `commit()` is called.
-5. If the callback throws, `rollback()` is called, and the error is re-thrown as a `TransactionError` (a [`ReadTimeoutError`](#readtimeouterror) is re-thrown as-is).
-6. The isolated connection is **always closed** in a `finally` block, regardless of outcome.
+4. If the callback resolves successfully and has not completed the transaction itself, `commit()` is called once.
+5. If the callback throws, `rollback()` is called once unless the transaction is already complete, and the error is re-thrown as a `TransactionError` (a [`ReadTimeoutError`](#readtimeouterror) is re-thrown as-is).
+6. The isolated connection is **always closed**, regardless of outcome.
+
+##### Transaction lifecycle
+
+A callback transaction has exactly one terminal outcome. Before `commit()` or `rollback()` is sent, the client waits for queries that are still running, so the end of the transaction is the last thing sent on its connection. If such a query never settles and no `readTimeout` is set, the transaction waits with it.
+
+| The callback... | Server sees | `transaction()` |
+|---|---|---|
+| Resolves | One commit | Resolves with its value |
+| Throws | One rollback | Rejects, `cause` is the callback's error |
+| Resolves, then the commit fails | One commit, then one rollback | Rejects, `cause` is the commit error |
+| Resolves while a query it did not await is still running, and that query fails | One rollback, never a commit | Rejects, `cause` is the query's error |
+| Calls `tx.commit()` and resolves | One commit | Resolves with its value |
+| Calls `tx.rollback()` and resolves | One rollback | Resolves with its value |
+| Calls `tx.commit()` and then throws | One commit, **no rollback: the work stays committed** | Rejects, `cause` is the callback's error |
+| Calls `tx.rollback()` and then throws | One rollback | Rejects, `cause` is the callback's error |
+| Calls `tx.commit()`, it fails, and the callback resolves anyway | One commit, then one rollback | Rejects, `cause` is the commit error |
+| Calls `tx.rollback()`, it fails, and the callback resolves anyway | One rollback, never a commit | Rejects, `cause` is the rollback error |
+
+`beginTransaction()` failing skips the callback, and no commit or rollback is sent because no transaction started. `transaction()` rejects with that failure as `cause`.
+
+**Queries the callback did not await.** These rules apply to `tx.query()`, `tx.queryResult()` and `tx.execute()` alike. A query still running when a commit starts, whether automatic or from `tx.commit()`, had no one to handle its failure, so its failure fails the transaction: nothing is committed, the work is rolled back, and `transaction()` rejects with no unhandled rejection. A query the callback awaited and handled is its own decision, so catching a failed `tx.query()` and resolving still commits. The same applies when `transaction()` itself commits after a query rejected too recently for the callback to have seen it, such as `void tx.query(sql)` followed by `await Promise.resolve()`. **One case cannot be detected:** a query that was not awaited and rejected before the callback's last `await` resumed looks the same as a handled one, so the commit goes ahead (and Node.js reports the unhandled rejection unless you attached a handler). Await every statement. During a rollback, a still-running query that fails changes nothing: the work is being discarded anyway and the original failure stays as `cause`. A query that was not awaited and rejected shortly before the callback threw raises no unhandled rejection either, unless the event loop moved on in between, for example while the callback awaited another statement. Node.js has reported it by then.
+
+**Use after completion.** Once `commit()` or `rollback()` has been called, every later `tx.query()`, `tx.queryResult()`, `tx.execute()`, `tx.commit()` and `tx.rollback()` rejects with a `TransactionError` and sends nothing to the server, including from a `tx` kept after `transaction()` settled. Only the first completion counts: a failed `commit()` or `rollback()` is not retried.
+
+**Failures during cleanup.** A rollback or close failure never replaces the original failure. `cause` keeps the original, and the later failures are on [`rollbackError`](#transactionerror) and `closeError`. Closing the connection ends the server session, so uncommitted work is discarded even when the rollback failed. There are two cases to check:
+
+- A [`ReadTimeoutError`](#readtimeouterror) is re-thrown unchanged, so later rollback and close failures are not reported on it.
+- If the commit succeeded and only the close failed, `transaction()` rejects with the close error, as it always has: a `ConnectionError` from the built-in adapter, not a `TransactionError`. **The work is committed**, so do not retry it blindly.
 
 ##### Examples
 
@@ -348,7 +376,7 @@ It sends the same single version request as [`ping()`](#ping), so it has the sam
 
 #### `close()`
 
-Closes the shared connection after the statements issued before it have finished. After calling `close()`, the client can no longer execute queries: a `query()`, `queryResult()`, `ping()`, `getServerVersion()`, `beginTransaction()`, `commit()` or `rollback()` issued after `close()` is called, even in the same tick, rejects with an error whose `cause` is `Client is closed.`, and no connection is opened. If no connection was opened, closing it is a no-op.
+Closes the shared connection after the statements issued before it have finished. After calling `close()`, the client can no longer execute queries: a `query()`, `queryResult()`, `execute()`, `ping()`, `getServerVersion()`, `transaction()`, `beginTransaction()`, `commit()` or `rollback()` issued after `close()` is called, even in the same tick, rejects with an error whose `cause` is `Client is closed.`, and no connection is opened. A `transaction()` already started runs to its end on its own connection. If no connection was opened, closing it is a no-op.
 
 ```ts
 async close(): Promise<void>
@@ -373,7 +401,9 @@ try {
 
 ## CubridTransaction
 
-A transaction-scoped client that delegates queries to the isolated transactional connection. You do **not** create this class directly — it is provided to you inside the `transaction()` callback.
+A transaction-scoped client that delegates queries to the isolated transactional connection. You do **not** create this class directly — it is provided to you inside the `transaction()` callback, where it follows the [transaction lifecycle](#transaction-lifecycle).
+
+The exported constructor stays available in 1.x for compatibility. An instance you construct yourself only forwards to the connection you gave it and has no lifecycle guards.
 
 ```ts
 class CubridTransaction implements ResultTransactionClient, ExecutableTransactionClient
@@ -392,7 +422,7 @@ async query<T extends QueryResultRow = QueryResultRow>(
 ): Promise<T[]>
 ```
 
-**Throws:** [`TransactionError`](#transactionerror) if execution fails.
+**Throws:** [`TransactionError`](#transactionerror) if execution fails, or if the transaction is already complete.
 
 #### `execute(sql, params?)`
 
@@ -406,7 +436,7 @@ async execute(sql: string, params?: QueryParams): Promise<ExecuteResult>
 
 #### `commit()`
 
-Commits the transaction. Called automatically by `CubridClient.transaction()` on success.
+Commits the transaction. Called automatically by `CubridClient.transaction()` on success, so you only need it to make the work durable before the callback ends. Rejects with a [`TransactionError`](#transactionerror) if the transaction is already complete.
 
 ```ts
 commit(): Promise<void>
@@ -414,7 +444,7 @@ commit(): Promise<void>
 
 #### `rollback()`
 
-Rolls back the transaction. Called automatically by `CubridClient.transaction()` on failure.
+Rolls back the transaction. Called automatically by `CubridClient.transaction()` on failure, so you only need it to abandon the work without throwing. Rejects with a [`TransactionError`](#transactionerror) if the transaction is already complete.
 
 ```ts
 rollback(): Promise<void>
@@ -519,11 +549,13 @@ Thrown when a transaction operation fails (begin, commit, rollback, or query wit
 ```ts
 class TransactionError extends Error {
   name = "TransactionError";
-  cause?: Error; // Original driver error
+  cause?: Error; // Original failure
   readonly code?: number; // See "Error details"
   readonly origin?: "server" | "cas";
   readonly sqlState?: string;
   readonly kind?: CubridErrorKind;
+  rollbackError?: Error; // transaction() only: rolling back also failed
+  closeError?: Error; // transaction() only: closing the connection also failed
 }
 ```
 
@@ -538,6 +570,10 @@ A failure inside a transaction stays a `TransactionError`, as it was before thes
 | Rollback fails | `"Failed to rollback."` |
 | Query inside transaction fails | `"Transaction query failed."` |
 | Transaction callback throws | `"Transaction failed."` |
+| `tx` used while a completion is running | `"Transaction is already completing."` |
+| `tx` used after a commit | `"Transaction has already been committed."` |
+| `tx` used after a rollback | `"Transaction has already been rolled back."` |
+| `tx` used after a failed commit or rollback | `"Transaction has already failed."` |
 
 ### ReadTimeoutError
 
