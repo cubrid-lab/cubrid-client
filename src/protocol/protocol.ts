@@ -239,6 +239,8 @@ export interface PrepareAndExecuteResult {
   columnCount: number;
   columns: ColumnMeta[];
   totalTupleCount: number;
+  /** One entry per statement the request ran; more than one for `a; b`. */
+  resultInfos: ResultInfo[];
   rows: Record<string, unknown>[];
 }
 
@@ -283,7 +285,7 @@ function readExecuteReply(
   const totalTupleCount = reader.parseInt();
   reader.parseByte(); // cache_reusable
   const resultCount = reader.parseInt();
-  parseResultInfos(reader, resultCount);
+  const resultInfos = parseResultInfos(reader, resultCount);
 
   if (protoVersion > 1 && reader.remaining > 0) {
     reader.parseByte(); // includes_column_info
@@ -311,6 +313,7 @@ function readExecuteReply(
     columnCount,
     columns,
     totalTupleCount,
+    resultInfos,
     rows,
   };
 }
@@ -500,6 +503,59 @@ export function parseCheckCas(data: Buffer): void {
   if (data.length > 0) {
     parseSimpleResponse(data);
   }
+}
+
+// ---------------------------------------------------------------------------
+// GetLastInsertId (FC=40)
+// ---------------------------------------------------------------------------
+
+export function writeGetLastInsertId(casInfo: Buffer): { header: Buffer; payload: Buffer } {
+  const w = new PacketWriter(8);
+  w.writeByte(CASFunctionCode.GET_LAST_INSERT_ID);
+
+  const payload = w.toBuffer();
+  const header = PacketWriter.buildHeader(payload.length, casInfo);
+  return { header, payload };
+}
+
+/**
+ * The session's last generated AUTO_INCREMENT value as decimal text, or
+ * undefined when the server holds none. The value is a cell: an int32 size that
+ * counts a type header (one byte, or two when the first has bit 0x80), then the
+ * digits and a NUL.
+ */
+export function parseGetLastInsertId(data: Buffer): string | undefined {
+  assertReplySize(data);
+  const reader = new PacketReader(data);
+  const code = reader.parseInt();
+
+  if (code < 0) {
+    const remaining = data.length - SIZE_INT;
+    const err = reader.readError(remaining);
+    throw new CasReplyError(
+      `CUBRID getLastInsertId failed (${err.code}): ${err.message}`,
+      code,
+      err.code,
+    );
+  }
+
+  return decodeReply(() => {
+    const size = reader.parseInt();
+    // Only -1 means "no value"; the broker never sends another size below 1.
+    if (size === -1) {
+      return undefined;
+    }
+    if (size < 1) {
+      throw new MalformedReplyError(`Malformed CAS packet: last insert id size ${size}`);
+    }
+    const cell = reader.subReader(size);
+    const headerSize = (cell.parseUByte() & 0x80) === 0 ? 1 : 2;
+    if (headerSize === 2) {
+      cell.parseUByte();
+    }
+    const text = cell.parseNullTermString(size - headerSize);
+    return text === "" ? undefined : text;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1189,12 +1245,21 @@ function readCollectionElement(
 // Result info parser (used by Execute/PrepareAndExecute)
 // ---------------------------------------------------------------------------
 
-function parseResultInfos(reader: PacketReader, count: number): void {
+export interface ResultInfo {
+  statementType: StatementType;
+  /** Rows the statement affected (DML) or matched (SELECT). */
+  resultCount: number;
+}
+
+function parseResultInfos(reader: PacketReader, count: number): ResultInfo[] {
+  const infos: ResultInfo[] = [];
   for (let i = 0; i < count; i++) {
-    reader.parseByte(); // statement type
-    reader.parseInt(); // result count
+    const statementType = reader.parseByte() as StatementType;
+    const resultCount = reader.parseInt();
     reader.parseBytes(SIZE_OID); // OID (8 bytes)
     reader.parseInt(); // cache time seconds
     reader.parseInt(); // cache time microseconds
+    infos.push({ statementType, resultCount });
   }
+  return infos;
 }

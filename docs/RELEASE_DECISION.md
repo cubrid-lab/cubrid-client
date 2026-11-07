@@ -39,10 +39,11 @@ SHA and its corresponding run URL into the sign-off section below.
 - BLOB/CLOB bytes have not been validated as complete LOB content
   ([#93](https://github.com/cubrid-lab/cubrid-client/issues/93),
   [#103](https://github.com/cubrid-lab/cubrid-client/issues/103)).
-- `query()` is not a server-side prepared binding API. DML affected-row
-  metadata is not exposed by the present Promise result
-  ([#85](https://github.com/cubrid-lab/cubrid-client/issues/85),
-  [#84](https://github.com/cubrid-lab/cubrid-client/issues/84)).
+- `query()` is not a server-side prepared binding API
+  ([#85](https://github.com/cubrid-lab/cubrid-client/issues/85)). DML
+  affected-row counts and generated ids are not part of its Promise result;
+  `execute()` returns them
+  ([#84](https://github.com/cubrid-lab/cubrid-client/issues/84)).
 - `maxConnectionRetryCount` retries only a failed TCP connect; it does not
   retry rejected credentials, requests or transactions, and there is no host
   fallback ([#83](https://github.com/cubrid-lab/cubrid-client/issues/83)). The `logger`

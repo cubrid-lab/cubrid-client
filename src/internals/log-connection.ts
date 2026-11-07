@@ -13,6 +13,7 @@ import type {
   ClientLogLevel,
   ConnectionFactory,
   ConnectionLike,
+  ExecuteResult,
 } from "../types/client.js";
 import type { QueryParams } from "../types/query.js";
 import type { QueryResult, QueryResultRow } from "../types/result.js";
@@ -156,6 +157,11 @@ export function withLogging(factory: ConnectionFactory, logger: unknown): Connec
           () => queryResult<T>(sql, params),
           (result) => result.rows.length,
         );
+    }
+    const execute = inner.execute?.bind(inner);
+    if (execute) {
+      wrapped.execute = (sql: string, params?: QueryParams): Promise<ExecuteResult> =>
+        timed("execute", { paramCount: params?.length ?? 0 }, () => execute(sql, params));
     }
     const ping = inner.ping?.bind(inner);
     if (ping) {

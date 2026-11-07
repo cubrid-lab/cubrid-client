@@ -133,6 +133,8 @@ const result = await db.query("INSERT INTO users (name) VALUES (?)", ["Alice"]);
 console.log(result); // [] — this is correct
 ```
 
+To learn how many rows a statement changed, or the generated `AUTO_INCREMENT` id of an `INSERT`, use `execute()`: `await db.execute("INSERT INTO users (name) VALUES (?)", ["Alice"])` resolves to `{ affectedRows: 1, lastInsertId: 1 }`. See [`execute()`](API_REFERENCE.md#executesql-params).
+
 The client detects DDL/DML statements (INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, TRUNCATE, RENAME, REPLACE, MERGE, SET, GRANT, REVOKE) and routes them through `execute()` instead of `queryAll()` to avoid `CAS_ER_NO_MORE_DATA` errors.
 
 ### Parameters not binding correctly

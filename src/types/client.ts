@@ -25,7 +25,7 @@ export type ClientLogLevel = "debug" | "info" | "error";
  * parameter values, row data, credentials or error messages.
  */
 export interface ClientLogFields {
-  /** `connection`, `connect`, `query`, `queryResult`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`. */
+  /** `connection`, `connect`, `query`, `queryResult`, `execute`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`. */
   operation?: string;
   host?: string;
   port?: number;
@@ -111,10 +111,39 @@ export interface ResultQueryable {
   ): Promise<QueryResult<T>>;
 }
 
+/**
+ * Outcome of a statement run with `execute()`.
+ *
+ * `affectedRows` is the number of rows an INSERT, UPDATE, DELETE or MERGE
+ * changed, added over every statement of a multi-statement string. It is 0 for
+ * DDL and SELECT, and 0 when an UPDATE or DELETE matched nothing.
+ *
+ * `lastInsertId` is set only when an INSERT ran and the session then holds a
+ * generated AUTO_INCREMENT value: a `number` while it is a safe integer and a
+ * `bigint` beyond that, so no precision is lost. It is absent otherwise.
+ */
+export interface ExecuteResult {
+  affectedRows: number;
+  lastInsertId?: number | bigint;
+}
+
+/** Runs a statement and reports its {@link ExecuteResult} instead of rows. */
+export interface Executable {
+  execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+}
+
 export interface TransactionClient extends Queryable {
   commit(): Promise<void>;
   rollback(): Promise<void>;
 }
+
+/**
+ * The transaction client `CubridClient.transaction()` hands to its callback: a
+ * {@link TransactionClient} that can also `execute()`. A separate type keeps
+ * `TransactionClient` as it was, so 1.x classes and test doubles implementing
+ * it still compile.
+ */
+export interface ExecutableTransactionClient extends TransactionClient, Executable {}
 
 export type TransactionCallback<
   T,
@@ -144,6 +173,11 @@ export interface ConnectionLike {
     sql: string,
     params?: QueryParams,
   ): Promise<QueryResult<T>>;
+  /**
+   * Optional so 1.x connection factories keep compiling. `execute()` on a
+   * client or transaction fails when its connection does not provide it.
+   */
+  execute?(sql: string, params?: QueryParams): Promise<ExecuteResult>;
   beginTransaction(): Promise<void>;
   commit(): Promise<void>;
   rollback(): Promise<void>;

@@ -2082,6 +2082,282 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
   });
 
   // -------------------------------------------------------------------------
+  // execute(): affected rows and last insert ID
+  // -------------------------------------------------------------------------
+
+  describe("execute results", () => {
+    const AUTO = "cc_exec_auto";
+    const PLAIN = "cc_exec_plain";
+    const BIG = "cc_exec_big";
+    const FRESH_A = "cc_exec_fresh_a";
+    const FRESH_B = "cc_exec_fresh_b";
+    const ALL = [AUTO, PLAIN, BIG, FRESH_A, FRESH_B];
+
+    test("create the tables", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        for (const table of ALL) {
+          await client.query(`DROP TABLE IF EXISTS ${table}`);
+        }
+        await client.query(`CREATE TABLE ${AUTO} (id INT AUTO_INCREMENT PRIMARY KEY, v INT)`);
+        await client.query(`CREATE TABLE ${PLAIN} (id INT, v INT)`);
+        for (const table of [FRESH_A, FRESH_B]) {
+          await client.query(`CREATE TABLE ${table} (id INT AUTO_INCREMENT PRIMARY KEY, v INT)`);
+        }
+        await client.query(
+          `CREATE TABLE ${BIG} (id BIGINT AUTO_INCREMENT(9007199254740993, 1) PRIMARY KEY, v INT)`,
+        );
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("INSERT, UPDATE and DELETE report their row counts and the generated id", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        assert.deepEqual(await client.execute(`INSERT INTO ${AUTO} (v) VALUES (?)`, [10]), {
+          affectedRows: 1,
+          lastInsertId: 1,
+        });
+        // A multi-row INSERT reports the first id it generated (here 2, 3 and 4).
+        assert.deepEqual(
+          await client.execute(`INSERT INTO ${AUTO} (v) VALUES (11), (12), (13)`),
+          { affectedRows: 3, lastInsertId: 2 },
+        );
+        assert.deepEqual(await client.execute(`UPDATE ${AUTO} SET v = v + 100 WHERE v > 10`), {
+          affectedRows: 3,
+        });
+        assert.deepEqual(await client.execute(`UPDATE ${AUTO} SET v = 0 WHERE v = -1`), {
+          affectedRows: 0,
+        });
+        assert.deepEqual(await client.execute(`DELETE FROM ${AUTO} WHERE v > 100`), {
+          affectedRows: 3,
+        });
+        assert.deepEqual(await client.execute(`DELETE FROM ${AUTO} WHERE v = -1`), {
+          affectedRows: 0,
+        });
+        // The next id continues after the deleted rows.
+        assert.deepEqual(await client.execute(`INSERT INTO ${AUTO} (v) VALUES (20)`), {
+          affectedRows: 1,
+          lastInsertId: 5,
+        });
+        // The statements were committed, and query() still returns no rows for DML.
+        // COUNT(*) is a number on 10.2 and 11.0 and a bigint from 11.2.
+        const [counted] = await client.query<{ n: number | bigint }>(
+          `SELECT COUNT(*) AS n FROM ${AUTO}`,
+        );
+        assert.equal(Number(counted?.n), 2);
+        assert.deepEqual(await client.query(`INSERT INTO ${AUTO} (v) VALUES (30)`), []);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("an INSERT into a table without AUTO_INCREMENT reports no id, not an earlier one", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        const generated = await client.execute(`INSERT INTO ${AUTO} (v) VALUES (1)`);
+        assert.equal(typeof generated.lastInsertId, "number");
+
+        const plain = await client.execute(`INSERT INTO ${PLAIN} (id, v) VALUES (1, 1), (2, 2)`);
+        assert.deepEqual(plain, { affectedRows: 2 });
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("execute adds up the statements of a multi-statement string", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        const result = await client.execute(
+          `INSERT INTO ${PLAIN} (id, v) VALUES (10, 1); INSERT INTO ${PLAIN} (id, v) VALUES (11, 2), (12, 3)`,
+        );
+        assert.deepEqual(result, { affectedRows: 3 });
+        assert.deepEqual(await client.execute(`DELETE FROM ${PLAIN} WHERE id >= 10`), {
+          affectedRows: 3,
+        });
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("execute reports 0 rows for DDL and for a SELECT", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        assert.deepEqual(await client.execute(`CREATE INDEX cc_exec_idx ON ${PLAIN} (v)`), {
+          affectedRows: 0,
+        });
+        assert.deepEqual(await client.execute(`DROP INDEX cc_exec_idx ON ${PLAIN}`), {
+          affectedRows: 0,
+        });
+        assert.deepEqual(await client.execute(`SELECT * FROM ${AUTO}`), { affectedRows: 0 });
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("execute returns a bigint when the id is beyond Number.MAX_SAFE_INTEGER", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        const result = await client.execute(`INSERT INTO ${BIG} (v) VALUES (1)`);
+        assert.deepEqual(result, { affectedRows: 1, lastInsertId: 9007199254740993n });
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("a failing autocommit execute rolls back and leaves the connection usable", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        await client.execute(`INSERT INTO ${PLAIN} (id, v) VALUES (500, 1)`);
+        await assert.rejects(
+          () => client.execute(`INSERT INTO ${AUTO} (id, v) VALUES (1, 1)`),
+          ConstraintError,
+        );
+        assert.deepEqual(await client.execute(`DELETE FROM ${PLAIN} WHERE id = 500`), {
+          affectedRows: 1,
+        });
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("an autocommit execute is visible to another connection at once", async () => {
+      const writer = createClient(TEST_CONFIG);
+      const reader = createClient(TEST_CONFIG);
+
+      try {
+        await writer.execute(`INSERT INTO ${PLAIN} (id, v) VALUES (600, 6)`);
+        assert.deepEqual(await reader.query(`SELECT v FROM ${PLAIN} WHERE id = 600`), [{ v: 6 }]);
+        await writer.execute(`DELETE FROM ${PLAIN} WHERE id = 600`);
+      } finally {
+        await writer.close();
+        await reader.close();
+      }
+    });
+
+    test("tx.execute reports ids, repeats none and honors rollback", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        await client.transaction(async (tx) => {
+          const first = await tx.execute(`INSERT INTO ${AUTO} (v) VALUES (41)`);
+          const second = await tx.execute(`INSERT INTO ${AUTO} (v) VALUES (42), (43)`);
+          assert.equal(typeof first.lastInsertId, "number");
+          assert.equal(Number(second.lastInsertId) > Number(first.lastInsertId), true);
+          assert.equal(second.affectedRows, 2);
+
+          // The server would answer with `second`'s id again for this INSERT.
+          assert.deepEqual(await tx.execute(`INSERT INTO ${PLAIN} (id, v) VALUES (700, 7)`), {
+            affectedRows: 1,
+          });
+          assert.deepEqual(await tx.execute(`DELETE FROM ${PLAIN} WHERE id = 700`), {
+            affectedRows: 1,
+          });
+        });
+
+        const before = await client.query<{ n: number }>(`SELECT COUNT(*) AS n FROM ${AUTO}`);
+        await assert.rejects(() =>
+          client.transaction(async (tx) => {
+            await tx.execute(`INSERT INTO ${AUTO} (v) VALUES (50)`);
+            throw new Error("abort");
+          }),
+        );
+        assert.deepEqual(
+          await client.query(`SELECT COUNT(*) AS n FROM ${AUTO}`),
+          before,
+        );
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("an INSERT inside a transaction reports no id after an autocommit INSERT into another table", async () => {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+
+      try {
+        const inserted = await adapter.execute(`INSERT INTO ${AUTO} (v) VALUES (60)`);
+        assert.equal(typeof inserted.lastInsertId, "number");
+
+        await adapter.beginTransaction();
+        assert.deepEqual(await adapter.execute(`INSERT INTO ${PLAIN} (id, v) VALUES (800, 8)`), {
+          affectedRows: 1,
+        });
+        await adapter.rollback();
+      } finally {
+        await adapter.close();
+      }
+    });
+
+    test("tx.execute reports no id after a tx.query INSERT it cannot tell apart", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        await client.transaction(async (tx) => {
+          // tx.query generates an id that nobody reads; the table without
+          // AUTO_INCREMENT then sees the server still answering with it.
+          assert.deepEqual(await tx.query(`INSERT INTO ${AUTO} (v) VALUES (70)`), []);
+          assert.deepEqual(await tx.execute(`INSERT INTO ${PLAIN} (id, v) VALUES (900, 9)`), {
+            affectedRows: 1,
+          });
+          // A different generated value is certainly this statement's.
+          assert.deepEqual(await tx.execute(`INSERT INTO ${FRESH_A} (v) VALUES (1)`), {
+            affectedRows: 1,
+            lastInsertId: 1,
+          });
+          await tx.execute(`DELETE FROM ${PLAIN} WHERE id = 900`);
+        });
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("tx.execute reports no id when two fresh tables generate the same number", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        // Restart both tables at 1.
+        for (const table of [FRESH_A, FRESH_B]) {
+          await client.execute(`DROP TABLE ${table}`);
+          await client.execute(`CREATE TABLE ${table} (id INT AUTO_INCREMENT PRIMARY KEY, v INT)`);
+        }
+        await client.transaction(async (tx) => {
+          // Both tables generate 1 and the server's answer is the same bytes
+          // for each, so the second id cannot be told from the first's: no id.
+          assert.deepEqual(await tx.execute(`INSERT INTO ${FRESH_A} (v) VALUES (1)`), {
+            affectedRows: 1,
+            lastInsertId: 1,
+          });
+          assert.deepEqual(await tx.execute(`INSERT INTO ${FRESH_B} (v) VALUES (1)`), {
+            affectedRows: 1,
+          });
+        });
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("drop the tables", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        for (const table of ALL) {
+          await client.query(`DROP TABLE IF EXISTS ${table}`);
+        }
+      } finally {
+        await client.close();
+      }
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // Close behavior
   // -------------------------------------------------------------------------
 
