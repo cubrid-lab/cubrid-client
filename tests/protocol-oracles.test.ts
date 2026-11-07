@@ -10,17 +10,25 @@ import assert from "node:assert/strict";
 import { CASFunctionCode, CUBRIDDataType, StatementType } from "../src/protocol/constants.js";
 import {
   encodeBindParams,
+  encodePreparedParams,
   LobLocator,
   MalformedReplyError,
+  parseExecute,
   parseFetch,
+  parsePrepare,
   parseLobRead,
   parsePrepareAndExecute,
   UnsupportedValueError,
+  writeExecute,
   writeFetch,
+  writePrepare,
   writeLobRead,
 } from "../src/protocol/protocol.js";
 import { CAPTURED_FRAMES, type CapturedFrame } from "./fixtures/collection-frames.js";
+import { PREPARED_FRAMES } from "./fixtures/dml-frames.js";
 import { LOB_FRAMES } from "./fixtures/lob-frames.js";
+import { ZONED_FRAMES } from "./fixtures/zoned-frames.js";
+import { ZonedDateTime } from "../src/types/zoned-date-time.js";
 
 const i32 = (value: number): Buffer => {
   const b = Buffer.alloc(4);
@@ -142,12 +150,12 @@ test("genuine SQL NULL and a valid empty string are different", () => {
   assert.equal(emptyRow.rows[0]?.value, "");
 });
 
-test("a captured TIMESTAMPTZ value rejects as unsupported, naming its column and wire type", () => {
+test("a captured OID value rejects as unsupported, naming its column and wire type", () => {
   assert.throws(
-    () => parsePrepareAndExecute(Buffer.from(CAPTURED_FRAMES.timestamptzValue.hex, "hex"), 7),
+    () => parsePrepareAndExecute(Buffer.from(ZONED_FRAMES.oidValue.hex, "hex"), 7),
     (error: Error) => {
       assert.ok(error instanceof UnsupportedValueError);
-      assert.match(error.message, /column "tz" \(wire type 29, 19 bytes\)/);
+      assert.match(error.message, /column "o" \(wire type 19, 8 bytes\)/);
       return true;
     },
   );
@@ -185,14 +193,14 @@ test("a zero-byte value is an empty Buffer only for BIT and VARBIT, and never fo
     assert.equal(parsePrepareAndExecute(selectWire(type, null), 1).rows[0]?.value, null);
   }
 
-  // No decoder: OBJECT, TIMESTAMPTZ, JSON and a code CCI does not define.
-  for (const type of [19, 29, 34, 99]) {
+  // No decoder: OBJECT, JSON (never sent below protocol 8) and a code CCI does not define.
+  for (const type of [19, 34, 99]) {
     assert.throws(() => parsePrepareAndExecute(selectWire(type, Buffer.alloc(0)), 1), (error: Error) =>
       error instanceof UnsupportedValueError && error.message.includes(`wire type ${type}, 0 bytes`));
   }
 
   // Decodable, but CAS counts the NUL of text and writes fixed widths in full.
-  for (const type of [2, 8, 21, 23]) {
+  for (const type of [2, 8, 21, 23, 29, 30, 31, 32]) {
     assert.throws(() => parsePrepareAndExecute(selectWire(type, Buffer.alloc(0)), 1), (error: Error) =>
       error instanceof MalformedReplyError &&
       error.message.includes(`wire type ${type}, 0 bytes`) &&
@@ -202,10 +210,10 @@ test("a zero-byte value is an empty Buffer only for BIT and VARBIT, and never fo
 });
 
 test("a NULL-typed column never turns a typed cell without value bytes into null", () => {
-  // Cell of size 1 holding only the type header: the literal TIMESTAMPTZ code 29.
+  // Cell of size 1 holding only the type header: the literal OBJECT code 19.
   assert.throws(
-    () => parsePrepareAndExecute(selectWire(0, Buffer.from([29])), 1),
-    (error: Error) => error instanceof UnsupportedValueError && /wire type 29, 0 bytes/.test(error.message),
+    () => parsePrepareAndExecute(selectWire(0, Buffer.from([19])), 1),
+    (error: Error) => error instanceof UnsupportedValueError && /wire type 19, 0 bytes/.test(error.message),
   );
   // Cell of size 0 has no room for the header, which must not come from the next bytes.
   assert.throws(
@@ -215,7 +223,7 @@ test("a NULL-typed column never turns a typed cell without value bytes into null
 });
 
 test("an unsupported value whose length overruns the reply is malformed, not unsupported", () => {
-  const wire = selectWire(29, Buffer.from("01020304", "hex"));
+  const wire = selectWire(19, Buffer.from("01020304", "hex"));
   assert.throws(
     () => parsePrepareAndExecute(wire.subarray(0, -2), 1),
     (error: Error) => error instanceof MalformedReplyError,
@@ -223,7 +231,7 @@ test("an unsupported value whose length overruns the reply is malformed, not uns
 });
 
 test("the first unsupported value is reported only once the whole reply holds together", () => {
-  const column = { type: 29, name: "tz" } as never;
+  const column = { type: 19, name: "tz" } as never;
   const row = (...cells: Buffer[]): Buffer => Buffer.concat([i32(1), Buffer.alloc(8), ...cells]);
   const value = Buffer.concat([i32(2), Buffer.from("0102", "hex")]);
 
@@ -339,7 +347,6 @@ test("the server sends a mixed-type collection as SQL NULL, also inside a collec
 
 test("unsupported collection elements reject and name the column", () => {
   for (const [frame, wireType] of [
-    [CAPTURED_FRAMES.datetimetzElement, 31],
     [CAPTURED_FRAMES.blobElement, 23],
     [CAPTURED_FRAMES.objectElement, 19],
   ] as const) {
@@ -687,3 +694,425 @@ for (const [name, wireType, cell, expected] of [
     assert.equal(Object.getPrototypeOf(row), Object.prototype);
   });
 }
+
+// ---------------------------------------------------------------------------
+// Timezone-aware values and JSON, from replies captured on live brokers (#111)
+// ---------------------------------------------------------------------------
+
+const zonedRow = (frame: { hex: string }): { tz: unknown; t: unknown } => {
+  const row = parsePrepareAndExecute(Buffer.from(frame.hex, "hex"), 7).rows[0];
+  assert.ok(row);
+  return { tz: row.tz, t: row.t };
+};
+
+const zonedCollection = (frame: { hex: string }): { c: unknown; t: unknown } => {
+  const row = parsePrepareAndExecute(Buffer.from(frame.hex, "hex"), 7).rows[0];
+  assert.ok(row);
+  return { c: row.c, t: row.t };
+};
+
+test("captured zoned values keep their fields and the zone text the server sent", () => {
+  const cases: Array<[{ hex: string; sql: string }, Record<string, unknown>]> = [
+    [ZONED_FRAMES.timestamptzOffset, {
+      type: "TIMESTAMPTZ", year: 2020, month: 1, day: 2, hour: 3, minute: 4, second: 5,
+      millisecond: 0, zone: "+09:00",
+    }],
+    [ZONED_FRAMES.timestamptzHalfHour, {
+      type: "TIMESTAMPTZ", year: 2020, month: 7, day: 2, hour: 3, minute: 4, second: 5,
+      millisecond: 0, zone: "-05:30",
+    }],
+    [ZONED_FRAMES.timestamptzRegion, {
+      type: "TIMESTAMPTZ", year: 2020, month: 1, day: 2, hour: 3, minute: 4, second: 5,
+      millisecond: 0, zone: "America/New_York EST",
+    }],
+    // LTZ values arrive in the session zone: the server's default UTC, or Asia/Seoul after
+    // SET TIME ZONE, which also moves 03:04:05 America/New_York in July to 16:04:05 KST.
+    [ZONED_FRAMES.timestampltz, {
+      type: "TIMESTAMPLTZ", year: 2020, month: 1, day: 1, hour: 18, minute: 4, second: 5,
+      millisecond: 0, zone: "UTC UTC",
+    }],
+    [ZONED_FRAMES.timestampltzSeoul, {
+      type: "TIMESTAMPLTZ", year: 2020, month: 1, day: 2, hour: 3, minute: 4, second: 5,
+      millisecond: 0, zone: "Asia/Seoul KST",
+    }],
+    [ZONED_FRAMES.datetimetzOffset, {
+      type: "DATETIMETZ", year: 2020, month: 1, day: 2, hour: 3, minute: 4, second: 5,
+      millisecond: 678, zone: "+09:00",
+    }],
+    [ZONED_FRAMES.datetimetzRegion, {
+      type: "DATETIMETZ", year: 2020, month: 7, day: 2, hour: 3, minute: 4, second: 5,
+      millisecond: 999, zone: "America/New_York EDT",
+    }],
+    [ZONED_FRAMES.datetimeltz, {
+      type: "DATETIMELTZ", year: 2020, month: 1, day: 1, hour: 18, minute: 4, second: 5,
+      millisecond: 678, zone: "UTC UTC",
+    }],
+    [ZONED_FRAMES.datetimeltzSeoul, {
+      type: "DATETIMELTZ", year: 2020, month: 7, day: 2, hour: 16, minute: 4, second: 5,
+      millisecond: 500, zone: "Asia/Seoul KST",
+    }],
+    // The extremes of the range: year 1 and year 9999 with a +14:00 offset.
+    [ZONED_FRAMES.datetimetzMin, {
+      type: "DATETIMETZ", year: 1, month: 1, day: 1, hour: 0, minute: 0, second: 0,
+      millisecond: 0, zone: "+00:00",
+    }],
+    [ZONED_FRAMES.datetimetzMax, {
+      type: "DATETIMETZ", year: 9999, month: 12, day: 31, hour: 23, minute: 59, second: 59,
+      millisecond: 999, zone: "+14:00",
+    }],
+  ];
+  for (const [frame, fields] of cases) {
+    const { tz, t } = zonedRow(frame);
+    assert.ok(tz instanceof ZonedDateTime, frame.sql);
+    assert.deepEqual({ ...tz }, fields, frame.sql);
+    assert.equal(t, "after", frame.sql);
+  }
+});
+
+test("a zoned value prints as SQL literal text and serializes to JSON with its zone", () => {
+  const texts: Array<[{ hex: string; sql: string }, string]> = [
+    [ZONED_FRAMES.timestamptzOffset, "2020-01-02 03:04:05 +09:00"],
+    [ZONED_FRAMES.datetimetzOffset, "2020-01-02 03:04:05.678 +09:00"],
+    [ZONED_FRAMES.datetimetzMin, "0001-01-01 00:00:00.000 +00:00"],
+    [ZONED_FRAMES.datetimeltzSeoul, "2020-07-02 16:04:05.500 Asia/Seoul KST"],
+  ];
+  for (const [frame, text] of texts) {
+    const { tz } = zonedRow(frame);
+    assert.equal(String(tz), text);
+    assert.equal(JSON.stringify({ tz }), JSON.stringify({ tz: text }));
+  }
+  assert.throws(() => {
+    (zonedRow(ZONED_FRAMES.timestamptzOffset).tz as { zone: string }).zone = "UTC";
+  }, TypeError);
+});
+
+test("a NULL zoned value is null, and a zoned value inside a collection keeps its zone", () => {
+  assert.deepEqual(zonedRow(ZONED_FRAMES.nullTimestamptz), { tz: null, t: "after" });
+
+  const sequence = zonedCollection(ZONED_FRAMES.sequenceOfTimestamptz);
+  assert.deepEqual(
+    (sequence.c as ZonedDateTime[]).map((value) => value.toString()),
+    ["2020-01-02 03:04:05 +09:00", "2020-07-02 03:04:05 -05:30"],
+  );
+  assert.equal(sequence.t, "after");
+  const set = zonedCollection(ZONED_FRAMES.setOfDatetimeltz);
+  assert.deepEqual((set.c as ZonedDateTime[]).map(String), ["2020-01-01 18:04:05.678 UTC UTC"]);
+});
+
+test("a captured zero zoned value rejects as unsupported, naming the column and size", () => {
+  for (const [frame, pattern] of [
+    [ZONED_FRAMES.zeroTimestamptz, /column "tz" \(wire type 29, 19 bytes\)/],
+    [ZONED_FRAMES.zeroDatetimetz, /column "tz" \(wire type 31, 21 bytes\)/],
+  ] as const) {
+    assert.throws(
+      () => parsePrepareAndExecute(Buffer.from(frame.hex, "hex"), 7),
+      (error: Error) => {
+        assert.ok(error instanceof UnsupportedValueError, frame.sql);
+        assert.match(error.message, pattern);
+        assert.match((error.cause as Error).message, /Zero date 0000-00-00/);
+        return true;
+      },
+      frame.sql,
+    );
+  }
+});
+
+test("a zoned cell that breaks its layout is malformed and never a value", () => {
+  const fields = (...values: number[]): Buffer => Buffer.concat(values.map(i16));
+  const timestamp = fields(2020, 1, 2, 3, 4, 5);
+  const datetime = fields(2020, 1, 2, 3, 4, 5, 678);
+  const zone = (text: string): Buffer => Buffer.from(text, "latin1");
+
+  const cases: Array<[string, number, Buffer]> = [
+    ["no zone text", 29, timestamp],
+    ["a NUL and no zone", 29, Buffer.concat([timestamp, zone("\0")])],
+    ["a zone without its NUL", 29, Buffer.concat([timestamp, zone("+09:00")])],
+    ["bytes after the NUL", 29, Buffer.concat([timestamp, zone("+09:00\0\0")])],
+    ["a NUL inside the zone", 29, Buffer.concat([timestamp, zone("+09\0:00\0")])],
+    ["a zone that is not UTF-8", 29, Buffer.concat([timestamp, Buffer.from([0xff, 0xfe, 0])])],
+    ["a month of 13", 29, Buffer.concat([fields(2020, 13, 2, 3, 4, 5), zone("+09:00\0")])],
+    ["a day of 0", 30, Buffer.concat([fields(2020, 1, 0, 3, 4, 5), zone("UTC UTC\0")])],
+    ["an hour of 24", 29, Buffer.concat([fields(2020, 1, 2, 24, 4, 5), zone("+09:00\0")])],
+    ["a negative year", 29, Buffer.concat([fields(-1, 1, 2, 3, 4, 5), zone("+09:00\0")])],
+    ["milliseconds of 1000", 31, Buffer.concat([fields(2020, 1, 2, 3, 4, 5, 1000), zone("+09:00\0")])],
+    ["year 10000", 31, Buffer.concat([fields(10000, 1, 2, 3, 4, 5, 6), zone("+09:00\0")])],
+    ["February 29 of a common year", 29, Buffer.concat([fields(2021, 2, 29, 3, 4, 5), zone("+09:00\0")])],
+    ["February 29 of 1900", 29, Buffer.concat([fields(1900, 2, 29, 3, 4, 5), zone("+09:00\0")])],
+    ["April 31", 29, Buffer.concat([fields(2020, 4, 31, 3, 4, 5), zone("+09:00\0")])],
+    ["a DATETIME shaped cell with no zone", 31, datetime],
+    ["a TIMESTAMP shaped cell in a DATETIMETZ column", 32, Buffer.concat([timestamp, zone("+9\0")])],
+  ];
+  for (const [name, type, cell] of cases) {
+    assert.throws(
+      () => parsePrepareAndExecute(selectWire(type, cell), 1),
+      (error: Error) => error instanceof MalformedReplyError && error.message.includes(`wire type ${type}`),
+      name,
+    );
+  }
+
+  // Real leap days and month ends decode.
+  for (const [y, m, d] of [[2020, 2, 29], [2000, 2, 29], [2021, 2, 28], [1900, 2, 28], [9999, 12, 31], [1, 1, 1]]) {
+    const value = parsePrepareAndExecute(
+      selectWire(29, Buffer.concat([fields(y!, m!, d!, 3, 4, 5), zone("+09:00\0")])),
+      1,
+    ).rows[0]?.value;
+    assert.ok(value instanceof ZonedDateTime, `${y}-${m}-${d}`);
+  }
+
+  // The same layouts that are valid decode, so the cases above fail for their stated reason.
+  const ok = parsePrepareAndExecute(
+    selectWire(31, Buffer.concat([datetime, zone("+09:00\0")])),
+    1,
+  ).rows[0]?.value;
+  assert.equal(String(ok), "2020-01-02 03:04:05.678 +09:00");
+});
+
+test("JSON is returned as its text, because the server sends it as VARCHAR below protocol 8", () => {
+  const result = parsePrepareAndExecute(Buffer.from(ZONED_FRAMES.jsonColumn.hex, "hex"), 7);
+  // Wire type 2 is VARCHAR, not the JSON code 34, and the value is not parsed.
+  assert.equal(result.columns[0]?.type, 2);
+  assert.deepEqual(result.rows, [{ j: '{"a":1}', t: "after" }]);
+});
+
+test("a damaged zero zoned value is malformed, never an unsupported value, in a column and a collection", () => {
+  const zeroFields = (...tail: number[]): Buffer => Buffer.concat([0, 0, 0, ...tail].map(i16));
+  const zone = (bytes: number[]): Buffer => Buffer.from(bytes);
+  const good = [0x2b, 0x30, 0x30, 0x3a, 0x30, 0x30, 0]; // "+00:00\0"
+  const cases: Array<[string, number, Buffer]> = [
+    ["an unterminated zone", 29, Buffer.concat([zeroFields(0, 0, 0), zone([0x2b, 0x30, 0x30])])],
+    ["a zone that is not UTF-8", 29, Buffer.concat([zeroFields(0, 0, 0), zone([0xff, 0xfe, 0])])],
+    ["an empty zone", 29, Buffer.concat([zeroFields(0, 0, 0), zone([0, 0])])],
+    ["an hour of 24", 29, Buffer.concat([zeroFields(24, 0, 0), zone(good)])],
+    ["milliseconds of 1000", 31, Buffer.concat([zeroFields(0, 0, 0, 1000), zone(good)])],
+  ];
+  const element = (cell: Buffer, type: number): Buffer =>
+    Buffer.concat([Buffer.from([type]), i32(1), i32(cell.length), cell]);
+  for (const [name, type, cell] of cases) {
+    assert.throws(
+      () => parsePrepareAndExecute(selectWire(type, cell), 1),
+      (error: Error) => error instanceof MalformedReplyError,
+      name,
+    );
+    const cellInSequence = element(cell, type);
+    assert.throws(
+      () => parsePrepareAndExecute(selectWire(18, cellInSequence), 1),
+      (error: Error) => error instanceof MalformedReplyError,
+      `${name} in a SEQUENCE`,
+    );
+  }
+
+  // The same zero date with its time and zone intact is still only unsupported.
+  const intact = Buffer.concat([zeroFields(0, 0, 0), zone(good)]);
+  assert.throws(
+    () => parsePrepareAndExecute(selectWire(29, intact), 1),
+    (error: Error) => error instanceof UnsupportedValueError,
+  );
+  assert.throws(
+    () => parsePrepareAndExecute(selectWire(18, element(intact, 29)), 1),
+    (error: Error) => error instanceof UnsupportedValueError,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Prepared binding: literal request bytes and captured replies
+// ---------------------------------------------------------------------------
+
+const frame = (hex: string): Buffer => Buffer.from(hex, "hex");
+const bindHex = (value: unknown): string => encodePreparedParams([value]).bytes.toString("hex");
+const CAS_INFO = Buffer.from("01ffffff", "hex");
+
+test("PREPARE sends function code 2, the SQL with its NUL, flag 0 and autocommit 0", () => {
+  const { header, payload } = writePrepare("SELECT 1", CAS_INFO);
+  assert.equal(
+    payload.toString("hex"),
+    "02" + "00000009" + "53454c4543542031" + "00" + "0000000100" + "0000000100",
+  );
+  assert.equal(header.toString("hex"), "00000018" + "01ffffff");
+});
+
+test("PREPARE refuses SQL with a NUL, which would cut the statement short", () => {
+  assert.throws(() => writePrepare("SELECT 1\0; DROP TABLE t", CAS_INFO), /null byte/);
+});
+
+test("EXECUTE sends the ten fixed arguments, then each type and value", () => {
+  const statement = parsePrepare(frame(PREPARED_FRAMES.prepareUntypedMarker));
+  const { payload } = writeExecute(statement, encodePreparedParams([7]), CAS_INFO);
+  assert.equal(
+    payload.toString("hex"),
+    "03" +
+      "00000004" + "00000001" + // handle
+      "00000001" + "02" + // EXECUTE_QUERY_ALL, so `a; b` runs both statements
+      "00000004" + "00000000" + // max_col_size
+      "00000004" + "00000000" + // max_row_size
+      "00000000" + // empty CALL-mode argument
+      "00000001" + "01" + // inline fetch of a SELECT
+      "00000001" + "00" + // autocommit
+      "00000001" + "00" + // forward_only
+      "00000008" + "00000000" + "00000000" + // cache time
+      "00000004" + "00000000" + // query timeout
+      "00000001" + "08" + "00000004" + "00000007", // INT 7
+  );
+});
+
+test("EXECUTE asks for no inline fetch unless the statement is a SELECT", () => {
+  const statement = {
+    ...parsePrepare(frame(PREPARED_FRAMES.prepareUntypedMarker)),
+    statementType: 20 as StatementType,
+  };
+  const { payload } = writeExecute(statement, encodePreparedParams([]), CAS_INFO);
+  assert.equal(payload.subarray(34, 39).toString("hex"), "0000000100");
+});
+
+test("prepared binds have literal type bytes and layouts", () => {
+  for (const [value, expected] of [
+    [null, "0000000100" + "00000000"],
+    [undefined, "0000000100" + "00000000"],
+    [true, "0000000108" + "00000004" + "00000001"],
+    [false, "0000000108" + "00000004" + "00000000"],
+    [-0, "0000000108" + "00000004" + "00000000"],
+    [2147483647, "0000000108" + "00000004" + "7fffffff"],
+    [2147483648, "0000000115" + "00000008" + "0000000080000000"],
+    [Number.MAX_SAFE_INTEGER, "0000000115" + "00000008" + "001fffffffffffff"],
+    [Number.MAX_SAFE_INTEGER + 1, "000000010c" + "00000008" + "4340000000000000"],
+    [1.5, "000000010c" + "00000008" + "3ff8000000000000"],
+    [9223372036854775807n, "0000000115" + "00000008" + "7fffffffffffffff"],
+    [-9223372036854775808n, "0000000115" + "00000008" + "8000000000000000"],
+    [9223372036854775808n, "0000000107" + "00000014" + "39323233333732303336383534373735383038" + "00"],
+    ["ab", "0000000101" + "00000003" + "6162" + "00"],
+    ["", "0000000101" + "00000001" + "00"],
+    ["\ud55c", "0000000101" + "00000004" + "ed959c" + "00"],
+    [Buffer.from([0xab, 0xcd]), "0000000106" + "00000002" + "abcd"],
+    [
+      new Date(Date.UTC(2024, 1, 29, 13, 45, 56, 789)),
+      "0000000116" + "0000000e" + "07e8" + "0002" + "001d" + "000d" + "002d" + "0038" + "0315",
+    ],
+  ] as const) {
+    assert.equal(bindHex(value), expected);
+  }
+});
+
+test("values that cannot be sent safely are refused without echoing them", () => {
+  for (const [value, message] of [
+    [Number.NaN, /NaN and Infinity/],
+    [Number.POSITIVE_INFINITY, /NaN and Infinity/],
+    [Number.NEGATIVE_INFINITY, /NaN and Infinity/],
+    [Buffer.alloc(0), /empty Buffer/],
+    ["secret\0", /null byte/],
+    ["secret\x1a", /Ctrl-Z/],
+    [10n ** 38n, /38 digits/],
+    [-(10n ** 38n), /38 digits/],
+    [new Date(Number.NaN), /invalid Date/],
+    [new Date("0000-06-01T00:00:00Z"), /0001 to 9999/],
+    [new Date("+010000-01-01T00:00:00Z"), /0001 to 9999/],
+    [{ secret: 1 }, /unsupported prepared parameter type/],
+    [new Uint8Array([1]), /unsupported prepared parameter type/],
+  ] as const) {
+    assert.throws(
+      () => encodePreparedParams([value]),
+      (error: Error) => message.test(error.message) && !error.message.includes("secret"),
+    );
+  }
+});
+
+test("the largest bigint NUMERIC can hold is sent as its 38 digits", () => {
+  const largest = 10n ** 38n - 1n;
+  assert.equal(bindHex(largest).slice(10, 18), "00000027");
+  assert.equal(bindHex(-largest).slice(10, 18), "00000028");
+});
+
+test("a captured PREPARE reply gives the handle, the type and the server's bind count", () => {
+  const statement = parsePrepare(frame(PREPARED_FRAMES.prepareUntypedMarker));
+  assert.equal(statement.queryHandle, 1);
+  assert.equal(statement.statementType, 21);
+  assert.equal(statement.bindCount, 1);
+  assert.equal(statement.columns[0]?.name, "v");
+  assert.equal(statement.columns[0]?.type, 0);
+});
+
+test("the two-byte type header of an untyped column's cell is decoded", () => {
+  const statement = parsePrepare(frame(PREPARED_FRAMES.prepareUntypedMarker));
+  const read = (hex: string): unknown => parseExecute(frame(hex), statement, 7).rows[0]?.v;
+  assert.equal(read(PREPARED_FRAMES.executeUntypedInt), 7);
+  assert.equal(read(PREPARED_FRAMES.executeUntypedText), "ab");
+  assert.equal(read(PREPARED_FRAMES.executeUntypedText102), "ab");
+  assert.equal(read(PREPARED_FRAMES.executeUntypedNull), null);
+});
+
+test("a type header longer than its cell is malformed", () => {
+  const statement = parsePrepare(frame(PREPARED_FRAMES.prepareUntypedMarker));
+  // The size says 1 but the header takes 2, and the error names the column.
+  const hex = PREPARED_FRAMES.executeUntypedInt.replace(
+    "0000000683080000000701",
+    "00000001" + "8363" + "00000000",
+  );
+  assert.throws(
+    () => parseExecute(frame(hex), statement, 7),
+    (error: Error) => error instanceof MalformedReplyError && /overruns the cell of column "v"/.test(error.message),
+  );
+});
+
+test("an EXECUTE reply handle stays PREPARE's, not its leading tuple count", () => {
+  const statement = { ...parsePrepare(frame(PREPARED_FRAMES.prepareUntypedMarker)), queryHandle: 9 };
+  const result = parseExecute(frame(PREPARED_FRAMES.executeUntypedInt), statement, 7);
+  assert.equal(result.queryHandle, 9);
+  assert.equal(result.totalTupleCount, 1);
+});
+
+test("the statement description refreshed by EXECUTE is read before the shard id", () => {
+  const statement = parsePrepare(frame(PREPARED_FRAMES.prepareMultiSelect));
+  const result = parseExecute(frame(PREPARED_FRAMES.executeMultiSelect), statement, 7);
+  assert.equal(result.resultInfos.length, 2);
+  assert.deepEqual(result.rows, [{ a: 1 }]);
+});
+
+test("an impossible column info flag in an EXECUTE reply is malformed", () => {
+  const statement = parsePrepare(frame(PREPARED_FRAMES.prepareUntypedMarker));
+  const hex = PREPARED_FRAMES.executeUntypedInt.replace(
+    "000000000000000000000000000000" + "00fffffffe",
+    "000000000000000000000000000000" + "02fffffffe",
+  );
+  assert.throws(() => parseExecute(frame(hex), statement, 7), MalformedReplyError);
+});
+
+test("a statement failure inside an EXECUTE reply is the server's error", () => {
+  const statement = parsePrepare(frame(PREPARED_FRAMES.prepareUntypedMarker));
+  const wire = Buffer.concat([
+    i32(1), Buffer.from([0]), i32(1), Buffer.from([20]), i32(-2),
+    i32(-670), i32(4), Buffer.from("dup\0"),
+  ]);
+  assert.throws(
+    () => parseExecute(wire, statement, 7),
+    (error: Error & { code?: number }) => error.code === -670 && error.message.includes("dup"),
+  );
+});
+
+test("captured PREPARE and EXECUTE server errors keep their codes", () => {
+  const statement = parsePrepare(frame(PREPARED_FRAMES.prepareUntypedMarker));
+  assert.throws(
+    () => parsePrepare(frame(PREPARED_FRAMES.prepareSyntaxError)),
+    (error: Error & { code?: number }) => error.code === -493,
+  );
+  assert.throws(
+    () => parseExecute(frame(PREPARED_FRAMES.executeCoercionError), statement, 7),
+    (error: Error & { code?: number }) => error.code === -494,
+  );
+});
+
+/** An EXECUTE reply to an UPDATE of two rows: the result record, the column info flag, the shard id. */
+const EXECUTE_UPDATE =
+  "00000002" + "00" + "00000001" + "16" + "00000002" + "0000000000000000" + "00000000" + "00000000" +
+  "00" + "fffffffe";
+
+test("an EXECUTE reply cut off before its column info flag or shard id is malformed", () => {
+  const statement = parsePrepare(frame(PREPARED_FRAMES.prepareUntypedMarker));
+  assert.deepEqual(parseExecute(frame(EXECUTE_UPDATE), statement, 7).resultInfos, [
+    { statementType: 22, resultCount: 2 },
+  ]);
+
+  for (const cut of [EXECUTE_UPDATE.length - 10, EXECUTE_UPDATE.length - 8]) {
+    assert.throws(
+      () => parseExecute(frame(EXECUTE_UPDATE.slice(0, cut)), statement, 7),
+      MalformedReplyError,
+    );
+  }
+});

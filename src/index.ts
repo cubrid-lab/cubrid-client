@@ -12,6 +12,7 @@ export {
 export { ReadTimeoutError } from "./errors/read-timeout-error.js";
 export { TransactionError } from "./errors/transaction-error.js";
 export { NativeCubridAdapter } from "./adapters/native.js";
+export { ZonedDateTime } from "./types/zoned-date-time.js";
 export { parseConnectionString } from "./utils/connection-string.js";
 export { escapeIdentifier, buildWhere } from "./utils/query.js";
 export type {
@@ -30,6 +31,8 @@ export type {
   Executable,
   ExecutableTransactionClient,
   ExecuteResult,
+  PreparedQueryable,
+  PreparedTransactionClient,
   Queryable,
   ResultQueryable,
   ResultTransactionClient,
@@ -52,4 +55,5 @@ export type {
   SchemaPrimaryKey,
   SchemaTable,
 } from "./types/schema.js";
+export type { ZonedDateTimeFields, ZonedDateTimeType } from "./types/zoned-date-time.js";
 export type { ConnectionConfig } from "./utils/connection-string.js";

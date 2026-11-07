@@ -1,3 +1,5 @@
+import type { ZonedDateTime } from "./zoned-date-time.js";
+
 export type QueryResultRow = Record<string, unknown>;
 
 /** One decoded SET, MULTISET or SEQUENCE element. */
@@ -6,6 +8,7 @@ export type CollectionElement =
   | number
   | bigint
   | Date
+  | ZonedDateTime
   | Buffer
   | null
   | CollectionElement[];

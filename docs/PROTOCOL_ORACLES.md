@@ -26,9 +26,30 @@ replies to INSERT, UPDATE, DELETE, DDL and a two-statement string, and to
 GET_LAST_INSERT_ID (function code 40), captured the same way. Facts they pin
 down: the per-statement row count is in the execute result list (one entry per
 statement of a multi-statement string); GET_LAST_INSERT_ID answers size `-1`
-after an autocommit statement because the commit clears the value; after a
-multi-row INSERT it is the first generated id; and after an INSERT into a table
-without AUTO_INCREMENT it still holds an earlier INSERT's value. The INSERT reply is the same bytes for a table with and without AUTO_INCREMENT, and two fresh AUTO_INCREMENT tables both answer `1` in one transaction, so the wire holds no signal that a statement generated the value; a commit or a rollback clears it (CUBRID 10.2 and 11.4).
+on a session that has generated nothing; after a multi-row INSERT it is the first
+generated id; and after an INSERT into a table without AUTO_INCREMENT it still
+holds an earlier INSERT's value. The INSERT reply is the same bytes for a table
+with and without AUTO_INCREMENT, and two fresh AUTO_INCREMENT tables both answer
+`1`, so the wire holds no signal that a statement generated the value. The value
+belongs to the session: a commit, a rollback, the autocommit flag and a failed
+statement all leave it in place, and only a new session starts without one.
+
+CAS_INFO status, measured on the wire on CUBRID 10.2, 11.0, 11.2 and 11.4 and
+pinned by the fake CAS in `tests/concurrent-lifecycle.test.ts`:
+
+| Reply to | `CAS_INFO[0]` |
+| --- | --- |
+| OPEN_DATABASE | 1 |
+| A statement with the autocommit flag, and CLOSE_REQ_HANDLE after it | 0 |
+| An autocommit SELECT with rows left to fetch | 1 |
+| A statement without the flag, failed or not, including after `-72` | 1 |
+| END_TRAN | 0 |
+| CHECK_CAS | 1, even on an idle session |
+
+Status 0 therefore means the last transaction ended, not that the CAS has gone.
+That is the state in which a CAS closes its socket on purpose, and CHECK_CAS holds
+it until the next statement ends, which is what makes the client's check before a
+request safe.
 
 ## Separate numeric domains
 
@@ -111,6 +132,13 @@ The four brokers sent the same layout, with protocol version 7:
   encode, so a client cannot detect that NULL.
 - **JSON** is sent as wire type `2` below protocol 8. This driver declares
   protocol 7, so all four brokers described it as `85 02` in column metadata.
+  A probe that declared protocol 8 on 11.4 received wire type `34` with the same
+  text and NUL (`7b2261223a317d00`), but the driver does not declare 8, so that
+  layout has no decoder and is not exercised (#111).
+- **TIMESTAMPTZ, TIMESTAMPLTZ, DATETIMETZ and DATETIMELTZ** are wire types `29`
+  to `32`: the fields of TIMESTAMP (six int16) or DATETIME (seven int16), then the
+  zone as NUL-terminated text (`+09:00`, `America/New_York EDT`, `UTC UTC`). The
+  zero date is all-zero fields with a zone. Captured in `tests/fixtures/zoned-frames.ts`.
 
 ## Required regression checks
 
@@ -121,8 +149,12 @@ rather than importing the implementation enum as an oracle. It checks:
 - Positive and negative 64-bit BIGINT decode from fixed wire bytes.
 - BIGINT parameter encoding (`0000000915000000000000002a` for 42n).
 - Distinguishing real SQL NULL, empty strings and unsupported non-NULL types,
-  with the captured `timestamptzValue` reply, and rejecting a zero-byte value
+  with the captured `oidValue` reply, and rejecting a zero-byte value
   of any type except BIT and VARBIT.
+- Captured TIMESTAMPTZ, TIMESTAMPLTZ, DATETIMETZ and DATETIMELTZ replies (offset
+  and region zones, year 1 and 9999, session zones, NULL, collections) decode to
+  their fields and zone text; the zero values reject as unsupported; every
+  layout violation (no zone, no NUL, out-of-range fields, bad UTF-8) is malformed.
 - The captured zero DATE, DATETIME and TIMESTAMP replies (all-zero fields, wire
   types 13, 22 and 15 with sizes 6, 14 and 12, identical on 10.2, 11.0, 11.2 and
   11.4) reject as unsupported instead of decoding to an 1899 `Date`. A zero date
@@ -145,7 +177,6 @@ The protocol test runs in the standard required Node.js CI and is
 independent of a database connection. Separate [live CUBRID
 validation](SUPPORT_MATRIX.md) exercises the current integration suite on
 actual server images; it does not guarantee that every SQL type and
-statement has been proven. Unsupported JSON decoding and full parity testing
-remain tracked in
-[#111](https://github.com/cubrid-lab/cubrid-client/issues/111) and
+statement has been proven. Parsed JSON, which needs protocol 8, is tracked in
+[#111](https://github.com/cubrid-lab/cubrid-client/issues/111); full parity testing remains tracked in
 [#118](https://github.com/cubrid-lab/cubrid-client/issues/118).

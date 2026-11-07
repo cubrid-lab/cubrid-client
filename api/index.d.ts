@@ -1,9 +1,57 @@
 type QueryParam = string | number | boolean | bigint | Date | Buffer | null;
 type QueryParams = readonly QueryParam[];
 
+/** The CUBRID type a {@link ZonedDateTime} was read from. */
+type ZonedDateTimeType = "TIMESTAMPTZ" | "TIMESTAMPLTZ" | "DATETIMETZ" | "DATETIMELTZ";
+/** The fields of a {@link ZonedDateTime}. */
+interface ZonedDateTimeFields {
+    type: ZonedDateTimeType;
+    year: number;
+    month: number;
+    day: number;
+    hour: number;
+    minute: number;
+    second: number;
+    millisecond: number;
+    zone: string;
+}
+/**
+ * A TIMESTAMPTZ, TIMESTAMPLTZ, DATETIMETZ or DATETIMELTZ value: the wall-clock
+ * fields the server sent and the zone they are in, exactly as sent.
+ *
+ * It is not a `Date`. A `Date` is an instant and cannot say which zone the
+ * value was stored in, and for a region zone the instant depends on the zone
+ * rules of the day. The server's own zone text is kept in `zone`: an offset
+ * such as `+09:00`, or a region and abbreviation such as `Asia/Seoul KST`.
+ * For a TIMESTAMPLTZ or DATETIMELTZ value the server sends the fields in the
+ * zone of the session that read it.
+ *
+ * `month` runs from 1 to 12, unlike `Date#getMonth`. `millisecond` is always 0
+ * for TIMESTAMPTZ and TIMESTAMPLTZ, which have no fractional seconds.
+ */
+declare class ZonedDateTime {
+    readonly type: ZonedDateTimeType;
+    readonly year: number;
+    readonly month: number;
+    readonly day: number;
+    readonly hour: number;
+    readonly minute: number;
+    readonly second: number;
+    readonly millisecond: number;
+    readonly zone: string;
+    constructor(fields: ZonedDateTimeFields);
+    /**
+     * The value as SQL literal text, `YYYY-MM-DD HH:MM:SS[.mmm] <zone>`; the
+     * fraction is written for DATETIMETZ and DATETIMELTZ only.
+     */
+    toString(): string;
+    /** The same text as {@link ZonedDateTime.toString}, so `JSON.stringify` keeps the zone. */
+    toJSON(): string;
+}
+
 type QueryResultRow = Record<string, unknown>;
 /** One decoded SET, MULTISET or SEQUENCE element. */
-type CollectionElement = string | number | bigint | Date | Buffer | null | CollectionElement[];
+type CollectionElement = string | number | bigint | Date | ZonedDateTime | Buffer | null | CollectionElement[];
 /**
  * A decoded SET, MULTISET or SEQUENCE column value, in the order the server sent
  * it. SET values arrive without duplicates and MULTISET values keep them; both
@@ -68,7 +116,7 @@ type ClientLogLevel = "debug" | "info" | "error";
  * parameter values, row data, credentials or error messages.
  */
 interface ClientLogFields {
-    /** `connection`, `connect`, `query`, `queryResult`, `execute`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`. */
+    /** `connection`, `connect`, `query`, `queryResult`, `execute`, `queryPrepared`, `queryResultPrepared`, `executePrepared`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`. */
     operation?: string;
     host?: string;
     port?: number;
@@ -171,6 +219,18 @@ interface ExecuteResult {
 interface Executable {
     execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
 }
+/**
+ * Runs statements with server-side prepared binding: the values travel as typed
+ * binds, never as SQL text. Each call prepares, executes and releases its own
+ * handle, so nothing is reused between calls. The results match `query()`,
+ * `queryResult()` and `execute()`; the differences in how values convert are in
+ * docs/TYPES.md. The methods without `Prepared` keep rendering SQL literals.
+ */
+interface PreparedQueryable {
+    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
+    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
+    executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+}
 interface TransactionClient extends Queryable {
     commit(): Promise<void>;
     rollback(): Promise<void>;
@@ -193,6 +253,13 @@ type TransactionCallback<T, Tx extends TransactionClient = TransactionClient> = 
  */
 interface ResultTransactionClient extends TransactionClient, ResultQueryable {
 }
+/**
+ * The transaction client `CubridClient.transaction()` passes in: a
+ * {@link TransactionClient} that can also bind on the server. Kept apart from
+ * `TransactionClient` so 1.x code that implements that interface keeps compiling.
+ */
+interface PreparedTransactionClient extends TransactionClient, PreparedQueryable {
+}
 interface ConnectionLike {
     connect(): Promise<void>;
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
@@ -206,6 +273,14 @@ interface ConnectionLike {
      * client or transaction fails when its connection does not provide it.
      */
     execute?(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+    /**
+     * Optional so 1.x connection factories keep compiling. The prepared methods
+     * on a client or transaction fail when their connection does not provide
+     * them, rather than falling back to SQL literals.
+     */
+    queryPrepared?<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
+    queryResultPrepared?<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
+    executePrepared?(sql: string, params?: QueryParams): Promise<ExecuteResult>;
     beginTransaction(): Promise<void>;
     commit(): Promise<void>;
     rollback(): Promise<void>;
@@ -274,16 +349,20 @@ interface SchemaIndex {
     columns: SchemaIndexColumn[];
 }
 
-declare class CubridClient implements Queryable, ResultQueryable, Executable {
+declare class CubridClient implements Queryable, ResultQueryable, Executable, PreparedQueryable {
     private readonly config;
     private readonly connectionFactory;
     private sharedConnectionPromise;
     private closed;
+    private readonly schemaOperations;
     constructor(config: ClientConfig, connectionFactory: ConnectionFactory);
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
     queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
     execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
-    transaction<T>(callback: TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient>): Promise<T>;
+    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
+    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
+    executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+    transaction<T>(callback: TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient>): Promise<T>;
     beginTransaction(): Promise<void>;
     commit(): Promise<void>;
     rollback(): Promise<void>;
@@ -306,18 +385,21 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable {
     getPrimaryKey(table: string, options?: SchemaOptions): Promise<SchemaPrimaryKey | null>;
     /** List the indexes of a table, including its primary and foreign keys. */
     getIndexes(table: string, options?: SchemaOptions): Promise<SchemaIndex[]>;
-    private readonly schemaQuery;
+    private runSchemaOperation;
     private getSharedConnection;
 }
 
 declare function createClient(options: ClientOptions): CubridClient;
 
-declare class CubridTransaction implements ResultTransactionClient, ExecutableTransactionClient {
+declare class CubridTransaction implements ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient {
     private readonly connection;
     constructor(connection: ConnectionLike);
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
     queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
     execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
+    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
+    executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>;
     commit(): Promise<void>;
     rollback(): Promise<void>;
 }
@@ -420,6 +502,14 @@ interface TransactionError extends Readonly<CubridErrorDetails> {
 }
 declare class TransactionError extends Error {
     name: string;
+    /**
+     * Set by `CubridClient.transaction()` when rolling back also failed. `cause`
+     * still holds the failure that started it. The connection is closed
+     * afterwards, so the server discards the uncommitted work either way.
+     */
+    rollbackError?: Error;
+    /** Set by `CubridClient.transaction()` when closing its connection also failed. */
+    closeError?: Error;
     constructor(message: string, options?: CubridErrorOptions);
 }
 
@@ -475,6 +565,9 @@ declare class NativeCubridAdapter implements DriverAdapter {
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
     queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
     execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
+    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
+    executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>;
     private executeNow;
     private queryNow;
     beginTransaction(): Promise<void>;
@@ -625,4 +718,4 @@ declare function buildWhere(conditions: Record<string, unknown>): {
     params: unknown[];
 };
 
-export { type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteResult, LockTimeoutError, NativeCubridAdapter, QueryError, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type TransactionCallback, type TransactionClient, TransactionError, buildWhere, createClient, escapeIdentifier, parseConnectionString };
+export { type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteResult, LockTimeoutError, NativeCubridAdapter, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type TransactionCallback, type TransactionClient, TransactionError, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, buildWhere, createClient, escapeIdentifier, parseConnectionString };

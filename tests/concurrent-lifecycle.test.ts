@@ -14,7 +14,8 @@
  *   of a SELECT. Every other cursor on the session closes with it.
  * - Fetching a handle closed that way fails with -1012. Fetching a number that
  *   session never issued fails with -1006.
- * - CAS_INFO[0] is 1 inside a transaction and 0 after it ends.
+ * - CAS_INFO[0] is 1 inside a transaction and 0 after it ends. CHECK_CAS always
+ *   replies 1, even on an idle session.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -22,7 +23,9 @@ import { createServer, type Server, type Socket as NetSocket } from "node:net";
 
 import { createClient } from "../src/client/create-client.js";
 import { ConnectionError } from "../src/errors/connection-error.js";
+import { QueryError } from "../src/errors/query-error.js";
 import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
+import { TransactionError } from "../src/errors/transaction-error.js";
 import { CASFunctionCode, EndTranType } from "../src/protocol/constants.js";
 
 const CAS_ER_NO_MORE_DATA = -1012;
@@ -150,6 +153,12 @@ class FakeCas {
   stallAtExecuteOf: string | null = null;
   /** Answer CHECK_CAS as a CAS does once its database server is gone. */
   failCheckCas = false;
+  /** Close the socket instead of answering the next CHECK_CAS. */
+  dropAtCheckCas = false;
+  /** Close the socket instead of answering the next CLOSE_REQ_HANDLE. */
+  dropAtClose = false;
+  /** Report no open transaction in the next reply to this function code. */
+  reportOutOfTransactionTo: number | null = null;
   /** Answer this owner's next SELECT with a reply that stops mid-header. */
   malformExecuteOf: string | null = null;
   /** Close this many incoming connections before their handshake. */
@@ -230,7 +239,11 @@ class FakeCas {
   }
 
   private replyWithStatus(session: Session, payload: Buffer): void {
-    this.reply(session, payload, session.inTransaction ? 1 : 0);
+    const reported = this.reportOutOfTransactionTo === this.requests.at(-1)?.code;
+    if (reported) {
+      this.reportOutOfTransactionTo = null;
+    }
+    this.reply(session, payload, session.inTransaction && !reported ? 1 : 0);
   }
 
   private endTransaction(session: Session): void {
@@ -265,6 +278,11 @@ class FakeCas {
       case CASFunctionCode.CLOSE_REQ_HANDLE: {
         const handle = payload.readInt32BE(5);
         this.requests.push({ session: session.id, code, handle });
+        if (this.dropAtClose) {
+          this.dropAtClose = false;
+          session.socket.destroy();
+          break;
+        }
         session.cursors.delete(handle);
         this.replyWithStatus(session, int32(0));
         break;
@@ -283,9 +301,15 @@ class FakeCas {
         break;
       case CASFunctionCode.CHECK_CAS:
         this.requests.push({ session: session.id, code });
-        this.replyWithStatus(
+        if (this.dropAtCheckCas) {
+          this.dropAtCheckCas = false;
+          session.socket.destroy();
+          break;
+        }
+        this.reply(
           session,
           this.failCheckCas ? Buffer.from("ffffffff0000232700", "hex") : Buffer.alloc(0),
+          1,
         );
         break;
       default:
@@ -909,5 +933,164 @@ test("close waits for a running query instead of cutting off its FETCHes", { tim
     assert.deepEqual(await running, rowsOf("a"));
     await closing;
     assert.ok(cas.of(CASFunctionCode.FETCH).length > 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// One session across autocommit statements, verified with CHECK_CAS
+// ---------------------------------------------------------------------------
+
+test("consecutive autocommit statements stay on one session, with one CHECK_CAS between them", { timeout: 10000 }, async () => {
+  await withClient(async (client, cas) => {
+    await client.query("INSERT INTO items VALUES (1)");
+    await client.query(selectFor("a"));
+    await client.query("INSERT INTO items VALUES (2)");
+
+    assert.deepEqual([...new Set(cas.requests.map((request) => request.session))], [1]);
+    const statements = cas.requests.filter(
+      ({ code }) => code === CASFunctionCode.PREPARE_AND_EXECUTE || code === CASFunctionCode.CHECK_CAS,
+    );
+    assert.deepEqual(statements.map(({ code }) => code), [
+      CASFunctionCode.PREPARE_AND_EXECUTE,
+      CASFunctionCode.CHECK_CAS,
+      CASFunctionCode.PREPARE_AND_EXECUTE,
+      CASFunctionCode.CHECK_CAS,
+      CASFunctionCode.PREPARE_AND_EXECUTE,
+    ]);
+  });
+});
+
+test("the backslash mode is measured once across autocommit statements", { timeout: 10000 }, async () => {
+  await withClient(async (client, cas) => {
+    await client.query("INSERT INTO items VALUES (?)", ["a\\b"]);
+    await client.query("INSERT INTO items VALUES (?)", ["c\\d"]);
+
+    const executions = cas.of(CASFunctionCode.PREPARE_AND_EXECUTE);
+    assert.equal(executions.filter(({ sql }) => sql?.includes("CHAR_LENGTH")).length, 1);
+    assert.equal(executions.length, 3);
+  });
+});
+
+test("statements queued behind a probe that finds the CAS gone run once on the new session", { timeout: 10000 }, async () => {
+  await withClient(async (client, cas) => {
+    await client.query("INSERT INTO items VALUES (0)");
+    cas.dropAtCheckCas = true;
+
+    const results = await Promise.allSettled([
+      client.query("INSERT INTO items VALUES (1)"),
+      client.query("INSERT INTO items VALUES (2)"),
+      client.query("INSERT INTO items VALUES (3)"),
+    ]);
+
+    assert.deepEqual(results.map(({ status }) => status), ["fulfilled", "fulfilled", "fulfilled"]);
+    assert.deepEqual(cas.of(CASFunctionCode.CHECK_CAS)[0]?.session, 1);
+    assert.deepEqual(
+      cas.of(CASFunctionCode.PREPARE_AND_EXECUTE).map(({ session, sql }) => [session, sql]),
+      [
+        [1, "INSERT INTO items VALUES (0)"],
+        [2, "INSERT INTO items VALUES (1)"],
+        [2, "INSERT INTO items VALUES (2)"],
+        [2, "INSERT INTO items VALUES (3)"],
+      ],
+    );
+  });
+});
+
+test("a CAS that goes to another client after its reply does not fail the statements behind it", { timeout: 10000 }, async () => {
+  await withClient(async (client, cas) => {
+    await client.query("INSERT INTO items VALUES (0)");
+    cas.dropAtClose = true;
+
+    const results = await Promise.allSettled([
+      client.query("INSERT INTO items VALUES (1)"),
+      client.query("INSERT INTO items VALUES (2)"),
+    ]);
+
+    assert.deepEqual(results.map(({ status }) => status), ["fulfilled", "fulfilled"]);
+    assert.equal(cas.of(CASFunctionCode.PREPARE_AND_EXECUTE).length, 3);
+    assert.equal(cas.of(CASFunctionCode.PREPARE_AND_EXECUTE).at(-1)?.session, 2);
+  });
+});
+
+async function openTransactionWithWork(client: ReturnType<typeof createClient>): Promise<void> {
+  await client.beginTransaction();
+  await client.query("INSERT INTO items VALUES (1)");
+}
+
+async function assertNothingCommits(client: ReturnType<typeof createClient>, cas: FakeCas): Promise<void> {
+  await assert.rejects(client.query("INSERT INTO items VALUES (3)"), QueryError);
+  await assert.rejects(client.commit(), TransactionError);
+  assert.deepEqual(cas.of(CASFunctionCode.END_TRAN), []);
+}
+
+for (const [name, code, statement] of [
+  ["execute", CASFunctionCode.PREPARE_AND_EXECUTE, "INSERT INTO items VALUES (2)"],
+  ["FETCH", CASFunctionCode.FETCH, selectFor("a")],
+  ["handle release", CASFunctionCode.CLOSE_REQ_HANDLE, selectFor("a")],
+] as const) {
+  test(`a ${name} reply that reports no open transaction fails the transaction`, { timeout: 10000 }, async () => {
+    await withClient(async (client, cas) => {
+      await openTransactionWithWork(client);
+      cas.reportOutOfTransactionTo = code;
+
+      await assert.rejects(client.query(statement), QueryError);
+
+      await assertNothingCommits(client, cas);
+    });
+  });
+}
+
+test("a ping reply that reports no open transaction is not hidden by the replies after it", { timeout: 10000 }, async () => {
+  await withClient(async (client, cas) => {
+    await openTransactionWithWork(client);
+    cas.reportOutOfTransactionTo = CASFunctionCode.GET_DB_VERSION;
+
+    await client.ping();
+
+    await assertNothingCommits(client, cas);
+    // The next statement was refused before it was sent, not undone afterwards.
+    assert.equal(cas.of(CASFunctionCode.PREPARE_AND_EXECUTE).length, 1);
+  });
+});
+
+test("commit refuses a transaction that a ping reply reported as over", { timeout: 10000 }, async () => {
+  await withClient(async (client, cas) => {
+    await openTransactionWithWork(client);
+    cas.reportOutOfTransactionTo = CASFunctionCode.GET_DB_VERSION;
+    await client.ping();
+
+    await assert.rejects(client.commit(), TransactionError);
+
+    assert.deepEqual(cas.of(CASFunctionCode.END_TRAN), []);
+  });
+});
+
+test("a ping before a transaction's first statement does not count against it", { timeout: 10000 }, async () => {
+  await withClient(async (client, cas) => {
+    await client.query("INSERT INTO items VALUES (0)");
+    await client.beginTransaction();
+    await client.ping();
+
+    await client.query("INSERT INTO items VALUES (1)");
+    await client.commit();
+
+    assert.equal(cas.of(CASFunctionCode.END_TRAN).at(-1)?.tranType, EndTranType.COMMIT);
+  });
+});
+
+test("FETCH stays on its session without a probe when the execute reply says OUT_TRAN", { timeout: 10000 }, async () => {
+  await withClient(async (client, cas) => {
+    await client.query("INSERT INTO items VALUES (1)");
+    await client.ping();
+    cas.requests.length = 0;
+    cas.reportOutOfTransactionTo = CASFunctionCode.PREPARE_AND_EXECUTE;
+
+    assert.deepEqual(await client.query(selectFor("a")), rowsOf("a"));
+
+    const after = cas.requests.map(({ code }) => code);
+    const execute = after.indexOf(CASFunctionCode.PREPARE_AND_EXECUTE);
+    assert.ok(after.includes(CASFunctionCode.FETCH));
+    assert.equal(after.slice(execute).includes(CASFunctionCode.CHECK_CAS), false);
+    assert.equal(cas.refusedFetches, 0);
   });
 });

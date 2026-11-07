@@ -11,10 +11,16 @@ import { ConnectionError } from "../src/errors/connection-error.js";
 import { DeadlockError, QueryError } from "../src/errors/query-error.js";
 import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { TransactionError } from "../src/errors/transaction-error.js";
-import type { ClientConfig } from "../src/types/client.js";
+import type {
+  ClientConfig,
+  ExecutableTransactionClient,
+  ResultTransactionClient,
+} from "../src/types/client.js";
+import type { QueryParam } from "../src/types/query.js";
 import { CAPTURED_FRAMES } from "./fixtures/collection-frames.js";
+import { ZONED_FRAMES } from "./fixtures/zoned-frames.js";
 import { LOB_FRAMES, LOB_READ_REPLY_LIMIT } from "./fixtures/lob-frames.js";
-import { DML_FRAMES, LAST_INSERT_ID_FRAMES } from "./fixtures/dml-frames.js";
+import { DML_FRAMES, LAST_INSERT_ID_FRAMES, PREPARED_FRAMES } from "./fixtures/dml-frames.js";
 import { writePrepareAndExecute } from "../src/protocol/protocol.js";
 
 // ---------------------------------------------------------------------------
@@ -175,6 +181,14 @@ class FakeCASConnection {
     return this.sendAndRecv(header, payload);
   }
 
+  async releaseOnSession(
+    generation: number,
+    header: Buffer,
+    payload: Buffer,
+  ): Promise<Buffer | null> {
+    return this.sendAndRecvOnSession(generation, header, payload);
+  }
+
   async close(beforeClose?: () => Promise<void>): Promise<void> {
     this.closeCalls += 1;
     // Mirror CASConnection.close(): run the pre-close hook (e.g. CON_CLOSE)
@@ -290,6 +304,9 @@ function buildDMLResponse(
   ri.writeInt32BE(0, 13); // cache time seconds
   ri.writeInt32BE(0, 17); // cache time microseconds
   parts.push(ri);
+
+  // includes_column_info = 0 and shard_id = 0, which protocol 7 always sends
+  parts.push(Buffer.alloc(1 + 4));
 
   return Buffer.concat(parts);
 }
@@ -1213,6 +1230,21 @@ test("NativeCubridAdapter query SELECT fetches remaining rows", async () => {
   assert.equal(fakeCAS.sendAndRecvCalls, 3);
 });
 
+test("NativeCubridAdapter never sends a FETCH to a session other than the one holding its handle", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(buildPartialSelectResponse(2));
+  // The session is replaced between the execute and its FETCH.
+  fakeCAS.sendAndRecvOnSession = async () => null;
+
+  await assert.rejects(adapter.query("SELECT 1"), (error: Error) => {
+    assert.ok(error instanceof QueryError);
+    assert.equal(error.kind, "connection-lost");
+    return true;
+  });
+
+  assert.equal(fakeCAS.sendAndRecvCalls, 1);
+});
+
 test("NativeCubridAdapter rejects zero-tuple FETCH before the advertised total", async () => {
   const { adapter, fakeCAS } = createAdapterWithFakeCAS();
 
@@ -1646,19 +1678,22 @@ test("a malformed reply cannot rebind a transaction on a replacement session", a
   assert.equal(fakeCAS.connectCalls, 0);
 });
 
+/** The query handle the broker gave the captured OID reply (its first int32). */
+const OID_FRAME_HANDLE = 20;
+
 test("a zero-byte value without a decoder rejects, and the session stays open", async () => {
   const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
-  // The captured TIMESTAMPTZ reply, with its 19-byte value (type 29) removed.
-  const value = "0000001307e4000100020003000400052b30393a303000";
-  const { hex } = CAPTURED_FRAMES.timestamptzValue;
+  // The captured OID reply, with its 8-byte value (type 19) removed.
+  const value = "000000080000110100020000";
+  const { hex } = ZONED_FRAMES.oidValue;
   assert.ok(hex.includes(value));
   fakeCAS.queueResponse(Buffer.from(hex.replace(value, "00000000"), "hex"));
 
-  await assertQueryFails(adapter, /column "tz" \(wire type 29, 0 bytes\)/);
+  await assertQueryFails(adapter, /column "o" \(wire type 19, 0 bytes\)/);
 
   assert.equal(fakeCAS.discardCalls, 0);
   assert.equal(fakeCAS.isConnected, true);
-  assert.deepEqual(fakeCAS.closedHandles, [1]);
+  assert.deepEqual(fakeCAS.closedHandles, [OID_FRAME_HANDLE]);
 });
 
 test("a captured zero date rejects, and the session stays open for the next query", async () => {
@@ -1667,6 +1702,8 @@ test("a captured zero date rejects, and the session stays open for the next quer
     CAPTURED_FRAMES.zeroDatetime,
     CAPTURED_FRAMES.zeroTimestamp,
     CAPTURED_FRAMES.zeroDateElement,
+    ZONED_FRAMES.zeroTimestamptz,
+    ZONED_FRAMES.zeroDatetimetz,
   ]) {
     const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
     fakeCAS.queueResponse(Buffer.from(frame.hex, "hex"));
@@ -1675,13 +1712,37 @@ test("a captured zero date rejects, and the session stays open for the next quer
 
     assert.equal(fakeCAS.discardCalls, 0, frame.sql);
     assert.equal(fakeCAS.isConnected, true, frame.sql);
-    assert.deepEqual(fakeCAS.closedHandles, [1], frame.sql);
+    assert.deepEqual(fakeCAS.closedHandles, [Number.parseInt(frame.hex.slice(0, 8), 16)], frame.sql);
   }
+});
+
+test("a zoned value reaches the caller with its zone, and its column has the type name", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  fakeCAS.queueResponse(Buffer.from(ZONED_FRAMES.datetimetzRegion.hex, "hex"));
+
+  const { rows, columns } = await adapter.queryResult("SELECT tz FROM t");
+
+  assert.equal(String(rows[0]?.tz), "2020-07-02 03:04:05.999 America/New_York EDT");
+  assert.equal(rows[0]?.t, "after");
+  assert.deepEqual(columns.map((column) => column.type), ["DATETIMETZ", "CHAR"]);
+});
+
+test("a zoned value whose zone text has no NUL drops the session", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  const { hex } = ZONED_FRAMES.timestamptzOffset;
+  // "+09:00" and its NUL become "+09:00:" in a cell of the same length.
+  const zone = "2b30393a303000";
+  assert.ok(hex.includes(zone));
+  fakeCAS.queueResponse(Buffer.from(hex.replace(zone, "2b30393a30303a"), "hex"));
+
+  await assertQueryFails(adapter, /zone text/);
+
+  assertSessionDiscarded(fakeCAS);
 });
 
 test("damage after an unsupported value still drops the session", async () => {
   const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
-  const { hex } = CAPTURED_FRAMES.timestamptzValue;
+  const { hex } = ZONED_FRAMES.oidValue;
   // Column t follows the unsupported value and now claims more bytes than remain.
   const tail = "0000000661667465720001";
   assert.ok(hex.endsWith(tail));
@@ -1783,12 +1844,12 @@ test("query handle: a failed close does not mask the fetch failure", async () =>
 
 test("query handle: a close rejected by the server does not mask the failure", async () => {
   const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
-  fakeCAS.queueResponse(Buffer.from(CAPTURED_FRAMES.timestamptzValue.hex, "hex"));
+  fakeCAS.queueResponse(Buffer.from(ZONED_FRAMES.oidValue.hex, "hex"));
   fakeCAS.queueResponse(buildErrorResponse(-1006, "invalid handle"));
 
-  await assertQueryFails(adapter, /Unsupported CUBRID CAS value type 29/);
+  await assertQueryFails(adapter, /Unsupported CUBRID CAS value type 19/);
 
-  assert.deepEqual(fakeCAS.closedHandles, [1]);
+  assert.deepEqual(fakeCAS.closedHandles, [OID_FRAME_HANDLE]);
   assert.equal(fakeCAS.isConnected, true);
 });
 
@@ -2444,7 +2505,7 @@ test("execute reports the rows and generated id of an autocommit INSERT", async 
   const result = await adapter.execute(DML_FRAMES.insertOneRow.sql);
 
   assert.deepEqual(result, { affectedRows: 1, lastInsertId: 1 });
-  // The server forgets the generated value when a statement commits, so the
+  // The value stays with the session, and a commit lets the CAS go, so the
   // statement is sent without the autocommit flag, asked for the value, and
   // committed afterwards.
   assert.deepEqual(sentCodes(fakeCAS), [PREPARE_AND_EXECUTE, GET_LAST_INSERT_ID, END_TRAN, CLOSE_REQ_HANDLE]);
@@ -2662,6 +2723,75 @@ test("execute reports no id in a transaction when it cannot tell the statement g
   const second = await adapter.execute("INSERT INTO second_table (v) VALUES (1)");
 
   assert.deepEqual(second, { affectedRows: 1 });
+});
+
+test("execute does not report a value that a kept session held from an earlier statement", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  fakeCAS.queueResponse(hex(DML_FRAMES.insertOneRow.hex));
+  fakeCAS.queueResponse(hex(LAST_INSERT_ID_FRAMES.one));
+  assert.equal((await adapter.execute("INSERT INTO keyed (v) VALUES (1)")).lastInsertId, 1);
+
+  // The same session and the same value: this table generated nothing.
+  fakeCAS.queueResponse(hex(DML_FRAMES.insertOneRow.hex));
+  fakeCAS.queueResponse(hex(LAST_INSERT_ID_FRAMES.one));
+  const plain = await adapter.execute("INSERT INTO plain_table (v) VALUES (1)");
+
+  assert.deepEqual(plain, { affectedRows: 1 });
+});
+
+test("a replaced session starts with no value, so an equal id is new there", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  fakeCAS.queueResponse(hex(DML_FRAMES.insertOneRow.hex));
+  fakeCAS.queueResponse(hex(LAST_INSERT_ID_FRAMES.one));
+  await adapter.execute("INSERT INTO keyed (v) VALUES (1)");
+
+  fakeCAS.released = true;
+  fakeCAS.queueResponse(hex(DML_FRAMES.insertOneRow.hex));
+  fakeCAS.queueResponse(hex(LAST_INSERT_ID_FRAMES.one));
+  const result = await adapter.execute("INSERT INTO other_keyed (v) VALUES (1)");
+
+  assert.deepEqual(result, { affectedRows: 1, lastInsertId: 1 });
+});
+
+test("execute reads the value first after a statement that may have changed it unseen", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  fakeCAS.queueResponse(hex(DML_FRAMES.insertOneRow.hex));
+  await adapter.query("INSERT INTO keyed (v) VALUES (1)");
+  fakeCAS.sentPayloads.length = 0;
+
+  fakeCAS.queueResponse(hex(LAST_INSERT_ID_FRAMES.one));
+  fakeCAS.queueResponse(hex(DML_FRAMES.insertOneRow.hex));
+  fakeCAS.queueResponse(hex(LAST_INSERT_ID_FRAMES.one));
+  const result = await adapter.execute("INSERT INTO plain_table (v) VALUES (1)");
+
+  assert.deepEqual(result, { affectedRows: 1 });
+  assert.equal(sentCodes(fakeCAS)[0], GET_LAST_INSERT_ID);
+});
+
+test("execute reads no value before a statement that cannot ask for one", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  fakeCAS.queueResponse(hex(DML_FRAMES.insertOneRow.hex));
+  await adapter.query("INSERT INTO keyed (v) VALUES (1)");
+  fakeCAS.sentPayloads.length = 0;
+
+  fakeCAS.queueResponse(buildDMLResponse(21, 1));
+  await adapter.execute("UPDATE keyed SET v = 2");
+
+  assert.equal(sentCodes(fakeCAS).includes(GET_LAST_INSERT_ID), false);
+});
+
+test("a failed statement makes execute read the value before its next INSERT", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  fakeCAS.queueResponse(buildServerErrorResponse(-670));
+  await assert.rejects(adapter.execute("INSERT INTO keyed (v) VALUES (1), (1)"));
+  fakeCAS.sentPayloads.length = 0;
+
+  fakeCAS.queueResponse(hex(LAST_INSERT_ID_FRAMES.one));
+  fakeCAS.queueResponse(hex(DML_FRAMES.insertOneRow.hex));
+  fakeCAS.queueResponse(hex(LAST_INSERT_ID_FRAMES.one));
+  const result = await adapter.execute("INSERT INTO plain_table (v) VALUES (1)");
+
+  assert.deepEqual(result, { affectedRows: 1 });
 });
 
 test("a server abort of the transaction during execute blocks later statements as it does for query", async () => {
@@ -3084,4 +3214,528 @@ test("LOB: queryResult() returns content too, never the locator", async () => {
   assert.deepEqual(rows[0], { id: 1, b: Buffer.from([1, 2, 3]), c: "hi" });
   assert.deepEqual(columns.map((column) => column.type), ["INT", "BLOB", "CLOB"]);
   assert.ok(!inspect(rows, { depth: null }).includes("file:"));
+});
+
+// ---------------------------------------------------------------------------
+// transaction() over a transaction the server rolled back on its own
+// ---------------------------------------------------------------------------
+
+/** The adapter is inside no transaction yet; transaction() begins it. */
+function transactionOverFakeCAS() {
+  const created = createAdapterWithFakeCAS();
+  const client = createClient({
+    host: DEFAULT_CONFIG.host,
+    database: DEFAULT_CONFIG.database,
+    user: DEFAULT_CONFIG.user,
+    connectionFactory: () => created.adapter,
+  });
+  return { ...created, client };
+}
+
+function rejectsWithAbort(error: unknown): boolean {
+  assert.ok(error instanceof TransactionError);
+  assert.equal(error.code, -72);
+  assert.equal(error.origin, "server");
+  assert.equal(error.kind, "deadlock");
+  return true;
+}
+
+function statementsSent(fakeCAS: FakeCASConnection): number {
+  return fakeCAS.sentPayloads.filter(
+    (payload) => payload[0] === CASFunctionCode.PREPARE_AND_EXECUTE,
+  ).length;
+}
+
+const TRANSACTION_STATEMENTS: Array<
+  [string, (tx: ResultTransactionClient & ExecutableTransactionClient) => Promise<unknown>]
+> = [
+  ["query", (tx) => tx.query("INSERT INTO t VALUES ('a')")],
+  ["queryResult", (tx) => tx.queryResult("INSERT INTO t VALUES ('a')")],
+  ["execute", (tx) => tx.execute("INSERT INTO t VALUES ('a')")],
+];
+
+for (const [statement, run] of TRANSACTION_STATEMENTS) {
+  test(`transaction() rolls back once when tx.${statement} gets -72 and the callback rethrows`, async () => {
+    const { client, fakeCAS } = transactionOverFakeCAS();
+    fakeCAS.queueResponse(buildServerErrorResponse(-72));
+    fakeCAS.queueResponse(buildSimpleResponse(0));
+
+    await assert.rejects(
+      client.transaction((tx) => run(tx)),
+      rejectsWithAbort,
+    );
+
+    assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+    assert.equal(fakeCAS.connectCalls, 0);
+  });
+
+  test(`transaction() rolls back once when the callback swallows -72 from tx.${statement}`, async () => {
+    const { client, fakeCAS } = transactionOverFakeCAS();
+    fakeCAS.queueResponse(buildServerErrorResponse(-72));
+    fakeCAS.queueResponse(buildSimpleResponse(0));
+
+    await assert.rejects(
+      client.transaction(async (tx) => {
+        await assert.rejects(run(tx), TransactionError);
+        return "must not be returned";
+      }),
+      rejectsWithAbort,
+    );
+
+    assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+  });
+}
+
+test("transaction() sends nothing behind -72 in a Promise.all, then rolls back once", async () => {
+  const { client, fakeCAS } = transactionOverFakeCAS();
+  fakeCAS.queueResponse(buildServerErrorResponse(-72));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+
+  await assert.rejects(
+    client.transaction((tx) =>
+      Promise.all([
+        tx.query("INSERT INTO t VALUES ('a')"),
+        tx.execute("INSERT INTO t VALUES ('b')"),
+        tx.queryResult("SELECT 1"),
+      ]),
+    ),
+    rejectsWithAbort,
+  );
+
+  assert.equal(statementsSent(fakeCAS), 1);
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+});
+
+test("a manual tx.rollback() after -72 is the only outcome of transaction()", async () => {
+  const { client, fakeCAS } = transactionOverFakeCAS();
+  fakeCAS.queueResponse(buildServerErrorResponse(-72));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+
+  const result = await client.transaction(async (tx) => {
+    await assert.rejects(tx.query("INSERT INTO t VALUES ('a')"), TransactionError);
+    await tx.rollback();
+    await assert.rejects(tx.commit(), TransactionError);
+    return "retry later";
+  });
+
+  assert.equal(result, "retry later");
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+});
+
+test("a manual tx.commit() after -72 rejects and sends no COMMIT", async () => {
+  const { client, fakeCAS } = transactionOverFakeCAS();
+  fakeCAS.queueResponse(buildServerErrorResponse(-72));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+
+  await assert.rejects(
+    client.transaction(async (tx) => {
+      await assert.rejects(tx.query("INSERT INTO t VALUES ('a')"), TransactionError);
+      await tx.commit();
+    }),
+    rejectsWithAbort,
+  );
+
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+});
+
+test("transaction() keeps -72 from the COMMIT reply and still ends with one rollback", async () => {
+  const { client, fakeCAS } = transactionOverFakeCAS();
+  fakeCAS.queueResponse(buildServerErrorResponse(-72));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+
+  await assert.rejects(client.transaction(async () => "lost"), rejectsWithAbort);
+
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.COMMIT, EndTranType.ROLLBACK]);
+});
+
+test("transaction() commits nothing after the session changed under the callback", async () => {
+  const { client, fakeCAS } = transactionOverFakeCAS();
+  fakeCAS.queueResponse(buildDMLResponse(20, 1));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+
+  await assert.rejects(
+    client.transaction(async (tx) => {
+      await tx.query("INSERT INTO t VALUES ('a')");
+      fakeCAS.connectionGeneration += 1;
+      await assert.rejects(tx.execute("INSERT INTO t VALUES ('b')"), TransactionError);
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof TransactionError);
+      assert.equal(error.kind, "connection-lost");
+      return true;
+    },
+  );
+
+  assert.equal(statementsSent(fakeCAS), 1);
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+});
+
+// ---------------------------------------------------------------------------
+// Prepared binding lifecycle: one handle per call, released on every path
+// ---------------------------------------------------------------------------
+
+const preparedReply = (hex: string): Buffer => Buffer.from(hex, "hex");
+
+/** The captured frames are protocol 7, so the session must be too. */
+const createPreparedAdapter = (): ReturnType<typeof createAdapterWithFakeCAS> =>
+  createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+
+function queuePreparedSelect(fakeCAS: FakeCASConnection): void {
+  fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.prepareUntypedMarker));
+  fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.executeUntypedInt));
+}
+
+test("queryPrepared prepares, executes, commits, then releases its handle", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  queuePreparedSelect(fakeCAS);
+
+  assert.deepEqual(await adapter.queryPrepared("SELECT ? AS v", [7]), [{ v: 7 }]);
+
+  assert.deepEqual(sentCodes(fakeCAS), [
+    CASFunctionCode.PREPARE,
+    CASFunctionCode.EXECUTE,
+    CASFunctionCode.END_TRAN,
+    CASFunctionCode.CLOSE_REQ_HANDLE,
+  ]);
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.COMMIT]);
+  assert.deepEqual(fakeCAS.closedHandles, [1]);
+});
+
+test("the prepared SQL keeps its markers and carries no bound value", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  queuePreparedSelect(fakeCAS);
+
+  await adapter.queryPrepared("SELECT ? AS v", [7]);
+
+  const prepared = fakeCAS.sentPayloads[0]!.toString("latin1");
+  assert.ok(prepared.includes("SELECT ? AS v"));
+  assert.ok(!prepared.includes("7"));
+});
+
+test("query() still sends one PREPARE_AND_EXECUTE and no typed bind", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  fakeCAS.queueResponse(buildDMLResponse(20, 1));
+
+  await adapter.query("INSERT INTO t VALUES (?)", [7]);
+
+  assert.equal(sentCodes(fakeCAS)[0], CASFunctionCode.PREPARE_AND_EXECUTE);
+  assert.ok(!sentCodes(fakeCAS).includes(CASFunctionCode.PREPARE));
+  assert.ok(!sentCodes(fakeCAS).includes(CASFunctionCode.EXECUTE));
+  assert.ok(fakeCAS.sentPayloads[0]!.toString("latin1").includes("VALUES (7)"));
+});
+
+test("a refused value sends nothing and opens no session", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  fakeCAS._isConnected = false;
+
+  await assert.rejects(adapter.queryPrepared("SELECT ? AS v", [Number.NaN]), QueryError);
+
+  assert.equal(fakeCAS.connectCalls, 0);
+  assert.deepEqual(fakeCAS.sentPayloads, []);
+});
+
+test("a marker count the server disagrees with is refused before EXECUTE", async () => {
+  for (const params of [[], [1, 2]]) {
+    const { adapter, fakeCAS } = createPreparedAdapter();
+    fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.prepareUntypedMarker));
+
+    await assert.rejects(adapter.queryPrepared("SELECT ? AS v", params), (error: QueryError) => {
+      assert.match((error.cause as Error).message, /Parameter count mismatch/);
+      return true;
+    });
+
+    assert.ok(!sentCodes(fakeCAS).includes(CASFunctionCode.EXECUTE));
+    assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+    assert.deepEqual(fakeCAS.closedHandles, [1]);
+  }
+});
+
+test("a failed PREPARE ends the transaction it left open and has no handle to release", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.prepareSyntaxError));
+
+  await assert.rejects(adapter.queryPrepared("SELEC 1"), (error: QueryError) => {
+    assert.equal(error.code, -493);
+    return true;
+  });
+
+  assert.deepEqual(sentCodes(fakeCAS), [CASFunctionCode.PREPARE, CASFunctionCode.END_TRAN]);
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+  assert.deepEqual(fakeCAS.closedHandles, []);
+});
+
+test("a server error at EXECUTE rolls back and releases the handle", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.prepareUntypedMarker));
+  fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.executeCoercionError));
+
+  await assert.rejects(adapter.executePrepared("SELECT ? AS v", ["abc"]), QueryError);
+
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+  assert.deepEqual(fakeCAS.closedHandles, [1]);
+});
+
+test("a malformed EXECUTE reply drops the session and sends nothing more on it", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.prepareUntypedMarker));
+  fakeCAS.queueResponse(Buffer.from("0000000100", "hex"));
+
+  await assert.rejects(adapter.queryPrepared("SELECT ? AS v", [7]), QueryError);
+
+  assert.equal(fakeCAS.discardCalls, 1);
+  assert.deepEqual(sentCodes(fakeCAS), [CASFunctionCode.PREPARE, CASFunctionCode.EXECUTE]);
+});
+
+test("EXECUTE is not sent when the session changed after PREPARE replied", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.prepareUntypedMarker));
+  const sendOnSession = fakeCAS.sendAndRecvOnSession.bind(fakeCAS);
+  fakeCAS.sendAndRecvOnSession = async (generation, header, payload) => {
+    fakeCAS.connectionGeneration += 1;
+    return sendOnSession(generation, header, payload);
+  };
+
+  await assert.rejects(adapter.queryPrepared("SELECT ? AS v", [7]), (error: QueryError) => {
+    assert.equal(error.kind, "connection-lost");
+    return true;
+  });
+
+  assert.deepEqual(sentCodes(fakeCAS), [CASFunctionCode.PREPARE]);
+});
+
+test("a lost connection at EXECUTE sends nothing more and leaves no handle to reuse", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.prepareUntypedMarker));
+  fakeCAS.queueExchangeFailure(new Error("socket closed"));
+
+  await assert.rejects(adapter.queryPrepared("SELECT ? AS v", [7]), QueryError);
+
+  assert.deepEqual(sentCodes(fakeCAS), [CASFunctionCode.PREPARE, CASFunctionCode.EXECUTE]);
+});
+
+test("a read timeout at EXECUTE stays a ReadTimeoutError and sends nothing more", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.prepareUntypedMarker));
+  fakeCAS.queueExchangeFailure(new ReadTimeoutError(1000));
+
+  await assert.rejects(adapter.queryPrepared("SELECT ? AS v", [7]), ReadTimeoutError);
+
+  assert.deepEqual(sentCodes(fakeCAS), [CASFunctionCode.PREPARE, CASFunctionCode.EXECUTE]);
+});
+
+test("a prepared statement in a transaction leaves ending it to the caller", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  await adapter.beginTransaction();
+  queuePreparedSelect(fakeCAS);
+
+  await adapter.queryPrepared("SELECT ? AS v", [7]);
+
+  assert.deepEqual(sentCodes(fakeCAS), [
+    CASFunctionCode.PREPARE,
+    CASFunctionCode.EXECUTE,
+    CASFunctionCode.CLOSE_REQ_HANDLE,
+  ]);
+});
+
+test("a prepared statement refuses to run after its transaction's session changed", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  await adapter.beginTransaction();
+  queuePreparedSelect(fakeCAS);
+  await adapter.queryPrepared("SELECT ? AS v", [7]);
+  fakeCAS.connectionGeneration += 1;
+  const sent = fakeCAS.sentPayloads.length;
+
+  await assert.rejects(adapter.queryPrepared("SELECT ? AS v", [7]), QueryError);
+
+  assert.equal(fakeCAS.sentPayloads.length, sent);
+});
+
+test("a server rollback at EXECUTE blocks the statements after it", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  await adapter.beginTransaction();
+  fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.prepareUntypedMarker));
+  const message = Buffer.from("deadlock\0");
+  const abort = Buffer.alloc(8);
+  abort.writeInt32BE(-2, 0);
+  abort.writeInt32BE(-72, 4);
+  fakeCAS.queueResponse(Buffer.concat([abort, message]));
+
+  await assert.rejects(adapter.queryPrepared("SELECT ? AS v", [7]), DeadlockError);
+  const sent = fakeCAS.sentPayloads.length;
+
+  await assert.rejects(adapter.queryPrepared("SELECT ? AS v", [7]), DeadlockError);
+  assert.equal(fakeCAS.sentPayloads.length, sent);
+});
+
+test("a FETCH of a prepared handle never reaches a replaced session", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  const twoRows = PREPARED_FRAMES.executeUntypedInt.replace(/^00000001/, "00000002");
+  fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.prepareUntypedMarker));
+  fakeCAS.queueResponse(preparedReply(twoRows));
+  const sendOnSession = fakeCAS.sendAndRecvOnSession.bind(fakeCAS);
+  fakeCAS.sendAndRecvOnSession = async (generation, header, payload) => {
+    if (payload[0] === CASFunctionCode.FETCH) {
+      fakeCAS.connectionGeneration += 1;
+    }
+    return sendOnSession(generation, header, payload);
+  };
+
+  await assert.rejects(adapter.queryPrepared("SELECT ? AS v", [7]), QueryError);
+
+  assert.ok(!sentCodes(fakeCAS).includes(CASFunctionCode.FETCH));
+});
+
+test("executePrepared reports affected rows from the EXECUTE reply", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  const update = "00000002000000000116000000020000000000000000000000000000000000fffffffe";
+  fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.prepareUntypedMarker));
+  fakeCAS.queueResponse(preparedReply(update));
+
+  assert.deepEqual(await adapter.executePrepared("UPDATE t SET a = ?", [7]), { affectedRows: 2 });
+});
+
+// ---------------------------------------------------------------------------
+// Prepared binding: what happens before the first request, and LOB content
+// ---------------------------------------------------------------------------
+
+/**
+ * The captured three-row LOB SELECT split where a PREPARE_AND_EXECUTE reply turns
+ * into its execute part: the tuple count 3, cache_reusable 0, one result, SELECT.
+ */
+function preparedLobReplies(blobSize?: bigint, clobSize?: bigint): [Buffer, Buffer] {
+  const reply = lobSelectReply(blobSize, clobSize);
+  const split = reply.indexOf(Buffer.from("00000003" + "00" + "00000001" + "15", "hex"));
+  assert.ok(split > 0);
+  return [reply.subarray(0, split), reply.subarray(split)];
+}
+
+test("prepared LOB content is committed once, by the statement, after it is read", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  for (const reply of preparedLobReplies()) {
+    fakeCAS.queueResponse(reply);
+  }
+  fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readBlobReply, "hex"));
+  fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readClobReply, "hex"));
+
+  const rows = await adapter.queryPrepared(SELECT_LOBS);
+
+  assert.deepEqual(rows[0]?.b, Buffer.from([1, 2, 3]));
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.COMMIT]);
+  assert.deepEqual(fakeCAS.closedHandles, [1]);
+});
+
+test("a prepared LOB read that fails commits nothing and rolls the statement back", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  for (const reply of preparedLobReplies()) {
+    fakeCAS.queueResponse(reply);
+  }
+  fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readBlobReply, "hex"));
+  // The CLOB read fails with a server error, after a statement of the same
+  // call may already have written.
+  const failure = Buffer.alloc(8);
+  failure.writeInt32BE(-2, 0);
+  failure.writeInt32BE(-1001, 4);
+  fakeCAS.queueResponse(Buffer.concat([failure, Buffer.from("failed\0")]));
+
+  await assert.rejects(adapter.queryPrepared(SELECT_LOBS), QueryError);
+
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+  assert.deepEqual(fakeCAS.closedHandles, [1]);
+});
+
+test("query() still ends its own LOB read transaction when a read fails", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  fakeCAS.queueResponse(lobSelectReply());
+  fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readBlobReply, "hex"));
+  const failure = Buffer.alloc(8);
+  failure.writeInt32BE(-2, 0);
+  failure.writeInt32BE(-1001, 4);
+  fakeCAS.queueResponse(Buffer.concat([failure, Buffer.from("failed\0")]));
+
+  await assert.rejects(adapter.query(SELECT_LOBS), QueryError);
+
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.COMMIT]);
+});
+
+test("a refused value sends nothing even when execute() would first read the insert id", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  // An INSERT through query() leaves the session's insert id unknown, so the
+  // next execute() of an INSERT reads it before sending the statement.
+  fakeCAS.queueResponse(buildDMLResponse(20, 1));
+  await adapter.query("INSERT INTO t VALUES (1)");
+  const sent = fakeCAS.sentPayloads.length;
+
+  await assert.rejects(
+    adapter.executePrepared("INSERT INTO t VALUES (?)", [Number.NaN]),
+    (error: QueryError) => /NaN and Infinity/.test((error.cause as Error).message),
+  );
+
+  assert.equal(fakeCAS.sentPayloads.length, sent);
+});
+
+test("SQL with a NUL is refused before a session is opened", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  fakeCAS._isConnected = false;
+
+  for (const run of [
+    () => adapter.queryPrepared("SELECT 1\0; DELETE FROM t"),
+    () => adapter.executePrepared("INSERT INTO t VALUES (1)\0", []),
+  ]) {
+    await assert.rejects(run(), (error: QueryError) =>
+      /null byte/.test((error.cause as Error).message),
+    );
+  }
+
+  assert.equal(fakeCAS.connectCalls, 0);
+  assert.deepEqual(fakeCAS.sentPayloads, []);
+});
+
+test("the values bound are the ones passed when the method was called", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  queuePreparedSelect(fakeCAS);
+  const params: QueryParam[] = [7];
+  // The statement only runs in a later turn, after this change to the array.
+  const prepared = adapter.queryPrepared("SELECT ? AS v", params);
+  params[0] = Number.NaN;
+
+  assert.deepEqual(await prepared, [{ v: 7 }]);
+
+  const execute = fakeCAS.sentPayloads.find((payload) => payload[0] === CASFunctionCode.EXECUTE);
+  assert.ok(execute);
+  assert.equal(execute.subarray(execute.length - 13).toString("hex"), "0000000108" + "00000004" + "00000007");
+});
+
+test("a truncated EXECUTE reply in autocommit drops the session and never commits", async () => {
+  // An UPDATE of two rows, cut off after its result record and after its column info flag.
+  const update = "00000002000000000116000000020000000000000000000000000000000000fffffffe";
+  for (const cut of [update.length - 10, update.length - 8]) {
+    const { adapter, fakeCAS } = createPreparedAdapter();
+    fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.prepareUntypedMarker));
+    fakeCAS.queueResponse(preparedReply(update.slice(0, cut)));
+
+    await assert.rejects(adapter.executePrepared("UPDATE t SET a = ?", [7]), QueryError);
+
+    assert.equal(fakeCAS.discardCalls, 1);
+    assert.deepEqual(endTranTypes(fakeCAS), []);
+  }
+});
+
+test("a truncated literal EXECUTE reply drops the session and never commits", async () => {
+  // An UPDATE of two rows, cut off before its shard id and before its column info flag too.
+  const update = buildDMLResponse(21, 2);
+  for (const run of [
+    (adapter: NativeCubridAdapter) => adapter.query("UPDATE t SET a = 1"),
+    (adapter: NativeCubridAdapter) => adapter.execute("UPDATE t SET a = 1"),
+  ]) {
+    for (const cut of [update.length - 4, update.length - 5]) {
+      const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+      fakeCAS.queueResponse(update.subarray(0, cut));
+
+      await assert.rejects(run(adapter), QueryError);
+
+      assert.equal(fakeCAS.discardCalls, 1);
+      assert.deepEqual(endTranTypes(fakeCAS), []);
+    }
+  }
 });

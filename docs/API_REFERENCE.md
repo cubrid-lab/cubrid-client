@@ -23,6 +23,8 @@ Complete reference for every public export of `cubrid-client`.
   - [Queryable](#queryable)
   - [Executable](#executable)
   - [ExecutableTransactionClient](#executabletransactionclient)
+  - [PreparedQueryable](#preparedqueryable)
+  - [PreparedTransactionClient](#preparedtransactionclient)
   - [ExecuteResult](#executeresult)
   - [TransactionClient](#transactionclient-interface)
   - [TransactionCallback](#transactioncallback)
@@ -202,11 +204,41 @@ console.log(updated.affectedRows); // 1, or 0 when no row matched
 What the server reports, checked on CUBRID 10.2, 11.0, 11.2 and 11.4 (the replies are byte for byte identical):
 
 - `affectedRows` is the server's count for `INSERT`, `UPDATE`, `DELETE` and `MERGE`, and 0 for DDL and `SELECT`. A multi-statement string (`"INSERT ...; INSERT ..."`) reports the sum over its statements. `REPLACE` over an existing row counts the deleted row and the inserted one (2).
-- `lastInsertId` is present only when the string contained an `INSERT` and the session then holds a generated value. An `INSERT` into a table with no `AUTO_INCREMENT` column, or one that supplies the key itself, has none. Inside a transaction the server keeps an earlier INSERT's value and answers with the same bytes whether or not this statement generated one, and two tables can generate the same number, so `execute()` reports an id only when the server's value differs from the one seen before the statement, and otherwise reports none: a wrong id is worse than none. After a `query()` INSERT in the same transaction, `execute()` reads the server's value once before its next statement to have that comparison. Two fresh tables that both generate `1` in one transaction therefore report an id for the first and none for the second; use separate transactions, or read the key back, when you need both. Outside a transaction every statement starts clean and its id is always reported. A multi-row `INSERT` reports the **first** id it generated, not the last. The value is a `number` while it is a safe integer and a `bigint` beyond `Number.MAX_SAFE_INTEGER`, so no precision is lost. In a multi-statement string it is the one of the last `INSERT`.
-- The server forgets the generated value when a transaction ends, so in autocommit mode `execute()` sends the statement without the autocommit flag, reads the value, then commits with a separate `END_TRAN` request (rolling back if anything failed). The statement is committed before `execute()` resolves, as with `query()`, at the cost of one more round trip. Inside a transaction nothing is committed until you commit.
+- `lastInsertId` is present only when the string contained an `INSERT` and the session then holds a generated value that is new. An `INSERT` into a table with no `AUTO_INCREMENT` column, or one that supplies the key itself, has none. The server keeps the last generated value for the whole [session](CONNECTION.md#session-reuse), through `COMMIT`, `ROLLBACK` and failed statements, and answers with the same bytes whether or not this statement generated one, so `execute()` reports an id only when the server's value differs from the one seen before the statement. A value that happens to repeat is therefore reported as no id, because a wrong id is worse than none: two fresh tables that both generate `1`, one straight after the other, report an id for the first and none for the second, so read the key back when you need both. After a statement that may have changed the value unseen, such as a `query()` INSERT or a failed statement, `execute()` reads the server's value once before its next `INSERT` to have that comparison, at the cost of one more round trip. A multi-row `INSERT` reports the **first** id it generated, not the last. The value is a `number` while it is a safe integer and a `bigint` beyond `Number.MAX_SAFE_INTEGER`, so no precision is lost. In a multi-statement string it is the one of the last `INSERT`.
+- In autocommit mode `execute()` sends the statement without the autocommit flag, reads the value, then commits with a separate `END_TRAN` request (rolling back if anything failed), because the CAS may go to another client once the statement commits and the value stays with the session. The statement is committed before `execute()` resolves, as with `query()`, at the cost of one more round trip. Inside a transaction nothing is committed until you commit.
 - Statements issued at the same time still run one at a time, in the order issued, whether they use `query()` or `execute()`.
 
 ---
+
+#### `queryPrepared<T>(sql, params?)`, `queryResultPrepared<T>(sql, params?)`, `executePrepared(sql, params?)`
+
+Opt-in server-side binding: the same results as `query()`, `queryResult()` and `execute()`, with the values sent as typed binds instead of SQL text.
+
+```ts
+async queryPrepared<T extends QueryResultRow = QueryResultRow>(
+  sql: string,
+  params?: QueryParams,
+): Promise<T[]>
+
+async queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
+  sql: string,
+  params?: QueryParams,
+): Promise<QueryResult<T>>
+
+async executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>
+```
+
+**Throws:** [`QueryError`](#queryerror) if execution fails, if a value is refused, if the number of values differs from the statement's markers, or if a custom `connectionFactory` connection does not provide the method. They never fall back to SQL literals.
+
+```ts
+const rows = await db.queryPrepared<{ id: number }>("SELECT id FROM users WHERE name = ?", [name]);
+const { affectedRows } = await db.executePrepared("UPDATE users SET name = ? WHERE id = ?", [name, 1]);
+```
+
+- **Types.** [Prepared binding](TYPES.md#prepared-binding) lists each JavaScript type, what is refused and how the result can differ from the literal path.
+- **Lifecycle.** Each call prepares, executes and releases its own handle, so a handle is never kept between calls or carried to another session. There is no reusable statement object.
+- **Autocommit.** The statement runs in a transaction of its own that ends with an explicit commit, or a rollback if anything failed.
+- **Cost.** A call takes more round trips than `query()`; see the [measurements](PERFORMANCE.md#prepared-binding). Do not expect it to be faster.
 
 #### `transaction<T>(callback)`
 
@@ -214,7 +246,10 @@ Executes a callback within an isolated transactional connection. Commits on succ
 
 ```ts
 async transaction<T>(
-  callback: TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient>,
+  callback: TransactionCallback<
+    T,
+    ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient
+  >,
 ): Promise<T>
 ```
 
@@ -224,16 +259,44 @@ async transaction<T>(
 
 **Returns:** `Promise<T>` — The return value of the callback.
 
-**Throws:** [`TransactionError`](#transactionerror) if the transaction or rollback fails.
+**Throws:** [`TransactionError`](#transactionerror) if the transaction fails, with the first failure in `cause`. See the [transaction lifecycle](#transaction-lifecycle) for the exceptions.
 
 ##### How It Works
 
 1. A **new isolated connection** is created via `connectionFactory`.
 2. `beginTransaction()` is called on that connection.
 3. The `callback` receives a [`CubridTransaction`](#cubridtransaction) instance scoped to that connection.
-4. If the callback resolves successfully, `commit()` is called.
-5. If the callback throws, `rollback()` is called, and the error is re-thrown as a `TransactionError` (a [`ReadTimeoutError`](#readtimeouterror) is re-thrown as-is).
-6. The isolated connection is **always closed** in a `finally` block, regardless of outcome.
+4. If the callback resolves successfully and has not completed the transaction itself, `commit()` is called once.
+5. If the callback throws, `rollback()` is called once unless the transaction is already complete, and the error is re-thrown as a `TransactionError` (a [`ReadTimeoutError`](#readtimeouterror) is re-thrown as-is).
+6. The isolated connection is **always closed**, regardless of outcome.
+
+##### Transaction lifecycle
+
+A callback transaction has exactly one terminal outcome. Before `commit()` or `rollback()` is sent, the client waits for queries that are still running, so the end of the transaction is the last thing sent on its connection. If such a query never settles and no `readTimeout` is set, the transaction waits with it.
+
+| The callback... | Server sees | `transaction()` |
+|---|---|---|
+| Resolves | One commit | Resolves with its value |
+| Throws | One rollback | Rejects, `cause` is the callback's error |
+| Resolves, then the commit fails | One commit, then one rollback | Rejects, `cause` is the commit error |
+| Resolves while a query it did not await is still running, and that query fails | One rollback, never a commit | Rejects, `cause` is the query's error |
+| Calls `tx.commit()` and resolves | One commit | Resolves with its value |
+| Calls `tx.rollback()` and resolves | One rollback | Resolves with its value |
+| Calls `tx.commit()` and then throws | One commit, **no rollback: the work stays committed** | Rejects, `cause` is the callback's error |
+| Calls `tx.rollback()` and then throws | One rollback | Rejects, `cause` is the callback's error |
+| Calls `tx.commit()`, it fails, and the callback resolves anyway | One commit, then one rollback | Rejects, `cause` is the commit error |
+| Calls `tx.rollback()`, it fails, and the callback resolves anyway | One rollback, never a commit | Rejects, `cause` is the rollback error |
+
+`beginTransaction()` failing skips the callback, and no commit or rollback is sent because no transaction started. `transaction()` rejects with that failure as `cause`.
+
+**Queries the callback did not await.** These rules apply to `tx.query()`, `tx.queryResult()` and `tx.execute()` alike. A query still running when a commit starts, whether automatic or from `tx.commit()`, had no one to handle its failure, so its failure fails the transaction: nothing is committed, the work is rolled back, and `transaction()` rejects with no unhandled rejection. A query the callback awaited and handled is its own decision, so catching a failed `tx.query()` and resolving still commits. The same applies when `transaction()` itself commits after a query rejected too recently for the callback to have seen it, such as `void tx.query(sql)` followed by `await Promise.resolve()`. **One case cannot be detected:** a query that was not awaited and rejected before the callback's last `await` resumed looks the same as a handled one, so the commit goes ahead (and Node.js reports the unhandled rejection unless you attached a handler). Await every statement. During a rollback, a still-running query that fails changes nothing: the work is being discarded anyway and the original failure stays as `cause`. A query that was not awaited and rejected shortly before the callback threw raises no unhandled rejection either, unless the event loop moved on in between, for example while the callback awaited another statement. Node.js has reported it by then.
+
+**Use after completion.** Once `commit()` or `rollback()` has been called, every later `tx.query()`, `tx.queryResult()`, `tx.execute()`, `tx.commit()` and `tx.rollback()` rejects with a `TransactionError` and sends nothing to the server, including from a `tx` kept after `transaction()` settled. Only the first completion counts: a failed `commit()` or `rollback()` is not retried.
+
+**Failures during cleanup.** A rollback or close failure never replaces the original failure. `cause` keeps the original, and the later failures are on [`rollbackError`](#transactionerror) and `closeError`. Closing the connection ends the server session, so uncommitted work is discarded even when the rollback failed. There are two cases to check:
+
+- A [`ReadTimeoutError`](#readtimeouterror) is re-thrown unchanged, so later rollback and close failures are not reported on it.
+- If the commit succeeded and only the close failed, `transaction()` rejects with the close error, as it always has: a `ConnectionError` from the built-in adapter, not a `TransactionError`. **The work is committed**, so do not retry it blindly.
 
 ##### Examples
 
@@ -339,7 +402,7 @@ Returns the CUBRID server version. It opens the shared connection if needed.
 async getServerVersion(): Promise<string>
 ```
 
-It sends the same single version request as [`ping()`](#ping), so it has the same effect on a transaction: inside a manual transaction it leaves the transaction open, and outside one it commits the session's empty transaction. It adds no extra network call and performs no caching, so it reports the server the shared connection is currently attached to, after any reconnect. Use it for compatibility checks; use `ping()` for health checks.
+It sends the same requests as [`ping()`](#ping), so it has the same effect on a transaction: inside a manual transaction it leaves the transaction open, and outside one it commits the session's empty transaction. It performs no caching, so it reports the server the shared connection is currently attached to, after any reconnect. Use it for compatibility checks; use `ping()` for health checks.
 
 **Returns:** The version string as the server reports it, without a trailing NUL, for example `11.4.6.1963`. It is not parsed or normalized.
 
@@ -379,7 +442,7 @@ const indexes = await db.getIndexes("athlete", { schema: "dba" });
 
 #### `close()`
 
-Closes the shared connection after the statements issued before it have finished. After calling `close()`, the client can no longer execute queries: a `query()`, `queryResult()`, `ping()`, `getServerVersion()`, `beginTransaction()`, `commit()` or `rollback()` issued after `close()` is called, even in the same tick, rejects with an error whose `cause` is `Client is closed.`, and no connection is opened. If no connection was opened, closing it is a no-op.
+Closes the shared connection after statements and multi-query schema inspections started before it have finished. After calling `close()`, the client can no longer execute queries: a `query()`, `queryResult()`, `execute()`, `ping()`, `getServerVersion()`, `getTables()`, `getColumns()`, `getPrimaryKey()`, `getIndexes()`, `transaction()`, `beginTransaction()`, `commit()` or `rollback()` issued after `close()` is called, even in the same tick, rejects with an error whose `cause` is `Client is closed.`, and no connection is opened. A `transaction()` already started runs to its end on its own connection. If no connection was opened, closing it is a no-op.
 
 ```ts
 async close(): Promise<void>
@@ -404,10 +467,13 @@ try {
 
 ## CubridTransaction
 
-A transaction-scoped client that delegates queries to the isolated transactional connection. You do **not** create this class directly — it is provided to you inside the `transaction()` callback.
+A transaction-scoped client that delegates queries to the isolated transactional connection. You do **not** create this class directly — it is provided to you inside the `transaction()` callback, where it follows the [transaction lifecycle](#transaction-lifecycle).
+
+The exported constructor stays available in 1.x for compatibility. An instance you construct yourself only forwards to the connection you gave it and has no lifecycle guards.
 
 ```ts
-class CubridTransaction implements ResultTransactionClient, ExecutableTransactionClient
+class CubridTransaction
+  implements ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient
 ```
 
 ### Methods
@@ -423,7 +489,7 @@ async query<T extends QueryResultRow = QueryResultRow>(
 ): Promise<T[]>
 ```
 
-**Throws:** [`TransactionError`](#transactionerror) if execution fails.
+**Throws:** [`TransactionError`](#transactionerror) if execution fails, or if the transaction is already complete.
 
 #### `execute(sql, params?)`
 
@@ -435,9 +501,15 @@ async execute(sql: string, params?: QueryParams): Promise<ExecuteResult>
 
 **Throws:** [`TransactionError`](#transactionerror) if execution fails.
 
+#### `queryPrepared<T>(sql, params?)`, `queryResultPrepared<T>(sql, params?)`, `executePrepared(sql, params?)`
+
+Same signatures and behavior as the [`CubridClient` methods](#querypreparedtsql-params-queryresultpreparedtsql-params-executepreparedsql-params), but run within the transaction's isolated connection. Nothing is committed until the transaction is.
+
+**Throws:** [`TransactionError`](#transactionerror) if execution fails.
+
 #### `commit()`
 
-Commits the transaction. Called automatically by `CubridClient.transaction()` on success.
+Commits the transaction. Called automatically by `CubridClient.transaction()` on success, so you only need it to make the work durable before the callback ends. Rejects with a [`TransactionError`](#transactionerror) if the transaction is already complete.
 
 ```ts
 commit(): Promise<void>
@@ -445,7 +517,7 @@ commit(): Promise<void>
 
 #### `rollback()`
 
-Rolls back the transaction. Called automatically by `CubridClient.transaction()` on failure.
+Rolls back the transaction. Called automatically by `CubridClient.transaction()` on failure, so you only need it to abandon the work without throwing. Rejects with a [`TransactionError`](#transactionerror) if the transaction is already complete.
 
 ```ts
 rollback(): Promise<void>
@@ -550,11 +622,13 @@ Thrown when a transaction operation fails (begin, commit, rollback, or query wit
 ```ts
 class TransactionError extends Error {
   name = "TransactionError";
-  cause?: Error; // Original driver error
+  cause?: Error; // Original failure
   readonly code?: number; // See "Error details"
   readonly origin?: "server" | "cas";
   readonly sqlState?: string;
   readonly kind?: CubridErrorKind;
+  rollbackError?: Error; // transaction() only: rolling back also failed
+  closeError?: Error; // transaction() only: closing the connection also failed
 }
 ```
 
@@ -569,6 +643,10 @@ A failure inside a transaction stays a `TransactionError`, as it was before thes
 | Rollback fails | `"Failed to rollback."` |
 | Query inside transaction fails | `"Transaction query failed."` |
 | Transaction callback throws | `"Transaction failed."` |
+| `tx` used while a completion is running | `"Transaction is already completing."` |
+| `tx` used after a commit | `"Transaction has already been committed."` |
+| `tx` used after a rollback | `"Transaction has already been rolled back."` |
+| `tx` used after a failed commit or rollback | `"Transaction has already failed."` |
 
 ### ReadTimeoutError
 
@@ -898,6 +976,32 @@ The type `transaction()` passes to its callback and `CubridTransaction` implemen
 interface ExecutableTransactionClient extends TransactionClient, Executable {}
 ```
 
+### PreparedQueryable
+
+Interface for any object that can run a statement with [server-side binding](TYPES.md#prepared-binding). `CubridClient` and `CubridTransaction` implement it.
+
+```ts
+interface PreparedQueryable {
+  queryPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<T[]>;
+  queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>>;
+  executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+}
+```
+
+### PreparedTransactionClient
+
+A `TransactionClient` that can also bind on the server. It is a separate type so that code implementing `TransactionClient` keeps compiling.
+
+```ts
+interface PreparedTransactionClient extends TransactionClient, PreparedQueryable {}
+```
+
 ### TransactionCallback
 
 Type for the callback function passed to `transaction()`.
@@ -917,7 +1021,7 @@ The transaction client that `transaction()` passes to its callback: a `Transacti
 interface ResultTransactionClient extends TransactionClient, ResultQueryable {}
 ```
 
-`CubridClient.transaction()` accepts a `TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient>`, so the callback's `tx` has `queryResult()` and `execute()`; a callback written against `TransactionClient` is still accepted.
+`CubridClient.transaction()` accepts a `TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient>`, so the callback's `tx` has `queryResult()` and `execute()`; a callback written against `TransactionClient` is still accepted.
 
 ### QueryParam
 
@@ -957,8 +1061,12 @@ type Tagged = { id: number; tags: CollectionValue | null };
 const rows = await db.query<Tagged>("SELECT id, tags FROM article");
 ```
 
-Unsupported non-NULL CUBRID wire values (including timezone-aware, OBJECT and
-unsupported collection element values that do not yet have a decoder) reject the
+TIMESTAMPTZ, TIMESTAMPLTZ, DATETIMETZ and DATETIMELTZ columns return the exported
+`ZonedDateTime` (wall-clock fields plus the zone text, not a `Date`); see
+[timezone-aware values](TYPES.md#timezone-aware-values).
+
+Unsupported non-NULL CUBRID wire values (including OBJECT and unsupported
+collection element values that do not yet have a decoder) reject the
 query with a `QueryError` rather than silently appearing as SQL `null`, and the
 connection stays usable. Its `cause` chain holds an error named
 `UnsupportedValueError`, which identifies the column name and CAS type number. A
@@ -968,9 +1076,8 @@ reply also drops the connection, which rolls back an open transaction, and its
 chain holds an error named `MalformedReplyError`. Both `name` values are stable,
 although the classes are not exported. A genuine
 SQL NULL is still returned as `null`; an empty SQL string is still `""`. JSON
-columns return their text as a `string`. See
-[values that cannot be decoded](TYPES.md#values-that-cannot-be-decoded) and
-[#111](https://github.com/cubrid-lab/cubrid-client/issues/111) for type coverage.
+columns return their text as a `string`; see [JSON columns](TYPES.md#json-columns).
+See [values that cannot be decoded](TYPES.md#values-that-cannot-be-decoded).
 
 ### QueryParams
 
@@ -1034,7 +1141,7 @@ interface ColumnInfo {
 | Field | Meaning |
 |-------|---------|
 | `name` | The column label: its alias, or its name when it has none. |
-| `type` | The CUBRID type name the server reports, such as `INT`, `BIGINT`, `VARCHAR`, `CHAR`, `NUMERIC`, `DATETIME` or `NULL` (an untyped `NULL` literal), or `UNKNOWN(<id>)` for a wire type id this driver does not name. The name is the server's wire type, so a JSON column reports `VARCHAR` (see [TYPES.md](TYPES.md)). |
+| `type` | The CUBRID type name the server reports, such as `INT`, `BIGINT`, `VARCHAR`, `CHAR`, `NUMERIC`, `DATETIME`, `TIMESTAMPTZ` or `NULL` (an untyped `NULL` literal), or `UNKNOWN(<id>)` for a wire type id this driver does not name. The name is the server's wire type, so a JSON column reports `VARCHAR` (see [TYPES.md](TYPES.md)). |
 | `elementType` | Set only for `SET`, `MULTISET` and `SEQUENCE`, which are the `type`. It is the declared element type, or `NULL` for a collection declared without one. |
 | `precision`, `scale` | The values the server reports. They depend on the type: `VARCHAR(20)` is precision 20, `NUMERIC(10,3)` is 10 and 3, `INT` is 10 and `DATETIME` is 23 and 3. Types without a meaningful size report `0`, and a `CHAR` expression such as a string literal can report `-1`. |
 | `nullable` | `false` only when the server reports the column as NOT NULL. It is `true` for a nullable table column, for the right side of an outer join and for expressions. |

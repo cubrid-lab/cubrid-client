@@ -11,6 +11,12 @@ import { CASConnection, type CASConnectionConfig } from "../protocol/connection.
 import {
   writePrepareAndExecute,
   parsePrepareAndExecute,
+  writePrepare,
+  parsePrepare,
+  writeExecute,
+  parseExecute,
+  encodePreparedParams,
+  assertPreparableSql,
   readQueryHandle,
   MalformedReplyError,
   writeFetch,
@@ -30,6 +36,7 @@ import {
   writeGetLastInsertId,
   parseGetLastInsertId,
   type PrepareAndExecuteResult,
+  type PreparedBinds,
 } from "../protocol/protocol.js";
 import {
   CUBRIDDataType,
@@ -95,10 +102,17 @@ export class NativeCubridAdapter implements DriverAdapter {
 
   /**
    * Session that holds the open transaction's statements. Set by the first
-   * statement rather than by beginTransaction(): a released CAS legitimately
-   * reconnects on that first statement, before there is any work to lose.
+   * statement rather than by beginTransaction(): a CAS that went away between
+   * transactions is legitimately replaced on that first statement, before there
+   * is any work to lose.
    */
   private transactionGeneration: number | null = null;
+
+  /**
+   * `cas.outOfTransactionReplies` just before the transaction's first statement,
+   * or null with no statement sent yet. See transactionEnded().
+   */
+  private transactionEndReplies: number | null = null;
 
   /**
    * The reply that said the server rolled back the open transaction on its own.
@@ -109,11 +123,13 @@ export class NativeCubridAdapter implements DriverAdapter {
   private transactionAbort: CasReplyError | null = null;
 
   /**
-   * The server's last generated AUTO_INCREMENT value as this adapter last saw it
-   * inside the open transaction: `undefined` for none, `null` when a query()
-   * INSERT may have changed it unseen. See readExecuteResult().
+   * The session's last generated AUTO_INCREMENT value as this adapter last saw
+   * it: `undefined` for none, `null` when a statement may have changed it unseen.
+   * See readExecuteResult().
    */
   private insertIdBaseline: string | undefined | null;
+  /** Session (`connectionGeneration`) that `insertIdBaseline` describes. */
+  private insertIdGeneration: number | null = null;
 
   /**
    * Tail of the statement queue; see inTurn(). It never rejects, so one failed
@@ -149,30 +165,57 @@ export class NativeCubridAdapter implements DriverAdapter {
   ): Promise<QueryResult<T>> {
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
-    return this.inTurn(() => this.queryNow<T>(sql, params, issued));
+    return this.inTurn(() => this.queryNow<T>(sql, params, issued, undefined));
   }
 
   async execute(sql: string, params?: QueryParams): Promise<ExecuteResult> {
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
-    return this.inTurn(() => this.executeNow(sql, params, issued));
+    return this.inTurn(() => this.executeNow(sql, params, issued, undefined));
+  }
+
+  async queryPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<T[]> {
+    return (await this.queryResultPrepared<T>(sql, params)).rows;
+  }
+
+  async queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>> {
+    const binds = bindOrRefuse(sql, params, "Failed to execute CUBRID query.");
+    const cas = this.getOrCreateCAS();
+    const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
+    return this.inTurn(() => this.queryNow<T>(sql, params, issued, binds));
+  }
+
+  async executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult> {
+    const binds = bindOrRefuse(sql, params, "Failed to execute CUBRID statement.");
+    const cas = this.getOrCreateCAS();
+    const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
+    return this.inTurn(() => this.executeNow(sql, params, issued, binds));
   }
 
   private async executeNow(
     sql: string,
     params: QueryParams | undefined,
     issued: IssuedOn,
+    binds: PreparedBinds | undefined,
   ): Promise<ExecuteResult> {
     try {
-      await this.readInsertIdBaseline();
+      await this.readInsertIdBaseline(sql);
       return await this.runStatement(
         sql,
         params,
         issued,
         (cas, result) => this.readExecuteResult(cas, result),
         true,
+        binds,
       );
     } catch (error) {
+      this.forgetInsertId();
       this.bindSessionLostByFirstStatement();
       this.recordTransactionAbort(error);
       throw mapError("query", error, "Failed to execute CUBRID statement.");
@@ -183,13 +226,15 @@ export class NativeCubridAdapter implements DriverAdapter {
     sql: string,
     params: QueryParams | undefined,
     issued: IssuedOn,
+    binds: PreparedBinds | undefined,
   ): Promise<QueryResult<T>> {
     try {
-      return await this.executeQuery<T>(sql, params, issued);
+      return await this.executeQuery<T>(sql, params, issued, binds);
     } catch (error) {
       // If the first transactional statement lost its session before the
       // post-response bind, remember that failed generation. A ping/reconnect
       // must never make subsequent statements commit on a replacement CAS.
+      this.forgetInsertId();
       this.bindSessionLostByFirstStatement();
       this.recordTransactionAbort(error);
       throw mapError("query", error, "Failed to execute CUBRID query.");
@@ -229,6 +274,8 @@ export class NativeCubridAdapter implements DriverAdapter {
     const cas = this.getOrCreateCAS();
 
     try {
+      await this.dropSessionIfTransactionEnded(cas);
+
       if (!cas.isConnected) {
         throw this.notConnectedError(cas);
       }
@@ -239,8 +286,8 @@ export class NativeCubridAdapter implements DriverAdapter {
       const responsePayload = await cas.sendAndRecv(header, payload);
       parseSimpleResponse(responsePayload);
 
-      // A transparent reconnect inside sendAndRecv() would have committed an
-      // empty session, so this success must still be checked.
+      // Replacing a session inside sendAndRecv() would have committed an empty
+      // one, so this success must still be checked.
       this.assertTransactionSession(cas);
       this.endTransaction();
     } catch (error) {
@@ -287,6 +334,8 @@ export class NativeCubridAdapter implements DriverAdapter {
     this.cas = null;
     this.noBackslashEscapes = null;
     this.backslashModeGeneration = null;
+    this.insertIdBaseline = undefined;
+    this.insertIdGeneration = null;
     this.endTransaction();
 
     try {
@@ -331,10 +380,10 @@ export class NativeCubridAdapter implements DriverAdapter {
    * CASConnection only keeps those frames apart. A statement that ran between
    * them would be unsafe: on CUBRID 10.2 to 11.4 the end of a transaction closes
    * every other cursor on the session, and in autocommit mode that end comes
-   * with DML, an error, a ping or another query's last row. The CAS_INFO status
-   * of that reply then sends the next FETCH to a new session, where the same
-   * handle number can be another query's result. So at most one query
-   * lifecycle is live at a time. Autocommit could not do better; an open
+   * with DML, an error, a ping or another query's last row. The next FETCH of
+   * the first query would then fail, or read whatever now has that handle
+   * number. So at most one query lifecycle is live at a time. Autocommit could
+   * not do better; an open
    * transaction could, but its commit and rollback would still have to wait.
    *
    * Nothing runs here but this adapter's own statements, so a statement can
@@ -352,15 +401,16 @@ export class NativeCubridAdapter implements DriverAdapter {
     sql: string,
     params: QueryParams | undefined,
     issued: IssuedOn,
+    binds: PreparedBinds | undefined,
   ): Promise<QueryResult<T>> {
-    return this.runStatement(sql, params, issued, async (cas, result) => {
-      // An INSERT here may generate a value that nobody reads, so a later
-      // execute() in this transaction cannot tell it from its own.
-      if (
-        !this.autoCommit &&
-        result.resultInfos.some((info) => info.statementType === StatementType.INSERT)
-      ) {
-        this.insertIdBaseline = null;
+    const read = async (
+      cas: CASConnection,
+      result: PrepareAndExecuteResult,
+    ): Promise<QueryResult<T>> => {
+      // This may generate a value that nobody reads, so a later execute() on this
+      // session could not tell it from its own.
+      if (result.resultInfos.some((info) => info.statementType !== StatementType.SELECT)) {
+        this.forgetInsertId();
       }
 
       if (result.statementType !== StatementType.SELECT) {
@@ -375,11 +425,15 @@ export class NativeCubridAdapter implements DriverAdapter {
       }
 
       if (result.columns.some(mayHoldLob)) {
-        await this.loadLobs(cas, generation, allRows);
+        // A prepared statement's transaction belongs to runStatement(), which
+        // commits it only once everything succeeded.
+        await this.loadLobs(cas, generation, allRows, binds === undefined);
       }
 
       return { rows: allRows as T[], columns: result.columns.map(toColumnInfo) };
-    });
+    };
+
+    return this.runStatement(sql, params, issued, read, false, binds);
   }
 
   /**
@@ -399,25 +453,24 @@ export class NativeCubridAdapter implements DriverAdapter {
 
     const executed: ExecuteResult = { affectedRows };
     if (!result.resultInfos.some((info) => info.statementType === StatementType.INSERT)) {
+      if (affectedRows > 0) {
+        this.forgetInsertId();
+      }
       return executed;
     }
 
     const text = await this.fetchLastInsertId(cas);
-    // The server keeps the value of an earlier INSERT of the same transaction,
-    // reports it again after an INSERT into a table without AUTO_INCREMENT, and
-    // two tables can generate the same number, so nothing in the reply says
-    // whether this statement generated it. Inside a transaction a value that
-    // differs from the one seen before the statement is certainly new; an equal
-    // one is ambiguous and reported as no id, because a wrong id is worse than
-    // none. An autocommit statement runs in a transaction of its own (see
-    // runStatement), which starts with no value, so any value is its own.
-    let generated = text !== undefined;
-    if (!this.autoCommit) {
-      generated = text !== undefined && text !== this.insertIdBaseline;
-      if (text !== undefined) {
-        this.insertIdBaseline = text;
-      }
-    }
+    // The value belongs to the session: on CUBRID 10.2 to 11.4 nothing clears it,
+    // not COMMIT, ROLLBACK or a failed statement, and an INSERT into a table
+    // without AUTO_INCREMENT reports it again. Two tables can also generate the
+    // same number, so nothing in the reply says whether this statement generated
+    // it. A value that differs from the one seen before the statement is certainly
+    // new; an equal one is ambiguous and reported as no id, because a wrong id is
+    // worse than none.
+    this.followInsertIdSession(cas);
+    const generated =
+      text !== undefined && this.insertIdBaseline !== null && text !== this.insertIdBaseline;
+    this.insertIdBaseline = text;
     if (text !== undefined && generated) {
       const id = BigInt(text);
       executed.lastInsertId =
@@ -433,10 +486,16 @@ export class NativeCubridAdapter implements DriverAdapter {
    * is open.
    *
    * `commitAfter` runs an autocommit statement as a transaction that ends only
-   * after `use`: the server forgets the generated AUTO_INCREMENT value when it
-   * commits, so a statement sent with the autocommit flag could never be asked
-   * for it (verified on CUBRID 10.2, 11.0, 11.2 and 11.4). The statement is
-   * then committed with END_TRAN, or rolled back if anything failed.
+   * after `use`: the generated AUTO_INCREMENT value lives in the session, and a
+   * commit lets the CAS go, so a question asked after the autocommit flag could
+   * reach a new session that holds no value. The statement is then committed with
+   * END_TRAN, or rolled back if anything failed.
+   *
+   * `binds`, encoded when the call was made, sends PREPARE and EXECUTE with
+   * typed binds instead of SQL text holding the values. The handle belongs to this one call and is released
+   * like any other, so it can never outlive its session or be reused. Prepared
+   * statements always end by END_TRAN in autocommit mode, so a failed PREPARE,
+   * which leaves the session in a transaction, is rolled back.
    */
   private async runStatement<R>(
     sql: string,
@@ -444,11 +503,13 @@ export class NativeCubridAdapter implements DriverAdapter {
     issued: IssuedOn,
     use: (cas: CASConnection, result: PrepareAndExecuteResult) => Promise<R>,
     commitAfter = false,
+    binds?: PreparedBinds,
   ): Promise<R> {
     const cas = this.getOrCreateCAS();
 
     // Reconnecting here would drop the earlier statements of this transaction
     // and let a later commit() persist only the ones that follow.
+    await this.dropSessionIfTransactionEnded(cas);
     this.assertTransactionSession(cas);
 
     // A query that was waiting when an earlier request ended with an unknown
@@ -461,15 +522,15 @@ export class NativeCubridAdapter implements DriverAdapter {
       throw new Error("CASConnection is not connected");
     }
 
-    // Settle the session before binding: a released CAS is replaced by the next
-    // request, which could otherwise be a different session than the one the
+    // Settle the session before binding: a CAS that has gone is replaced by the
+    // next request, which could otherwise be a different session than the one the
     // backslash mode was measured on.
     await cas.ensureSession();
 
     // Only a backslash, CR or LF is escaped differently by the two modes, so any
     // other parameters bind the same on every session and skip the probe.
     const resolvedSql =
-      params && params.length > 0
+      !binds && params && params.length > 0
         ? interpolateParams(
             sql,
             params,
@@ -477,27 +538,29 @@ export class NativeCubridAdapter implements DriverAdapter {
           )
         : sql;
 
-    const deferCommit = commitAfter && this.autoCommit;
-    const { header, payload } = writePrepareAndExecute(
-      resolvedSql,
-      this.autoCommit && !deferCommit,
-      cas.casInfo,
-    );
+    const deferCommit = (commitAfter || binds !== undefined) && this.autoCommit;
+    const { header, payload } = binds
+      ? writePrepare(sql, cas.casInfo)
+      : writePrepareAndExecute(resolvedSql, this.autoCommit && !deferCommit, cas.casInfo);
 
-    // Taken after the exchange: sending can replace a released CAS, and the
-    // statement then ran on the new session that COMMIT must reach.
+    // Before the first statement a ping may truthfully report OUT_TRAN.
+    if (!this.autoCommit && this.transactionGeneration === null) {
+      this.transactionEndReplies = cas.outOfTransactionReplies;
+    }
+
+    // Taken after the exchange: sending can replace a session whose CAS has gone,
+    // and the statement then ran on the new session that COMMIT must reach.
     let generation = cas.connectionGeneration;
     try {
       const responsePayload = await cas.sendAndRecv(header, payload);
       generation = cas.connectionGeneration;
 
-      return await this.withQueryHandle(cas, responsePayload, async () => {
+      const finished = await this.withQueryHandle(cas, responsePayload, async () => {
         await this.bindTransactionSession(cas);
 
-        const result: PrepareAndExecuteResult = parsePrepareAndExecute(
-          responsePayload,
-          cas.protoVersion,
-        );
+        const result: PrepareAndExecuteResult = binds
+          ? await this.executeHandle(cas, responsePayload, binds, generation)
+          : parsePrepareAndExecute(responsePayload, cas.protoVersion);
 
         const value = await use(cas, result);
         if (deferCommit) {
@@ -505,6 +568,14 @@ export class NativeCubridAdapter implements DriverAdapter {
         }
         return value;
       });
+
+      // A FETCH or the handle's release may have reported the end of the
+      // transaction, so this statement cannot be called part of it.
+      if (this.transactionEnded(cas)) {
+        await cas.discardSession();
+        throw new ConnectionLostError("Connection lost during transaction");
+      }
+      return finished;
     } catch (error) {
       if (deferCommit) {
         await this.endStatementTransaction(cas, EndTranType.ROLLBACK, generation).catch(
@@ -513,6 +584,43 @@ export class NativeCubridAdapter implements DriverAdapter {
       }
       throw error;
     }
+  }
+
+  /**
+   * Sends EXECUTE for the handle in a PREPARE reply. It must reach the session
+   * that prepared it: on any other session the same number is another statement
+   * or nothing. The CAS ignores extra values and the literal path ignores extra
+   * parameters, so the count is checked against the server's here.
+   */
+  private async executeHandle(
+    cas: CASConnection,
+    prepareReply: Buffer,
+    binds: PreparedBinds,
+    generation: number,
+  ): Promise<PrepareAndExecuteResult> {
+    const statement = parsePrepare(prepareReply);
+    if (statement.bindCount !== binds.count) {
+      throw new Error(
+        `Parameter count mismatch: the statement has ${statement.bindCount} markers, got ${binds.count} values`,
+      );
+    }
+
+    const { header, payload } = writeExecute(statement, binds, cas.casInfo);
+    const reply = await this.exchangeOnSession(cas, generation, header, payload);
+    return parseExecute(reply, statement, cas.protoVersion);
+  }
+
+  private async exchangeOnSession(
+    cas: CASConnection,
+    generation: number,
+    header: Buffer,
+    payload: Buffer,
+  ): Promise<Buffer> {
+    const reply = await cas.sendAndRecvOnSession(generation, header, payload);
+    if (!reply) {
+      throw new ConnectionLostError("Connection lost before the prepared statement finished");
+    }
+    return reply;
   }
 
   /** Ends the transaction of a statement run by runStatement(commitAfter), on its own session. */
@@ -537,19 +645,38 @@ export class NativeCubridAdapter implements DriverAdapter {
     return parseGetLastInsertId(await cas.sendAndRecv(header, payload));
   }
 
+  /** A new session starts with no value, whatever the last one held. */
+  private followInsertIdSession(cas: CASConnection): void {
+    if (this.insertIdGeneration !== cas.connectionGeneration) {
+      this.insertIdGeneration = cas.connectionGeneration;
+      this.insertIdBaseline = undefined;
+    }
+  }
+
+  /** The statement that just ran or failed may have changed the session's value. */
+  private forgetInsertId(): void {
+    if (this.cas) {
+      this.followInsertIdSession(this.cas);
+      this.insertIdBaseline = null;
+    }
+  }
+
   /**
-   * After a query() INSERT inside a transaction the baseline is unknown, so read
-   * the server's value before the next execute() statement to have one.
+   * When the baseline is unknown, read the server's value before a statement that
+   * may ask for it. REPLACE replies as an INSERT, and no other SQL text does.
    */
-  private async readInsertIdBaseline(): Promise<void> {
-    if (this.autoCommit || this.insertIdBaseline !== null) {
+  private async readInsertIdBaseline(sql: string): Promise<void> {
+    const cas = this.getOrCreateCAS();
+    this.followInsertIdSession(cas);
+    if (this.insertIdBaseline !== null || !/insert|replace/i.test(sql)) {
       return;
     }
-    const cas = this.getOrCreateCAS();
     this.assertTransactionSession(cas);
     if (cas.isConnected) {
       try {
-        this.insertIdBaseline = await this.fetchLastInsertId(cas);
+        const value = await this.fetchLastInsertId(cas);
+        this.followInsertIdSession(cas);
+        this.insertIdBaseline = value;
       } catch (error) {
         // This read is outside withQueryHandle(), so a damaged reply, which may
         // not have ended where its frame said, must drop the session here.
@@ -630,15 +757,41 @@ export class NativeCubridAdapter implements DriverAdapter {
    * Called after a statement ran. If the session changed underneath it, that
    * statement is open on the new session, so drop the session rather than
    * let a later autocommit query persist work reported here as failed.
+   *
+   * The same goes for a transaction the server reports as over. See
+   * transactionEnded().
    */
   private async bindTransactionSession(cas: CASConnection): Promise<void> {
     if (!this.autoCommit && this.transactionGeneration === null) {
       this.transactionGeneration = cas.connectionGeneration;
     }
 
-    if (this.isTransactionSessionLost(cas)) {
+    if (this.isTransactionSessionLost(cas) || this.transactionEnded(cas)) {
       await cas.discardSession();
       throw new ConnectionLostError("Connection lost during transaction");
+    }
+  }
+
+  /**
+   * Whether any reply since the transaction's first statement, END_TRAN aside,
+   * said no transaction is open. Every reply inside a transaction says IN_TRAN on
+   * CUBRID 10.2 to 11.4, even after -72, so this would mean the earlier statements
+   * are gone and the next one would start over on a healthy session. It covers
+   * FETCH, handle releases and pings too, because any later reply overwrites the
+   * status, and a later statement would make it look open again.
+   */
+  private transactionEnded(cas: CASConnection): boolean {
+    return (
+      !this.autoCommit &&
+      this.transactionEndReplies !== null &&
+      cas.outOfTransactionReplies !== this.transactionEndReplies
+    );
+  }
+
+  /** Dropping the session turns this into a lost transaction, which everything checks. */
+  private async dropSessionIfTransactionEnded(cas: CASConnection): Promise<void> {
+    if (cas.isConnected && this.transactionEnded(cas)) {
+      await cas.discardSession();
     }
   }
 
@@ -661,9 +814,9 @@ export class NativeCubridAdapter implements DriverAdapter {
   }
 
   private endTransaction(): void {
-    this.insertIdBaseline = undefined;
     this.autoCommit = true;
     this.transactionGeneration = null;
+    this.transactionEndReplies = null;
     this.transactionAbort = null;
   }
 
@@ -751,8 +904,8 @@ export class NativeCubridAdapter implements DriverAdapter {
   private async negotiateBackslashEscapes(cas: CASConnection): Promise<boolean> {
     const { header, payload } = writePrepareAndExecute(
       "SELECT CHAR_LENGTH('\\\\')",
-      // Never autocommit: that would end the session's turn and make the very next
-      // request replace it, so the statement would bind on another session.
+      // Never autocommit: that would commit an open transaction, and in autocommit
+      // mode end the turn of the session the statement is about to bind on.
       false,
       cas.casInfo,
     );
@@ -783,6 +936,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     allRows: Record<string, unknown>[],
   ): Promise<void> {
     let fetched = allRows.length;
+    const generation = cas.connectionGeneration;
 
     while (fetched < result.totalTupleCount) {
       const { header, payload } = writeFetch(
@@ -791,7 +945,12 @@ export class NativeCubridAdapter implements DriverAdapter {
         DEFAULT_FETCH_SIZE,
         cas.casInfo,
       );
-      const fetchPayload = await cas.sendAndRecv(header, payload);
+      // The handle exists only on this session, and FETCH is not a new request
+      // that could be probed or moved to another one.
+      const fetchPayload = await cas.sendAndRecvOnSession(generation, header, payload);
+      if (fetchPayload === null) {
+        throw new ConnectionLostError("Connection lost during FETCH");
+      }
       const fetchResult = parseFetch(fetchPayload, result.columns);
 
       // Returning a partial result as success silently corrupts the query
@@ -821,7 +980,7 @@ export class NativeCubridAdapter implements DriverAdapter {
    * CUBRID 10.2 to 11.4 a later commit of a DELETE or UPDATE, or a rollback,
    * deletes the file it names, and there is no request that holds it or releases
    * it. The session is pinned for the same reason a query handle's release is:
-   * sendAndRecv() would open a new session after an autocommit reply.
+   * sendAndRecv() could move to a new session after an autocommit reply.
    *
    * The sizes are checked before the first read, so a result over the limit
    * costs no LOB transfer and no memory.
@@ -830,6 +989,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     cas: CASConnection,
     generation: number,
     rows: Record<string, unknown>[],
+    endsReadTransaction: boolean,
   ): Promise<void> {
     const limit = this.config.maxLobBytes ?? DEFAULT_MAX_LOB_BYTES;
     const cells: Array<{ row: Record<string, unknown>; name: string; lob: LobLocator }> = [];
@@ -862,7 +1022,7 @@ export class NativeCubridAdapter implements DriverAdapter {
       throw error;
     } finally {
       // An empty LOB sends no LOB_READ, and nothing may follow a damaged reply.
-      if (total > 0 && !replyDamaged) {
+      if (total > 0 && !replyDamaged && endsReadTransaction) {
         await this.endLobReadTransaction(cas, generation);
       }
     }
@@ -940,7 +1100,7 @@ export class NativeCubridAdapter implements DriverAdapter {
   ): Promise<void> {
     try {
       const { header, payload } = writeCloseReqHandle(queryHandle, cas.casInfo);
-      const responsePayload = await cas.sendAndRecvOnSession(generation, header, payload);
+      const responsePayload = await cas.releaseOnSession(generation, header, payload);
 
       if (responsePayload) {
         parseSimpleResponse(responsePayload);
@@ -948,6 +1108,21 @@ export class NativeCubridAdapter implements DriverAdapter {
     } catch {
       // Best-effort cleanup — ignore errors
     }
+  }
+}
+
+/**
+ * Checks the SQL and encodes the values when a prepared method is called, before
+ * it waits for its turn or sends anything: a refused statement must not read the
+ * insert id, open a session or be probed. The binds are a snapshot, so changing
+ * the array afterwards does not change what is sent.
+ */
+function bindOrRefuse(sql: string, params: QueryParams | undefined, message: string): PreparedBinds {
+  try {
+    assertPreparableSql(sql);
+    return encodePreparedParams(params ?? []);
+  } catch (error) {
+    throw mapError("query", error, message);
   }
 }
 

@@ -264,10 +264,18 @@ test("CASConnection connect over TLS — rejects negative redirect/status code",
   }
 });
 
-test("CASConnection over TLS reconnects when the CAS is released", async () => {
+test("CASConnection over TLS replaces a session whose CAS has closed", async () => {
   const released = Buffer.from([0x00, 0x02, 0x03, 0x04]);
+  const answered = new WeakSet<TLSSocket>();
   const { server, port } = await createMockSslBroker({
-    onRequest: (tls) => tls.write(frameResponse(released)),
+    onRequest: (tls) => {
+      if (answered.has(tls)) {
+        tls.destroy();
+      } else {
+        answered.add(tls);
+        tls.write(frameResponse(released));
+      }
+    },
   });
 
   try {

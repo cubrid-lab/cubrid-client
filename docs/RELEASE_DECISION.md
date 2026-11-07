@@ -45,7 +45,8 @@ SHA and its corresponding run URL into the sign-off section below.
   [limitations listed in the type guide](TYPES.md#blob-and-clob-columns). LOB
   writes through a handle are not implemented
   ([#103](https://github.com/cubrid-lab/cubrid-client/issues/103)).
-- `query()` is not a server-side prepared binding API
+- `query()` is not a server-side prepared binding API; the opt-in
+  `queryPrepared()` family is
   ([#85](https://github.com/cubrid-lab/cubrid-client/issues/85)). DML
   affected-row counts and generated ids are not part of its Promise result;
   `execute()` returns them

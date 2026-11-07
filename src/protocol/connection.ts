@@ -12,7 +12,12 @@
 
 import { Socket } from "node:net";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
-import { DEFAULT_MAX_FRAME_LENGTH, SIZE_CAS_INFO, SIZE_DATA_LENGTH } from "./constants.js";
+import {
+  CASFunctionCode,
+  DEFAULT_MAX_FRAME_LENGTH,
+  SIZE_CAS_INFO,
+  SIZE_DATA_LENGTH,
+} from "./constants.js";
 import { ConnectionLostError } from "../errors/internal-errors.js";
 import { ReadTimeoutError } from "../errors/read-timeout-error.js";
 import { parseConnectionString } from "../utils/connection-string.js";
@@ -32,6 +37,9 @@ const RETRY_BASE_DELAY_MS = 100;
 const RETRY_MAX_DELAY_MS = 2000;
 /** Handshake inactivity limit when `readTimeout` is unset. Later requests are not limited by it. */
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
+
+/** CAS_INFO[0] once no transaction is open. Any other value means one is. */
+const CAS_INFO_STATUS_OUT_TRAN = 0;
 
 /** The TCP connection could not be opened; no byte was sent, so a retry is safe. */
 class SocketConnectError extends Error {}
@@ -101,6 +109,10 @@ export class CASConnection {
   private _connectionGeneration = 0;
   private _failedExchanges = 0;
   private inHandshake = false;
+  private _outOfTransaction = false;
+  private _outOfTransactionReplies = 0;
+  /** A probe has answered since the last reply. Never inferred from CAS_INFO. */
+  private casVerified = false;
 
   /**
    * Per-instance FIFO serialization queue. Public entry points that mutate
@@ -127,14 +139,14 @@ export class CASConnection {
   }
 
   /**
-   * Open a session if there is none, and replace one the broker has released
-   * (CAS_INFO status 0). sendAndRecv() would do the same on its next request;
-   * calling this first lets the caller learn which session that request will
-   * run on, so anything it measures on that session is not stale when sent.
+   * Open a session if there is none, and verify one that is out of transaction,
+   * replacing it if its CAS has gone. sendAndRecv() would do the same on its next
+   * request; calling this first lets the caller learn which session that request
+   * will run on, so anything it measures on that session is not stale when sent.
    */
   async ensureSession(): Promise<void> {
     return this.enqueue(async () => {
-      await this.checkReconnectUnlocked();
+      await this.verifySessionUnlocked();
       await this.connectUnlocked();
     });
   }
@@ -213,6 +225,8 @@ export class CASConnection {
       this._protoVersion = result.protoVersion;
       this._sessionId = result.sessionId;
       this._connectionGeneration += 1;
+      this._outOfTransaction = false;
+      this.casVerified = false;
       this.connected = true;
     } catch (error) {
       brokerSocket.destroy();
@@ -259,13 +273,12 @@ export class CASConnection {
    * Send request and receive response in one call.
    * Strips the CAS_INFO from the response (first 4 bytes) and returns the payload.
    *
-   * Before sending, checks CAS_INFO status and reconnects if the broker
-   * has released the CAS process — matching the official CUBRID JDBC
-   * driver's `UClientSideConnection.checkReconnect()`.
+   * Before sending, verifies a session that is out of transaction, and replaces
+   * it only if its CAS has gone. See verifySessionUnlocked().
    */
   async sendAndRecv(header: Buffer, payload: Buffer): Promise<Buffer> {
     return this.enqueue(async () => {
-      await this.checkReconnectUnlocked();
+      await this.verifySessionUnlocked();
       return this.exchangeUnlocked(header, payload);
     });
   }
@@ -273,8 +286,9 @@ export class CASConnection {
   /**
    * Exchange on one specific session, for requests that mean nothing on any
    * other, such as closing a query handle. Unlike sendAndRecv() this never
-   * reconnects: a released CAS still answers on its socket and still holds its
-   * handles, whereas a new session would accept the request and do nothing.
+   * reconnects: a CAS that is out of transaction still answers on its socket and
+   * still holds its handles, whereas a new session would accept the request and
+   * do nothing.
    *
    * Returns null without sending anything when that session is gone.
    */
@@ -292,8 +306,32 @@ export class CASConnection {
     });
   }
 
+  /**
+   * sendAndRecvOnSession() for a request whose failure says nothing about any
+   * statement, such as releasing the handle of one that has already answered.
+   * A CAS can go to another client straight after an autocommit reply, and that
+   * must not fail the statements waiting behind this one.
+   */
+  async releaseOnSession(
+    generation: number,
+    header: Buffer,
+    payload: Buffer,
+  ): Promise<Buffer | null> {
+    return this.enqueue(async () => {
+      if (!this.connected || this._connectionGeneration !== generation) {
+        return null;
+      }
+
+      return this.exchangeUnlocked(header, payload, false);
+    });
+  }
+
   /** Unlocked exchange body. MUST only be called from within the queue. */
-  private async exchangeUnlocked(header: Buffer, payload: Buffer): Promise<Buffer> {
+  private async exchangeUnlocked(
+    header: Buffer,
+    payload: Buffer,
+    outcomeUnknownOnFailure = true,
+  ): Promise<Buffer> {
     let response: Buffer;
     try {
       await this.send(header, payload);
@@ -301,13 +339,21 @@ export class CASConnection {
     } catch (error) {
       // The stream position is unknown after a failed exchange, so this
       // socket can never be trusted to line up with the next frame.
-      this._failedExchanges += 1;
+      if (outcomeUnknownOnFailure) {
+        this._failedExchanges += 1;
+      }
       this.retireSocket();
       throw error;
     }
 
     // Update CAS_INFO from response
     response.copy(this._casInfo, 0, 0, SIZE_CAS_INFO);
+
+    this._outOfTransaction = this._casInfo[0] === CAS_INFO_STATUS_OUT_TRAN;
+    this.casVerified = false;
+    if (this._outOfTransaction && payload[0] !== CASFunctionCode.END_TRAN) {
+      this._outOfTransactionReplies += 1;
+    }
 
     // Return payload portion (after CAS_INFO)
     return response.subarray(SIZE_CAS_INFO);
@@ -361,25 +407,53 @@ export class CASConnection {
   }
 
   /**
-   * Reconnect to the broker when the CAS has been released.
+   * Before a request on a session that last replied OUT_TRAN, confirm with one
+   * CHECK_CAS that its CAS is still there, and open a new session only if not.
    *
-   * The CUBRID broker sets `CAS_INFO[0]` to `INACTIVE` (0) when the CAS
-   * process is no longer reserved for this client (`KEEP_CONNECTION=AUTO`).
-   * The official JDBC driver checks this before every request and
-   * transparently reconnects.
+   * CAS_INFO status 0 means the last transaction ended, not that the CAS is gone:
+   * on CUBRID 10.2 to 11.4 the session and its settings stay, whatever the
+   * broker's KEEP_CONNECTION. But it is also the state in which a CAS closes the
+   * socket on purpose: to serve another client when KEEP_CONNECTION=AUTO has more
+   * clients than CASes, or once a broker restart or a lost database server leaves
+   * it nothing to do. A statement sent into that gap would have an unknown
+   * outcome, and it could not safely be repeated. The probe runs no SQL, so a
+   * failed one loses nothing. It also closes the gap, because the CAS counts as
+   * in transaction from CHECK_CAS until the next statement ends.
+   *
+   * Runs at most once per request, before the request is first sent. Nothing is
+   * replayed. A failed probe is not a failed exchange: it proves nothing about
+   * earlier statements, so the statements waiting behind it stay valid.
+   *
+   * The official JDBC driver makes the same check in
+   * `UClientSideConnection.checkReconnect()`.
    */
-  private async checkReconnectUnlocked(): Promise<void> {
-    if (!this.connected || !this.socket) {
+  private async verifySessionUnlocked(): Promise<void> {
+    if (!this.connected || !this._outOfTransaction || this.casVerified) {
       return;
     }
 
-    if (this._casInfo[0] === CASConnection.CAS_INFO_STATUS_INACTIVE) {
-      this.retireSocket();
-      await this.connectUnlocked();
+    if (await this.probeCasUnlocked()) {
+      this.casVerified = true;
+      return;
     }
+
+    this.retireSocket();
+    await this.connectUnlocked();
   }
 
-  private static readonly CAS_INFO_STATUS_INACTIVE = 0;
+  /** True if this socket's CAS answered CHECK_CAS. Every failure means replace it. */
+  private async probeCasUnlocked(): Promise<boolean> {
+    try {
+      const { header, payload } = writeCheckCas(this._casInfo);
+      await this.send(header, payload);
+      const response = await this.recv();
+      response.copy(this._casInfo, 0, 0, SIZE_CAS_INFO);
+      parseCheckCas(response.subarray(SIZE_CAS_INFO));
+      return true;
+    } catch {
+      return false;
+    }
+  }
 
   /**
    * Verify the connection is alive.
@@ -401,6 +475,7 @@ export class CASConnection {
     const response = await this.sendAndRecv(header, payload);
     return parseGetDbVersion(response);
   }
+
   /** Current CAS_INFO bytes (echoed back to server on each request). */
   get casInfo(): Buffer {
     return this._casInfo;
@@ -429,6 +504,15 @@ export class CASConnection {
    */
   get failedExchanges(): number {
     return this._failedExchanges;
+  }
+
+  /**
+   * Replies that said no transaction is open, across every session, leaving out
+   * END_TRAN, which is meant to, and probes, which report IN_TRAN regardless. A
+   * count, because the status itself is overwritten by the very next reply.
+   */
+  get outOfTransactionReplies(): number {
+    return this._outOfTransactionReplies;
   }
 
   /** Whether the connection is currently open. */

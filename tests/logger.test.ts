@@ -10,6 +10,7 @@ import {
   SqlSyntaxError,
 } from "../src/errors/query-error.js";
 import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
+import { TransactionError } from "../src/errors/transaction-error.js";
 import type { ClientLogger, ConnectionLike } from "../src/types/client.js";
 
 const PASSWORD = "s3cret-pw";
@@ -94,6 +95,49 @@ test("logger receives an error event without the error message", async () => {
   assert.equal(failure?.fields.errorName, "Error");
   const serialized = JSON.stringify(entries);
   assert.ok(!serialized.includes(PARAM) && !serialized.includes(SQL_LITERAL));
+});
+
+test("logger sees one completion when a transaction callback commits by itself", async () => {
+  const { logger, entries } = recorder();
+
+  await client(logger, fakeConnection()).transaction(async (tx) => {
+    await tx.commit();
+    await assert.rejects(tx.commit());
+    await assert.rejects(tx.query("SELECT 1"));
+  });
+
+  assert.deepEqual(
+    entries.map((entry) => entry.fields.operation),
+    ["connection", "beginTransaction", "commit", "close"],
+  );
+});
+
+test("logger reports the rollback and close of a failed transaction", async () => {
+  const { logger, entries } = recorder();
+  const connection = fakeConnection();
+  connection.rollback = () => Promise.reject(new Error("rollback"));
+  connection.close = () => Promise.reject(new Error("close"));
+
+  await assert.rejects(
+    client(logger, connection).transaction(async () => {
+      throw new Error("original");
+    }),
+    (error: unknown) =>
+      error instanceof TransactionError &&
+      (error.cause as Error).message === "original" &&
+      error.rollbackError?.message === "rollback" &&
+      error.closeError?.message === "close",
+  );
+
+  assert.deepEqual(
+    entries.map((entry) => [entry.level, entry.fields.operation]),
+    [
+      ["info", "connection"],
+      ["debug", "beginTransaction"],
+      ["error", "rollback"],
+      ["error", "close"],
+    ],
+  );
 });
 
 test("logger covers transactions", async () => {
@@ -287,4 +331,36 @@ test("logger reports execute without SQL, parameters or the insert id", async ()
   const logged = JSON.stringify(entries);
   assert.equal(logged.includes(SQL_LITERAL), false);
   assert.equal(logged.includes(PARAM), false);
+});
+
+test("logger reports the prepared methods without SQL, parameters or rows", async () => {
+  const { logger, entries } = recorder();
+  const connection = fakeConnection();
+  connection.queryPrepared = async <T>() => [{ v: ROW_VALUE }] as unknown as T[];
+  connection.queryResultPrepared = async <T>() => ({
+    rows: [{ v: ROW_VALUE }] as unknown as T[],
+    columns: [],
+  });
+  connection.executePrepared = async () => ({ affectedRows: 5, lastInsertId: 99 });
+  const c = client(logger, connection);
+  const sql = `SELECT '${SQL_LITERAL}', ?`;
+
+  await c.queryPrepared(sql, [PARAM]);
+  await c.queryResultPrepared(sql, [PARAM]);
+  await c.executePrepared(sql, [PARAM]);
+
+  for (const [operation, rowCount] of [
+    ["queryPrepared", 1],
+    ["queryResultPrepared", 1],
+    ["executePrepared", undefined],
+  ] as const) {
+    const entry = entries.find((e) => e.fields.operation === operation);
+    assert.ok(entry);
+    assert.equal(entry.fields.paramCount, 1);
+    assert.equal(entry.fields.rowCount, rowCount);
+  }
+  const logged = JSON.stringify(entries);
+  assert.equal(logged.includes(SQL_LITERAL), false);
+  assert.equal(logged.includes(PARAM), false);
+  assert.equal(logged.includes(ROW_VALUE), false);
 });

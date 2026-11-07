@@ -10,10 +10,11 @@
  */
 import test, { describe, after } from "node:test";
 import assert from "node:assert/strict";
-import { createServer, connect as netConnect, type Server } from "node:net";
+import { createServer, connect as netConnect, type Server, type Socket } from "node:net";
 
 import { createClient } from "../src/client/create-client.js";
 import { NativeCubridAdapter } from "../src/adapters/native.js";
+import { ZonedDateTime } from "../src/types/zoned-date-time.js";
 import { ConnectionError } from "../src/errors/connection-error.js";
 import {
   ConstraintError,
@@ -26,6 +27,8 @@ import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { TransactionError } from "../src/errors/transaction-error.js";
 import { CASFunctionCode } from "../src/protocol/constants.js";
 import { CASConnection } from "../src/protocol/connection.js";
+import type { TransactionClient } from "../src/types/client.js";
+import type { QueryParam, QueryParams } from "../src/types/query.js";
 import {
   parseFetch,
   parsePrepareAndExecute,
@@ -582,6 +585,338 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
   });
 
   // -------------------------------------------------------------------------
+  // Transaction callback lifecycle: one terminal outcome, nothing after it
+  // -------------------------------------------------------------------------
+
+  describe("transaction callback lifecycle", () => {
+    const table = "tx_lifecycle_test_native";
+
+    /**
+     * A real adapter that counts END_TRAN requests. Failure switches stand in
+     * for faults a live broker will not produce on demand; the injected
+     * rollback and commit never reach the server, so what the assertions read
+     * back is what the server really kept.
+     */
+    class ObservedAdapter extends NativeCubridAdapter {
+      commits = 0;
+      rollbacks = 0;
+      failCommit = false;
+      failRollback = false;
+      failClose = false;
+
+      override async commit(): Promise<void> {
+        this.commits += 1;
+        if (this.failCommit) {
+          throw new Error("injected commit failure");
+        }
+        await super.commit();
+      }
+
+      override async rollback(): Promise<void> {
+        this.rollbacks += 1;
+        if (this.failRollback) {
+          throw new Error("injected rollback failure");
+        }
+        await super.rollback();
+      }
+
+      override async close(): Promise<void> {
+        await super.close();
+        if (this.failClose) {
+          throw new Error("injected close failure");
+        }
+      }
+    }
+
+    async function withObservedClient(
+      run: (
+        client: ReturnType<typeof createClient>,
+        observed: ObservedAdapter,
+        insertedValues: () => Promise<string[]>,
+      ) => Promise<void>,
+      configure: (adapter: ObservedAdapter) => void = () => undefined,
+    ): Promise<void> {
+      const setup = createClient(TEST_CONFIG);
+      const observed = new ObservedAdapter(TEST_CONFIG);
+      configure(observed);
+      const client = createClient({ ...TEST_CONFIG, connectionFactory: () => observed });
+
+      const insertedValues = async () => {
+        const rows = await setup.query<{ val: string }>(`SELECT val FROM ${table} ORDER BY id`);
+        return rows.map((row) => row.val);
+      };
+
+      try {
+        await setup.query(`DROP TABLE IF EXISTS ${table}`);
+        await setup.query(
+          `CREATE TABLE ${table} (id INT AUTO_INCREMENT PRIMARY KEY, val VARCHAR(50))`,
+        );
+        await run(client, observed, insertedValues);
+      } finally {
+        await setup.query(`DROP TABLE IF EXISTS ${table}`);
+        await setup.close();
+      }
+    }
+
+    const insert = (value: string) => `INSERT INTO ${table} (val) VALUES ('${value}')`;
+
+    test("manual commit is the only commit and later statements cannot autocommit", async () => {
+      await withObservedClient(async (client, observed, insertedValues) => {
+        const result = await client.transaction(async (tx) => {
+          await tx.query(insert("before commit"));
+          await tx.commit();
+          await assert.rejects(tx.query(insert("after commit")), TransactionError);
+          await assert.rejects(tx.commit(), TransactionError);
+          await assert.rejects(tx.rollback(), TransactionError);
+          return "ok";
+        });
+
+        assert.equal(result, "ok");
+        assert.equal(observed.commits, 1);
+        assert.equal(observed.rollbacks, 0);
+        assert.deepEqual(await insertedValues(), ["before commit"]);
+      });
+    });
+
+    test("manual rollback stops the automatic commit", async () => {
+      await withObservedClient(async (client, observed, insertedValues) => {
+        const result = await client.transaction(async (tx) => {
+          await tx.query(insert("rolled back"));
+          await tx.rollback();
+          await assert.rejects(tx.query(insert("after rollback")), TransactionError);
+          return "declined";
+        });
+
+        assert.equal(result, "declined");
+        assert.equal(observed.commits, 0);
+        assert.equal(observed.rollbacks, 1);
+        assert.deepEqual(await insertedValues(), []);
+      });
+    });
+
+    test("an error after manual commit rejects and the commit stands", async () => {
+      await withObservedClient(async (client, observed, insertedValues) => {
+        await assert.rejects(
+          client.transaction(async (tx) => {
+            await tx.query(insert("kept"));
+            await tx.commit();
+            throw new Error("after commit");
+          }),
+          (error: Error) => error instanceof TransactionError && error.cause instanceof Error,
+        );
+
+        assert.equal(observed.rollbacks, 0);
+        assert.deepEqual(await insertedValues(), ["kept"]);
+      });
+    });
+
+    test("a tx kept after transaction() returned cannot write", async () => {
+      await withObservedClient(async (client, _observed, insertedValues) => {
+        let leaked: TransactionClient | undefined;
+
+        await client.transaction(async (tx) => {
+          leaked = tx;
+          await tx.query(insert("committed"));
+        });
+
+        assert.ok(leaked);
+        await assert.rejects(leaked.query(insert("leaked")), TransactionError);
+        assert.deepEqual(await insertedValues(), ["committed"]);
+      });
+    });
+
+    test("a bound query the callback did not await still lands inside the transaction", async () => {
+      await withObservedClient(async (client, observed, insertedValues) => {
+        // The first bound query on a connection waits for the backslash-mode
+        // probe, so its statement would otherwise follow the automatic commit.
+        await client.transaction(async (tx) => {
+          void tx.query(`INSERT INTO ${table} (val) VALUES (?)`, ["not awaited"]);
+        });
+
+        assert.equal(observed.commits, 1);
+        assert.deepEqual(await insertedValues(), ["not awaited"]);
+      });
+    });
+
+    test("a query that fails unawaited rolls back the rest of the transaction", async () => {
+      await withObservedClient(async (client, observed, insertedValues) => {
+        await assert.rejects(
+          client.transaction(async (tx) => {
+            await tx.query(insert("must not persist"));
+            void tx.query("INSERT INTO tx_lifecycle_no_such_table (val) VALUES ('x')");
+          }),
+          TransactionError,
+        );
+
+        assert.equal(observed.commits, 0);
+        assert.equal(observed.rollbacks, 1);
+        assert.deepEqual(await insertedValues(), []);
+      });
+    });
+
+    test("Promise.all of bound statements commits all of them through the queue", async () => {
+      await withObservedClient(async (client, observed, insertedValues) => {
+        const values = ["one", "two", "three", "four", "five"];
+
+        await client.transaction((tx) =>
+          Promise.all(
+            values.map((value) => tx.query(`INSERT INTO ${table} (val) VALUES (?)`, [value])),
+          ),
+        );
+
+        assert.equal(observed.commits, 1);
+        assert.equal(observed.rollbacks, 0);
+        assert.deepEqual(await insertedValues(), values);
+      });
+    });
+
+    test("Promise.all of query, queryResult and execute commits all of them once", async () => {
+      await withObservedClient(async (client, observed, insertedValues) => {
+        await client.transaction((tx) =>
+          Promise.all([
+            tx.query(insert("one")),
+            tx.queryResult(insert("two")),
+            tx.execute(insert("three")),
+          ]),
+        );
+
+        assert.equal(observed.commits, 1);
+        assert.equal(observed.rollbacks, 0);
+        assert.deepEqual(await insertedValues(), ["one", "two", "three"]);
+      });
+    });
+
+    test("an execute() the callback did not await lands inside the transaction", async () => {
+      await withObservedClient(async (client, observed, insertedValues) => {
+        await client.transaction(async (tx) => {
+          void tx.execute(`INSERT INTO ${table} (val) VALUES (?)`, ["not awaited"]);
+        });
+
+        assert.equal(observed.commits, 1);
+        assert.deepEqual(await insertedValues(), ["not awaited"]);
+      });
+    });
+
+    test("an execute() that fails unawaited rolls back the rest of the transaction", async () => {
+      await withObservedClient(async (client, observed, insertedValues) => {
+        await assert.rejects(
+          client.transaction(async (tx) => {
+            await tx.query(insert("kept out"));
+            void tx.execute("INSERT INTO tx_lifecycle_no_such_table (val) VALUES ('x')");
+          }),
+          TransactionError,
+        );
+
+        assert.equal(observed.commits, 0);
+        assert.equal(observed.rollbacks, 1);
+        assert.deepEqual(await insertedValues(), []);
+      });
+    });
+
+    test("execute() and queryResult() after a manual commit reject and write nothing", async () => {
+      await withObservedClient(async (client, observed, insertedValues) => {
+        await client.transaction(async (tx) => {
+          await tx.execute(insert("committed"));
+          await tx.commit();
+          await assert.rejects(tx.execute(insert("late execute")), TransactionError);
+          await assert.rejects(tx.queryResult(insert("late queryResult")), TransactionError);
+        });
+
+        assert.equal(observed.commits, 1);
+        assert.deepEqual(await insertedValues(), ["committed"]);
+      });
+    });
+
+    test("Promise.all with a failing statement rolls back the statements queued with it", async () => {
+      await withObservedClient(async (client, observed, insertedValues) => {
+        await assert.rejects(
+          client.transaction((tx) =>
+            Promise.all([
+              tx.query(insert("before the failure")),
+              tx.query("INSERT INTO tx_lifecycle_no_such_table (val) VALUES ('x')"),
+              tx.query(insert("after the failure")),
+            ]),
+          ),
+          TransactionError,
+        );
+
+        assert.equal(observed.commits, 0);
+        assert.equal(observed.rollbacks, 1);
+        assert.deepEqual(await insertedValues(), []);
+      });
+    });
+
+    test("a failed commit rolls back on the server and keeps its cause", async () => {
+      await withObservedClient(
+        async (client, observed, insertedValues) => {
+          await assert.rejects(
+            client.transaction(async (tx) => {
+              await tx.query(insert("not committed"));
+            }),
+            (error: Error) =>
+              error instanceof TransactionError &&
+              (error.cause as Error).message === "injected commit failure",
+          );
+
+          assert.equal(observed.commits, 1);
+          assert.equal(observed.rollbacks, 1);
+          assert.deepEqual(await insertedValues(), []);
+        },
+        (adapter) => {
+          adapter.failCommit = true;
+        },
+      );
+    });
+
+    test("rollback and close failures keep the original error and discard the work", async () => {
+      await withObservedClient(
+        async (client, observed, insertedValues) => {
+          const original = new Error("original");
+
+          await assert.rejects(
+            client.transaction(async (tx) => {
+              await tx.query(insert("never committed"));
+              throw original;
+            }),
+            (error: Error) =>
+              error instanceof TransactionError &&
+              error.cause === original &&
+              error.rollbackError?.message === "injected rollback failure" &&
+              error.closeError?.message === "injected close failure",
+          );
+
+          assert.equal(observed.commits, 0);
+          assert.equal(observed.rollbacks, 1);
+          assert.deepEqual(await insertedValues(), []);
+        },
+        (adapter) => {
+          adapter.failRollback = true;
+          adapter.failClose = true;
+        },
+      );
+    });
+
+    test("a close failure after commit rejects but the commit is durable", async () => {
+      await withObservedClient(
+        async (client, observed, insertedValues) => {
+          await assert.rejects(
+            client.transaction(async (tx) => {
+              await tx.query(insert("durable"));
+            }),
+            (error: Error) => error.message === "injected close failure",
+          );
+
+          assert.equal(observed.commits, 1);
+          assert.deepEqual(await insertedValues(), ["durable"]);
+        },
+        (adapter) => {
+          adapter.failClose = true;
+        },
+      );
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // Parameterized queries (client-side interpolation)
   // -------------------------------------------------------------------------
 
@@ -766,6 +1101,243 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     });
   });
 
+  describe("years 1 to 99", () => {
+    const TABLE = "integration_early_years";
+
+    test("DATE, DATETIME and TIMESTAMP keep their stored year", async () => {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+      await adapter.connect();
+      try {
+        await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await adapter.query(`CREATE TABLE ${TABLE} (id INT PRIMARY KEY, d DATE, dt DATETIME)`);
+        await adapter.query(
+          `INSERT INTO ${TABLE} VALUES (1, DATE'0050-06-15', DATETIME'0050-06-15 03:04:05.678')`,
+        );
+        await adapter.query(
+          `INSERT INTO ${TABLE} VALUES (2, DATE'0099-12-31', DATETIME'0099-12-31 23:59:59.999')`,
+        );
+        const rows = await adapter.query(`SELECT id, d, dt FROM ${TABLE} ORDER BY id`);
+        assert.equal(rows.length, 2);
+        assert.equal((rows[0]!.d as Date).getFullYear(), 50);
+        assert.equal((rows[0]!.dt as Date).getFullYear(), 50);
+        assert.equal((rows[1]!.d as Date).getFullYear(), 99);
+        assert.equal((rows[1]!.dt as Date).getFullYear(), 99);
+        assert.equal((rows[0]!.dt as Date).getMilliseconds(), 678);
+      } finally {
+        try {
+          await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        } finally {
+          await adapter.close();
+        }
+      }
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Timezone-aware values and JSON (#111)
+  // -------------------------------------------------------------------------
+
+  describe("timezone-aware values and JSON", () => {
+    const TABLE = "integration_zoned_values";
+    const COLUMNS = ["tstz", "tsltz", "dttz", "dtltz"] as const;
+
+    /** The value of the first column of the only row of `sql`, on a fresh session. */
+    async function selectValue(sql: string): Promise<unknown> {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+      try {
+        const rows = await adapter.query(sql);
+        assert.equal(rows.length, 1);
+        return Object.values(rows[0] as Record<string, unknown>)[0];
+      } finally {
+        await adapter.close();
+      }
+    }
+
+    const LITERALS: Array<{ literal: string; text: string; type: string }> = [
+      {
+        literal: "TIMESTAMPTZ'2020-01-02 03:04:05 +09:00'",
+        text: "2020-01-02 03:04:05 +09:00",
+        type: "TIMESTAMPTZ",
+      },
+      {
+        literal: "TIMESTAMPTZ'2020-07-02 03:04:05 -05:30'",
+        text: "2020-07-02 03:04:05 -05:30",
+        type: "TIMESTAMPTZ",
+      },
+      {
+        literal: "TIMESTAMPTZ'2020-01-02 03:04:05 America/New_York'",
+        text: "2020-01-02 03:04:05 America/New_York EST",
+        type: "TIMESTAMPTZ",
+      },
+      {
+        literal: "DATETIMETZ'2020-01-02 03:04:05.678 +09:00'",
+        text: "2020-01-02 03:04:05.678 +09:00",
+        type: "DATETIMETZ",
+      },
+      {
+        literal: "DATETIMETZ'2020-07-02 03:04:05.999 America/New_York EDT'",
+        text: "2020-07-02 03:04:05.999 America/New_York EDT",
+        type: "DATETIMETZ",
+      },
+      {
+        literal: "DATETIMETZ'0001-01-01 00:00:00.000 +00:00'",
+        text: "0001-01-01 00:00:00.000 +00:00",
+        type: "DATETIMETZ",
+      },
+      {
+        literal: "DATETIMETZ'9999-12-31 23:59:59.999 +14:00'",
+        text: "9999-12-31 23:59:59.999 +14:00",
+        type: "DATETIMETZ",
+      },
+    ];
+
+    for (const { literal, text, type } of LITERALS) {
+      test(`${literal} keeps its zone and its fields`, async () => {
+        const value = await selectValue(`SELECT ${literal} AS v`);
+        assert.ok(value instanceof ZonedDateTime);
+        assert.equal(value.type, type);
+        assert.equal(String(value), text);
+      });
+
+      test(`${literal} round-trips: its text, written back as a literal, reads the same`, async () => {
+        const first = (await selectValue(`SELECT ${literal} AS v`)) as ZonedDateTime;
+        const again = await selectValue(`SELECT ${first.type}'${first.toString()}' AS v`);
+        assert.ok(again instanceof ZonedDateTime);
+        assert.deepEqual({ ...again }, { ...first });
+      });
+    }
+
+    test("leap days decode, and the server refuses a date that does not exist", async () => {
+      assert.equal(
+        String(await selectValue("SELECT DATETIMETZ'2020-02-29 23:59:59.999 +00:00' AS v")),
+        "2020-02-29 23:59:59.999 +00:00",
+      );
+      assert.equal(
+        String(await selectValue("SELECT DATETIMETZ'2000-02-29 00:00:00.000 +00:00' AS v")),
+        "2000-02-29 00:00:00.000 +00:00",
+      );
+      // The decoder also rejects these as malformed, but the server never sends them.
+      for (const literal of [
+        "DATETIMETZ'2021-02-29 00:00:00.000 +00:00'",
+        "DATETIMETZ'1900-02-29 00:00:00.000 +00:00'",
+        "DATETIMETZ'10000-01-01 00:00:00.000 +00:00'",
+        "TIMESTAMPTZ'2021-04-31 00:00:00 +00:00'",
+      ]) {
+        await assert.rejects(
+          selectValue(`SELECT ${literal} AS v`),
+          (error: Error) => {
+            assert.ok(error instanceof QueryError, literal);
+            assert.match(String((error.cause as Error | undefined)?.message), /Invalid utime/, literal);
+            return true;
+          },
+          literal,
+        );
+      }
+    });
+
+    test("a local-zone value arrives in the session zone and round-trips", async () => {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+      try {
+        // In a transaction the broker keeps the session, and so its time zone.
+        await adapter.beginTransaction();
+        await adapter.query("SET TIME ZONE 'Asia/Seoul'");
+        const [row] = await adapter.query(
+          "SELECT TIMESTAMPLTZ'2020-01-02 03:04:05 +09:00' AS a, " +
+            "DATETIMELTZ'2020-07-02 03:04:05.5 America/New_York' AS b",
+        );
+        const a = row?.a as ZonedDateTime;
+        const b = row?.b as ZonedDateTime;
+        assert.equal(a.type, "TIMESTAMPLTZ");
+        assert.equal(String(a), "2020-01-02 03:04:05 Asia/Seoul KST");
+        assert.equal(b.type, "DATETIMELTZ");
+        assert.equal(String(b), "2020-07-02 16:04:05.500 Asia/Seoul KST");
+
+        const [again] = await adapter.query(
+          `SELECT ${a.type}'${a.toString()}' AS a, ${b.type}'${b.toString()}' AS b`,
+        );
+        assert.deepEqual({ ...(again?.a as ZonedDateTime) }, { ...a });
+        assert.deepEqual({ ...(again?.b as ZonedDateTime) }, { ...b });
+      } finally {
+        await adapter.close();
+      }
+    });
+
+    test("stored values, NULL and a collection read back exactly, with the type names in the columns", async () => {
+      const client = createClient(TEST_CONFIG);
+      try {
+        await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await client.query(
+          `CREATE TABLE ${TABLE} (id INT PRIMARY KEY, tstz TIMESTAMPTZ, tsltz TIMESTAMPLTZ, ` +
+            "dttz DATETIMETZ, dtltz DATETIMELTZ, seq SEQUENCE OF TIMESTAMPTZ, j JSON)",
+        );
+        await client.query(
+          `INSERT INTO ${TABLE} VALUES (1, TIMESTAMPTZ'2020-01-02 03:04:05 +09:00', ` +
+            "TIMESTAMPLTZ'2020-01-02 03:04:05 +09:00', DATETIMETZ'2020-01-02 03:04:05.678 +09:00', " +
+            "DATETIMELTZ'2020-01-02 03:04:05.678 +09:00', " +
+            "{TIMESTAMPTZ'2020-01-02 03:04:05 +09:00', TIMESTAMPTZ'2020-07-02 03:04:05 -05:30'}, " +
+            `'{"a":[1,2.5,null]}')`,
+        );
+        await client.query(`INSERT INTO ${TABLE} (id) VALUES (2)`);
+
+        const { rows, columns } = await client.queryResult(`SELECT * FROM ${TABLE} ORDER BY id`);
+
+        assert.deepEqual(
+          columns.map((column) => column.type),
+          ["INT", "TIMESTAMPTZ", "TIMESTAMPLTZ", "DATETIMETZ", "DATETIMELTZ", "SEQUENCE", "VARCHAR"],
+        );
+        const [first, second] = rows;
+        assert.equal(String(first?.tstz), "2020-01-02 03:04:05 +09:00");
+        assert.equal(String(first?.dttz), "2020-01-02 03:04:05.678 +09:00");
+        for (const column of ["tsltz", "dtltz"] as const) {
+          assert.ok(first?.[column] instanceof ZonedDateTime);
+        }
+        assert.deepEqual(
+          (first?.seq as ZonedDateTime[]).map(String),
+          ["2020-01-02 03:04:05 +09:00", "2020-07-02 03:04:05 -05:30"],
+        );
+        for (const column of [...COLUMNS, "seq", "j"]) {
+          assert.equal(second?.[column], null, column);
+        }
+
+        // JSON is the server's text, not a parsed value, because below protocol 8 the
+        // server sends wire type 2 (VARCHAR) instead of 34.
+        assert.equal(first?.j, '{"a":[1,2.5,null]}');
+        assert.deepEqual(JSON.parse(first?.j as string), { a: [1, 2.5, null] });
+      } finally {
+        await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await client.close();
+      }
+    });
+
+    for (const { type, literal, wireType, size } of [
+      { type: "TIMESTAMPTZ", literal: "TIMESTAMPTZ'0000-00-00 00:00:00 +00:00'", wireType: 29, size: 19 },
+      { type: "DATETIMETZ", literal: "DATETIMETZ'0000-00-00 00:00:00.000 +00:00'", wireType: 31, size: 21 },
+    ]) {
+      test(`a zero ${type} rejects with its column and type, and the session stays usable`, async () => {
+        const adapter = new NativeCubridAdapter(TEST_CONFIG);
+        await adapter.connect();
+        const cas = (adapter as unknown as { cas: CASConnection }).cas;
+        const generation = cas.connectionGeneration;
+
+        try {
+          await assert.rejects(adapter.query(`SELECT ${literal} AS zero_value, 'after' AS t`), (err: Error) => {
+            assert.ok(err instanceof QueryError);
+            assert.match(
+              (err.cause as Error).message,
+              new RegExp(`column "zero_value" \\(wire type ${wireType}, ${size} bytes\\)`),
+            );
+            return true;
+          });
+
+          assert.equal(cas.connectionGeneration, generation);
+          assert.deepEqual(await adapter.query("SELECT 1 AS one"), [{ one: 1 }]);
+        } finally {
+          await adapter.close();
+        }
+      });
+    }
+  });
+
   // -------------------------------------------------------------------------
   // Collections (#82)
   // -------------------------------------------------------------------------
@@ -774,12 +1346,12 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     const client = createClient(TEST_CONFIG);
     try {
       await assert.rejects(
-        client.query("SELECT TIMESTAMPTZ'2020-01-02 03:04:05 +09:00' AS zoned"),
+        client.query("SELECT DATETIME'0000-00-00 00:00:00' AS zeroed"),
         (error: Error) => {
           const failure = ((error.cause as Error).cause as Error);
           assert.equal(error.name, "QueryError");
           assert.equal(failure.name, "UnsupportedValueError");
-          assert.match(failure.message, /column "zoned" \(wire type 29, /);
+          assert.match(failure.message, /column "zeroed" \(wire type 22, /);
           return true;
         },
       );
@@ -945,7 +1517,6 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       const client = collectionClient();
       try {
         for (const expression of [
-          "CAST({DATETIMETZ'2024-01-02 03:04:05.678 +09:00'} AS SEQUENCE OF DATETIMETZ)",
           "CAST({X'0f'} AS SEQUENCE OF BLOB)",
         ]) {
           await assert.rejects(
@@ -1008,10 +1579,10 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
   describe("query handle release", () => {
     const TABLE = "integration_test_handles";
     const SELECT_ALL = `SELECT id, val FROM ${TABLE} ORDER BY id`;
-    // Only the last row has a TIMESTAMPTZ value, which has no decoder. Ascending
+    // Only the last row has a zero DATETIME, which has no JavaScript value. Ascending
     // order meets it in a FETCH reply, descending order in the first reply.
-    const UNSUPPORTED_IN_FETCH = `SELECT id, zoned FROM ${TABLE} ORDER BY id`;
-    const UNSUPPORTED_IN_FIRST_REPLY = `SELECT id, zoned FROM ${TABLE} ORDER BY id DESC`;
+    const UNSUPPORTED_IN_FETCH = `SELECT id, zeroed FROM ${TABLE} ORDER BY id`;
+    const UNSUPPORTED_IN_FIRST_REPLY = `SELECT id, zeroed FROM ${TABLE} ORDER BY id DESC`;
     const CAS_ER_SRV_HANDLE = -1006;
 
     /** Enough rows that the first response cannot carry them all. */
@@ -1048,6 +1619,15 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         if (response) {
           sent.push(payload[0]!);
         }
+        return response && tamper(payload[0]!, response);
+      };
+
+      const releaseOnSession = cas.releaseOnSession.bind(cas);
+      cas.releaseOnSession = async (generation, header, payload) => {
+        const response = await releaseOnSession(generation, header, payload);
+        if (response) {
+          sent.push(payload[0]!);
+        }
         return response;
       };
 
@@ -1078,14 +1658,14 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       try {
         await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`);
         await adapter.query(
-          `CREATE TABLE ${TABLE} (id INT PRIMARY KEY, val VARCHAR(40), zoned TIMESTAMPTZ)`,
+          `CREATE TABLE ${TABLE} (id INT PRIMARY KEY, val VARCHAR(40), zeroed DATETIME)`,
         );
         await adapter.beginTransaction();
         for (let id = 0; id < ROW_COUNT; id += 1) {
           await adapter.query(`INSERT INTO ${TABLE} (id, val) VALUES (${id}, 'row ${id}')`);
         }
         await adapter.query(
-          `UPDATE ${TABLE} SET zoned = TIMESTAMPTZ'2020-01-02 03:04:05 +09:00' ` +
+          `UPDATE ${TABLE} SET zeroed = DATETIME'0000-00-00 00:00:00' ` +
             `WHERE id = ${ROW_COUNT - 1}`,
         );
         await adapter.commit();
@@ -1129,8 +1709,8 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         await assert.rejects(trace.adapter.query(UNSUPPORTED_IN_FETCH), QueryError);
 
         assert.ok(count(trace, CASFunctionCode.FETCH) > 0);
-        // The broker has marked the CAS released by now, so anything that goes
-        // through sendAndRecv() would reconnect and close nothing.
+        // The transaction has ended by now. A new session would accept the
+        // release and close nothing, and fetchCode() below shows this one did.
         assert.equal(count(trace, CASFunctionCode.CLOSE_REQ_HANDLE), 1);
         assert.equal(trace.cas.connectionGeneration, generation);
         assert.equal(await fetchCode(trace), CAS_ER_SRV_HANDLE);
@@ -1202,12 +1782,12 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     test("attempts no release on a socket lost during FETCH, then recovers", async () => {
       const trace = await open((_code, response) => response);
       const internals = trace.cas as unknown as { socket: { destroy(): void } };
-      const sendAndRecv = trace.cas.sendAndRecv;
-      trace.cas.sendAndRecv = async (header, payload) => {
+      const sendAndRecvOnSession = trace.cas.sendAndRecvOnSession;
+      trace.cas.sendAndRecvOnSession = async (generation, header, payload) => {
         if (payload[0] === CASFunctionCode.FETCH) {
           internals.socket.destroy();
         }
-        return sendAndRecv(header, payload);
+        return sendAndRecvOnSession(generation, header, payload);
       };
 
       try {
@@ -1277,10 +1857,10 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
           const adapter = new NativeCubridAdapter(config);
           await adapter.connect();
           const cas = (adapter as unknown as { cas: CASConnection }).cas;
-          const sendAndRecv = cas.sendAndRecv.bind(cas);
-          cas.sendAndRecv = (header, payload) => {
+          const sendAndRecvOnSession = cas.sendAndRecvOnSession.bind(cas);
+          cas.sendAndRecvOnSession = (generation, header, payload) => {
             fetches += payload[0] === CASFunctionCode.FETCH ? 1 : 0;
-            return sendAndRecv(header, payload);
+            return sendAndRecvOnSession(generation, header, payload);
           };
           return adapter;
         },
@@ -1460,7 +2040,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         await cas.connect();
         const generation = cas.connectionGeneration;
 
-        // sendAndRecvOnSession() because sendAndRecv() would reconnect once
+        // sendAndRecvOnSession() because sendAndRecv() would send CHECK_CAS once
         // CAS_INFO reports the transaction ended, which is the moment of interest.
         const exchange = async (request: { header: Buffer; payload: Buffer }): Promise<Buffer> => {
           const response = await cas.sendAndRecvOnSession(
@@ -1605,6 +2185,199 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
   // Structured server errors: each of these failures really happens on the server
   // -------------------------------------------------------------------------
 
+  describe("autocommit statements on one session", () => {
+    const TABLE = "cc_keep_session";
+
+    function casOf(adapter: NativeCubridAdapter): CASConnection {
+      return (adapter as unknown as { cas: CASConnection }).cas;
+    }
+
+    test("consecutive autocommit statements share one session and its state", async () => {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+      await adapter.connect();
+      const cas = casOf(adapter);
+      const generation = cas.connectionGeneration;
+      const sessionId = cas.sessionId;
+
+      try {
+        await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await adapter.query("SET @cc_keep_session = 171");
+        await adapter.query(`CREATE TABLE ${TABLE} (id INT PRIMARY KEY)`);
+        await adapter.query(`INSERT INTO ${TABLE} VALUES (1)`);
+        await assert.rejects(adapter.query(`INSERT INTO ${TABLE} VALUES (1)`), ConstraintError);
+        await adapter.query(`UPDATE ${TABLE} SET id = 2`);
+        await adapter.ping();
+        assert.deepEqual(await adapter.query(`SELECT id FROM ${TABLE}`), [{ id: 2 }]);
+        await adapter.beginTransaction();
+        await adapter.query(`DELETE FROM ${TABLE}`);
+        await adapter.commit();
+        assert.deepEqual(await adapter.query(`SELECT id FROM ${TABLE}`), []);
+
+        // A variable is lost with its session, so this shows the server agrees.
+        assert.deepEqual(await adapter.query("SELECT CAST(@cc_keep_session AS INT) AS kept"), [
+          { kept: 171 },
+        ]);
+        assert.equal(cas.connectionGeneration, generation);
+        assert.equal(cas.sessionId, sessionId);
+      } finally {
+        await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`).catch(() => {});
+        await adapter.close();
+      }
+    });
+
+    test("a large autocommit SELECT and the statements after it share one session", async () => {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+      await adapter.connect();
+      const cas = casOf(adapter);
+      const generation = cas.connectionGeneration;
+
+      try {
+        await adapter.query("SELECT 1 FROM db_root");
+        const rows = await adapter.query("SELECT a.class_name FROM db_class a, db_class b LIMIT 500");
+        assert.equal(rows.length, 500);
+        await adapter.query("SELECT 1 FROM db_root");
+        await adapter.query("SELECT 1 FROM db_root");
+        assert.equal(cas.connectionGeneration, generation);
+      } finally {
+        await adapter.close();
+      }
+    });
+
+    test("a lock timeout set in autocommit applies to a later transaction", async () => {
+      const holder = new NativeCubridAdapter(TEST_CONFIG);
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+      await holder.connect();
+      await adapter.connect();
+      let release: NodeJS.Timeout | undefined;
+
+      try {
+        await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await adapter.query(`CREATE TABLE ${TABLE} (id INT PRIMARY KEY, n INT)`);
+        await adapter.query(`INSERT INTO ${TABLE} VALUES (1, 0)`);
+
+        await holder.beginTransaction();
+        await holder.query(`UPDATE ${TABLE} SET n = 1 WHERE id = 1`);
+
+        await adapter.query("SET TRANSACTION LOCK TIMEOUT 1");
+        await adapter.beginTransaction();
+
+        // The lock is freed in time for a statement that ignored the setting to
+        // finish, so the test ends either way and that statement fails it.
+        release = setTimeout(() => void holder.rollback(), 6000);
+        await assert.rejects(
+          adapter.query(`UPDATE ${TABLE} SET n = 2 WHERE id = 1`),
+          LockTimeoutError,
+        );
+      } finally {
+        clearTimeout(release);
+        await adapter.rollback().catch(() => {});
+        await holder.rollback().catch(() => {});
+        await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`).catch(() => {});
+        await adapter.close();
+        await holder.close();
+      }
+    });
+
+    test("execute() on a kept session never reports a value left by an earlier statement", async () => {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+      await adapter.connect();
+      const cas = casOf(adapter);
+      const keyed = `${TABLE}_keyed`;
+      const plain = `${TABLE}_plain`;
+      const insertPlain = `INSERT INTO ${plain} VALUES (1)`;
+      const insertKeyed = `INSERT INTO ${keyed} (n) VALUES (1)`;
+
+      try {
+        await adapter.query(`DROP TABLE IF EXISTS ${keyed}`);
+        await adapter.query(`DROP TABLE IF EXISTS ${plain}`);
+        await adapter.query(`CREATE TABLE ${keyed} (id INT AUTO_INCREMENT(100, 1) PRIMARY KEY, n INT)`);
+        await adapter.query(`CREATE TABLE ${plain} (n INT)`);
+        const generation = cas.connectionGeneration;
+
+        assert.deepEqual(await adapter.execute(insertKeyed), { affectedRows: 1, lastInsertId: 100 });
+        assert.deepEqual(await adapter.execute(insertPlain), { affectedRows: 1 });
+
+        await adapter.query(insertKeyed);
+        assert.deepEqual(await adapter.execute(insertPlain), { affectedRows: 1 });
+
+        await adapter.beginTransaction();
+        assert.deepEqual(await adapter.execute(insertKeyed), { affectedRows: 1, lastInsertId: 102 });
+        await adapter.rollback();
+        assert.deepEqual(await adapter.execute(insertPlain), { affectedRows: 1 });
+
+        await adapter.beginTransaction();
+        assert.deepEqual(await adapter.execute(insertKeyed), { affectedRows: 1, lastInsertId: 103 });
+        await adapter.commit();
+        await adapter.beginTransaction();
+        assert.deepEqual(await adapter.execute(insertPlain), { affectedRows: 1 });
+        await adapter.commit();
+
+        await assert.rejects(adapter.execute(`INSERT INTO ${keyed} (id, n) VALUES (103, 1)`), ConstraintError);
+        assert.deepEqual(await adapter.execute(insertPlain), { affectedRows: 1 });
+
+        await adapter.query(`REPLACE INTO ${keyed} (n) VALUES (1)`);
+        assert.deepEqual(await adapter.execute(insertPlain), { affectedRows: 1 });
+        assert.deepEqual(await adapter.execute(insertKeyed), { affectedRows: 1, lastInsertId: 105 });
+
+        assert.equal(cas.connectionGeneration, generation);
+      } finally {
+        await adapter.rollback().catch(() => {});
+        await adapter.query(`DROP TABLE IF EXISTS ${keyed}`).catch(() => {});
+        await adapter.query(`DROP TABLE IF EXISTS ${plain}`).catch(() => {});
+        await adapter.close();
+      }
+    });
+
+    test("a session cut after an autocommit statement is replaced without running SQL twice", async () => {
+      // A relay stands in for a CAS closing its socket, which a test cannot ask
+      // of a shared broker.
+      const sockets = new Set<Socket>();
+      const relay = createServer((client) => {
+        const upstream = netConnect(TEST_CONFIG.port, TEST_CONFIG.host);
+        for (const socket of [client, upstream]) {
+          sockets.add(socket);
+          socket.on("close", () => sockets.delete(socket));
+        }
+        client.on("error", () => upstream.destroy());
+        upstream.on("error", () => client.destroy());
+        client.pipe(upstream).pipe(client);
+      });
+      await new Promise<void>((resolve) => relay.listen(0, "127.0.0.1", resolve));
+      const { port } = relay.address() as { port: number };
+      const adapter = new NativeCubridAdapter({ ...TEST_CONFIG, port });
+      const observer = new NativeCubridAdapter(TEST_CONFIG);
+
+      try {
+        await adapter.connect();
+        await observer.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await observer.query(`CREATE TABLE ${TABLE} (id INT AUTO_INCREMENT PRIMARY KEY, n INT)`);
+
+        const cas = casOf(adapter);
+        const generation = cas.connectionGeneration;
+        await adapter.query(`INSERT INTO ${TABLE} (n) VALUES (1)`);
+        await adapter.query(`INSERT INTO ${TABLE} (n) VALUES (2)`);
+        assert.equal(cas.connectionGeneration, generation);
+
+        for (const socket of sockets) {
+          socket.destroy();
+        }
+        await adapter.query(`INSERT INTO ${TABLE} (n) VALUES (3)`);
+
+        assert.equal(cas.connectionGeneration, generation + 1);
+        assert.deepEqual(await observer.query(`SELECT n FROM ${TABLE} ORDER BY n`), [
+          { n: 1 },
+          { n: 2 },
+          { n: 3 },
+        ]);
+      } finally {
+        await observer.query(`DROP TABLE IF EXISTS ${TABLE}`).catch(() => {});
+        await observer.close();
+        await adapter.close();
+        relay.close();
+      }
+    });
+  });
+
   describe("server error details", () => {
     const PARENT = "cc_err_parent";
     const CHILD = "cc_err_child";
@@ -1640,8 +2413,6 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
 
     /**
      * Makes each adapter wait for the row the other has already locked.
-     * SET TRANSACTION LOCK TIMEOUT runs inside the transaction because, sent in
-     * autocommit before beginTransaction(), a later statement still waited forever.
      */
     async function deadlock(
       first: NativeCubridAdapter,
@@ -1802,7 +2573,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
 
       try {
         const error = await failure(() =>
-          client.query("SELECT TIMESTAMPTZ'2020-01-02 03:04:05 +09:00' AS zoned"),
+          client.query("SELECT DATETIME'0000-00-00 00:00:00' AS zeroed"),
         );
         let current: unknown = error;
         while (current instanceof Error && current.name !== "UnsupportedValueError") {
@@ -2037,6 +2808,56 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
           await victim.commit();
 
           assert.deepEqual(await committedRows(), [earlierRow]);
+        });
+        await removeRows();
+      });
+
+      test("a transaction() callback that swallows -72 rejects and commits nothing", async () => {
+        await withAdapters(async (first, second) => {
+          let bothHoldLocks: () => void = () => undefined;
+          let arrived = 0;
+          const locksHeld = new Promise<void>((resolve) => {
+            bothHoldLocks = resolve;
+          });
+
+          // Each callback writes a row, locks its own row, then asks for the other's.
+          const contend = (adapter: NativeCubridAdapter, own: number, other: number, row: number) =>
+            createClient({ ...TEST_CONFIG, connectionFactory: () => adapter }).transaction(
+              async (tx) => {
+                await tx.execute(`INSERT INTO ${ROWS} VALUES (${row}, 'row${row}', 0)`);
+                await tx.execute(`UPDATE ${ROWS} SET n = n + 1 WHERE id = ${own}`);
+                arrived += 1;
+                if (arrived === 2) {
+                  bothHoldLocks();
+                }
+                await locksHeld;
+                await new Promise((resolve) => setTimeout(resolve, own === 1 ? 0 : 200));
+
+                const updated = await tx
+                  .execute(`UPDATE ${ROWS} SET n = n + 1 WHERE id = ${other}`)
+                  .then(
+                    () => true,
+                    () => false,
+                  );
+
+                // The survivor gives its work back, so only the victim's outcome is tested.
+                if (updated) {
+                  await tx.rollback();
+                }
+              },
+            );
+
+          const results = await Promise.allSettled([
+            contend(first, 1, 2, FIRST_ROW),
+            contend(second, 2, 1, SECOND_ROW),
+          ]);
+          const failures = rejections(results);
+
+          assert.equal(failures.length, 1);
+          assert.ok(failures[0] instanceof TransactionError);
+          assert.equal(failures[0].code, -72);
+          assert.equal(failures[0].kind, "deadlock");
+          assert.deepEqual(await committedRows(), []);
         });
         await removeRows();
       });
@@ -2857,6 +3678,626 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
   // -------------------------------------------------------------------------
   // Close behavior
   // -------------------------------------------------------------------------
+
+  describe("prepared binding", () => {
+    const TYPES = "cc_prep_types";
+    const ROWS = "cc_prep_rows";
+    const AI = "cc_prep_ai";
+    const CAS_ER_SRV_HANDLE = -1006;
+    const WHEN = new Date(Date.UTC(2024, 1, 29, 13, 45, 56, 789));
+    const COLUMNS = [
+      "c_short", "c_int", "c_big", "c_float", "c_double", "c_money", "c_num", "c_char", "c_var",
+      "c_nchar", "c_date", "c_time", "c_dt", "c_ts", "c_bit", "c_vbit", "c_enum",
+    ];
+    const INSERT_TYPES = `INSERT INTO ${TYPES} (k, ${COLUMNS.join(", ")}) VALUES (?, ${COLUMNS.map(() => "?").join(", ")})`;
+
+    interface Trace {
+      adapter: NativeCubridAdapter;
+      cas: CASConnection;
+      sent: number[];
+      handle: () => number;
+    }
+
+    /** Observe every request and let `tamper` replace the response decoded by the adapter. */
+    async function open(
+      tamper: (functionCode: number, response: Buffer) => Buffer = (_code, response) => response,
+    ): Promise<Trace> {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+      await adapter.connect();
+      const cas = (adapter as unknown as { cas: CASConnection }).cas;
+      const sent: number[] = [];
+      let handle = -1;
+
+      const sendAndRecv = cas.sendAndRecv.bind(cas);
+      cas.sendAndRecv = async (header, payload) => {
+        sent.push(payload[0]!);
+        const response = await sendAndRecv(header, payload);
+        if (payload[0] === CASFunctionCode.PREPARE && response.readInt32BE(0) >= 0) {
+          handle = response.readInt32BE(0);
+        }
+        return tamper(payload[0]!, response);
+      };
+
+      const sendAndRecvOnSession = cas.sendAndRecvOnSession.bind(cas);
+      cas.sendAndRecvOnSession = async (generation, header, payload) => {
+        const response = await sendAndRecvOnSession(generation, header, payload);
+        if (response) {
+          sent.push(payload[0]!);
+        }
+        return response && tamper(payload[0]!, response);
+      };
+
+      const releaseOnSession = cas.releaseOnSession.bind(cas);
+      cas.releaseOnSession = async (generation, header, payload) => {
+        const response = await releaseOnSession(generation, header, payload);
+        if (response) {
+          sent.push(payload[0]!);
+        }
+        return response;
+      };
+
+      return { adapter, cas, sent, handle: () => handle };
+    }
+
+    /** The server's verdict on the last handle, without the adapter in the way. */
+    async function fetchCode(trace: Trace): Promise<number> {
+      const { cas } = trace;
+      const { header, payload } = writeFetch(trace.handle(), 0, 1, cas.casInfo);
+      const response = await cas.sendAndRecvOnSession(cas.connectionGeneration, header, payload);
+      assert.ok(response, "the session is still open");
+      return response.readInt32BE(0) < 0 ? response.readInt32BE(4) : 0;
+    }
+
+    /** Whether `run` succeeds or fails, the handle it prepared must be gone from the server. */
+    async function assertReleasedAfter(trace: Trace, run: () => Promise<unknown>): Promise<void> {
+      const prepares = trace.sent.filter((code) => code === CASFunctionCode.PREPARE).length;
+      await run().catch(() => undefined);
+      assert.equal(
+        trace.sent.filter((code) => code === CASFunctionCode.PREPARE).length,
+        prepares + 1,
+        "the statement was prepared",
+      );
+      assert.equal(await fetchCode(trace), CAS_ER_SRV_HANDLE);
+    }
+
+    test("create the tables", async () => {
+      const client = createClient(TEST_CONFIG);
+      try {
+        for (const table of [TYPES, ROWS, AI]) {
+          await client.query(`DROP TABLE IF EXISTS ${table}`);
+        }
+        await client.query(`CREATE TABLE ${TYPES} (
+          k INT, c_short SMALLINT, c_int INT, c_big BIGINT, c_float FLOAT, c_double DOUBLE,
+          c_money MONETARY, c_num NUMERIC(38,4), c_char CHAR(12), c_var VARCHAR(80),
+          c_nchar NCHAR VARYING(40), c_date DATE, c_time TIME, c_dt DATETIME, c_ts TIMESTAMP,
+          c_bit BIT(16), c_vbit BIT VARYING(64), c_enum ENUM('a', 'b'))`);
+        await client.query(`CREATE TABLE ${ROWS} (id INT PRIMARY KEY, n INT, big NUMERIC(38,0))`);
+        await client.query(`CREATE TABLE ${AI} (id INT AUTO_INCREMENT PRIMARY KEY, v INT)`);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("every supported column type stores the same value as the literal path", async () => {
+      const client = createClient(TEST_CONFIG);
+      const buffer = Buffer.from([0xab, 0xcd]);
+      const cases: QueryParams[] = [
+        [12, 1234, 9007199254740993n, 1.5, 0.1, 19.99, 12345.6789, "abc", "text", null, WHEN, WHEN, WHEN, WHEN, buffer, buffer, "a"],
+        [-12, -1234, -5000000000, -2.25, -1e300, -1, -0.5, "", "", null, WHEN, WHEN, WHEN, WHEN, buffer, buffer, "b"],
+        [true, false, 42, 42, 42, 42, 42, 42, 42, null, WHEN, WHEN, WHEN, WHEN, buffer, buffer, 1],
+        COLUMNS.map(() => null),
+      ];
+
+      try {
+        for (const [index, values] of cases.entries()) {
+          await client.query(`DELETE FROM ${TYPES}`);
+          await client.query(INSERT_TYPES, [1, ...values]);
+          await client.queryPrepared(INSERT_TYPES, [2, ...values]);
+          const rows = await client.query<Record<string, unknown>>(
+            `SELECT ${COLUMNS.join(", ")} FROM ${TYPES} ORDER BY k`,
+          );
+
+          assert.equal(rows.length, 2, `case ${index}`);
+          assert.deepEqual(rows[1], rows[0], `case ${index}`);
+        }
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("text cannot be bound to NCHAR on either path", async () => {
+      const client = createClient(TEST_CONFIG);
+      const insert = `INSERT INTO ${TYPES} (k, c_nchar) VALUES (?, ?)`;
+      const code = (error: unknown): unknown => (error as QueryError).code;
+      try {
+        const literal = await client.query(insert, [1, "abc"]).catch(code);
+        const prepared = await client.queryPrepared(insert, [1, "abc"]).catch(code);
+        assert.equal(literal, -494);
+        assert.equal(prepared, literal);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("a NULL bind is SQL NULL in every column and in a comparison", async () => {
+      const client = createClient(TEST_CONFIG);
+      try {
+        await client.query(`DELETE FROM ${TYPES}`);
+        await client.queryPrepared(INSERT_TYPES, [1, ...COLUMNS.map(() => null)]);
+        const nulls = COLUMNS.map((column) => `${column} IS NULL AS ${column}`).join(", ");
+        const [row] = await client.query<Record<string, unknown>>(`SELECT ${nulls} FROM ${TYPES}`);
+
+        assert.ok(row);
+        assert.deepEqual(new Set(Object.values(row)), new Set([1]));
+        assert.deepEqual(
+          await client.queryPrepared(`SELECT k FROM ${TYPES} WHERE c_int = ?`, [null]),
+          [],
+        );
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("BLOB and CLOB columns hold the same bytes as the literal path", async () => {
+      const client = createClient(TEST_CONFIG);
+      const table = "cc_prep_lob";
+      try {
+        await client.query(`DROP TABLE IF EXISTS ${table}`);
+        await client.query(`CREATE TABLE ${table} (k INT, b BLOB, c CLOB)`);
+        const insert = `INSERT INTO ${table} VALUES (?, ?, ?)`;
+        await client.query(insert, [1, Buffer.from([1, 2, 3]), "clob text"]);
+        await client.queryPrepared(insert, [2, Buffer.from([1, 2, 3]), "clob text"]);
+
+        const rows = await client.query<{ b: string; c: string }>(
+          `SELECT TO_CHAR(BIT_LENGTH(BLOB_TO_BIT(b))) AS b, CLOB_TO_CHAR(c) AS c FROM ${table} ORDER BY k`,
+        );
+        assert.deepEqual(rows[1], rows[0]);
+        assert.deepEqual(rows[0], { b: "24", c: "clob text" });
+      } finally {
+        await client.query(`DROP TABLE IF EXISTS ${table}`);
+        await client.close();
+      }
+    });
+
+    test("text binds arrive unchanged, whatever SQL they look like", async () => {
+      const client = createClient(TEST_CONFIG);
+      const values = [
+        "it's", "double\"quote", "back\\slash", "\\'", "line\nbreak\r", "한글", "", "ab  ",
+        "100%_", "?", "-- comment", "/* comment */", "'; DROP TABLE cc_prep_rows; --",
+      ];
+      try {
+        for (const value of values) {
+          await client.query(`DELETE FROM ${TYPES}`);
+          await client.queryPrepared(`INSERT INTO ${TYPES} (k, c_var) VALUES (?, ?)`, [1, value]);
+
+          const rows = await client.queryPrepared<{ c_var: string }>(
+            `SELECT c_var FROM ${TYPES} WHERE c_var = ?`,
+            [value],
+          );
+          assert.deepEqual(rows, [{ c_var: value }]);
+        }
+        // COUNT(*) is INT before 11.4 and BIGINT from 11.4 on.
+        const [count] = await client.query<{ n: number | bigint }>(`SELECT COUNT(*) AS n FROM ${ROWS}`);
+        assert.equal(Number(count?.n), 0);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("a marker with no type at PREPARE returns each value in its own type", async () => {
+      const client = createClient(TEST_CONFIG);
+      const select = async (value: QueryParam): Promise<unknown> =>
+        (await client.queryPrepared<{ v: unknown }>("SELECT ? AS v FROM db_root", [value]))[0]?.v;
+      try {
+        assert.equal(await select(7), 7);
+        assert.equal(await select(true), 1);
+        assert.equal(await select(12345678901), 12345678901n);
+        assert.equal(await select(12345678901n), 12345678901n);
+        assert.equal(await select(1.5), 1.5);
+        assert.equal(await select("x"), "x");
+        assert.equal(await select(""), "");
+        assert.equal(await select(null), null);
+        assert.deepEqual(await select(Buffer.from([1, 2])), Buffer.from([1, 2]));
+        assert.equal(await select(10n ** 38n - 1n), String(10n ** 38n - 1n));
+        assert.equal(await select(1n - 10n ** 38n), String(1n - 10n ** 38n));
+        assert.ok((await select(WHEN)) instanceof Date);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("number and bigint limits keep their value", async () => {
+      const client = createClient(TEST_CONFIG);
+      const largest = 10n ** 38n - 1n;
+      try {
+        await client.query(`DELETE FROM ${ROWS}`);
+        const insert = `INSERT INTO ${ROWS} (id, big) VALUES (?, ?)`;
+        await client.queryPrepared(insert, [1, largest]);
+        await client.queryPrepared(insert, [2, -largest]);
+        await client.queryPrepared(insert, [3, 2n ** 63n]);
+        assert.deepEqual(await client.query(`SELECT big FROM ${ROWS} ORDER BY id`), [
+          { big: String(largest) },
+          { big: String(-largest) },
+          { big: "9223372036854775808" },
+        ]);
+
+        await client.query(`DELETE FROM ${TYPES}`);
+        const sum = 0.1 + 0.2;
+        await client.queryPrepared(`INSERT INTO ${TYPES} (k, c_double, c_big) VALUES (?, ?, ?)`, [
+          1,
+          sum,
+          2 ** 60,
+        ]);
+        assert.deepEqual(await client.query(`SELECT c_double, c_big FROM ${TYPES}`), [
+          { c_double: sum, c_big: 2n ** 60n },
+        ]);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("every statement of a multi-statement string runs, as on the literal path", async () => {
+      const client = createClient(TEST_CONFIG);
+      try {
+        await client.query(`DELETE FROM ${ROWS}`);
+        const result = await client.executePrepared(
+          `INSERT INTO ${ROWS} (id, n) VALUES (?, ?); INSERT INTO ${ROWS} (id, n) VALUES (?, ?)`,
+          [1, 10, 2, 20],
+        );
+
+        assert.equal(result.affectedRows, 2);
+        assert.deepEqual(await client.query(`SELECT id, n FROM ${ROWS} ORDER BY id`), [
+          { id: 1, n: 10 },
+          { id: 2, n: 20 },
+        ]);
+        const multiSelect = "SELECT 1 AS a FROM db_root; SELECT 2 AS b FROM db_root";
+        assert.deepEqual(
+          await client.queryPrepared(multiSelect),
+          await client.query(multiSelect),
+        );
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("rows past the first reply arrive by FETCH with the same column metadata", async () => {
+      const client = createClient(TEST_CONFIG);
+      const count = 1000;
+      try {
+        await client.query(`DELETE FROM ${ROWS}`);
+        const values = Array.from({ length: count }, (_, i) => `(${i}, ${i})`).join(", ");
+        await client.query(`INSERT INTO ${ROWS} (id, n) VALUES ${values}`);
+        const sql = `SELECT id, n FROM ${ROWS} WHERE id >= ? ORDER BY id`;
+
+        const prepared = await client.queryResultPrepared(sql, [0]);
+        const literal = await client.queryResult(sql, [0]);
+
+        assert.equal(prepared.rows.length, count);
+        assert.deepEqual(prepared, literal);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("an autocommit statement is committed at once, and a failed one leaves nothing", async () => {
+      const client = createClient(TEST_CONFIG);
+      const observer = createClient(TEST_CONFIG);
+      try {
+        await client.query(`DELETE FROM ${ROWS}`);
+        await client.queryPrepared(`INSERT INTO ${ROWS} (id, n) VALUES (?, ?)`, [1, 1]);
+        assert.equal((await observer.query(`SELECT id FROM ${ROWS}`)).length, 1);
+
+        await assert.rejects(
+          client.executePrepared(
+            `INSERT INTO ${ROWS} (id, n) VALUES (?, ?); INSERT INTO ${ROWS} (id, n) VALUES (?, ?)`,
+            [2, 2, 1, 1],
+          ),
+          ConstraintError,
+        );
+        assert.equal((await observer.query(`SELECT id FROM ${ROWS}`)).length, 1);
+      } finally {
+        await client.close();
+        await observer.close();
+      }
+    });
+
+    test("executePrepared reports the row count and the generated id", async () => {
+      const client = createClient(TEST_CONFIG);
+      try {
+        const first = await client.executePrepared(`INSERT INTO ${AI} (v) VALUES (?)`, [1]);
+        const second = await client.executePrepared(`INSERT INTO ${AI} (v) VALUES (?)`, [2]);
+        assert.equal(first.affectedRows, 1);
+        assert.equal(typeof first.lastInsertId, "number");
+        assert.equal(second.lastInsertId, Number(first.lastInsertId) + 1);
+
+        const update = await client.executePrepared(`UPDATE ${AI} SET v = ? WHERE v > ?`, [9, 0]);
+        assert.equal(update.affectedRows, 2);
+        assert.equal(update.lastInsertId, undefined);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("a transaction keeps prepared statements until it commits or rolls back", async () => {
+      const client = createClient(TEST_CONFIG);
+      const observer = createClient(TEST_CONFIG);
+      try {
+        await client.query(`DELETE FROM ${ROWS}`);
+        await client.transaction(async (tx) => {
+          await tx.executePrepared(`INSERT INTO ${ROWS} (id) VALUES (?)`, [1]);
+          assert.deepEqual(await observer.query(`SELECT id FROM ${ROWS}`), []);
+          assert.deepEqual(await tx.queryPrepared(`SELECT id FROM ${ROWS} WHERE id = ?`, [1]), [
+            { id: 1 },
+          ]);
+        });
+        assert.equal((await observer.query(`SELECT id FROM ${ROWS}`)).length, 1);
+
+        await assert.rejects(
+          client.transaction(async (tx) => {
+            await tx.queryPrepared(`INSERT INTO ${ROWS} (id) VALUES (?)`, [2]);
+            throw new Error("undo");
+          }),
+          TransactionError,
+        );
+        assert.equal((await observer.query(`SELECT id FROM ${ROWS}`)).length, 1);
+      } finally {
+        await client.close();
+        await observer.close();
+      }
+    });
+
+    test("the handle is gone from the server after every way a statement can end", async () => {
+      const trace = await open();
+      const { adapter } = trace;
+      try {
+        await adapter.query(`DELETE FROM ${ROWS}`);
+        await adapter.beginTransaction();
+        await adapter.query(`INSERT INTO ${ROWS} (id, n) VALUES (1, 1), (2, 2)`);
+        const big = Array.from({ length: 1000 }, (_, i) => `(${i + 10}, ${i})`).join(", ");
+        await adapter.query(`INSERT INTO ${ROWS} (id, n) VALUES ${big}`);
+
+        for (const run of [
+          () => adapter.queryPrepared("SELECT ? AS v FROM db_root", [1]),
+          () => adapter.queryPrepared(`SELECT id FROM ${ROWS} WHERE id >= ?`, [0]),
+          () => adapter.executePrepared(`UPDATE ${ROWS} SET n = ? WHERE id = ?`, [5, 1]),
+          // The value fails at EXECUTE.
+          () => adapter.queryPrepared("SELECT CAST(? AS INT) AS v FROM db_root", ["abc"]),
+          // The statement fails at EXECUTE, after a successful PREPARE.
+          () => adapter.executePrepared(`INSERT INTO ${ROWS} (id) VALUES (?)`, [1]),
+          // Too few values: refused between PREPARE and EXECUTE.
+          () => adapter.queryPrepared("SELECT ?, ? FROM db_root", [1]),
+          // Too many values.
+          () => adapter.queryPrepared("SELECT 1 FROM db_root", [1]),
+          // A value that cannot be decoded: the zero date has no Date.
+          () => adapter.queryPrepared("SELECT CAST(? AS DATETIME) AS z FROM db_root", ["0000-00-00 00:00:00"]),
+        ]) {
+          await assertReleasedAfter(trace, run);
+        }
+      } finally {
+        await adapter.rollback().catch(() => undefined);
+        await adapter.close();
+      }
+    });
+
+    test("an autocommit statement releases its handle and ends its transaction", async () => {
+      const trace = await open();
+      try {
+        await trace.adapter.queryPrepared("SELECT ? AS v FROM db_root", [1]);
+        assert.deepEqual(trace.sent, [
+          CASFunctionCode.PREPARE,
+          CASFunctionCode.EXECUTE,
+          CASFunctionCode.END_TRAN,
+          CASFunctionCode.CLOSE_REQ_HANDLE,
+        ]);
+        assert.equal(trace.cas.casInfo[0], 0);
+      } finally {
+        await trace.adapter.close();
+      }
+    });
+
+    test("a failed PREPARE leaves no transaction open on an autocommit connection", async () => {
+      const trace = await open();
+      try {
+        await assert.rejects(trace.adapter.queryPrepared("SELEC ?", [1]), SqlSyntaxError);
+        assert.deepEqual(trace.sent, [CASFunctionCode.PREPARE, CASFunctionCode.END_TRAN]);
+        assert.equal(trace.cas.casInfo[0], 0);
+      } finally {
+        await trace.adapter.close();
+      }
+    });
+
+    test("a refused value sends nothing", async () => {
+      const trace = await open();
+      try {
+        for (const value of [
+          Number.NaN,
+          Number.POSITIVE_INFINITY,
+          Buffer.alloc(0),
+          "a\0b",
+          "a\x1ab",
+          10n ** 38n,
+          new Date(Number.NaN),
+          new Date("0000-06-01T00:00:00Z"),
+        ]) {
+          await assert.rejects(trace.adapter.queryPrepared("SELECT ? FROM db_root", [value]), QueryError);
+        }
+        assert.deepEqual(trace.sent, []);
+      } finally {
+        await trace.adapter.close();
+      }
+    });
+
+    test("the next statement after a replaced session prepares again and reuses nothing", async () => {
+      const trace = await open();
+      const internals = trace.cas as unknown as { socket: { destroy(): void } };
+      try {
+        await trace.adapter.queryPrepared("SELECT ? AS v FROM db_root", [1]);
+        internals.socket.destroy();
+        await new Promise((resolve) => setImmediate(resolve));
+        const sent = trace.sent.length;
+
+        assert.deepEqual(
+          await trace.adapter.queryPrepared("SELECT ? AS v FROM db_root", [2]),
+          [{ v: 2 }],
+        );
+        assert.equal(trace.sent[sent], CASFunctionCode.PREPARE);
+      } finally {
+        await trace.adapter.close();
+      }
+    });
+
+    test("a socket lost at EXECUTE sends no release, and the next statement recovers", async () => {
+      const trace = await open();
+      const internals = trace.cas as unknown as { socket: { destroy(): void } };
+      const sendOnSession = trace.cas.sendAndRecvOnSession;
+      trace.cas.sendAndRecvOnSession = async (generation, header, payload) => {
+        if (payload[0] === CASFunctionCode.EXECUTE) {
+          internals.socket.destroy();
+        }
+        return sendOnSession(generation, header, payload);
+      };
+
+      try {
+        await assert.rejects(trace.adapter.queryPrepared("SELECT ? AS v FROM db_root", [1]), QueryError);
+        assert.equal(trace.sent.includes(CASFunctionCode.CLOSE_REQ_HANDLE), false);
+
+        trace.cas.sendAndRecvOnSession = sendOnSession;
+        assert.deepEqual(await trace.adapter.queryPrepared("SELECT ? AS v FROM db_root", [2]), [
+          { v: 2 },
+        ]);
+      } finally {
+        await trace.adapter.close();
+      }
+    });
+
+    test("a malformed EXECUTE reply drops the session, so the statement cannot commit", async () => {
+      const trace = await open((code, response) =>
+        code === CASFunctionCode.EXECUTE ? response.subarray(0, 6) : response,
+      );
+      const observer = createClient(TEST_CONFIG);
+      try {
+        await observer.query(`DELETE FROM ${ROWS}`);
+        await assert.rejects(
+          trace.adapter.executePrepared(`INSERT INTO ${ROWS} (id) VALUES (?)`, [1]),
+          QueryError,
+        );
+
+        assert.equal(trace.cas.isConnected, false);
+        assert.deepEqual(await observer.query(`SELECT id FROM ${ROWS}`), []);
+      } finally {
+        await trace.adapter.close();
+        await observer.close();
+      }
+    });
+
+    test("a transaction that lost its session refuses prepared statements", async () => {
+      const trace = await open();
+      const internals = trace.cas as unknown as { socket: { destroy(): void } };
+      const observer = createClient(TEST_CONFIG);
+      try {
+        await observer.query(`DELETE FROM ${ROWS}`);
+        await trace.adapter.beginTransaction();
+        await trace.adapter.executePrepared(`INSERT INTO ${ROWS} (id) VALUES (?)`, [1]);
+        internals.socket.destroy();
+        await new Promise((resolve) => setImmediate(resolve));
+
+        await assert.rejects(
+          trace.adapter.executePrepared(`INSERT INTO ${ROWS} (id) VALUES (?)`, [2]),
+          (error: QueryError) => error.kind === "connection-lost",
+        );
+        await assert.rejects(trace.adapter.commit(), TransactionError);
+        assert.deepEqual(await observer.query(`SELECT id FROM ${ROWS}`), []);
+      } finally {
+        await trace.adapter.close();
+        await observer.close();
+      }
+    });
+
+    test("a deadlock victim at EXECUTE blocks later statements until rollback", async () => {
+      const seed = createClient(TEST_CONFIG);
+      const first = new NativeCubridAdapter(TEST_CONFIG);
+      const second = new NativeCubridAdapter(TEST_CONFIG);
+      const update = `UPDATE ${ROWS} SET n = n + 1 WHERE id = ?`;
+      try {
+        await seed.query(`DELETE FROM ${ROWS}`);
+        await seed.query(`INSERT INTO ${ROWS} (id, n) VALUES (1, 0), (2, 0)`);
+        await first.connect();
+        await second.connect();
+        await first.beginTransaction();
+        await second.beginTransaction();
+        await first.executePrepared(update, [1]);
+        await second.executePrepared(update, [2]);
+
+        const results = await Promise.allSettled([
+          first.executePrepared(update, [2]),
+          new Promise((resolve) => setTimeout(resolve, 200)).then(() =>
+            second.executePrepared(update, [1]),
+          ),
+        ]);
+        const failed = results.findIndex((result) => result.status === "rejected");
+        const victim = failed === 0 ? first : second;
+        const reason = (results[failed] as PromiseRejectedResult).reason as QueryError;
+
+        assert.ok(reason instanceof DeadlockError);
+        assert.equal(reason.code, -72);
+        await assert.rejects(victim.executePrepared(update, [1]), DeadlockError);
+        await victim.rollback();
+      } finally {
+        await first.rollback().catch(() => undefined);
+        await second.rollback().catch(() => undefined);
+        await first.close();
+        await second.close();
+        await seed.close();
+      }
+    });
+
+    test("a read timeout at EXECUTE stays a ReadTimeoutError and drops the session", async () => {
+      const impatient = new NativeCubridAdapter({ ...TEST_CONFIG, readTimeout: 2000 });
+      const holder = new NativeCubridAdapter(TEST_CONFIG);
+      const update = `UPDATE ${ROWS} SET n = n + 1 WHERE id = ?`;
+      try {
+        await holder.beginTransaction();
+        await holder.executePrepared(update, [1]);
+        await impatient.connect();
+        await impatient.beginTransaction();
+
+        await assert.rejects(impatient.executePrepared(update, [1]), ReadTimeoutError);
+        await assert.rejects(impatient.executePrepared(update, [1]), QueryError);
+      } finally {
+        await holder.rollback().catch(() => undefined);
+        await holder.close();
+        await impatient.rollback().catch(() => undefined);
+        await impatient.close().catch(() => undefined);
+      }
+    });
+
+    test("overlapping prepared and literal statements return exactly their own rows", async () => {
+      const client = createClient(TEST_CONFIG);
+      try {
+        const results = await Promise.all(
+          Array.from({ length: 20 }, (_, i) =>
+            i % 2 === 0
+              ? client.queryPrepared<{ v: number }>("SELECT ? AS v FROM db_root", [i])
+              : client.query<{ v: number }>("SELECT ? AS v FROM db_root", [i]),
+          ),
+        );
+        assert.deepEqual(results.map((rows) => rows[0]?.v), results.map((_, i) => i));
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("drop the tables", async () => {
+      const client = createClient(TEST_CONFIG);
+      try {
+        for (const table of [TYPES, ROWS, AI]) {
+          await client.query(`DROP TABLE IF EXISTS ${table}`);
+        }
+      } finally {
+        await client.close();
+      }
+    });
+  });
 
   test("close is safe to call multiple times", async () => {
     const client = createClient(TEST_CONFIG);

@@ -183,3 +183,43 @@ test("a closed client rejects schema calls and opens no connection", async () =>
   await assert.rejects(() => client.getTables(), QueryError);
   assert.equal(opened, 0);
 });
+
+// Schema lookup can start before close() but issue further catalog requests later.
+for (const method of ["getColumns", "getIndexes", "getPrimaryKey"] as const) {
+  test(`close() waits for in-flight ${method}`, async () => {
+    const connection = new CatalogConnection();
+    connection.views.db_class = [{ class_name: "t", owner_name: "DBA" }];
+    let firstQueryStarted!: () => void;
+    let releaseFirstQuery!: () => void;
+    const started = new Promise<void>((resolve) => { firstQueryStarted = resolve; });
+    const gate = new Promise<void>((resolve) => { releaseFirstQuery = resolve; });
+    const query = connection.query.bind(connection);
+    const requests: string[] = [];
+    let closedCount = 0;
+    connection.query = async <T extends Row = Row>(sql: string, params?: QueryParams): Promise<T[]> => {
+      requests.push(sql);
+      const rows = await query<T>(sql, params);
+      if (sql.includes("FROM db_class")) {
+        firstQueryStarted();
+        await gate;
+      }
+      return rows;
+    };
+    connection.close = async () => { closedCount += 1; };
+    const client = clientWith(connection);
+    const ongoing = client[method]("t");
+    await started;
+    let closeCompleted = false;
+    const closing = client.close().then(() => { closeCompleted = true; });
+    await Promise.resolve();
+    assert.equal(closedCount, 0);
+    assert.equal(closeCompleted, false);
+    await assert.rejects(() => client.getTables(), QueryError);
+    releaseFirstQuery();
+    await ongoing;
+    await closing;
+    assert.equal(closedCount, 1);
+    assert.equal(requests.length, method === "getColumns" ? 2 : 3);
+    await assert.rejects(() => client[method]("t"), QueryError);
+  });
+}

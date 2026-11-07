@@ -14,6 +14,7 @@ import {
   SIZE_DATA_LENGTH,
   SIZE_BROKER_INFO,
   CAS_PROTOCOL_VERSION,
+  CASFunctionCode,
 } from "../src/protocol/constants.js";
 
 // ---------------------------------------------------------------------------
@@ -1094,20 +1095,158 @@ test("CASConnection sends requests after a broker redirect", async () => {
   }
 });
 
-test("CASConnection connectionGeneration changes on a transparent reconnect", async () => {
-  const released = Buffer.from([0x00, 0x02, 0x03, 0x04]);
-  const { server, port } = await brokerWith((socket) => socket.write(frameResponse(released)));
+/** CAS_INFO status of a reply: no transaction is open. */
+const OUT_TRAN = Buffer.from([0x00, 0x02, 0x03, 0x04]);
+
+/**
+ * A broker whose sessions report each CAS request as `session:function code`,
+ * and answer it through `onRequest`. The sessions count up from 1.
+ */
+async function recordingBroker(
+  onRequest: (socket: NetSocket, code: number, session: number) => void,
+): Promise<{ server: Server; port: number; requests: string[] }> {
+  const requests: string[] = [];
+  let sessions = 0;
+  const { server, port } = await createMockBroker((socket) => {
+    const session = ++sessions;
+    socket.on("error", () => {});
+    socket.once("data", () => {
+      socket.write(Buffer.alloc(4));
+      socket.once("data", () => {
+        socket.write(frameResponse(buildOpenDbResponse(session)));
+        socket.on("data", (data) => {
+          const code = (data as Buffer)[8]!;
+          requests.push(`${session}:${code}`);
+          onRequest(socket, code, session);
+        });
+      });
+    });
+  });
+  return { server, port, requests };
+}
+
+const REQUEST = REQUEST_PAYLOAD[0];
+const CHECK_CAS: number = CASFunctionCode.CHECK_CAS;
+/** The payload above is 1, which is END_TRAN's code; this one is an ordinary request. */
+const STATEMENT = Buffer.from([CASFunctionCode.PREPARE_AND_EXECUTE]);
+
+test("an OUT_TRAN reply keeps the session, verified by one CHECK_CAS before the next request", async () => {
+  const replies = [OUT_TRAN, CAS_INFO, CAS_INFO];
+  const { server, port, requests } = await recordingBroker((socket, code) => {
+    socket.write(frameResponse(code === CHECK_CAS ? CAS_INFO : replies.shift()!));
+  });
 
   try {
-    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
-    await cas.connect();
-    assert.equal(cas.connectionGeneration, 1);
+    await withConnection(port, async (cas) => {
+      await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+      await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+      // That reply reported a transaction, so the next request needs no probe.
+      await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
 
-    await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
-    await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+      assert.deepEqual(requests, [`1:${REQUEST}`, `1:${CHECK_CAS}`, `1:${REQUEST}`, `1:${REQUEST}`]);
+      assert.equal(cas.connectionGeneration, 1);
+    });
+  } finally {
+    await closeServer(server);
+  }
+});
 
-    assert.equal(cas.connectionGeneration, 2);
-    await cas.close();
+test("a session settled by ensureSession() is not probed again by its request", async () => {
+  // Even a server that kept reporting OUT_TRAN to CHECK_CAS gets one probe only.
+  const { server, port, requests } = await recordingBroker((socket) => {
+    socket.write(frameResponse(OUT_TRAN));
+  });
+
+  try {
+    await withConnection(port, async (cas) => {
+      await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+      await cas.ensureSession();
+      await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+
+      assert.deepEqual(requests, [`1:${REQUEST}`, `1:${CHECK_CAS}`, `1:${REQUEST}`]);
+    });
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("an OUT_TRAN reply stays counted through a probe and later replies, unless it answers END_TRAN", async () => {
+  const { server, port } = await recordingBroker((socket, code) => {
+    socket.write(frameResponse(code === CHECK_CAS ? CAS_INFO : OUT_TRAN));
+  });
+
+  try {
+    await withConnection(port, async (cas) => {
+      await cas.sendAndRecv(REQUEST_HEADER, STATEMENT);
+      await cas.ensureSession();
+
+      assert.equal(cas.casInfo[0], 1);
+      assert.equal(cas.outOfTransactionReplies, 1);
+
+      await cas.sendAndRecv(REQUEST_HEADER, Buffer.from([CASFunctionCode.END_TRAN]));
+      assert.equal(cas.outOfTransactionReplies, 1);
+    });
+  } finally {
+    await closeServer(server);
+  }
+});
+
+const ERROR_REPLY = Buffer.from("ffffffff0000232700", "hex");
+
+for (const [failure, failProbe] of [
+  ["closes the socket", (socket: NetSocket) => socket.destroy()],
+  ["resets the socket", (socket: NetSocket) => socket.resetAndDestroy()],
+  ["answers with an error", (socket: NetSocket) => socket.write(frameResponse(Buffer.concat([CAS_INFO, ERROR_REPLY])))],
+  ["sends an impossible frame", (socket: NetSocket) => socket.write(frameHeader(-5))],
+  ["stays silent", () => {}],
+] as const) {
+  test(`a CAS that ${failure} on the probe is replaced before the request is first sent`, { timeout: 5000 }, async () => {
+    const { server, port, requests } = await recordingBroker((socket, code, session) => {
+      if (code === CHECK_CAS && session === 1) {
+        failProbe(socket);
+      } else {
+        socket.write(frameResponse(session === 1 ? OUT_TRAN : CAS_INFO));
+      }
+    });
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port, readTimeout: 200 });
+
+    try {
+      await cas.connect();
+      await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+
+      await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+
+      assert.deepEqual(requests, [`1:${REQUEST}`, `1:${CHECK_CAS}`, `2:${REQUEST}`]);
+      assert.equal(cas.connectionGeneration, 2);
+      // No statement had an unknown outcome, so nothing queued may be failed.
+      assert.equal(cas.failedExchanges, 0);
+    } finally {
+      await cas.close();
+      await closeServer(server);
+    }
+  });
+}
+
+test("the CAS closing right after its reply is noticed without a probe on the dead socket", async () => {
+  const { server, port, requests } = await recordingBroker((socket, _code, session) => {
+    if (session === 1) {
+      socket.end(frameResponse(OUT_TRAN));
+    } else {
+      socket.write(frameResponse(CAS_INFO));
+    }
+  });
+
+  try {
+    await withConnection(port, async (cas) => {
+      await cas.sendAndRecv(REQUEST_HEADER, STATEMENT);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      await cas.ensureSession();
+
+      assert.deepEqual(requests, [`1:${STATEMENT[0]}`]);
+      assert.equal(cas.connectionGeneration, 2);
+      assert.equal(cas.outOfTransactionReplies, 1);
+    });
   } finally {
     await closeServer(server);
   }
@@ -1456,7 +1595,7 @@ test("readTimeout rejects when OpenDatabase is never answered, and connect can r
   }
 });
 
-test("readTimeout bounds the transparent reconnect of a released CAS", { timeout: 5000 }, async () => {
+test("readTimeout bounds the replacement of a CAS that stopped answering", { timeout: 5000 }, async () => {
   let connections = 0;
   const { server, port } = await createMockBroker((socket) => {
     const connection = ++connections;

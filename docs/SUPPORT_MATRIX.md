@@ -76,6 +76,14 @@ BLOB and CLOB reads are asserted the same way, against local `cubrid/cubrid` 10.
 several LOB_READ replies, a multibyte CLOB, the size limit and transaction
 behavior ([#93](https://github.com/cubrid-lab/cubrid-client/issues/93)).
 
+Prepared binding is asserted against local `cubrid/cubrid` 10.2, 11.0, 11.2 and
+11.4 containers with statement pooling on, and on 11.4 again with
+`STATEMENT_POOLING=OFF`: every supported column type against the literal path,
+SQL NULL, text, number and bigint limits, multi-statement strings, FETCH,
+autocommit and transactions, and the release of each handle on every way a
+statement ends, together with a lost socket, a malformed reply, a deadlock and a
+read timeout ([#85](https://github.com/cubrid-lab/cubrid-client/issues/85)).
+
 ## Release-blocking coverage still needed
 
 - [#95](https://github.com/cubrid-lab/cubrid-client/issues/95):
