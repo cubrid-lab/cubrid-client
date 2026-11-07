@@ -84,8 +84,8 @@ await db.close();
 
 See [CUBRID-to-JavaScript type behavior](docs/TYPES.md) for the current
 result and input mapping, including `BIGINT` as `bigint`, decimal `NUMERIC`
-as `string`, and unsupported collection/JSON values. The
-[roadmap](ROADMAP.md) tracks work that has **not** been released.
+as `string`, SET/MULTISET/SEQUENCE collections as arrays, and unsupported
+JSON values. The [roadmap](ROADMAP.md) tracks work that has **not** been released.
 
 ## Typed Queries
 

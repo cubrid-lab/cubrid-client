@@ -550,6 +550,171 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
   });
 
   // -------------------------------------------------------------------------
+  // Collections (#82)
+  // -------------------------------------------------------------------------
+
+  describe("collection columns", () => {
+    const TABLE = "integration_collections";
+    const collectionClient = () => createClient(TEST_CONFIG);
+
+    test("SET, MULTISET and SEQUENCE keep their documented semantics and the next column", async () => {
+      const client = collectionClient();
+      try {
+        await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await client.query(
+          `CREATE TABLE ${TABLE} (id INT PRIMARY KEY, s SET OF INT, m MULTISET OF VARCHAR(20), ` +
+            "q SEQUENCE OF BIGINT, after_collections VARCHAR(10))",
+        );
+        await client.query(
+          `INSERT INTO ${TABLE} VALUES (1, {3,1,2,2}, {'b','a','b'}, {30000000000,1,1}, 'one')`,
+        );
+        await client.query(`INSERT INTO ${TABLE} VALUES (2, {}, {}, {}, 'two')`);
+        await client.query(`INSERT INTO ${TABLE} VALUES (3, NULL, NULL, NULL, 'three')`);
+        await client.query(
+          `INSERT INTO ${TABLE} VALUES (4, {NULL}, {NULL,'x'}, {NULL,5,NULL}, 'four')`,
+        );
+
+        const rows = await client.query(`SELECT * FROM ${TABLE} ORDER BY id`);
+        assert.deepEqual(rows, [
+          {
+            id: 1,
+            s: [1, 2, 3],
+            m: ["a", "b", "b"],
+            q: [30000000000n, 1n, 1n],
+            after_collections: "one",
+          },
+          { id: 2, s: [], m: [], q: [], after_collections: "two" },
+          { id: 3, s: null, m: null, q: null, after_collections: "three" },
+          { id: 4, s: [null], m: ["x", null], q: [null, 5n, null], after_collections: "four" },
+        ]);
+      } finally {
+        await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await client.close();
+      }
+    });
+
+    test("collection rows decode across more than one FETCH", async () => {
+      const client = collectionClient();
+      try {
+        await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await client.query(
+          `CREATE TABLE ${TABLE} (id INT PRIMARY KEY, q SEQUENCE OF INT, label VARCHAR(10))`,
+        );
+        // 150 rows pass the 100-row fetch size, as in the multi-fetch test above.
+        for (let i = 0; i < 150; i++) {
+          await client.query(`INSERT INTO ${TABLE} VALUES (${i}, {${i},${i}}, 'row${i}')`);
+        }
+
+        const rows = await client.query(`SELECT id, q, label FROM ${TABLE} ORDER BY id`);
+        assert.equal(rows.length, 150);
+        assert.deepEqual(rows[0], { id: 0, q: [0, 0], label: "row0" });
+        assert.deepEqual(rows[149], { id: 149, q: [149, 149], label: "row149" });
+      } finally {
+        await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await client.close();
+      }
+    });
+
+    test("each supported element type decodes like its scalar column", async () => {
+      const client = collectionClient();
+      const cases: Array<[string, unknown[]]> = [
+        ["CAST({1} AS SEQUENCE OF SMALLINT)", [1]],
+        ["CAST({1,2} AS SEQUENCE OF INT)", [1, 2]],
+        ["CAST({1.5} AS SEQUENCE OF FLOAT)", [1.5]],
+        ["CAST({1.5,2.5} AS SEQUENCE OF DOUBLE)", [1.5, 2.5]],
+        ["CAST({1} AS SEQUENCE OF MONETARY)", [1]],
+        ["CAST({12.50} AS SEQUENCE OF NUMERIC(6,2))", ["12.50"]],
+        ["CAST({'ab'} AS SEQUENCE OF CHAR(4))", ["ab  "]],
+        ["CAST({'\ud55c\uae00',''} AS SEQUENCE OF VARCHAR(10))", ["\ud55c\uae00", ""]],
+        ["CAST({1,2} AS SET OF ENUM('a','b'))", ["a", "b"]],
+        ["CAST({X'0f'} AS SEQUENCE OF BIT VARYING(8))", [Buffer.from([0x0f])]],
+        ["CAST({X''} AS SEQUENCE OF BIT VARYING(8))", [Buffer.alloc(0)]],
+        ["CAST({DATE'2024-01-02'} AS SEQUENCE OF DATE)", [new Date(2024, 0, 2)]],
+        ["CAST({TIME'03:04:05'} AS SEQUENCE OF TIME)", [new Date(1970, 0, 1, 3, 4, 5)]],
+        [
+          "CAST({TIMESTAMP'2024-01-02 03:04:05'} AS SEQUENCE OF TIMESTAMP)",
+          [new Date(2024, 0, 2, 3, 4, 5)],
+        ],
+        [
+          "CAST({DATETIME'2024-01-02 03:04:05.678'} AS SEQUENCE OF DATETIME)",
+          [new Date(2024, 0, 2, 3, 4, 5, 678)],
+        ],
+      ];
+      try {
+        for (const [expression, expected] of cases) {
+          const rows = await client.query(`SELECT ${expression} AS c, 'after' AS t`);
+          assert.deepEqual(rows, [{ c: expected, t: "after" }], expression);
+        }
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("nested collections decode recursively", async () => {
+      const client = collectionClient();
+      try {
+        assert.deepEqual(await client.query("SELECT {{1,2},{'a'}} AS c, 'after' AS t"), [
+          { c: [[1, 2], ["a"]], t: "after" },
+        ]);
+        assert.deepEqual(await client.query("SELECT {{},{1}} AS c, {NULL,{1}} AS d, 'after' AS t"), [
+          { c: [[], [1]], d: [null, [1]], t: "after" },
+        ]);
+        assert.deepEqual(await client.query("SELECT {{{1}}} AS c, 'after' AS t"), [
+          { c: [[[1]]], t: "after" },
+        ]);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("the server sends a mixed-type collection as NULL; a cast reads it", async () => {
+      const client = collectionClient();
+      try {
+        await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await client.query(`CREATE TABLE ${TABLE} (id INT PRIMARY KEY, u SET)`);
+        await client.query(`INSERT INTO ${TABLE} VALUES (1, {1,'a'})`);
+        await client.query(`INSERT INTO ${TABLE} VALUES (2, {2,3})`);
+
+        // The bytes of row 1 equal a genuine NULL, so the driver cannot tell them apart.
+        assert.deepEqual(await client.query(`SELECT id, u FROM ${TABLE} ORDER BY id`), [
+          { id: 1, u: null },
+          { id: 2, u: [2, 3] },
+        ]);
+        assert.deepEqual(
+          await client.query(`SELECT CAST(u AS SET OF VARCHAR(20)) AS u FROM ${TABLE} ORDER BY id`),
+          [{ u: ["1", "a"] }, { u: ["2", "3"] }],
+        );
+      } finally {
+        await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await client.close();
+      }
+    });
+
+    test("an unsupported element rejects and leaves the session usable", async () => {
+      const client = collectionClient();
+      try {
+        for (const expression of [
+          "CAST({DATETIMETZ'2024-01-02 03:04:05.678 +09:00'} AS SEQUENCE OF DATETIMETZ)",
+          "CAST({X'0f'} AS SEQUENCE OF BLOB)",
+        ]) {
+          await assert.rejects(
+            () => client.query(`SELECT ${expression} AS c, 'after' AS t`),
+            (error: Error) => {
+              assert.ok(error instanceof QueryError);
+              return true;
+            },
+          );
+        }
+        assert.deepEqual(await client.query("SELECT {1} AS c, 'after' AS t"), [
+          { c: [1], t: "after" },
+        ]);
+      } finally {
+        await client.close();
+      }
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // SQL syntax error
   // -------------------------------------------------------------------------
 

@@ -2,6 +2,14 @@ type QueryParam = string | number | boolean | bigint | Date | Buffer | null;
 type QueryParams = readonly QueryParam[];
 
 type QueryResultRow = Record<string, unknown>;
+/** One decoded SET, MULTISET or SEQUENCE element. */
+type CollectionElement = string | number | bigint | Date | Buffer | null | CollectionElement[];
+/**
+ * A decoded SET, MULTISET or SEQUENCE column value, in the order the server sent
+ * it. SET values arrive without duplicates and MULTISET values keep them; both
+ * use a server-defined order, and only SEQUENCE keeps the stored order.
+ */
+type CollectionValue = CollectionElement[];
 
 /**
  * TLS/SSL options for connecting to an SSL-enabled CUBRID broker (`SSL=ON`).
@@ -183,4 +191,4 @@ declare function buildWhere(conditions: Record<string, unknown>): {
     params: unknown[];
 };
 
-export { type ClientConfig, type ClientOptions, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, CubridClient, CubridTransaction, NativeCubridAdapter, QueryError, type QueryParam, type QueryParams, type QueryResultRow, type Queryable, ReadTimeoutError, type TransactionCallback, type TransactionClient, TransactionError, buildWhere, createClient, escapeIdentifier, parseConnectionString };
+export { type ClientConfig, type ClientOptions, type CollectionElement, type CollectionValue, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, CubridClient, CubridTransaction, NativeCubridAdapter, QueryError, type QueryParam, type QueryParams, type QueryResultRow, type Queryable, ReadTimeoutError, type TransactionCallback, type TransactionClient, TransactionError, buildWhere, createClient, escapeIdentifier, parseConnectionString };

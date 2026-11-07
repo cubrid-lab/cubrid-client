@@ -33,7 +33,8 @@ production compatibility from a small successful fixture.
 | One-connection query ordering | Internal queue | CAS send/receive FIFO serialization | Verify concurrent FETCH + transaction cases [#114](https://github.com/cubrid-lab/cubrid-client/issues/114) |
 | BIGINT | CCI wire ID 21 in source; returned JS representation needs comparison | `bigint`, ID 21 | Independent ID fixture added; live value precision and mapping [#81](https://github.com/cubrid-lab/cubrid-client/issues/81) |
 | NUMERIC, time/date | Original decoder behavior per version | NUMERIC string, Date decoded in process local timezone | Conversion differences may be intentional or unstable [#113](https://github.com/cubrid-lab/cubrid-client/issues/113) |
-| SET, MULTISET, SEQUENCE, JSON | Historical implementation may have type/version limits | Unsupported non-NULL values reject explicitly | Intentionally not advertised as decoded [#82](https://github.com/cubrid-lab/cubrid-client/issues/82), [#111](https://github.com/cubrid-lab/cubrid-client/issues/111) |
+| SET, MULTISET, SEQUENCE | Historical implementation may have type/version limits | Arrays, checked on live 10.2, 11.0, 11.2 and 11.4 ([collection columns](TYPES.md#collection-columns)) | Not compared with the original driver [#118](https://github.com/cubrid-lab/cubrid-client/issues/118) |
+| JSON | Historical implementation may have type/version limits | Unsupported non-NULL values reject explicitly | Intentionally not advertised as decoded [#111](https://github.com/cubrid-lab/cubrid-client/issues/111) |
 | BLOB/CLOB | Explicit LOB packets in original | No verified full LOB read/write API | Feature gap, not a promise of parity [#93](https://github.com/cubrid-lab/cubrid-client/issues/93), [#103](https://github.com/cubrid-lab/cubrid-client/issues/103) |
 | Native bind/prepared SQL | `executeWithTypedParams` | Client-side SQL interpolation for `query(sql, params)` | Deliberate different behavior, opt-in native binding tracked [#85](https://github.com/cubrid-lab/cubrid-client/issues/85) |
 | Multiple hosts / connection retries | Uses host fallback and retry counter | `maxConnectionRetryCount` accepted but not effective | **Known functional gap** [#83](https://github.com/cubrid-lab/cubrid-client/issues/83) |
@@ -51,7 +52,7 @@ and a successful query after a rejected query.
 
 This is a starting scope, **not** proof of every item in the matrix. In
 particular, cross-driver date, 64-bit integer precision, large FETCH, LOB
-and version-specific JSON/collection semantics need separately reviewed
+and version-specific JSON semantics and cross-driver collection results need separately reviewed
 fixtures before full production readiness. Do not label absent fixtures
 "passing". See [#118](https://github.com/cubrid-lab/cubrid-client/issues/118)
 and [release validation gate](https://github.com/cubrid-lab/cubrid-client/issues/120).

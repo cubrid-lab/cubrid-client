@@ -97,6 +97,19 @@ export class PacketReader {
     return raw.subarray(0, end).toString("utf-8");
   }
 
+  /**
+   * Bound a reader to the next `length` bytes and move this reader past them.
+   * A value decoded from the returned reader cannot read beyond its declared
+   * length, and this reader stays aligned on the following value whatever the
+   * decoder does.
+   */
+  subReader(length: number): PacketReader {
+    this.assertAvailable(length);
+    const reader = new PacketReader(this.buf.subarray(this.offset, this.offset + length));
+    this.offset += length;
+    return reader;
+  }
+
   /** Parse CAS_INFO (4 bytes). */
   parseCASInfo(): Buffer {
     return this.parseBytes(SIZE_CAS_INFO);

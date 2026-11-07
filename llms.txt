@@ -9,6 +9,7 @@ Key facts:
 - Connect: `createClient({ host: "localhost", port: 33000, database: "demodb", user: "dba" })`
 - Query: `await db.query<User>("SELECT * FROM users WHERE id = ?", [1])`
 - Transactions: `await db.transaction(async (tx) => { await tx.query(...) })`
+- Collections: SET, MULTISET and SEQUENCE columns return JavaScript arrays (`CollectionValue`); `{1,'a'}`-style mixed-type collections arrive from the server as SQL NULL
 - Error classes: `ConnectionError`, `QueryError`, `TransactionError`, `ReadTimeoutError`
 - ESM and CommonJS output
 - Node.js 18+ support
