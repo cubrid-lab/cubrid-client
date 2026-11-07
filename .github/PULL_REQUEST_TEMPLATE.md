@@ -50,3 +50,9 @@
 - [ ] Do not confuse local build/offline tests with actual live CUBRID SQL execution. Record the database/version and count of executed integration cases when claiming that behavior.
 - [ ] Node.js engine range, npm package exports, TypeScript declarations, and versioned dependency constraints are reviewed if relevant; no silent compatibility-breaking setup change.
 - [ ] Required final-head CI and release checks remain in place; missing/failed/skipped checks are reported truthfully and a docs-only shortcut is **not** a release verification.
+
+## Repository-owned change and reference review
+
+- [ ] The title, rationale, expected behavior, ADR context and release notes describe **cubrid-client**'s own responsibility (Node.js/TypeScript CAS driver and npm consumer contract), not work to replicate another repository's design or release.
+- [ ] Cross-repository links, if any, are necessary for an actual supported dependency/consumer interface, an independent CUBRID/JDBC comparison, or explicitly scoped coordination. They are context, not substituted test evidence or tracking ownership.
+- [ ] Issue/PR/ADR text does not contain pasted tooling, API names, version rules, or test claims belonging to an unrelated language or repository.
