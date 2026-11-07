@@ -6,7 +6,7 @@
 
 ## Context
 
-`cubrid-client` is the Node.js CUBRID driver, distinct from the Rust crate with the same package name. Its published Node 1.x API is documented in `docs/API_STABILITY.md`. The project's role is CAS protocol, connections, query/prepared execution, result and type conversion, typed errors, streaming and transaction safety. Drizzle's CUBRID dialect belongs to `drizzle-cubrid`. The pycubrid project supplies researched CAS and failure regressions, **not** a TypeScript API to port.
+`cubrid-client` is a Node.js/TypeScript CUBRID driver with its own 1.x API contract documented in `docs/API_STABILITY.md`. The driver owns CAS protocol transport, connections, query/prepared execution, result and type conversion, typed errors, streaming, and transaction safety. ORM-specific query generation and migrations are outside this driver's responsibilities.
 
 ## Decision
 
@@ -16,18 +16,18 @@ Retain a Node-native, Promise-oriented client with explicit boundaries:
 - A reconnect is a new physical session generation. Handles, cursors and LOB resources from the previous session must not be used in the replacement. A normal `OUT_TRAN` transaction status must not itself trigger a reconnect.
 - Never reissue SQL whose server execution may have occurred. Distinguish safe connect-only retries from uncertain query, FETCH, COMMIT or ROLLBACK outcomes. Propagate accurate failure information rather than success/default values.
 - Preserve distinct `query()` row behavior and `execute()` DML result metadata; maintain TypeScript, ESM and CommonJS public contracts in released artifacts.
-- Delegate ORM SQL compilation, schema inference, dialect type declarations and migrations to the separately versioned `drizzle-cubrid` adapter.
+- Leave ORM SQL compilation, schema inference, ORM type declarations, and migrations to consumers and separately maintained integrations; this package does not own their implementation or release schedules.
 - Limit changes to the stable 1.x surface according to published SemVer and tested compatibility. The design/sign-off checklist requires **real CUBRID** independent evidence before new correctness claims.
 
 ## Alternatives considered
 
-- **Rejected:** Import MySQL or Drizzle SQL compilation into this driver; it would invert ownership and confuse transport with ORM semantics.
-- **Rejected:** Copy Python DB-API classes and exception names; it violates Node/TypeScript expectations and does not preserve published 1.x consumers.
+- **Rejected:** Embed ORM-specific SQL compilation inside the CAS driver; it would confuse driver transport responsibilities with application-level SQL generation.
+- **Rejected:** Replace the documented Node.js Promise API and typed errors with an incompatible interface; that would break published 1.x consumers.
 - **Rejected:** Retry every network error or return `null` for unrecognized values; it can duplicate writes or silently corrupt data.
 
 ## Consequences and trade-offs
 
-The driver requires careful lifecycle tests and may retire ambiguous sessions rather than transparently reconnecting. The Drizzle adapter must maintain its own SQL/ORM integration checks and verified dependency range. Existing feature defects remain tracked and are not solved by accepting this ADR.
+The driver requires careful lifecycle tests and may retire ambiguous sessions rather than transparently reconnecting. Consumers and external integrations must verify their own compatibility independently. Existing feature defects remain tracked and are not solved by accepting this ADR.
 
 ## Verification / acceptance criteria
 
