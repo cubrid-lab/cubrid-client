@@ -95,6 +95,19 @@ that cannot be decoded. The [roadmap](ROADMAP.md) tracks work that has **not** b
 const version = await db.getServerVersion(); // "11.4.6.1963"
 ```
 
+## Schema Introspection
+
+`getTables()`, `getColumns()`, `getPrimaryKey()` and `getIndexes()` return typed metadata read from the catalog views, which behave the same on CUBRID 10.2 to 11.4. Pass the bare table name; matching ignores case, and a `schema` option picks the owner when CUBRID 11.2 or later has the same table name under several users.
+
+```ts
+const tables = await db.getTables(); // [{ name: "athlete", schema: "DBA", type: "table" }, ...]
+const columns = await db.getColumns("athlete"); // name, position, dataType, precision, scale, nullable, defaultValue
+const pk = await db.getPrimaryKey("athlete"); // { name: "pk_athlete_code", columns: ["code"] } or null
+const indexes = await db.getIndexes("athlete"); // unique, reverse, primaryKey, foreignKey, filter, columns
+```
+
+The catalog lists only tables the connected user may `SELECT`, so an inaccessible table is absent from `getTables()` and rejects with a `QueryError` in the others. See the [API reference](docs/API_REFERENCE.md#schema-introspection-gettables-getcolumns-getprimarykey-getindexes) for names, owners, permissions and what is not included.
+
 ## Result Columns
 
 `query()` returns only rows. Use `queryResult()` to also get the type, precision, scale and nullability of each column, for example to know the type of a column that is NULL in every row:
