@@ -48,5 +48,5 @@
 
 - [ ] Clean checkout and native dependency install resolve without unexpected manifest/lockfile changes; report runtime/compiler version and result, or explain why not run.
 - [ ] Do not confuse local build/offline tests with actual live CUBRID SQL execution. Record the database/version and count of executed integration cases when claiming that behavior.
-- [ ] Public package engines, Go module path, Cargo MSRV/features and versioned dependency constraints are reviewed if relevant; no silent compatibility-breaking setup change.
+- [ ] Node.js engine range, npm package exports, TypeScript declarations, and versioned dependency constraints are reviewed if relevant; no silent compatibility-breaking setup change.
 - [ ] Required final-head CI and release checks remain in place; missing/failed/skipped checks are reported truthfully and a docs-only shortcut is **not** a release verification.
