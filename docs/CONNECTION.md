@@ -141,6 +141,31 @@ sequenceDiagram
     Client->>Conn1: Close Connection #1
 ```
 
+### Concurrent Statements on One Connection
+
+`query()`, `transaction()` statements, `commit()`, `rollback()`, `ping()` and `close()` can be issued at the same time, for example with `Promise.all`. The client runs the statements of one connection strictly in the order they were issued, each one finishing all its work (execute, every FETCH, handle release) before the next starts:
+
+```typescript
+// Safe: each promise gets exactly its own rows, however many FETCHes they need.
+const [users, orders] = await Promise.all([
+  db.query('SELECT * FROM users'),
+  db.query('SELECT * FROM orders'),
+]);
+```
+
+This is required rather than conservative. CUBRID closes every open cursor on a session when a transaction ends, and in autocommit mode a transaction ends with each DML statement, each failed statement, each `ping()` and each SELECT that reaches its last row. Only inside an open transaction can a session hold several live cursors, and `commit()` or `rollback()` closes them there too. The results of the live tests in `tests/integration.test.ts`:
+
+| Broker (image tag) | Several live handles in an open transaction | Several live handles in autocommit mode |
+|--------------------|---------------------------------------------|-----------------------------------------|
+| 10.2, 11.0, 11.2, 11.4 | Safe to interleave FETCHes | Not safe: the others fail with `-1012` once one ends the transaction |
+
+What this means for an application:
+
+- **Promises settle independently.** A failed statement rejects only its own promise. The statements around it still run.
+- **Concurrency does not make one connection faster.** Statements wait for each other, so a slow query delays the ones behind it. Waiting does not count towards `readTimeout`. For queries that must run in parallel, use several clients.
+- **`commit()`, `rollback()` and `close()` wait for the statements issued before them**, and apply only to those. A statement issued after `rollback()` runs outside that transaction.
+- **A lost connection fails the waiting queries too.** Queries that were waiting when a request failed on the connection reject without being sent, including those issued before a new client finished connecting. They are never retried, and the first query issued afterwards opens a new session. A failed connection attempt sends nothing, so a waiting query still makes its own attempt.
+
 ### Transaction Connection
 
 Each `db.transaction()` call creates an **isolated connection** that is independent of the shared connection. The isolated connection is automatically closed when the transaction completes:

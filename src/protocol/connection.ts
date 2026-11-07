@@ -78,6 +78,7 @@ export class CASConnection {
   private _sessionId = 0;
   private receiveBuffer: Buffer = Buffer.alloc(0);
   private _connectionGeneration = 0;
+  private _failedExchanges = 0;
 
   /**
    * Per-instance FIFO serialization queue. Public entry points that mutate
@@ -243,6 +244,7 @@ export class CASConnection {
     } catch (error) {
       // The stream position is unknown after a failed exchange, so this
       // socket can never be trusted to line up with the next frame.
+      this._failedExchanges += 1;
       this.retireSocket();
       throw error;
     }
@@ -345,6 +347,15 @@ export class CASConnection {
   /** Changes on every new session, including transparent reconnects. */
   get connectionGeneration(): number {
     return this._connectionGeneration;
+  }
+
+  /**
+   * Requests whose outcome is unknown because their exchange failed, across
+   * every session. The generation cannot show this: it also changes on each
+   * transparent reconnect. A failed connect sends no statement and is not counted.
+   */
+  get failedExchanges(): number {
+    return this._failedExchanges;
   }
 
   /** Whether the connection is currently open. */

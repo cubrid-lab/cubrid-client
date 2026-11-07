@@ -28,6 +28,12 @@ import type { QueryResultRow } from "../types/result.js";
 
 const DEFAULT_FETCH_SIZE = 100;
 
+/** The connection a query was issued on, and its failure count at that moment. */
+interface IssuedOn {
+  cas: CASConnection;
+  failedExchanges: number;
+}
+
 export class NativeCubridAdapter implements DriverAdapter {
   private cas: CASConnection | null = null;
   private autoCommit = true;
@@ -46,6 +52,12 @@ export class NativeCubridAdapter implements DriverAdapter {
    */
   private transactionGeneration: number | null = null;
 
+  /**
+   * Tail of the statement queue; see inTurn(). It never rejects, so one failed
+   * statement cannot block the ones behind it.
+   */
+  private statementQueue: Promise<void> = Promise.resolve();
+
   constructor(private readonly config: ClientConfig) {}
 
   async connect(): Promise<void> {
@@ -62,8 +74,18 @@ export class NativeCubridAdapter implements DriverAdapter {
     sql: string,
     params?: QueryParams,
   ): Promise<T[]> {
+    const cas = this.getOrCreateCAS();
+    const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
+    return this.inTurn(() => this.queryNow<T>(sql, params, issued));
+  }
+
+  private async queryNow<T extends QueryResultRow>(
+    sql: string,
+    params: QueryParams | undefined,
+    issued: IssuedOn,
+  ): Promise<T[]> {
     try {
-      return await this.executeQuery<T>(sql, params);
+      return await this.executeQuery<T>(sql, params, issued);
     } catch (error) {
       // If the first transactional statement lost its session before the
       // post-response bind, remember that failed generation. A ping/reconnect
@@ -74,6 +96,10 @@ export class NativeCubridAdapter implements DriverAdapter {
   }
 
   async beginTransaction(): Promise<void> {
+    return this.inTurn(() => this.beginTransactionNow());
+  }
+
+  private async beginTransactionNow(): Promise<void> {
     try {
       const cas = this.getOrCreateCAS();
 
@@ -94,6 +120,10 @@ export class NativeCubridAdapter implements DriverAdapter {
   }
 
   async commit(): Promise<void> {
+    return this.inTurn(() => this.commitNow());
+  }
+
+  private async commitNow(): Promise<void> {
     const cas = this.getOrCreateCAS();
 
     try {
@@ -118,6 +148,10 @@ export class NativeCubridAdapter implements DriverAdapter {
   }
 
   async rollback(): Promise<void> {
+    return this.inTurn(() => this.rollbackNow());
+  }
+
+  private async rollbackNow(): Promise<void> {
     const cas = this.getOrCreateCAS();
 
     try {
@@ -137,6 +171,10 @@ export class NativeCubridAdapter implements DriverAdapter {
   }
 
   async close(): Promise<void> {
+    return this.inTurn(() => this.closeNow());
+  }
+
+  private async closeNow(): Promise<void> {
     if (!this.cas) {
       return;
     }
@@ -160,6 +198,10 @@ export class NativeCubridAdapter implements DriverAdapter {
   }
 
   async ping(): Promise<string> {
+    return this.inTurn(() => this.pingNow());
+  }
+
+  private async pingNow(): Promise<string> {
     try {
       const cas = this.getOrCreateCAS();
 
@@ -177,15 +219,50 @@ export class NativeCubridAdapter implements DriverAdapter {
   // Internal helpers
   // ---------------------------------------------------------------------------
 
+  /**
+   * Run `statement` after every statement issued before it has settled.
+   *
+   * One query is several CAS requests (execute, FETCHes, handle release), and
+   * CASConnection only keeps those frames apart. A statement that ran between
+   * them would be unsafe: on CUBRID 10.2 to 11.4 the end of a transaction closes
+   * every other cursor on the session, and in autocommit mode that end comes
+   * with DML, an error, a ping or another query's last row. The CAS_INFO status
+   * of that reply then sends the next FETCH to a new session, where the same
+   * handle number can be another query's result. So at most one query
+   * lifecycle is live at a time. Autocommit could not do better; an open
+   * transaction could, but its commit and rollback would still have to wait.
+   *
+   * Nothing runs here but this adapter's own statements, so a statement can
+   * never wait on its own turn. Waiting does not count towards readTimeout.
+   */
+  private inTurn<T>(statement: () => Promise<T>): Promise<T> {
+    const turn = this.statementQueue.then(statement);
+    // The tail drops the result, so an idle connection does not keep its rows.
+    const settled = (): void => undefined;
+    this.statementQueue = turn.then(settled, settled);
+    return turn;
+  }
+
   private async executeQuery<T extends QueryResultRow>(
     sql: string,
-    params?: QueryParams,
+    params: QueryParams | undefined,
+    issued: IssuedOn,
   ): Promise<T[]> {
     const cas = this.getOrCreateCAS();
 
     // Reconnecting here would drop the earlier statements of this transaction
     // and let a later commit() persist only the ones that follow.
     this.assertTransactionSession(cas);
+
+    // A query that was waiting when an earlier request ended with an unknown
+    // outcome fails too, even if that session opened after this query was
+    // issued or a ping has since reconnected. Running it on a new session would
+    // hide that the statements before it may not have completed, and a hung
+    // server would hold every waiting query for its own readTimeout. The next
+    // query issued reconnects.
+    if (cas === issued.cas && cas.failedExchanges !== issued.failedExchanges) {
+      throw new Error("CASConnection is not connected");
+    }
 
     if (!cas.isConnected) {
       await cas.connect();

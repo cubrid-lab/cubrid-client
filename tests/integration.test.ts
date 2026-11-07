@@ -3,7 +3,8 @@
  *
  * Requires: a CUBRID broker on 127.0.0.1:33000 with database `testdb`
  * (user `dba`, empty password). Database-dependent cases self-skip when no
- * server is reachable. Set CUBRID_TEST_PORT to use another broker port.
+ * server is reachable. Set CUBRID_TEST_PORT to use another broker port, and
+ * CUBRID_CONCURRENCY_ROUNDS to repeat the overlapping-query tests more often.
  *
  * Run:  npm run test:integration
  */
@@ -15,8 +16,15 @@ import { NativeCubridAdapter } from "../src/adapters/native.js";
 import { ConnectionError } from "../src/errors/connection-error.js";
 import { QueryError } from "../src/errors/query-error.js";
 import { CASFunctionCode } from "../src/protocol/constants.js";
-import type { CASConnection } from "../src/protocol/connection.js";
-import { writeFetch } from "../src/protocol/protocol.js";
+import { CASConnection } from "../src/protocol/connection.js";
+import {
+  parseFetch,
+  parsePrepareAndExecute,
+  writeFetch,
+  writePrepareAndExecute,
+  type FetchResult,
+  type PrepareAndExecuteResult,
+} from "../src/protocol/protocol.js";
 
 const TEST_CONFIG = {
   host: "127.0.0.1",
@@ -932,6 +940,364 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     test("drops the table", async () => {
       const adapter = new NativeCubridAdapter(TEST_CONFIG);
       await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`);
+      await adapter.close();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Overlapping query lifecycles on one connection (#114)
+  // -------------------------------------------------------------------------
+
+  describe("overlapping query lifecycles on one connection", () => {
+    const TABLE = "integration_test_concurrent";
+    const WRITES = "integration_test_concurrent_writes";
+    const GROUPS = 6;
+    /** With PADDING, too much data for the first reply, whose limit is bytes rather than rows. */
+    const ROWS_PER_GROUP = 350;
+    const PADDING = "x".repeat(800);
+    const ROUNDS = Number(process.env.CUBRID_CONCURRENCY_ROUNDS ?? 3);
+
+    const selectGroup = (group: number): string =>
+      `SELECT id, grp, pad FROM ${TABLE} WHERE grp = ${group} ORDER BY id`;
+
+    function assertOwnRows(rows: unknown[], group: number): void {
+      const expected = Array.from({ length: ROWS_PER_GROUP }, (_unused, index) => ({
+        id: group * ROWS_PER_GROUP + index,
+        grp: group,
+        pad: PADDING,
+      }));
+      assert.deepEqual(rows, expected);
+    }
+
+    /** A client whose connections count every FETCH they send. */
+    function tracedClient(): { client: ReturnType<typeof createClient>; fetches: () => number } {
+      let fetches = 0;
+      const client = createClient({
+        ...TEST_CONFIG,
+        connectionFactory: async (config) => {
+          const adapter = new NativeCubridAdapter(config);
+          await adapter.connect();
+          const cas = (adapter as unknown as { cas: CASConnection }).cas;
+          const sendAndRecv = cas.sendAndRecv.bind(cas);
+          cas.sendAndRecv = (header, payload) => {
+            fetches += payload[0] === CASFunctionCode.FETCH ? 1 : 0;
+            return sendAndRecv(header, payload);
+          };
+          return adapter;
+        },
+      });
+      return { client, fetches: () => fetches };
+    }
+
+    test("creates tables whose rows need FETCH", async () => {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+
+      try {
+        await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await adapter.query(`DROP TABLE IF EXISTS ${WRITES}`);
+        await adapter.query(
+          `CREATE TABLE ${TABLE} (id INT PRIMARY KEY, grp INT, pad VARCHAR(1000))`,
+        );
+        await adapter.query(`CREATE TABLE ${WRITES} (id INT)`);
+        await adapter.beginTransaction();
+        for (let group = 0; group < GROUPS; group += 1) {
+          for (let index = 0; index < ROWS_PER_GROUP; index += 1) {
+            const id = group * ROWS_PER_GROUP + index;
+            await adapter.query(`INSERT INTO ${TABLE} VALUES (${id}, ${group}, '${PADDING}')`);
+          }
+        }
+        await adapter.commit();
+      } finally {
+        await adapter.close();
+      }
+    });
+
+    test("Promise.all SELECTs return exactly their own rows in every round", async () => {
+      const { client, fetches } = tracedClient();
+
+      try {
+        for (let round = 0; round < ROUNDS; round += 1) {
+          const groups = Array.from({ length: GROUPS }, (_unused, group) => group);
+          const results = await Promise.all(groups.map((group) => client.query(selectGroup(group))));
+          groups.forEach((group) => assertOwnRows(results[group]!, group));
+        }
+        assert.ok(fetches() > 0, "the test proves nothing unless these rows needed FETCH");
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("parameterized Promise.all SELECTs return exactly their own rows", async () => {
+      const { client, fetches } = tracedClient();
+
+      try {
+        const groups = [0, 1, 2];
+        const results = await Promise.all(
+          groups.map((group) =>
+            client.query(`SELECT id, grp, pad FROM ${TABLE} WHERE grp = ? ORDER BY id`, [group]),
+          ),
+        );
+        groups.forEach((group) => assertOwnRows(results[group]!, group));
+        assert.ok(fetches() > 0);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("DML, a failing statement and a ping leave running SELECTs intact", async () => {
+      const { client, fetches } = tracedClient();
+
+      try {
+        for (let round = 0; round < ROUNDS; round += 1) {
+          const [first, inserted, failed, version, last] = await Promise.allSettled([
+            client.query(selectGroup(0)),
+            client.query(`INSERT INTO ${WRITES} VALUES (${round})`),
+            client.query("SELEC bogus"),
+            client.ping(),
+            client.query(selectGroup(1)),
+          ]);
+
+          assert.equal(first.status, "fulfilled");
+          assertOwnRows(first.status === "fulfilled" ? first.value : [], 0);
+          assert.equal(inserted.status, "fulfilled");
+          assert.equal(failed.status, "rejected");
+          assert.equal(version.status, "fulfilled");
+          assert.equal(last.status, "fulfilled");
+          assertOwnRows(last.status === "fulfilled" ? last.value : [], 1);
+        }
+        assert.ok(fetches() > 0);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("Promise.all inside transaction() keeps rows and commits every statement", async () => {
+      const { client, fetches } = tracedClient();
+
+      try {
+        await client.query(`DELETE FROM ${WRITES}`);
+        const results = await client.transaction((tx) =>
+          Promise.all([
+            tx.query(selectGroup(0)),
+            tx.query(`INSERT INTO ${WRITES} VALUES (1)`),
+            tx.query(selectGroup(1)),
+          ]),
+        );
+
+        assertOwnRows(results[0], 0);
+        assertOwnRows(results[2], 1);
+        assert.ok(fetches() > 0);
+        const written = await client.query(`SELECT id FROM ${WRITES}`);
+        assert.deepEqual(written, [{ id: 1 }]);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("rollback issued alongside queries undoes their writes and cuts off no rows", async () => {
+      const { client, fetches } = tracedClient();
+
+      try {
+        await client.query(`DELETE FROM ${WRITES}`);
+        await client.beginTransaction();
+        const [before, , , after] = await Promise.all([
+          client.query(selectGroup(0)),
+          client.query(`INSERT INTO ${WRITES} VALUES (2)`),
+          client.rollback(),
+          client.query(selectGroup(1)),
+        ]);
+
+        assertOwnRows(before, 0);
+        assertOwnRows(after, 1);
+        assert.ok(fetches() > 0);
+        assert.deepEqual(await client.query(`SELECT id FROM ${WRITES}`), []);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("commit issued alongside queries runs after them", async () => {
+      const { client, fetches } = tracedClient();
+
+      try {
+        await client.query(`DELETE FROM ${WRITES}`);
+        await client.beginTransaction();
+        const [rows] = await Promise.all([
+          client.query(selectGroup(2)),
+          client.query(`INSERT INTO ${WRITES} VALUES (3)`),
+          client.commit(),
+        ]);
+
+        assertOwnRows(rows, 2);
+        assert.ok(fetches() > 0);
+        assert.deepEqual(await client.query(`SELECT id FROM ${WRITES}`), [{ id: 3 }]);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("close waits for a query that is still fetching", async () => {
+      const { client, fetches } = tracedClient();
+
+      await client.ping();
+      const running = client.query(selectGroup(3));
+      const closing = client.close();
+
+      assertOwnRows(await running, 3);
+      await closing;
+      assert.ok(fetches() > 0);
+    });
+
+    // The tests below drive the server without the adapter's statement queue,
+    // to record what a broker does with several live handles. If one starts to
+    // fail on a new server version, the reason for serializing has changed.
+    describe("what the server does with several live handles", () => {
+      async function openSession(): Promise<{
+        cas: CASConnection;
+        execute: (sql: string, autoCommit: boolean) => Promise<PrepareAndExecuteResult>;
+        fetch: (result: PrepareAndExecuteResult, position: number) => Promise<FetchResult>;
+      }> {
+        const cas = new CASConnection(TEST_CONFIG);
+        await cas.connect();
+        const generation = cas.connectionGeneration;
+
+        // sendAndRecvOnSession() because sendAndRecv() would reconnect once
+        // CAS_INFO reports the transaction ended, which is the moment of interest.
+        const exchange = async (request: { header: Buffer; payload: Buffer }): Promise<Buffer> => {
+          const response = await cas.sendAndRecvOnSession(
+            generation,
+            request.header,
+            request.payload,
+          );
+          assert.ok(response, "the session must stay open");
+          return response;
+        };
+
+        return {
+          cas,
+          execute: async (sql, autoCommit) =>
+            parsePrepareAndExecute(
+              await exchange(writePrepareAndExecute(sql, autoCommit, cas.casInfo)),
+              cas.protoVersion,
+            ),
+          fetch: async (result, position) =>
+            parseFetch(
+              await exchange(writeFetch(result.queryHandle, position, 100, cas.casInfo)),
+              result.columns,
+            ),
+        };
+      }
+
+      test("handles of an open transaction interleave FETCHes safely", async () => {
+        const { cas, execute, fetch } = await openSession();
+
+        try {
+          const groups = [0, 1, 2];
+          const results: PrepareAndExecuteResult[] = [];
+          for (const group of groups) {
+            results.push(await execute(selectGroup(group), false));
+          }
+
+          const handles = new Set(results.map((result) => result.queryHandle));
+          assert.equal(handles.size, groups.length);
+          const rows = results.map((result) => [...result.rows]);
+          assert.ok(rows.every((own) => own.length < ROWS_PER_GROUP), "FETCH must be needed");
+
+          while (rows.some((own) => own.length < ROWS_PER_GROUP)) {
+            for (const group of groups) {
+              if (rows[group]!.length < ROWS_PER_GROUP) {
+                const page = await fetch(results[group]!, rows[group]!.length);
+                rows[group]!.push(...page.rows);
+              }
+            }
+          }
+
+          groups.forEach((group) => assertOwnRows(rows[group]!, group));
+        } finally {
+          await cas.close();
+        }
+      });
+
+      test("an autocommit SELECT reaching its last row closes other live handles", async () => {
+        const { cas, execute, fetch } = await openSession();
+
+        try {
+          const survivor = await execute(selectGroup(0), true);
+          const finisher = await execute(selectGroup(1), true);
+
+          let position = finisher.rows.length;
+          while (position < ROWS_PER_GROUP) {
+            position += (await fetch(finisher, position)).tupleCount;
+          }
+
+          await assert.rejects(fetch(survivor, survivor.rows.length), /\(-1012\)/);
+        } finally {
+          await cas.close();
+        }
+      });
+
+      test("an autocommit INSERT closes other live handles", async () => {
+        const { cas, execute, fetch } = await openSession();
+
+        try {
+          const survivor = await execute(selectGroup(0), true);
+          await execute(`INSERT INTO ${WRITES} VALUES (4)`, true);
+
+          await assert.rejects(fetch(survivor, survivor.rows.length), /\(-1012\)/);
+        } finally {
+          await cas.close();
+        }
+      });
+
+      test("a failing autocommit statement closes other live handles", async () => {
+        const { cas, execute, fetch } = await openSession();
+
+        try {
+          const survivor = await execute(selectGroup(0), true);
+          await assert.rejects(execute("SELEC bogus", true), /\(-493\)/);
+
+          await assert.rejects(fetch(survivor, survivor.rows.length), /\(-1012\)/);
+        } finally {
+          await cas.close();
+        }
+      });
+
+      test("a ping closes other live handles", async () => {
+        const { cas, execute, fetch } = await openSession();
+
+        try {
+          const survivor = await execute(selectGroup(0), true);
+          await cas.ping();
+
+          await assert.rejects(fetch(survivor, survivor.rows.length), /\(-1012\)/);
+        } finally {
+          await cas.close();
+        }
+      });
+
+      test("a handle number means another result on a newer session", async () => {
+        const first = await openSession();
+        const second = await openSession();
+
+        try {
+          const stale = await first.execute(selectGroup(0), true);
+          const other = await second.execute(selectGroup(1), true);
+          assert.equal(stale.queryHandle, other.queryHandle);
+
+          const page = await second.fetch(stale, stale.rows.length);
+          assert.ok(page.rows.length > 0);
+          assert.ok(page.rows.every((row) => row.grp === 1));
+        } finally {
+          await first.cas.close();
+          await second.cas.close();
+        }
+      });
+    });
+
+    test("drops the tables", async () => {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+      await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`);
+      await adapter.query(`DROP TABLE IF EXISTS ${WRITES}`);
       await adapter.close();
     });
   });
