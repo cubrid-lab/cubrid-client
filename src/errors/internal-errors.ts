@@ -51,6 +51,23 @@ export class CasReplyError extends Error {
   }
 }
 
+/**
+ * ER_LK_UNILATERALLY_ABORTED. Before replying, the server rolled the whole
+ * transaction back. The live 10.2, 11.0, 11.2 and 11.4 servers did that after a
+ * deadlock and under rollback_on_lock_escalation, while -74, -75, -967 and -968
+ * left the transaction open. The reply cannot tell these apart any other way:
+ * after -72 too, CAS_INFO[0] still says the transaction is active.
+ */
+const SERVER_ABORTED_TRANSACTION = -72;
+
+export function isServerTransactionAbort(error: unknown): error is CasReplyError {
+  return (
+    error instanceof CasReplyError &&
+    error.origin === "server" &&
+    error.code === SERVER_ABORTED_TRANSACTION
+  );
+}
+
 /** The socket to the CAS went away, or the session that held a transaction is gone. */
 export class ConnectionLostError extends Error {
   readonly kind: CubridErrorKind = "connection-lost";

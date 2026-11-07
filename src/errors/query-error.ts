@@ -24,9 +24,11 @@ export class SqlSyntaxError extends QueryError {
 
 /**
  * The server chose this transaction as a deadlock victim. With code `-72` it
- * already rolled the whole transaction back; with `-967` or `-968`, reported
- * under a finite lock timeout, only the statement failed and the transaction
- * stays open. Either way, roll back and retry the transaction from its start.
+ * already rolled the whole transaction back, so later statements and `commit()`
+ * on this connection reject until `rollback()` or a rejected `commit()`
+ * acknowledges that. With `-967` or `-968`, reported under a finite lock timeout,
+ * only the statement failed and the transaction stays open. Either way, roll back
+ * and retry the transaction from its start.
  */
 export class DeadlockError extends QueryError {
   override name = "DeadlockError";
