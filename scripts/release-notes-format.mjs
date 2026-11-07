@@ -9,9 +9,16 @@ const changeHeadings = new Set([
 const credit = / by @[A-Za-z0-9-]+(?: \(first contribution 🎉\))?$/;
 const decorativeEmoji = /[\p{Extended_Pictographic}\p{Regional_Indicator}\p{Emoji_Modifier}\uFE0F\u20E3]/u;
 
-export function validateCuratedNote(version, note) {
+export function validateCuratedNote(version, note, knownVersions = Object.keys(previousVersion)) {
   const errors = [];
-  if (!(version in previousVersion)) return ["Unknown release version: " + version];
+  // Resolve the previous *tagged* release from all curated version files. Future
+  // versions need no changes to this validator when their note is added.
+  const versions = [...new Set([...knownVersions, version])].sort((a, b) => {
+    const left = a.split(".").map(Number);
+    const right = b.split(".").map(Number);
+    for (let i = 0; i < 3; i++) if (left[i] !== right[i]) return left[i] - right[i];
+    return 0;
+  });
   const tag = "v" + version;
   const lines = note.trimEnd().split("\n");
   if (!new RegExp("^## " + tag.replaceAll(".", "\\.") + " \\(\\d{4}-\\d{2}-\\d{2}\\)$").test(lines[0])) {
@@ -42,7 +49,8 @@ export function validateCuratedNote(version, note) {
   const ids = [...note.matchAll(/github\.com\/cubrid-lab\/cubrid-client\/pull\/(\d+)/g)].map(x => x[1]);
   if (ids.length !== new Set(ids).size) errors.push("Repeated pull-request reference");
 
-  const prior = previousVersion[version];
+  const index = versions.indexOf(version);
+  const prior = index > 0 ? versions[index - 1] : null;
   const footer = prior === null
     ? "**Full Changelog:** [v0.1.0 commits](https://github.com/cubrid-lab/cubrid-client/commits/v0.1.0)"
     : "**Full Changelog:** [v" + prior + "..." + tag + "](https://github.com/cubrid-lab/cubrid-client/compare/v" + prior + "..." + tag + ")";
