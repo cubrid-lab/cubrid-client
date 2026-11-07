@@ -56,7 +56,7 @@ export class NativeCubridAdapter implements DriverAdapter {
    * Tail of the statement queue; see inTurn(). It never rejects, so one failed
    * statement cannot block the ones behind it.
    */
-  private statementQueue: Promise<unknown> = Promise.resolve();
+  private statementQueue: Promise<void> = Promise.resolve();
 
   constructor(private readonly config: ClientConfig) {}
 
@@ -237,7 +237,9 @@ export class NativeCubridAdapter implements DriverAdapter {
    */
   private inTurn<T>(statement: () => Promise<T>): Promise<T> {
     const turn = this.statementQueue.then(statement);
-    this.statementQueue = turn.catch(() => undefined);
+    // The tail drops the result, so an idle connection does not keep its rows.
+    const settled = (): void => undefined;
+    this.statementQueue = turn.then(settled, settled);
     return turn;
   }
 
