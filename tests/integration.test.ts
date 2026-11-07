@@ -1101,6 +1101,38 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     });
   });
 
+  describe("years 1 to 99", () => {
+    const TABLE = "integration_early_years";
+
+    test("DATE, DATETIME and TIMESTAMP keep their stored year", async () => {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+      await adapter.connect();
+      try {
+        await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await adapter.query(`CREATE TABLE ${TABLE} (id INT PRIMARY KEY, d DATE, dt DATETIME)`);
+        await adapter.query(
+          `INSERT INTO ${TABLE} VALUES (1, DATE'0050-06-15', DATETIME'0050-06-15 03:04:05.678')`,
+        );
+        await adapter.query(
+          `INSERT INTO ${TABLE} VALUES (2, DATE'0099-12-31', DATETIME'0099-12-31 23:59:59.999')`,
+        );
+        const rows = await adapter.query(`SELECT id, d, dt FROM ${TABLE} ORDER BY id`);
+        assert.equal(rows.length, 2);
+        assert.equal((rows[0]!.d as Date).getFullYear(), 50);
+        assert.equal((rows[0]!.dt as Date).getFullYear(), 50);
+        assert.equal((rows[1]!.d as Date).getFullYear(), 99);
+        assert.equal((rows[1]!.dt as Date).getFullYear(), 99);
+        assert.equal((rows[0]!.dt as Date).getMilliseconds(), 678);
+      } finally {
+        try {
+          await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        } finally {
+          await adapter.close();
+        }
+      }
+    });
+  });
+
   // -------------------------------------------------------------------------
   // Timezone-aware values and JSON (#111)
   // -------------------------------------------------------------------------

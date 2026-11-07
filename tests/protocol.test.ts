@@ -383,6 +383,29 @@ test("PacketReader parseDate reads date only, zeroes time", () => {
   assert.equal(d.getDate(), 15);
 });
 
+for (const year of [1, 99, 100, 9999]) {
+  test(`PacketReader keeps year ${year} out of the 1900s for DATE, DATETIME and TIMESTAMP`, () => {
+    const buf = Buffer.alloc(14);
+    [year, 3, 14, 10, 30, 45, 123].forEach((v, i) => buf.writeInt16BE(v, i * 2));
+
+    const dt = new PacketReader(buf).parseDatetime();
+    assert.equal(dt.getFullYear(), year);
+    assert.deepEqual(
+      [dt.getMonth(), dt.getDate(), dt.getHours(), dt.getMinutes(), dt.getSeconds()],
+      [2, 14, 10, 30, 45],
+    );
+    assert.equal(dt.getMilliseconds(), 123);
+
+    const ts = new PacketReader(buf).parseTimestamp();
+    assert.equal(ts.getFullYear(), year);
+    assert.equal(ts.getSeconds(), 45);
+
+    const d = new PacketReader(buf).parseDate();
+    assert.equal(d.getFullYear(), year);
+    assert.deepEqual([d.getMonth(), d.getDate(), d.getHours()], [2, 14, 0]);
+  });
+}
+
 test("PacketReader parseTime reads time only", () => {
   const buf = Buffer.alloc(6);
   buf.writeInt16BE(10, 0);  // hour
