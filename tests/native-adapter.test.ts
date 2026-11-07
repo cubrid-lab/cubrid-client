@@ -3450,3 +3450,126 @@ test("settings given after construction end with close(), so a reused adapter ca
 
   assert.deepEqual(sessionParameters(adapter), [{ parameter: 2, value: 2000 }]);
 });
+
+/**
+ * A broker that answers each SET_DB_PARAMETER after `delayMs`, with an error
+ * when `refuse` is set. Everything else gets an empty success reply.
+ * `settingsSent` resolves when the first SET_DB_PARAMETER arrives, which is the
+ * moment the transport is open but the session is not ready yet.
+ */
+async function slowSettingsBroker(
+  refuse: boolean,
+  delayMs: number,
+  events: string[],
+): Promise<{ server: Server; port: number; sessions: () => number; settingsSent: Promise<void> }> {
+  let sessions = 0;
+  let markSent = (): void => {};
+  const settingsSent = new Promise<void>((resolve) => {
+    markSent = resolve;
+  });
+  const frame = (body: Buffer): Buffer => {
+    const length = Buffer.alloc(4);
+    length.writeInt32BE(body.length - 4, 0);
+    return Buffer.concat([length, body]);
+  };
+  const casInfo = Buffer.from([0x01, 0x00, 0x00, 0x00]);
+  const ok = Buffer.alloc(4);
+  const refused = Buffer.from("ffffffff0000232700", "hex");
+
+  const server = createServer((socket: NetSocket) => {
+    socket.on("error", () => {});
+    const session = ++sessions;
+    let buffered = Buffer.alloc(0);
+    let stage: "client-info" | "open" | "requests" = "client-info";
+
+    socket.on("data", (chunk: Buffer) => {
+      buffered = Buffer.concat([buffered, chunk]);
+      for (;;) {
+        if (stage === "client-info") {
+          if (buffered.length < 10) return;
+          buffered = buffered.subarray(10);
+          socket.write(Buffer.alloc(4));
+          stage = "open";
+        } else if (stage === "open") {
+          if (buffered.length < 628) return;
+          buffered = buffered.subarray(628);
+          const brokerInfo = Buffer.alloc(8);
+          brokerInfo[4] = 7;
+          const sessionId = Buffer.alloc(4);
+          sessionId.writeInt32BE(session, 0);
+          socket.write(frame(Buffer.concat([casInfo, ok, brokerInfo, sessionId])));
+          stage = "requests";
+        } else {
+          if (buffered.length < 8) return;
+          const size = 8 + buffered.readInt32BE(0);
+          if (buffered.length < size) return;
+          const code = buffered[8];
+          buffered = buffered.subarray(size);
+          if (code === CASFunctionCode.SET_DB_PARAMETER) {
+            markSent();
+            setTimeout(() => {
+              events.push(`session ${session}: settings ${refuse ? "refused" : "applied"}`);
+              socket.write(frame(Buffer.concat([casInfo, refuse ? refused : ok])));
+            }, delayMs);
+          } else {
+            socket.write(frame(Buffer.concat([casInfo, ok])));
+          }
+        }
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as { port: number };
+  return { server, port, sessions: () => sessions, settingsSent };
+}
+
+test("beginTransaction does not report success while a new session's settings may still fail", async () => {
+  const events: string[] = [];
+  const { server, port, sessions, settingsSent } = await slowSettingsBroker(true, 50, events);
+  const adapter = new NativeCubridAdapter({
+    ...DEFAULT_CONFIG,
+    port,
+    isolationLevel: "serializable",
+    readTimeout: 2000,
+  });
+
+  try {
+    const connecting = adapter.connect();
+    await settingsSent;
+    const beginning = adapter.beginTransaction();
+
+    await assert.rejects(connecting, ConnectionError);
+    // The begin waits for a session of its own, whose settings are refused too.
+    await assert.rejects(beginning, TransactionError);
+    assert.equal(sessions(), 2);
+  } finally {
+    await adapter.close();
+    server.close();
+  }
+});
+
+test("beginTransaction resolves only once a new session's settings hold", async () => {
+  const events: string[] = [];
+  const { server, port, sessions, settingsSent } = await slowSettingsBroker(false, 50, events);
+  const adapter = new NativeCubridAdapter({
+    ...DEFAULT_CONFIG,
+    port,
+    isolationLevel: "serializable",
+    readTimeout: 2000,
+  });
+
+  try {
+    const connecting = adapter.connect();
+    await settingsSent;
+    await adapter.beginTransaction();
+    events.push("begin resolved");
+    await connecting;
+
+    assert.deepEqual(events, ["session 1: settings applied", "begin resolved"]);
+    assert.equal(sessions(), 1);
+  } finally {
+    await adapter.rollback().catch(() => {});
+    await adapter.close();
+    server.close();
+  }
+});

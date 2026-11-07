@@ -123,6 +123,11 @@ export class CASConnection {
   private _outOfTransactionReplies = 0;
   /** A probe has answered since the last reply. Never inferred from CAS_INFO. */
   private casVerified = false;
+  /**
+   * The transport is open but the session settings are still being sent. Until
+   * they hold, the session is not usable, so `isConnected` stays false.
+   */
+  private settingUp = false;
 
   /**
    * Per-instance FIFO serialization queue. Public entry points that mutate
@@ -241,9 +246,12 @@ export class CASConnection {
       this._outOfTransaction = false;
       this.casVerified = false;
       this.connected = true;
+      this.settingUp = true;
       await this.applySessionParametersUnlocked();
+      this.settingUp = false;
     } catch (error) {
       this.connected = false;
+      this.settingUp = false;
       brokerSocket.destroy();
       this.socket?.destroy();
       this.socket = null;
@@ -607,9 +615,12 @@ export class CASConnection {
     return this._outOfTransactionReplies;
   }
 
-  /** Whether the connection is currently open. */
+  /** Whether a session is open and ready: its transport is up and its settings hold. */
   get isConnected(): boolean {
-    return this.connected;
+    // Callers outside the queue, such as beginTransaction(), decide from this
+    // whether to wait for connect(). A session whose settings are still being
+    // sent may yet fail, so it must not count as one they can start work on.
+    return this.connected && !this.settingUp;
   }
 
   // ---------------------------------------------------------------------------
