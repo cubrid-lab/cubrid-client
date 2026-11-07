@@ -142,7 +142,7 @@ export class PacketReader {
     const minute = this.parseShort();
     const second = this.parseShort();
     const ms = this.parseShort();
-    return new Date(year, month, day, hour, minute, second, ms);
+    return localDate(year, month, day, hour, minute, second, ms);
   }
 
   /** Read 6 × int16 (TIMESTAMP — no ms) and return a Date. */
@@ -153,7 +153,7 @@ export class PacketReader {
     const hour = this.parseShort();
     const minute = this.parseShort();
     const second = this.parseShort();
-    return new Date(year, month, day, hour, minute, second);
+    return localDate(year, month, day, hour, minute, second, 0);
   }
 
   /** Read 3 × int16 (DATE only — year, month, day) and return a Date. */
@@ -161,7 +161,7 @@ export class PacketReader {
     const year = this.parseShort();
     const month = this.parseShort() - 1;
     const day = this.parseShort();
-    return new Date(year, month, day);
+    return localDate(year, month, day, 0, 0, 0, 0);
   }
 
   /** Read 3 × int16 (TIME only — hour, min, sec) and return a Date. */
@@ -214,3 +214,22 @@ export class PacketReader {
     }
   }
 }
+
+/**
+ * Build a local-time Date. `new Date(year, ...)` maps years 0 to 99 into the
+ * 1900s, so build in a leap year and set the full year afterwards.
+ */
+function localDate(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+  second: number,
+  ms: number,
+): Date {
+  const date = new Date(2000, month, day, hour, minute, second, ms);
+  date.setFullYear(year, month, day);
+  return date;
+}
+
