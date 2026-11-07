@@ -13,6 +13,7 @@ import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { TransactionError } from "../src/errors/transaction-error.js";
 import type { ClientConfig } from "../src/types/client.js";
 import { CAPTURED_FRAMES } from "./fixtures/collection-frames.js";
+import { ZONED_FRAMES } from "./fixtures/zoned-frames.js";
 import { LOB_FRAMES, LOB_READ_REPLY_LIMIT } from "./fixtures/lob-frames.js";
 import { DML_FRAMES, LAST_INSERT_ID_FRAMES } from "./fixtures/dml-frames.js";
 import { writePrepareAndExecute } from "../src/protocol/protocol.js";
@@ -1646,19 +1647,22 @@ test("a malformed reply cannot rebind a transaction on a replacement session", a
   assert.equal(fakeCAS.connectCalls, 0);
 });
 
+/** The query handle the broker gave the captured OID reply (its first int32). */
+const OID_FRAME_HANDLE = 20;
+
 test("a zero-byte value without a decoder rejects, and the session stays open", async () => {
   const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
-  // The captured TIMESTAMPTZ reply, with its 19-byte value (type 29) removed.
-  const value = "0000001307e4000100020003000400052b30393a303000";
-  const { hex } = CAPTURED_FRAMES.timestamptzValue;
+  // The captured OID reply, with its 8-byte value (type 19) removed.
+  const value = "000000080000110100020000";
+  const { hex } = ZONED_FRAMES.oidValue;
   assert.ok(hex.includes(value));
   fakeCAS.queueResponse(Buffer.from(hex.replace(value, "00000000"), "hex"));
 
-  await assertQueryFails(adapter, /column "tz" \(wire type 29, 0 bytes\)/);
+  await assertQueryFails(adapter, /column "o" \(wire type 19, 0 bytes\)/);
 
   assert.equal(fakeCAS.discardCalls, 0);
   assert.equal(fakeCAS.isConnected, true);
-  assert.deepEqual(fakeCAS.closedHandles, [1]);
+  assert.deepEqual(fakeCAS.closedHandles, [OID_FRAME_HANDLE]);
 });
 
 test("a captured zero date rejects, and the session stays open for the next query", async () => {
@@ -1667,6 +1671,8 @@ test("a captured zero date rejects, and the session stays open for the next quer
     CAPTURED_FRAMES.zeroDatetime,
     CAPTURED_FRAMES.zeroTimestamp,
     CAPTURED_FRAMES.zeroDateElement,
+    ZONED_FRAMES.zeroTimestamptz,
+    ZONED_FRAMES.zeroDatetimetz,
   ]) {
     const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
     fakeCAS.queueResponse(Buffer.from(frame.hex, "hex"));
@@ -1675,13 +1681,37 @@ test("a captured zero date rejects, and the session stays open for the next quer
 
     assert.equal(fakeCAS.discardCalls, 0, frame.sql);
     assert.equal(fakeCAS.isConnected, true, frame.sql);
-    assert.deepEqual(fakeCAS.closedHandles, [1], frame.sql);
+    assert.deepEqual(fakeCAS.closedHandles, [Number.parseInt(frame.hex.slice(0, 8), 16)], frame.sql);
   }
+});
+
+test("a zoned value reaches the caller with its zone, and its column has the type name", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  fakeCAS.queueResponse(Buffer.from(ZONED_FRAMES.datetimetzRegion.hex, "hex"));
+
+  const { rows, columns } = await adapter.queryResult("SELECT tz FROM t");
+
+  assert.equal(String(rows[0]?.tz), "2020-07-02 03:04:05.999 America/New_York EDT");
+  assert.equal(rows[0]?.t, "after");
+  assert.deepEqual(columns.map((column) => column.type), ["DATETIMETZ", "CHAR"]);
+});
+
+test("a zoned value whose zone text has no NUL drops the session", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  const { hex } = ZONED_FRAMES.timestamptzOffset;
+  // "+09:00" and its NUL become "+09:00:" in a cell of the same length.
+  const zone = "2b30393a303000";
+  assert.ok(hex.includes(zone));
+  fakeCAS.queueResponse(Buffer.from(hex.replace(zone, "2b30393a30303a"), "hex"));
+
+  await assertQueryFails(adapter, /zone text/);
+
+  assertSessionDiscarded(fakeCAS);
 });
 
 test("damage after an unsupported value still drops the session", async () => {
   const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
-  const { hex } = CAPTURED_FRAMES.timestamptzValue;
+  const { hex } = ZONED_FRAMES.oidValue;
   // Column t follows the unsupported value and now claims more bytes than remain.
   const tail = "0000000661667465720001";
   assert.ok(hex.endsWith(tail));
@@ -1783,12 +1813,12 @@ test("query handle: a failed close does not mask the fetch failure", async () =>
 
 test("query handle: a close rejected by the server does not mask the failure", async () => {
   const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
-  fakeCAS.queueResponse(Buffer.from(CAPTURED_FRAMES.timestamptzValue.hex, "hex"));
+  fakeCAS.queueResponse(Buffer.from(ZONED_FRAMES.oidValue.hex, "hex"));
   fakeCAS.queueResponse(buildErrorResponse(-1006, "invalid handle"));
 
-  await assertQueryFails(adapter, /Unsupported CUBRID CAS value type 29/);
+  await assertQueryFails(adapter, /Unsupported CUBRID CAS value type 19/);
 
-  assert.deepEqual(fakeCAS.closedHandles, [1]);
+  assert.deepEqual(fakeCAS.closedHandles, [OID_FRAME_HANDLE]);
   assert.equal(fakeCAS.isConnected, true);
 });
 

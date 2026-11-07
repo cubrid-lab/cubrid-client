@@ -926,8 +926,12 @@ type Tagged = { id: number; tags: CollectionValue | null };
 const rows = await db.query<Tagged>("SELECT id, tags FROM article");
 ```
 
-Unsupported non-NULL CUBRID wire values (including timezone-aware, OBJECT and
-unsupported collection element values that do not yet have a decoder) reject the
+TIMESTAMPTZ, TIMESTAMPLTZ, DATETIMETZ and DATETIMELTZ columns return the exported
+`ZonedDateTime` (wall-clock fields plus the zone text, not a `Date`); see
+[timezone-aware values](TYPES.md#timezone-aware-values).
+
+Unsupported non-NULL CUBRID wire values (including OBJECT and unsupported
+collection element values that do not yet have a decoder) reject the
 query with a `QueryError` rather than silently appearing as SQL `null`, and the
 connection stays usable. Its `cause` chain holds an error named
 `UnsupportedValueError`, which identifies the column name and CAS type number. A
@@ -937,9 +941,8 @@ reply also drops the connection, which rolls back an open transaction, and its
 chain holds an error named `MalformedReplyError`. Both `name` values are stable,
 although the classes are not exported. A genuine
 SQL NULL is still returned as `null`; an empty SQL string is still `""`. JSON
-columns return their text as a `string`. See
-[values that cannot be decoded](TYPES.md#values-that-cannot-be-decoded) and
-[#111](https://github.com/cubrid-lab/cubrid-client/issues/111) for type coverage.
+columns return their text as a `string`; see [JSON columns](TYPES.md#json-columns).
+See [values that cannot be decoded](TYPES.md#values-that-cannot-be-decoded).
 
 ### QueryParams
 
@@ -1003,7 +1006,7 @@ interface ColumnInfo {
 | Field | Meaning |
 |-------|---------|
 | `name` | The column label: its alias, or its name when it has none. |
-| `type` | The CUBRID type name the server reports, such as `INT`, `BIGINT`, `VARCHAR`, `CHAR`, `NUMERIC`, `DATETIME` or `NULL` (an untyped `NULL` literal), or `UNKNOWN(<id>)` for a wire type id this driver does not name. The name is the server's wire type, so a JSON column reports `VARCHAR` (see [TYPES.md](TYPES.md)). |
+| `type` | The CUBRID type name the server reports, such as `INT`, `BIGINT`, `VARCHAR`, `CHAR`, `NUMERIC`, `DATETIME`, `TIMESTAMPTZ` or `NULL` (an untyped `NULL` literal), or `UNKNOWN(<id>)` for a wire type id this driver does not name. The name is the server's wire type, so a JSON column reports `VARCHAR` (see [TYPES.md](TYPES.md)). |
 | `elementType` | Set only for `SET`, `MULTISET` and `SEQUENCE`, which are the `type`. It is the declared element type, or `NULL` for a collection declared without one. |
 | `precision`, `scale` | The values the server reports. They depend on the type: `VARCHAR(20)` is precision 20, `NUMERIC(10,3)` is 10 and 3, `INT` is 10 and `DATETIME` is 23 and 3. Types without a meaningful size report `0`, and a `CHAR` expression such as a string literal can report `-1`. |
 | `nullable` | `false` only when the server reports the column as NOT NULL. It is `true` for a nullable table column, for the right side of an outer join and for expressions. |

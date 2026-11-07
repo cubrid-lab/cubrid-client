@@ -12,6 +12,7 @@
 import { CasReplyError } from "../errors/internal-errors.js";
 import { PacketReader } from "./packet-reader.js";
 import { PacketWriter } from "./packet-writer.js";
+import { ZonedDateTime } from "../types/zoned-date-time.js";
 import {
   CASFunctionCode,
   CAS_MAGIC,
@@ -1209,6 +1210,13 @@ function readValue(
     case CUBRIDDataType.TIMESTAMP:
       rejectZeroDate(reader, size, SIZE_SHORT * 6);
       return reader.parseTimestamp();
+
+    case CUBRIDDataType.TIMESTAMPTZ:
+    case CUBRIDDataType.TIMESTAMPLTZ:
+    case CUBRIDDataType.DATETIMETZ:
+    case CUBRIDDataType.DATETIMELTZ:
+      return readZonedDateTime(reader, colType, size);
+
     case CUBRIDDataType.BIT:
     case CUBRIDDataType.VARBIT:
       return reader.parseBytes(size);
@@ -1266,6 +1274,90 @@ function readLobLocator(
   }
 
   return new LobLocator(colType, Number(lobSize), handle);
+}
+
+const ZONED_TYPE_NAMES = {
+  [CUBRIDDataType.TIMESTAMPTZ]: "TIMESTAMPTZ",
+  [CUBRIDDataType.TIMESTAMPLTZ]: "TIMESTAMPLTZ",
+  [CUBRIDDataType.DATETIMETZ]: "DATETIMETZ",
+  [CUBRIDDataType.DATETIMELTZ]: "DATETIMELTZ",
+} as const;
+
+const ZONE_TEXT_DECODER = new TextDecoder("utf-8", { fatal: true });
+
+/**
+ * Decode a TIMESTAMPTZ, TIMESTAMPLTZ, DATETIMETZ or DATETIMELTZ cell: the fields
+ * of the plain type (TIMESTAMP six int16, DATETIME seven) and then the zone as
+ * text with its NUL, filling the rest of the cell. The zone is `+09:00` for an
+ * offset and `Asia/Seoul KST` for a region, and it stays in the value (#111).
+ * The zero date is reported as unsupported like the plain types; every other
+ * layout violation is malformed.
+ */
+function readZonedDateTime(
+  reader: PacketReader,
+  colType: keyof typeof ZONED_TYPE_NAMES,
+  size: number,
+): ZonedDateTime {
+  const hasMilliseconds =
+    colType === CUBRIDDataType.DATETIMETZ || colType === CUBRIDDataType.DATETIMELTZ;
+  const fixed = SIZE_SHORT * (hasMilliseconds ? 7 : 6);
+  const cell = reader.subReader(size);
+  // At least one character of zone text and its NUL must follow the fields.
+  if (size < fixed + 2) {
+    throw new Error(`Malformed CAS packet: zoned value of ${size} bytes has no zone`);
+  }
+  if (cell.peekZeroDate()) {
+    throw new UnsupportedValueError(
+      "Zero date 0000-00-00 cannot be represented as a ZonedDateTime",
+    );
+  }
+
+  const year = cell.parseShort();
+  const month = cell.parseShort();
+  const day = cell.parseShort();
+  const hour = cell.parseShort();
+  const minute = cell.parseShort();
+  const second = cell.parseShort();
+  const millisecond = hasMilliseconds ? cell.parseShort() : 0;
+  if (
+    year < 1 ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31 ||
+    hour < 0 ||
+    hour > 23 ||
+    minute < 0 ||
+    minute > 59 ||
+    second < 0 ||
+    second > 59 ||
+    millisecond < 0 ||
+    millisecond > 999
+  ) {
+    throw new Error(
+      `Malformed CAS packet: zoned value fields ${year}-${month}-${day} ` +
+        `${hour}:${minute}:${second}.${millisecond} are out of range`,
+    );
+  }
+
+  const zoneBytes = cell.parseBytes(cell.remaining);
+  const nul = zoneBytes.indexOf(0);
+  if (nul !== zoneBytes.length - 1 || nul === 0) {
+    throw new Error("Malformed CAS packet: zone text is empty or not one NUL-terminated string");
+  }
+  const zone = ZONE_TEXT_DECODER.decode(zoneBytes.subarray(0, nul));
+
+  return new ZonedDateTime({
+    type: ZONED_TYPE_NAMES[colType],
+    year,
+    month,
+    day,
+    hour,
+    minute,
+    second,
+    millisecond,
+    zone,
+  });
 }
 
 function isCollectionType(colType: CUBRIDDataType): boolean {

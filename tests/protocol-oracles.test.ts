@@ -21,6 +21,8 @@ import {
 } from "../src/protocol/protocol.js";
 import { CAPTURED_FRAMES, type CapturedFrame } from "./fixtures/collection-frames.js";
 import { LOB_FRAMES } from "./fixtures/lob-frames.js";
+import { ZONED_FRAMES } from "./fixtures/zoned-frames.js";
+import { ZonedDateTime } from "../src/types/zoned-date-time.js";
 
 const i32 = (value: number): Buffer => {
   const b = Buffer.alloc(4);
@@ -142,12 +144,12 @@ test("genuine SQL NULL and a valid empty string are different", () => {
   assert.equal(emptyRow.rows[0]?.value, "");
 });
 
-test("a captured TIMESTAMPTZ value rejects as unsupported, naming its column and wire type", () => {
+test("a captured OID value rejects as unsupported, naming its column and wire type", () => {
   assert.throws(
-    () => parsePrepareAndExecute(Buffer.from(CAPTURED_FRAMES.timestamptzValue.hex, "hex"), 7),
+    () => parsePrepareAndExecute(Buffer.from(ZONED_FRAMES.oidValue.hex, "hex"), 7),
     (error: Error) => {
       assert.ok(error instanceof UnsupportedValueError);
-      assert.match(error.message, /column "tz" \(wire type 29, 19 bytes\)/);
+      assert.match(error.message, /column "o" \(wire type 19, 8 bytes\)/);
       return true;
     },
   );
@@ -185,14 +187,14 @@ test("a zero-byte value is an empty Buffer only for BIT and VARBIT, and never fo
     assert.equal(parsePrepareAndExecute(selectWire(type, null), 1).rows[0]?.value, null);
   }
 
-  // No decoder: OBJECT, TIMESTAMPTZ, JSON and a code CCI does not define.
-  for (const type of [19, 29, 34, 99]) {
+  // No decoder: OBJECT, JSON (never sent below protocol 8) and a code CCI does not define.
+  for (const type of [19, 34, 99]) {
     assert.throws(() => parsePrepareAndExecute(selectWire(type, Buffer.alloc(0)), 1), (error: Error) =>
       error instanceof UnsupportedValueError && error.message.includes(`wire type ${type}, 0 bytes`));
   }
 
   // Decodable, but CAS counts the NUL of text and writes fixed widths in full.
-  for (const type of [2, 8, 21, 23]) {
+  for (const type of [2, 8, 21, 23, 29, 30, 31, 32]) {
     assert.throws(() => parsePrepareAndExecute(selectWire(type, Buffer.alloc(0)), 1), (error: Error) =>
       error instanceof MalformedReplyError &&
       error.message.includes(`wire type ${type}, 0 bytes`) &&
@@ -202,10 +204,10 @@ test("a zero-byte value is an empty Buffer only for BIT and VARBIT, and never fo
 });
 
 test("a NULL-typed column never turns a typed cell without value bytes into null", () => {
-  // Cell of size 1 holding only the type header: the literal TIMESTAMPTZ code 29.
+  // Cell of size 1 holding only the type header: the literal OBJECT code 19.
   assert.throws(
-    () => parsePrepareAndExecute(selectWire(0, Buffer.from([29])), 1),
-    (error: Error) => error instanceof UnsupportedValueError && /wire type 29, 0 bytes/.test(error.message),
+    () => parsePrepareAndExecute(selectWire(0, Buffer.from([19])), 1),
+    (error: Error) => error instanceof UnsupportedValueError && /wire type 19, 0 bytes/.test(error.message),
   );
   // Cell of size 0 has no room for the header, which must not come from the next bytes.
   assert.throws(
@@ -215,7 +217,7 @@ test("a NULL-typed column never turns a typed cell without value bytes into null
 });
 
 test("an unsupported value whose length overruns the reply is malformed, not unsupported", () => {
-  const wire = selectWire(29, Buffer.from("01020304", "hex"));
+  const wire = selectWire(19, Buffer.from("01020304", "hex"));
   assert.throws(
     () => parsePrepareAndExecute(wire.subarray(0, -2), 1),
     (error: Error) => error instanceof MalformedReplyError,
@@ -223,7 +225,7 @@ test("an unsupported value whose length overruns the reply is malformed, not uns
 });
 
 test("the first unsupported value is reported only once the whole reply holds together", () => {
-  const column = { type: 29, name: "tz" } as never;
+  const column = { type: 19, name: "tz" } as never;
   const row = (...cells: Buffer[]): Buffer => Buffer.concat([i32(1), Buffer.alloc(8), ...cells]);
   const value = Buffer.concat([i32(2), Buffer.from("0102", "hex")]);
 
@@ -339,7 +341,6 @@ test("the server sends a mixed-type collection as SQL NULL, also inside a collec
 
 test("unsupported collection elements reject and name the column", () => {
   for (const [frame, wireType] of [
-    [CAPTURED_FRAMES.datetimetzElement, 31],
     [CAPTURED_FRAMES.blobElement, 23],
     [CAPTURED_FRAMES.objectElement, 19],
   ] as const) {
@@ -687,3 +688,169 @@ for (const [name, wireType, cell, expected] of [
     assert.equal(Object.getPrototypeOf(row), Object.prototype);
   });
 }
+
+// ---------------------------------------------------------------------------
+// Timezone-aware values and JSON, from replies captured on live brokers (#111)
+// ---------------------------------------------------------------------------
+
+const zonedRow = (frame: { hex: string }): { tz: unknown; t: unknown } => {
+  const row = parsePrepareAndExecute(Buffer.from(frame.hex, "hex"), 7).rows[0];
+  assert.ok(row);
+  return { tz: row.tz, t: row.t };
+};
+
+const zonedCollection = (frame: { hex: string }): { c: unknown; t: unknown } => {
+  const row = parsePrepareAndExecute(Buffer.from(frame.hex, "hex"), 7).rows[0];
+  assert.ok(row);
+  return { c: row.c, t: row.t };
+};
+
+test("captured zoned values keep their fields and the zone text the server sent", () => {
+  const cases: Array<[{ hex: string; sql: string }, Record<string, unknown>]> = [
+    [ZONED_FRAMES.timestamptzOffset, {
+      type: "TIMESTAMPTZ", year: 2020, month: 1, day: 2, hour: 3, minute: 4, second: 5,
+      millisecond: 0, zone: "+09:00",
+    }],
+    [ZONED_FRAMES.timestamptzHalfHour, {
+      type: "TIMESTAMPTZ", year: 2020, month: 7, day: 2, hour: 3, minute: 4, second: 5,
+      millisecond: 0, zone: "-05:30",
+    }],
+    [ZONED_FRAMES.timestamptzRegion, {
+      type: "TIMESTAMPTZ", year: 2020, month: 1, day: 2, hour: 3, minute: 4, second: 5,
+      millisecond: 0, zone: "America/New_York EST",
+    }],
+    // LTZ values arrive in the session zone: the server's default UTC, or Asia/Seoul after
+    // SET TIME ZONE, which also moves 03:04:05 America/New_York in July to 16:04:05 KST.
+    [ZONED_FRAMES.timestampltz, {
+      type: "TIMESTAMPLTZ", year: 2020, month: 1, day: 1, hour: 18, minute: 4, second: 5,
+      millisecond: 0, zone: "UTC UTC",
+    }],
+    [ZONED_FRAMES.timestampltzSeoul, {
+      type: "TIMESTAMPLTZ", year: 2020, month: 1, day: 2, hour: 3, minute: 4, second: 5,
+      millisecond: 0, zone: "Asia/Seoul KST",
+    }],
+    [ZONED_FRAMES.datetimetzOffset, {
+      type: "DATETIMETZ", year: 2020, month: 1, day: 2, hour: 3, minute: 4, second: 5,
+      millisecond: 678, zone: "+09:00",
+    }],
+    [ZONED_FRAMES.datetimetzRegion, {
+      type: "DATETIMETZ", year: 2020, month: 7, day: 2, hour: 3, minute: 4, second: 5,
+      millisecond: 999, zone: "America/New_York EDT",
+    }],
+    [ZONED_FRAMES.datetimeltz, {
+      type: "DATETIMELTZ", year: 2020, month: 1, day: 1, hour: 18, minute: 4, second: 5,
+      millisecond: 678, zone: "UTC UTC",
+    }],
+    [ZONED_FRAMES.datetimeltzSeoul, {
+      type: "DATETIMELTZ", year: 2020, month: 7, day: 2, hour: 16, minute: 4, second: 5,
+      millisecond: 500, zone: "Asia/Seoul KST",
+    }],
+    // The extremes of the range: year 1 and year 9999 with a +14:00 offset.
+    [ZONED_FRAMES.datetimetzMin, {
+      type: "DATETIMETZ", year: 1, month: 1, day: 1, hour: 0, minute: 0, second: 0,
+      millisecond: 0, zone: "+00:00",
+    }],
+    [ZONED_FRAMES.datetimetzMax, {
+      type: "DATETIMETZ", year: 9999, month: 12, day: 31, hour: 23, minute: 59, second: 59,
+      millisecond: 999, zone: "+14:00",
+    }],
+  ];
+  for (const [frame, fields] of cases) {
+    const { tz, t } = zonedRow(frame);
+    assert.ok(tz instanceof ZonedDateTime, frame.sql);
+    assert.deepEqual({ ...tz }, fields, frame.sql);
+    assert.equal(t, "after", frame.sql);
+  }
+});
+
+test("a zoned value prints as SQL literal text and serializes to JSON with its zone", () => {
+  const texts: Array<[{ hex: string; sql: string }, string]> = [
+    [ZONED_FRAMES.timestamptzOffset, "2020-01-02 03:04:05 +09:00"],
+    [ZONED_FRAMES.datetimetzOffset, "2020-01-02 03:04:05.678 +09:00"],
+    [ZONED_FRAMES.datetimetzMin, "0001-01-01 00:00:00.000 +00:00"],
+    [ZONED_FRAMES.datetimeltzSeoul, "2020-07-02 16:04:05.500 Asia/Seoul KST"],
+  ];
+  for (const [frame, text] of texts) {
+    const { tz } = zonedRow(frame);
+    assert.equal(String(tz), text);
+    assert.equal(JSON.stringify({ tz }), JSON.stringify({ tz: text }));
+  }
+  assert.throws(() => {
+    (zonedRow(ZONED_FRAMES.timestamptzOffset).tz as { zone: string }).zone = "UTC";
+  }, TypeError);
+});
+
+test("a NULL zoned value is null, and a zoned value inside a collection keeps its zone", () => {
+  assert.deepEqual(zonedRow(ZONED_FRAMES.nullTimestamptz), { tz: null, t: "after" });
+
+  const sequence = zonedCollection(ZONED_FRAMES.sequenceOfTimestamptz);
+  assert.deepEqual(
+    (sequence.c as ZonedDateTime[]).map((value) => value.toString()),
+    ["2020-01-02 03:04:05 +09:00", "2020-07-02 03:04:05 -05:30"],
+  );
+  assert.equal(sequence.t, "after");
+  const set = zonedCollection(ZONED_FRAMES.setOfDatetimeltz);
+  assert.deepEqual((set.c as ZonedDateTime[]).map(String), ["2020-01-01 18:04:05.678 UTC UTC"]);
+});
+
+test("a captured zero zoned value rejects as unsupported, naming the column and size", () => {
+  for (const [frame, pattern] of [
+    [ZONED_FRAMES.zeroTimestamptz, /column "tz" \(wire type 29, 19 bytes\)/],
+    [ZONED_FRAMES.zeroDatetimetz, /column "tz" \(wire type 31, 21 bytes\)/],
+  ] as const) {
+    assert.throws(
+      () => parsePrepareAndExecute(Buffer.from(frame.hex, "hex"), 7),
+      (error: Error) => {
+        assert.ok(error instanceof UnsupportedValueError, frame.sql);
+        assert.match(error.message, pattern);
+        assert.match((error.cause as Error).message, /Zero date 0000-00-00/);
+        return true;
+      },
+      frame.sql,
+    );
+  }
+});
+
+test("a zoned cell that breaks its layout is malformed and never a value", () => {
+  const fields = (...values: number[]): Buffer => Buffer.concat(values.map(i16));
+  const timestamp = fields(2020, 1, 2, 3, 4, 5);
+  const datetime = fields(2020, 1, 2, 3, 4, 5, 678);
+  const zone = (text: string): Buffer => Buffer.from(text, "latin1");
+
+  const cases: Array<[string, number, Buffer]> = [
+    ["no zone text", 29, timestamp],
+    ["a NUL and no zone", 29, Buffer.concat([timestamp, zone("\0")])],
+    ["a zone without its NUL", 29, Buffer.concat([timestamp, zone("+09:00")])],
+    ["bytes after the NUL", 29, Buffer.concat([timestamp, zone("+09:00\0\0")])],
+    ["a NUL inside the zone", 29, Buffer.concat([timestamp, zone("+09\0:00\0")])],
+    ["a zone that is not UTF-8", 29, Buffer.concat([timestamp, Buffer.from([0xff, 0xfe, 0])])],
+    ["a month of 13", 29, Buffer.concat([fields(2020, 13, 2, 3, 4, 5), zone("+09:00\0")])],
+    ["a day of 0", 30, Buffer.concat([fields(2020, 1, 0, 3, 4, 5), zone("UTC UTC\0")])],
+    ["an hour of 24", 29, Buffer.concat([fields(2020, 1, 2, 24, 4, 5), zone("+09:00\0")])],
+    ["a negative year", 29, Buffer.concat([fields(-1, 1, 2, 3, 4, 5), zone("+09:00\0")])],
+    ["milliseconds of 1000", 31, Buffer.concat([fields(2020, 1, 2, 3, 4, 5, 1000), zone("+09:00\0")])],
+    ["a DATETIME shaped cell with no zone", 31, datetime],
+    ["a TIMESTAMP shaped cell in a DATETIMETZ column", 32, Buffer.concat([timestamp, zone("+9\0")])],
+  ];
+  for (const [name, type, cell] of cases) {
+    assert.throws(
+      () => parsePrepareAndExecute(selectWire(type, cell), 1),
+      (error: Error) => error instanceof MalformedReplyError && error.message.includes(`wire type ${type}`),
+      name,
+    );
+  }
+
+  // The same layouts that are valid decode, so the cases above fail for their stated reason.
+  const ok = parsePrepareAndExecute(
+    selectWire(31, Buffer.concat([datetime, zone("+09:00\0")])),
+    1,
+  ).rows[0]?.value;
+  assert.equal(String(ok), "2020-01-02 03:04:05.678 +09:00");
+});
+
+test("JSON is returned as its text, because the server sends it as VARCHAR below protocol 8", () => {
+  const result = parsePrepareAndExecute(Buffer.from(ZONED_FRAMES.jsonColumn.hex, "hex"), 7);
+  // Wire type 2 is VARCHAR, not the JSON code 34, and the value is not parsed.
+  assert.equal(result.columns[0]?.type, 2);
+  assert.deepEqual(result.rows, [{ j: '{"a":1}', t: "after" }]);
+});
