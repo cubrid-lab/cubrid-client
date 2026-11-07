@@ -7,7 +7,7 @@ const version = packageJson.version;
 const tag = `v${version}`;
 const notePath = join("docs", "releases", `${tag}.md`);
 const isCandidate = process.argv.includes("--candidate");
-// Reject emoji in both historical and upcoming release notes, including flags and keycap sequences.
+// Reject decorative emoji, but allow the agreed inline first-contribution celebration.
 const emojiPattern = /[\p{Extended_Pictographic}\p{Regional_Indicator}\p{Emoji_Modifier}\uFE0F\u20E3]/u;
 
 function fail(message) {
@@ -84,8 +84,10 @@ if (notes) {
 for (const filename of readdirSync(join("docs", "releases"))) {
   if (!/^v\d+\.\d+\.\d+\.md$/.test(filename)) continue;
   const path = join("docs", "releases", filename);
-  if (emojiPattern.test(readFileSync(path, "utf8"))) {
-    fail(`emoji are not allowed in ${path}`);
+  const content = readFileSync(path, "utf8");
+  const withoutFirstContributionCelebrations = content.replaceAll("(first contribution 🎉)", "(first contribution)");
+  if (emojiPattern.test(withoutFirstContributionCelebrations)) {
+    fail(`emoji are not allowed in ${path}, except an inline first-contribution credit`);
   }
 }
 
