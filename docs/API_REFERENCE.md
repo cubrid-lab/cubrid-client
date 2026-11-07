@@ -346,7 +346,7 @@ It sends the same single version request as [`ping()`](#ping), so it has the sam
 
 #### `close()`
 
-Closes the shared connection after the statements issued before it have finished. After calling `close()`, the client can no longer execute queries. If no connection was opened, this is a no-op.
+Closes the shared connection after the statements issued before it have finished. After calling `close()`, the client can no longer execute queries: a `query()`, `queryResult()`, `ping()`, `getServerVersion()`, `beginTransaction()`, `commit()` or `rollback()` issued after `close()` is called, even in the same tick, rejects with an error whose `cause` is `Client is closed.`, and no connection is opened. If no connection was opened, closing it is a no-op.
 
 ```ts
 async close(): Promise<void>

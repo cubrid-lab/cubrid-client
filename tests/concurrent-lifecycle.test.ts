@@ -793,14 +793,22 @@ test("the next query after a lost socket runs once on a new session, with nothin
   });
 });
 
-test("a query issued right after close opens a new session instead of failing", { timeout: 10000 }, async () => {
+test("a query issued right after close rejects and leaves no session open", { timeout: 10000 }, async () => {
   await withClient(async (client, cas) => {
     assert.deepEqual(await client.query(selectFor("a")), rowsOf("a"));
 
-    await Promise.all([client.close(), client.query(selectFor("b"))]);
+    const [closed, late] = await Promise.allSettled([client.close(), client.query(selectFor("b"))]);
+
+    assert.equal(closed.status, "fulfilled");
+    assert.equal(late.status, "rejected");
+    await assert.rejects(client.query(selectFor("c")));
 
     const executions = cas.of(CASFunctionCode.PREPARE_AND_EXECUTE);
-    assert.deepEqual(executions.map((request) => request.owner), ["a", "b"]);
+    assert.deepEqual(executions.map((request) => request.owner), ["a"]);
+    for (let waited = 0; cas.sockets.size > 0 && waited < 2000; waited += 10) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(cas.sockets.size, 0);
   });
 });
 
