@@ -77,8 +77,9 @@ descriptions without changing tags or packages.
    version/changelog PR generator**, while the publication job independently
    checks the reviewed PR/title and version files. This avoids relying on the
    mutable explanatory text of a human-reviewed Release Please PR.
-   Use **npm Trusted Publishing (OIDC)** rather than a long-lived
-   `NPM_TOKEN`: an npm package maintainer must first register the publisher
+   For **already registered npm packages**, use **npm Trusted Publishing
+   (OIDC)** rather than a long-lived `NPM_TOKEN`: an npm package maintainer
+   must register the publisher
    for organization `cubrid-lab`, repository `cubrid-client`, workflow
    filename `publish.yml`, and environment `npm-publish`, with direct
    `npm publish` permission (not just staging). The publish job uses Node
@@ -141,19 +142,64 @@ A read-only follow-up diagnostic also demonstrated that the previous
 [auth diagnostic](https://github.com/cubrid-lab/cubrid-client/actions/runs/42320289488).
 Never create a different version to work around a registry credential failure.
 
-An **npm package maintainer** must configure the Trusted Publisher under
-npmjs.com → package `cubrid-client` → Settings → Trusted Publishing.
-Set the provider to GitHub Actions, organization/user `cubrid-lab`,
-repository `cubrid-client`, workflow `publish.yml`, environment
-`npm-publish`, and enable direct `npm publish`. The package owner must
-perform this one-time external-account operation. See the
-[official npm setup](https://docs.npmjs.com/trusted-publishers/).
+**Important first-publish exception:** npm Trusted Publishing cannot
+register a package that has never been published. If anonymous
+`npm view cubrid-client name` returns `E404`, there is no npm package
+settings page and consequently no `Trusted publishing` menu. The
+GitHub v1.2.0 Release exists but did not register a package on npm.
+The read-only
+[`Check npm package registration` workflow](../.github/workflows/verify-npm-publisher.yml)
+reports whether the name exists (without authenticating).
 
-After that setup, use the existing Actions → Publish verified npm release
-manual recovery with `confirmation=PUBLISH` and
-`recovery_tag=v1.2.0`. This checks and republishes **the original
-immutable tag** without creating or modifying another GitHub Release.
-Confirm the actual npm registry version after the workflow succeeds.
+For an **unregistered** `cubrid-client`, the legitimate npm publisher
+must first complete an interactive one-time bootstrap. From a clean
+machine with Node 22 or later and appropriate npm account/2FA enabled:
+
+```sh
+git clone https://github.com/cubrid-lab/cubrid-client.git
+cd cubrid-client
+git fetch --tags
+git checkout --detach v1.2.0
+
+npm ci
+npm test
+npm run build
+npm run typecheck
+npm run api:check
+npm pack --dry-run
+
+npm login --registry=https://registry.npmjs.org/
+npm whoami
+npm publish --access public
+npm view cubrid-client@1.2.0 version
+```
+
+This publishes **the exact existing v1.2.0 tagged sources**, not a new
+GitHub release or a placeholder version. Publish only if the npm package
+name is genuinely unregistered **and you are authorized to claim it**.
+If the name is already owned by another account, do not attempt to
+publish over that owner's package: request publish access or obtain
+approval for a different npm package name and a coordinated release
+change. If the interactive publish fails, preserve the error and stop;
+do not change source or tags simply to bypass authorization.
+
+**After the initial npm publish succeeds**, navigate to npmjs.com →
+Packages → `cubrid-client` → Settings → Trusted publishing. A package
+maintainer can now create the GitHub Actions trusted publisher for
+organization/user `cubrid-lab`, repository `cubrid-client`, workflow
+filename `publish.yml`, environment `npm-publish` and explicitly
+enable direct `npm publish` (not just staged publishing).
+This is an external npm-account operation. See
+[official npm Trusted Publishing docs](https://docs.npmjs.com/trusted-publishers/).
+
+If v1.2.0 has **already been published manually**, do **not** rerun
+recovery to re-publish the same version; the registry and GitHub tag
+should now be checked for consistency. In the event an existing package
+only needs authorization repaired (not an initial bootstrap), configure
+OIDC and use the Actions → Publish verified npm release manual recovery
+with `confirmation=PUBLISH` and `recovery_tag=v1.2.0`.
+This preserves the immutable GitHub tag. Confirm the actual npm
+registry version after the workflow succeeds.
 See [#166](https://github.com/cubrid-lab/cubrid-client/issues/166)
 for the tracked release discrepancy.
 
