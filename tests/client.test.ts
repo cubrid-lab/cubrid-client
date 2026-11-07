@@ -6,10 +6,18 @@ import { CubridClient } from "../src/client/client.js";
 import { CubridTransaction } from "../src/client/transaction.js";
 import { NodeCubridAdapter } from "../src/adapters/node-cubrid.js";
 import { ConnectionError } from "../src/errors/connection-error.js";
-import { QueryError } from "../src/errors/query-error.js";
+import { CasReplyError, ConnectionLostError } from "../src/errors/internal-errors.js";
+import {
+  ConstraintError,
+  DeadlockError,
+  LockTimeoutError,
+  QueryError,
+  SqlSyntaxError,
+} from "../src/errors/query-error.js";
 import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { TransactionError } from "../src/errors/transaction-error.js";
 import { mapError } from "../src/internals/map-error.js";
+import { MalformedReplyError, UnsupportedValueError } from "../src/protocol/protocol.js";
 import { mapResult } from "../src/internals/map-result.js";
 import { normalizeConfig } from "../src/internals/normalize-config.js";
 import type {
@@ -858,4 +866,263 @@ test("client ping throws when connection has no ping method", async () => {
       error instanceof ConnectionError &&
       error.message === "Health check failed.",
   );
+});
+
+// ---------------------------------------------------------------------------
+// Structured error details. The indicator -2 is DBMS_ERROR_INDICATOR on the wire
+// and -1 is CAS_ERROR_INDICATOR; the codes are the ones live servers reported.
+// ---------------------------------------------------------------------------
+
+const serverError = (code: number): CasReplyError =>
+  new CasReplyError(`CUBRID query failed (${code}): message`, -2, code);
+
+test("mapError gives every measured server code its class and kind", () => {
+  const cases: Array<[number, string, new (...args: never[]) => QueryError]> = [
+    [-670, "unique-violation", ConstraintError],
+    [-886, "unique-violation", ConstraintError],
+    [-631, "not-null-violation", ConstraintError],
+    [-922, "foreign-key-violation", ConstraintError],
+    [-924, "foreign-key-violation", ConstraintError],
+    [-1284, "foreign-key-violation", ConstraintError],
+    [-493, "syntax", SqlSyntaxError],
+    [-72, "deadlock", DeadlockError],
+    [-967, "deadlock", DeadlockError],
+    [-968, "deadlock", DeadlockError],
+    [-74, "lock-timeout", LockTimeoutError],
+    [-75, "lock-timeout", LockTimeoutError],
+  ];
+
+  for (const [code, kind, errorClass] of cases) {
+    const error = mapError("query", serverError(code), "Query failed.") as QueryError;
+    assert.ok(error instanceof errorClass, `${code} is a ${errorClass.name}`);
+    assert.ok(error instanceof QueryError, `${code} stays a QueryError`);
+    assert.equal(error.code, code);
+    assert.equal(error.origin, "server");
+    assert.equal(error.kind, kind);
+    assert.equal(error.sqlState, undefined);
+    assert.equal(error.message, "Query failed.");
+  }
+});
+
+test("mapError keeps classified codes without a subclass as a plain QueryError", () => {
+  for (const [code, kind] of [
+    [-494, "semantic"],
+    [-4, "interrupted"],
+    [-111, "connection-lost"],
+    [-171, "authentication"],
+    [-165, "authentication"],
+  ] as const) {
+    const error = mapError("query", serverError(code), "Query failed.") as QueryError;
+    assert.equal(error.constructor, QueryError);
+    assert.equal(error.kind, kind);
+    assert.equal(error.code, code);
+  }
+});
+
+test("a server code without a measured meaning keeps its code and has no kind", () => {
+  // -73 and -76 are lock timeouts by name in the headers but were never observed.
+  for (const code of [-73, -76, -181, -427, -677]) {
+    const error = mapError("query", serverError(code), "Query failed.") as QueryError;
+    assert.equal(error.constructor, QueryError);
+    assert.equal(error.code, code);
+    assert.equal(error.origin, "server");
+    assert.equal("kind" in error, false);
+  }
+});
+
+test("a CAS code is never classified as the server error with the same number", () => {
+  const fromCas = new CasReplyError("CUBRID fetch failed (-670): ", -1, -670);
+  const error = mapError("query", fromCas, "Query failed.") as QueryError;
+
+  assert.equal(error.constructor, QueryError);
+  assert.equal(error.code, -670);
+  assert.equal(error.origin, "cas");
+  assert.equal("kind" in error, false);
+});
+
+test("an unknown reply indicator keeps the code without claiming an origin", () => {
+  const error = mapError("query", new CasReplyError("x", -3, -670), "Query failed.") as QueryError;
+
+  assert.equal(error.code, -670);
+  assert.equal("origin" in error, false);
+  assert.equal("kind" in error, false);
+});
+
+test("details survive every wrapping layer and the original cause stays reachable", () => {
+  const original = serverError(-670);
+  const adapter = mapError("query", original, "Failed to execute CUBRID query.");
+  const statement = mapError("transaction", adapter, "Transaction query failed.");
+  const outer = mapError("transaction", statement, "Transaction failed.") as TransactionError;
+
+  assert.ok(outer instanceof TransactionError);
+  assert.equal(outer.code, -670);
+  assert.equal(outer.origin, "server");
+  assert.equal(outer.kind, "unique-violation");
+  assert.ok(adapter instanceof ConstraintError);
+  assert.equal(outer.cause, statement);
+  assert.equal(statement.cause, adapter);
+  assert.equal(adapter.cause, original);
+});
+
+test("a ConnectionError carries the code that refused it through to a QueryError", () => {
+  const refused = mapError(
+    "connection",
+    new CasReplyError("CUBRID connection failed (-171): password", -2, -171),
+    "Failed to connect to CUBRID.",
+  ) as ConnectionError;
+  const query = mapError("query", refused, "Query failed.") as QueryError;
+
+  assert.ok(refused instanceof ConnectionError);
+  assert.equal(refused.code, -171);
+  assert.equal(refused.kind, "authentication");
+  assert.equal(query.code, -171);
+  assert.equal(query.kind, "authentication");
+  assert.equal(query.cause, refused);
+});
+
+test("details are found through an error the application wrapped", () => {
+  const wrapped = new Error("could not save", {
+    cause: mapError("query", serverError(-670), "Failed to execute CUBRID query."),
+  });
+  const error = mapError("transaction", wrapped, "Transaction failed.") as TransactionError;
+
+  assert.equal(error.code, -670);
+  assert.equal(error.kind, "unique-violation");
+  assert.equal(error.cause, wrapped);
+});
+
+test("a cyclic cause chain ends the search instead of hanging", () => {
+  const first = new Error("first");
+  const second = new Error("second", { cause: first });
+  first.cause = second;
+
+  assert.equal("code" in (mapError("query", first, "Query failed.") as QueryError), false);
+});
+
+test("a code on a foreign error is not reported as a CUBRID code", () => {
+  const nodeError = Object.assign(new Error("reset"), { code: "ECONNRESET", kind: "deadlock" });
+  const foreign = Object.assign(new Error("other driver"), { code: -670 });
+
+  for (const cause of [nodeError, foreign]) {
+    const error = mapError("query", cause, "Query failed.") as QueryError;
+    assert.equal(error.constructor, QueryError);
+    assert.equal("code" in error, false);
+    assert.equal("kind" in error, false);
+  }
+});
+
+test("a lost connection has a kind but no code", () => {
+  const lost = new ConnectionLostError("Connection closed while reading");
+  const query = mapError("query", lost, "Query failed.") as QueryError;
+  const transaction = mapError("transaction", query, "Transaction failed.") as TransactionError;
+
+  assert.equal(query.constructor, QueryError);
+  assert.equal(query.kind, "connection-lost");
+  assert.equal(transaction.kind, "connection-lost");
+  assert.equal("code" in transaction, false);
+  assert.equal("origin" in transaction, false);
+});
+
+test("a client read timeout is not a server error", () => {
+  const timeout = new ReadTimeoutError(50);
+
+  assert.equal(timeout.kind, "read-timeout");
+  assert.equal("code" in timeout, false);
+  assert.equal("origin" in timeout, false);
+  assert.ok(!(timeout instanceof QueryError));
+  assert.equal(mapError("query", timeout, "Query failed."), timeout);
+});
+
+test("a lock timeout is not a client read timeout", () => {
+  const error = mapError("query", serverError(-75), "Query failed.");
+
+  assert.ok(error instanceof LockTimeoutError);
+  assert.ok(!(error instanceof ReadTimeoutError));
+  assert.ok(!(error instanceof ConnectionError));
+});
+
+test("errors without details gain no properties", () => {
+  const error = mapError("query", new Error("x"), "Query failed.");
+
+  assert.deepEqual(Object.keys(error), ["name"]);
+});
+
+test("application code can construct errors with details", () => {
+  const cause = new Error("x");
+  const error = new ConstraintError("taken", {
+    cause,
+    code: -670,
+    origin: "server",
+    sqlState: "23000",
+    kind: "unique-violation",
+  });
+
+  assert.equal(error.cause, cause);
+  assert.equal(error.name, "ConstraintError");
+  assert.equal(error.sqlState, "23000");
+  assert.equal(new TransactionError("x", { sqlState: "40001" }).sqlState, "40001");
+  assert.equal(new ConnectionError("x", { sqlState: "08006" }).sqlState, "08006");
+  assert.equal(
+    (mapError("query", error, "Query failed.") as QueryError).sqlState,
+    "23000",
+  );
+});
+
+test("a connection factory error reaches callers of client.query with its details", async () => {
+  const client = new CubridClient(normalizeConfig(baseOptions()), async () => {
+    throw new ConnectionError("refused", { code: -171, origin: "server", kind: "authentication" });
+  });
+
+  await assert.rejects(
+    () => client.query("SELECT 1"),
+    (error: unknown) =>
+      error instanceof QueryError && error.code === -171 && error.kind === "authentication",
+  );
+});
+
+test("transaction() exposes the server code on the TransactionError it rejects with", async () => {
+  const connection = new FakeConnection();
+  connection.query = async () => {
+    throw mapError("query", serverError(-670), "Failed to execute CUBRID query.");
+  };
+  const client = new CubridClient(normalizeConfig(baseOptions()), async () => connection);
+
+  await assert.rejects(
+    () => client.transaction((tx) => tx.query("INSERT INTO t VALUES (1)")),
+    (error: unknown) =>
+      error instanceof TransactionError &&
+      error.code === -670 &&
+      error.kind === "unique-violation" &&
+      error.origin === "server",
+  );
+  assert.equal(connection.rollbackCalls, 1);
+});
+
+test("decode failures stay reachable by name and never gain server details", () => {
+  // Callers walk the cause chain for these two names, a stable 1.x contract.
+  for (const failure of [
+    new UnsupportedValueError("column c: unsupported CAS type 29"),
+    new MalformedReplyError("Malformed CAS packet", { cause: new RangeError("short") }),
+  ]) {
+    const adapter = mapError("query", failure, "Failed to execute CUBRID query.");
+    const inTransaction = mapError("transaction", adapter, "Transaction query failed.");
+
+    for (const [outer, type] of [
+      [mapError("query", adapter, "Query failed."), QueryError],
+      [mapError("transaction", inTransaction, "Transaction failed."), TransactionError],
+    ] as const) {
+      assert.ok(outer instanceof type);
+      assert.equal(outer.constructor, type);
+
+      let current: unknown = outer;
+      while (current instanceof Error && current.name !== failure.name) {
+        current = current.cause;
+      }
+
+      assert.equal(current, failure);
+      assert.equal("code" in outer, false);
+      assert.equal("origin" in outer, false);
+      assert.equal("kind" in outer, false);
+    }
+  }
 });

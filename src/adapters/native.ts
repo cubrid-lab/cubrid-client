@@ -21,6 +21,7 @@ import {
   type PrepareAndExecuteResult,
 } from "../protocol/protocol.js";
 import { EndTranType, StatementType } from "../protocol/constants.js";
+import { ConnectionLostError } from "../errors/internal-errors.js";
 import { mapError } from "../internals/map-error.js";
 import type { DriverAdapter } from "./base.js";
 import type { ClientConfig } from "../types/client.js";
@@ -129,7 +130,7 @@ export class NativeCubridAdapter implements DriverAdapter {
 
     try {
       if (!cas.isConnected) {
-        throw new Error("Not connected");
+        throw this.notConnectedError(cas);
       }
 
       this.assertTransactionSession(cas);
@@ -157,7 +158,7 @@ export class NativeCubridAdapter implements DriverAdapter {
 
     try {
       if (!cas.isConnected) {
-        throw new Error("Not connected");
+        throw this.notConnectedError(cas);
       }
 
       const { header, payload } = writeEndTran(EndTranType.ROLLBACK, cas.casInfo);
@@ -347,9 +348,15 @@ export class NativeCubridAdapter implements DriverAdapter {
     );
   }
 
+  /** Nothing was lost if this adapter never held a transaction on a session. */
+  private notConnectedError(cas: CASConnection): Error {
+    const message = "Not connected";
+    return this.isTransactionSessionLost(cas) ? new ConnectionLostError(message) : new Error(message);
+  }
+
   private assertTransactionSession(cas: CASConnection): void {
     if (this.isTransactionSessionLost(cas)) {
-      throw new Error("Connection lost during transaction");
+      throw new ConnectionLostError("Connection lost during transaction");
     }
   }
 
@@ -365,7 +372,7 @@ export class NativeCubridAdapter implements DriverAdapter {
 
     if (this.isTransactionSessionLost(cas)) {
       await cas.discardSession();
-      throw new Error("Connection lost during transaction");
+      throw new ConnectionLostError("Connection lost during transaction");
     }
   }
 

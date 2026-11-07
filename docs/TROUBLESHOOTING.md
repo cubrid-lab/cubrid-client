@@ -79,10 +79,13 @@ try {
 } catch (error) {
   if (error instanceof QueryError) {
     console.error("Query failed:", error.message);
+    console.error("Server code:", error.code); // -493 for an unknown table
     console.error("Original error:", error.cause);
   }
 }
 ```
+
+`error.code` and `error.kind` identify the failure without parsing the message. See [Error details](API_REFERENCE.md#error-details) for the measured codes.
 
 ### `QueryError` because a value or reply could not be decoded
 
@@ -179,9 +182,15 @@ try {
 } catch (error) {
   if (error instanceof TransactionError) {
     console.error("Transaction failed (auto-rolled back):", error.message);
+    console.error("Why:", error.kind, error.code); // For example "deadlock" -72
   }
 }
 ```
+
+`error.kind` tells these causes apart: `deadlock`, `lock-timeout` or `connection-lost`.
+
+- **`deadlock`**: retry the whole transaction. If your callback catches a `deadlock` error from `tx.query()` it must not continue, because with code `-72` the server already discarded the transaction's earlier statements.
+- **`lock-timeout`**: only the statement failed and the transaction is still open. CUBRID waits indefinitely by default. To limit the wait, run `SET TRANSACTION LOCK TIMEOUT <seconds>` inside the transaction.
 
 ### Transaction auto-rollback
 

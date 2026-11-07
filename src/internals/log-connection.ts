@@ -1,5 +1,11 @@
 import { ConnectionError } from "../errors/connection-error.js";
-import { QueryError } from "../errors/query-error.js";
+import {
+  ConstraintError,
+  DeadlockError,
+  LockTimeoutError,
+  QueryError,
+  SqlSyntaxError,
+} from "../errors/query-error.js";
 import { ReadTimeoutError } from "../errors/read-timeout-error.js";
 import { TransactionError } from "../errors/transaction-error.js";
 import type {
@@ -40,11 +46,16 @@ function createEmit(logger: unknown) {
 
 /**
  * Classifies an error by class, never by its mutable `name`, which a custom
- * connection could set to a bound value. Unknown classes report `Error`.
+ * connection could set to a bound value. Unknown classes report `Error`. The
+ * first match wins, so a subclass must come before the class it extends.
  */
 const ERROR_NAMES: ReadonlyArray<readonly [abstract new (...args: never[]) => Error, string]> = [
   [ReadTimeoutError, "ReadTimeoutError"],
   [ConnectionError, "ConnectionError"],
+  [ConstraintError, "ConstraintError"],
+  [SqlSyntaxError, "SqlSyntaxError"],
+  [DeadlockError, "DeadlockError"],
+  [LockTimeoutError, "LockTimeoutError"],
   [QueryError, "QueryError"],
   [TransactionError, "TransactionError"],
   [TypeError, "TypeError"],

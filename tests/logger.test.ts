@@ -2,7 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { createClient } from "../src/client/create-client.js";
-import { QueryError } from "../src/errors/query-error.js";
+import {
+  ConstraintError,
+  DeadlockError,
+  LockTimeoutError,
+  QueryError,
+  SqlSyntaxError,
+} from "../src/errors/query-error.js";
 import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import type { ClientLogger, ConnectionLike } from "../src/types/client.js";
 
@@ -219,6 +225,11 @@ test("errorName reports a fixed class name, never a custom Error.name", async ()
     [Object.assign(new TypeError("x"), { name: PARAM }), "TypeError"],
     [new ReadTimeoutError(5), "ReadTimeoutError"],
     [new QueryError("x"), "QueryError"],
+    [new ConstraintError("x"), "ConstraintError"],
+    [new SqlSyntaxError("x"), "SqlSyntaxError"],
+    [new DeadlockError("x"), "DeadlockError"],
+    [new LockTimeoutError("x"), "LockTimeoutError"],
+    [Object.assign(new ConstraintError("x"), { name: PARAM }), "ConstraintError"],
   ];
   for (const [error, expected] of cases) {
     const { logger, entries } = recorder();

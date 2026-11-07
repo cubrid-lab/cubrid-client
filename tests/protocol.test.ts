@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { CasReplyError } from "../src/errors/internal-errors.js";
 import { PacketWriter } from "../src/protocol/packet-writer.js";
 import { PacketReader } from "../src/protocol/packet-reader.js";
 import {
@@ -1888,4 +1889,86 @@ test("PacketReader reads exactly to the end of the packet", () => {
   assert.deepEqual(r.parseBytes(3), Buffer.from([2, 3, 4]));
   assert.equal(r.remaining, 0);
   r.skip(0);
+});
+
+// ---------------------------------------------------------------------------
+// Error replies. Layout captured from 10.2, 11.0, 11.2 and 11.4 brokers:
+// int32 indicator (-2 database server, -1 CAS), int32 code, NUL-terminated text.
+// ---------------------------------------------------------------------------
+
+function errorReply(indicator: number, code: number, text: string): Buffer {
+  const message = Buffer.from(`${text}\0`, "utf-8");
+  const reply = Buffer.alloc(8 + message.length);
+  reply.writeInt32BE(indicator, 0);
+  reply.writeInt32BE(code, 4);
+  message.copy(reply, 8);
+  return reply;
+}
+
+test("error replies keep the code, its origin and the existing message", () => {
+  const cases: Array<[(reply: Buffer) => unknown, string]> = [
+    [(reply) => parsePrepareAndExecute(reply, 7), "CUBRID query failed"],
+    [(reply) => parseFetch(reply, []), "CUBRID fetch failed"],
+    [parseGetDbVersion, "CUBRID getDbVersion failed"],
+    [parseSimpleResponse, "CUBRID operation failed"],
+  ];
+
+  for (const [parse, prefix] of cases) {
+    assert.throws(
+      () => parse(errorReply(-2, -670, "duplicate")),
+      (error: unknown) => {
+        assert.ok(error instanceof CasReplyError);
+        assert.equal(error.code, -670);
+        assert.equal(error.origin, "server");
+        assert.equal(error.kind, "unique-violation");
+        assert.equal(error.message, `${prefix} (-670): duplicate`);
+        return true;
+      },
+    );
+  }
+});
+
+test("parseOpenDatabase reports the code that refused the login", () => {
+  const reply = Buffer.concat([Buffer.alloc(SIZE_CAS_INFO), errorReply(-2, -171, "bad password")]);
+
+  assert.throws(
+    () => parseOpenDatabase(reply),
+    (error: unknown) => {
+      assert.ok(error instanceof CasReplyError);
+      assert.equal(error.code, -171);
+      assert.equal(error.kind, "authentication");
+      assert.equal(error.message, "CUBRID connection failed (-171): bad password");
+      return true;
+    },
+  );
+});
+
+test("an invalid handle error comes from the CAS and is not classified", () => {
+  // A 10.2 to 11.4 broker answers FETCH on an unknown handle with exactly this reply.
+  const reply = Buffer.alloc(9);
+  reply.writeInt32BE(-1, 0);
+  reply.writeInt32BE(-1006, 4);
+
+  assert.throws(
+    () => parseFetch(reply, []),
+    (error: unknown) => {
+      assert.ok(error instanceof CasReplyError);
+      assert.equal(error.code, -1006);
+      assert.equal(error.origin, "cas");
+      assert.equal("kind" in error, false);
+      return true;
+    },
+  );
+});
+
+test("a server error reply is never reported as a malformed reply", () => {
+  for (const parse of [
+    (reply: Buffer) => parsePrepareAndExecute(reply, 7),
+    (reply: Buffer) => parseFetch(reply, []),
+  ]) {
+    assert.throws(
+      () => parse(errorReply(-2, -493, "Syntax: unexpected")),
+      (error: Error) => error instanceof CasReplyError && error.name !== "MalformedReplyError",
+    );
+  }
 });

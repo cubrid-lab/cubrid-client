@@ -1209,6 +1209,29 @@ async function beginWithOneInsert() {
   return created;
 }
 
+test("committing on a lost session reports the lost connection", async () => {
+  const { adapter, fakeCAS } = await beginWithOneInsert();
+  fakeCAS._isConnected = false;
+
+  await assert.rejects(adapter.commit(), (error: unknown) => {
+    assert.ok(error instanceof TransactionError);
+    assert.equal(error.kind, "connection-lost");
+    assert.equal(error.code, undefined);
+    return true;
+  });
+});
+
+test("committing with no transaction on a closed connection loses nothing", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS._isConnected = false;
+
+  await assert.rejects(adapter.commit(), (error: unknown) => {
+    assert.ok(error instanceof TransactionError);
+    assert.equal(error.kind, undefined);
+    return true;
+  });
+});
+
 test("NativeCubridAdapter does not resume a failed first transaction statement after ping", async () => {
   const { adapter, fakeCAS } = createAdapterWithFakeCAS();
   await adapter.beginTransaction();

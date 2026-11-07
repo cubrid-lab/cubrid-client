@@ -14,6 +14,7 @@ Complete reference for every public export of `cubrid-client`.
   - [QueryError](#queryerror)
   - [TransactionError](#transactionerror)
   - [ReadTimeoutError](#readtimeouterror)
+  - [Error details](#error-details)
 - [Types](#types)
   - [ClientOptions](#clientoptions)
   - [ClientConfig](#clientconfig)
@@ -342,6 +343,10 @@ graph TD
     E --> Q[QueryError - SQL execution failures]
     E --> T[TransactionError - transaction lifecycle failures]
     C --> R[ReadTimeoutError - server silent for readTimeout ms]
+    Q --> CE[ConstraintError - unique, NOT NULL or foreign key]
+    Q --> S[SqlSyntaxError - unparsable statement or unknown table]
+    Q --> D[DeadlockError - deadlock victim]
+    Q --> L[LockTimeoutError - server lock wait expired]
 ```
 
 ### Common Pattern
@@ -392,8 +397,21 @@ Thrown when a SQL statement fails to execute.
 class QueryError extends Error {
   name = "QueryError";
   cause?: Error; // Original driver error
+  readonly code?: number; // See "Error details"
+  readonly origin?: "server" | "cas";
+  readonly sqlState?: string;
+  readonly kind?: CubridErrorKind;
 }
 ```
+
+Outside a transaction, the failures in the table below reject with a subclass of `QueryError`, so `instanceof QueryError` still holds. Its `name` is the subclass name, for example `"ConstraintError"`.
+
+| Class | `kind` |
+|-------|--------|
+| `ConstraintError` | `unique-violation`, `not-null-violation`, `foreign-key-violation` |
+| `SqlSyntaxError` | `syntax` |
+| `DeadlockError` | `deadlock` |
+| `LockTimeoutError` | `lock-timeout` |
 
 **When thrown:**
 
@@ -411,8 +429,14 @@ Thrown when a transaction operation fails (begin, commit, rollback, or query wit
 class TransactionError extends Error {
   name = "TransactionError";
   cause?: Error; // Original driver error
+  readonly code?: number; // See "Error details"
+  readonly origin?: "server" | "cas";
+  readonly sqlState?: string;
+  readonly kind?: CubridErrorKind;
 }
 ```
+
+A failure inside a transaction stays a `TransactionError`, as it was before these subclasses existed. Test `error.kind`, which has the same value in both places, or find the `ConstraintError` and the like further down `error.cause`.
 
 **When thrown:**
 
@@ -450,6 +474,60 @@ try {
 ```
 
 ### Accessing the Original Error
+
+### Error details
+
+`QueryError`, `TransactionError` and `ConnectionError` expose the same read-only properties, so a failure can be identified without parsing a message. Every property is `undefined` when it does not apply.
+
+| Property | Type | Meaning |
+|----------|------|---------|
+| `code` | `number` | Numeric code of the CAS error reply. Client-side failures have none. |
+| `origin` | `"server" \| "cas"` | Who assigned `code`. The database server and the CAS process number their errors in ranges that overlap, so compare a code together with its origin. Only `server` codes have a `kind`. |
+| `kind` | `CubridErrorKind` | Classification of a known failure. |
+| `sqlState` | `string` | Never set by this driver: CAS error replies carry no SQLSTATE and CUBRID documents no mapping from its codes. It stays available for a custom `connectionFactory` that has a real value to report. |
+
+```ts
+import { QueryError, TransactionError } from "cubrid-client";
+
+try {
+  await db.transaction(async (tx) => {
+    await tx.query("INSERT INTO users (email) VALUES (?)", [email]);
+  });
+} catch (error) {
+  if (error instanceof TransactionError && error.kind === "unique-violation") {
+    return "That address is already registered.";
+  }
+  throw error;
+}
+```
+
+`kind` is set only for the codes below. Each one was reported by live CUBRID 10.2, 11.0, 11.2 and 11.4 servers, except where noted. Any other server error keeps its `code` and `origin` and has no `kind`, including `-73` and `-76`, which the CUBRID headers name as lock timeouts but which were never observed.
+
+| `kind` | `code` | Reported when |
+|--------|--------|---------------|
+| `unique-violation` | `-670` | A primary key or unique index rejected a value |
+| `unique-violation` | `-886` | The same, on a server with `print_key_value_on_unique_error=yes` |
+| `not-null-violation` | `-631` | `NULL` into a `NOT NULL` column. A literal `SET col = NULL` is rejected earlier as `semantic` |
+| `foreign-key-violation` | `-922` | No parent row matches |
+| `foreign-key-violation` | `-924` | A child row refers to the row being changed |
+| `foreign-key-violation` | `-1284` | `TRUNCATE` of a referenced table (11.2 and later; earlier servers report `-924`) |
+| `syntax` | `-493` | The statement cannot be parsed, or it names an unknown table |
+| `semantic` | `-494` | Unknown column or function, a missing privilege, a type mismatch or a constant division by zero |
+| `deadlock` | `-72` | Deadlock victim. The server rolled back **the whole transaction** |
+| `deadlock` | `-967`, `-968` | Deadlock victim while a finite lock timeout is set (table lock, row lock). Only the statement failed and the transaction stays open |
+| `lock-timeout` | `-74`, `-75` | A lock wait expired (table lock, row lock). Only the statement failed and the transaction stays open |
+| `interrupted` | `-4` | The server stopped the statement, for example with `cubrid killtran` |
+| `authentication` | `-165`, `-171` | Unknown user, wrong password |
+| `connection-lost` | `-111` | `cub_server` died, taking the transaction with it |
+
+Failures detected by the client have a `kind` but no `code` or `origin`:
+
+| `kind` | Reported when |
+|--------|---------------|
+| `connection-lost` | The socket closed, or the session that held the transaction is gone. The outcome of a request that was in flight is unknown |
+| `read-timeout` | [`ReadTimeoutError`](#readtimeouterror): the client stopped waiting for a response. A server lock wait that expires is `lock-timeout` instead |
+
+After any `deadlock`, roll back and retry the transaction from its start. Do not continue in it: after `-72` the server has already discarded the earlier statements, so anything sent next and committed would persist on its own.
 
 All error classes preserve the original driver error via the standard `cause` property:
 

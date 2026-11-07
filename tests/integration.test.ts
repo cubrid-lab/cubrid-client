@@ -14,7 +14,14 @@ import assert from "node:assert/strict";
 import { createClient } from "../src/client/create-client.js";
 import { NativeCubridAdapter } from "../src/adapters/native.js";
 import { ConnectionError } from "../src/errors/connection-error.js";
-import { QueryError } from "../src/errors/query-error.js";
+import {
+  ConstraintError,
+  DeadlockError,
+  LockTimeoutError,
+  QueryError,
+  SqlSyntaxError,
+} from "../src/errors/query-error.js";
+import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { TransactionError } from "../src/errors/transaction-error.js";
 import { CASFunctionCode } from "../src/protocol/constants.js";
 import { CASConnection } from "../src/protocol/connection.js";
@@ -1395,6 +1402,363 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`);
       await adapter.query(`DROP TABLE IF EXISTS ${WRITES}`);
       await adapter.close();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Structured server errors: each of these failures really happens on the server
+  // -------------------------------------------------------------------------
+
+  describe("server error details", () => {
+    const PARENT = "cc_err_parent";
+    const CHILD = "cc_err_child";
+    const ROWS = "cc_err_rows";
+
+    /** Resolves with the rejection, and fails the test if `run` succeeds. */
+    async function failure<E extends Error = QueryError>(run: () => Promise<unknown>): Promise<E> {
+      try {
+        await run();
+      } catch (error) {
+        return error as E;
+      }
+      throw new Error("expected the statement to fail");
+    }
+
+    async function withAdapters(
+      run: (first: NativeCubridAdapter, second: NativeCubridAdapter) => Promise<void>,
+    ): Promise<void> {
+      const first = new NativeCubridAdapter(TEST_CONFIG);
+      const second = new NativeCubridAdapter(TEST_CONFIG);
+
+      try {
+        await first.connect();
+        await second.connect();
+        await run(first, second);
+      } finally {
+        await first.rollback().catch(() => {});
+        await second.rollback().catch(() => {});
+        await first.close();
+        await second.close();
+      }
+    }
+
+    /**
+     * Makes each adapter wait for the row the other has already locked.
+     * SET TRANSACTION LOCK TIMEOUT runs inside the transaction because, sent in
+     * autocommit before beginTransaction(), a later statement still waited forever.
+     */
+    async function deadlock(
+      first: NativeCubridAdapter,
+      second: NativeCubridAdapter,
+      lockTimeoutSeconds?: number,
+    ): Promise<PromiseSettledResult<unknown>[]> {
+      await first.beginTransaction();
+      await second.beginTransaction();
+
+      if (lockTimeoutSeconds !== undefined) {
+        await first.query(`SET TRANSACTION LOCK TIMEOUT ${lockTimeoutSeconds}`);
+        await second.query(`SET TRANSACTION LOCK TIMEOUT ${lockTimeoutSeconds}`);
+      }
+
+      await first.query(`UPDATE ${ROWS} SET n = n + 1 WHERE id = 1`);
+      await second.query(`UPDATE ${ROWS} SET n = n + 1 WHERE id = 2`);
+
+      return Promise.allSettled([
+        first.query(`UPDATE ${ROWS} SET n = n + 1 WHERE id = 2`),
+        new Promise((resolve) => setTimeout(resolve, 200)).then(() =>
+          second.query(`UPDATE ${ROWS} SET n = n + 1 WHERE id = 1`),
+        ),
+      ]);
+    }
+
+    const rejections = (results: PromiseSettledResult<unknown>[]): QueryError[] =>
+      results.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
+
+    test("create the tables", async () => {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+
+      try {
+        await adapter.query(`DROP TABLE IF EXISTS ${CHILD}`);
+        await adapter.query(`DROP TABLE IF EXISTS ${PARENT}`);
+        await adapter.query(`DROP TABLE IF EXISTS ${ROWS}`);
+        await adapter.query(`CREATE TABLE ${PARENT} (id INT PRIMARY KEY)`);
+        await adapter.query(
+          `CREATE TABLE ${CHILD} (id INT PRIMARY KEY, parent_id INT, ` +
+            `FOREIGN KEY (parent_id) REFERENCES ${PARENT} (id))`,
+        );
+        await adapter.query(
+          `CREATE TABLE ${ROWS} (id INT PRIMARY KEY, label VARCHAR(20) UNIQUE, n INT NOT NULL)`,
+        );
+        await adapter.query(`INSERT INTO ${PARENT} VALUES (1)`);
+        await adapter.query(`INSERT INTO ${CHILD} VALUES (1, 1)`);
+        await adapter.query(`INSERT INTO ${ROWS} VALUES (1, 'a', 1), (2, 'b', 2)`);
+      } finally {
+        await adapter.close();
+      }
+    });
+
+    test("a duplicate primary key and a duplicate unique column report -670", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        for (const sql of [
+          `INSERT INTO ${ROWS} VALUES (1, 'z', 1)`,
+          `INSERT INTO ${ROWS} VALUES (9, 'a', 1)`,
+          `UPDATE ${ROWS} SET label = 'a' WHERE id = 2`,
+        ]) {
+          const error = await failure(() => client.query(sql));
+
+          assert.ok(error instanceof ConstraintError);
+          assert.ok(error instanceof QueryError);
+          assert.equal(error.name, "ConstraintError");
+          assert.equal(error.code, -670);
+          assert.equal(error.origin, "server");
+          assert.equal(error.kind, "unique-violation");
+          assert.equal(error.sqlState, undefined);
+        }
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("a syntax error reports -493", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        const error = await failure(() => client.query("SELEC 1"));
+
+        assert.ok(error instanceof SqlSyntaxError);
+        assert.ok(error instanceof QueryError);
+        assert.equal(error.code, -493);
+        assert.equal(error.origin, "server");
+        assert.equal(error.kind, "syntax");
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("an unknown table is a -493 syntax error, an unknown column a -494", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        const table = await failure(() => client.query("SELECT * FROM cc_err_no_such_table"));
+        assert.ok(table instanceof SqlSyntaxError);
+        assert.equal(table.code, -493);
+
+        const column = await failure(() => client.query(`SELECT nope FROM ${ROWS}`));
+        assert.equal(column.constructor, QueryError);
+        assert.equal(column.code, -494);
+        assert.equal(column.kind, "semantic");
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("constraint violations report their own codes", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        const notNull = await failure(() =>
+          client.query(`INSERT INTO ${ROWS} VALUES (5, 'n', NULL)`),
+        );
+        assert.ok(notNull instanceof ConstraintError);
+        assert.equal(notNull.code, -631);
+        assert.equal(notNull.kind, "not-null-violation");
+
+        const noParent = await failure(() => client.query(`INSERT INTO ${CHILD} VALUES (2, 99)`));
+        assert.ok(noParent instanceof ConstraintError);
+        assert.equal(noParent.code, -922);
+        assert.equal(noParent.kind, "foreign-key-violation");
+
+        const hasChild = await failure(() => client.query(`DELETE FROM ${PARENT} WHERE id = 1`));
+        assert.ok(hasChild instanceof ConstraintError);
+        assert.equal(hasChild.code, -924);
+        assert.equal(hasChild.kind, "foreign-key-violation");
+
+        const truncate = await failure(() => client.query(`TRUNCATE ${PARENT}`));
+        assert.ok(truncate instanceof ConstraintError);
+        assert.ok(truncate.code === -924 || truncate.code === -1284, `got ${truncate.code}`);
+        assert.equal(truncate.kind, "foreign-key-violation");
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("a server code nobody classified still reaches the caller", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        const error = await failure(() => client.query("SELECT CAST('x' AS INT)"));
+
+        assert.equal(error.constructor, QueryError);
+        assert.equal(error.code, -181);
+        assert.equal(error.origin, "server");
+        assert.equal(error.kind, undefined);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("an undecodable value keeps its name and has no server details", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        const error = await failure(() =>
+          client.query("SELECT TIMESTAMPTZ'2020-01-02 03:04:05 +09:00' AS zoned"),
+        );
+        let current: unknown = error;
+        while (current instanceof Error && current.name !== "UnsupportedValueError") {
+          current = current.cause;
+        }
+
+        assert.ok(current instanceof Error);
+        assert.equal(error.constructor, QueryError);
+        assert.equal(error.code, undefined);
+        assert.equal(error.origin, undefined);
+        assert.equal(error.kind, undefined);
+
+        const next = await failure(() => client.query("SELEC 1"));
+        assert.ok(next instanceof SqlSyntaxError);
+        assert.equal(next.code, -493);
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("a failure inside transaction() stays a TransactionError with the same details", async () => {
+      const client = createClient(TEST_CONFIG);
+
+      try {
+        const error = await failure<TransactionError>(() =>
+          client.transaction((tx) => tx.query(`INSERT INTO ${ROWS} VALUES (1, 'z', 1)`)),
+        );
+
+        assert.ok(error instanceof TransactionError);
+        assert.equal(error.code, -670);
+        assert.equal(error.kind, "unique-violation");
+        assert.equal(error.origin, "server");
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("a wrong password and an unknown user report their own codes", async () => {
+      const password = new NativeCubridAdapter({ ...TEST_CONFIG, password: "wrong" });
+      const passwordError = await failure<ConnectionError>(() => password.connect());
+      assert.ok(passwordError instanceof ConnectionError);
+      assert.equal(passwordError.code, -171);
+      assert.equal(passwordError.origin, "server");
+      assert.equal(passwordError.kind, "authentication");
+      await password.close().catch(() => {});
+
+      const user = new NativeCubridAdapter({ ...TEST_CONFIG, user: "cc_err_no_such_user" });
+      const userError = await failure<ConnectionError>(() => user.connect());
+      assert.equal(userError.code, -165);
+      assert.equal(userError.kind, "authentication");
+      await user.close().catch(() => {});
+    });
+
+    test("a server lock timeout on a row is -75 and leaves the transaction open", async () => {
+      await withAdapters(async (first, second) => {
+        await first.beginTransaction();
+        await first.query(`UPDATE ${ROWS} SET n = n + 1 WHERE id = 1`);
+
+        await second.beginTransaction();
+        await second.query("SET TRANSACTION LOCK TIMEOUT 1");
+
+        const error = await failure(() =>
+          second.query(`UPDATE ${ROWS} SET n = n + 1 WHERE id = 1`),
+        );
+
+        assert.ok(error instanceof LockTimeoutError);
+        assert.ok(error instanceof QueryError);
+        assert.ok(!(error instanceof ConnectionError));
+        assert.equal(error.code, -75);
+        assert.equal(error.origin, "server");
+        assert.equal(error.kind, "lock-timeout");
+
+        await second.query(`UPDATE ${ROWS} SET n = n + 1 WHERE id = 2`);
+      });
+    });
+
+    test("a server lock timeout on a table is -74", async () => {
+      await withAdapters(async (first, second) => {
+        await first.beginTransaction();
+        await first.query(`ALTER TABLE ${ROWS} ADD COLUMN cc_err_extra INT`);
+
+        await second.beginTransaction();
+        await second.query("SET TRANSACTION LOCK TIMEOUT 1");
+
+        const error = await failure(() => second.query(`SELECT * FROM ${ROWS}`));
+
+        assert.ok(error instanceof LockTimeoutError);
+        assert.equal(error.code, -74);
+      });
+    });
+
+    test("the client's read timeout stays distinct from a server lock wait", async () => {
+      const impatient = new NativeCubridAdapter({ ...TEST_CONFIG, readTimeout: 2000 });
+      const holder = new NativeCubridAdapter(TEST_CONFIG);
+
+      try {
+        await holder.beginTransaction();
+        await holder.query(`UPDATE ${ROWS} SET n = n + 1 WHERE id = 1`);
+        await impatient.connect();
+        await impatient.beginTransaction();
+
+        const error = await failure<ReadTimeoutError>(() =>
+          impatient.query(`UPDATE ${ROWS} SET n = n + 1 WHERE id = 1`),
+        );
+
+        assert.ok(error instanceof ReadTimeoutError);
+        assert.ok(!(error instanceof LockTimeoutError));
+        assert.equal(error.kind, "read-timeout");
+        assert.equal(error.code, undefined);
+        assert.equal(error.origin, undefined);
+      } finally {
+        await holder.rollback().catch(() => {});
+        await holder.close();
+        await impatient.close().catch(() => {});
+      }
+    });
+
+    test("a deadlock victim gets -72 and the other transaction proceeds", async () => {
+      await withAdapters(async (first, second) => {
+        const results = await deadlock(first, second);
+        const failed = rejections(results);
+
+        assert.equal(failed.length, 1);
+        assert.ok(failed[0] instanceof DeadlockError);
+        assert.ok(failed[0] instanceof QueryError);
+        assert.equal(failed[0].code, -72);
+        assert.equal(failed[0].origin, "server");
+        assert.equal(failed[0].kind, "deadlock");
+      });
+    });
+
+    test("under a finite lock timeout the deadlock victim gets -968", async () => {
+      await withAdapters(async (first, second) => {
+        const failed = rejections(await deadlock(first, second, 4));
+        const codes = failed.map((error) => error.code).sort();
+
+        // The survivor still waits for its own lock until its timeout expires.
+        assert.deepEqual(codes, [-75, -968]);
+        const victim = failed.find((error) => error.code === -968);
+        assert.ok(victim instanceof DeadlockError);
+        assert.equal(victim.kind, "deadlock");
+      });
+    });
+
+    test("drop the tables", async () => {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+
+      try {
+        await adapter.query(`DROP TABLE IF EXISTS ${CHILD}`);
+        await adapter.query(`DROP TABLE IF EXISTS ${PARENT}`);
+        await adapter.query(`DROP TABLE IF EXISTS ${ROWS}`);
+      } finally {
+        await adapter.close();
+      }
     });
   });
 
