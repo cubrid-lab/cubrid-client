@@ -23,6 +23,10 @@ See [cubrid-lab issue, PR, and commit standard](https://github.com/cubrid-lab/.g
 
 
 
+## Node.js 18 compatibility through 1.x
+
+For **every `cubrid-client@1.x` release**, preserve `engines.node >=18` and the existing Node 20 support commitment; see [ADR 0006](docs/adr/0006-node-18-support-through-1x.md) and [API stability](docs/API_STABILITY.md#nodejs-support-schedule). Node 22 is the contributor/toolchain baseline **only**. Validate the actual packed ESM/CJS consumer under Node 18 before a 1.x release. Raising the runtime floor is a separately approved **2.0 MAJOR** consideration, never a 1.x patch/minor workaround.
+
 ## Development setup before design and TDD implementation
 
 Use the repository-specific [development setup guide](docs/DEVELOPMENT_SETUP.md) and [setup ADR 0005](docs/adr/0005-development-setup.md) (**Proposed**) before attempting new runtime or ORM work. Verify the **actual** manifest, supported developer toolchain, dependency resolution, read-only offline checks, and availability/absence of real CUBRID integration separately. Do not invent an unavailable Docker Compose file, integration test, linter, Cargo registry artifact, or Go module import path. A successful unit build is not a successful real-database test or a published package. Record observed setup blockers as issues; do not silently change public consumer engine/Go module paths/Rust MSRV, weaken CI, or modify release credentials to make onboarding appear green.
