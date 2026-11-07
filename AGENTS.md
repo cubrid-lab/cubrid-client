@@ -22,6 +22,11 @@ See [cubrid-lab issue, PR, and commit standard](https://github.com/cubrid-lab/.g
 
 
 
+
+## Test-first implementation after architecture review
+
+Before implementing a CUBRID behavior change, check the approved API/SQL/protocol contract and [TDD ADR 0004](docs/adr/0004-test-first-development.md) (**currently Proposed**). Follow **Red → Green → Refactor** in focused slices: execute a deterministic failure for the intended reason first, implement the smallest fix, rerun the case and relevant regressions, then refactor. Explain the initial failure and actual checks in the PR without inventing command output. A final PR must pass its required CI; never keep a deliberately failing regression as proof of Red. Confirm database-dependent behavior through real CUBRID tests and the release candidate matrix; mocks alone cannot certify it. Upstream feasibility prototypes and docs-only changes are exempt from ritual Red steps but must show their own accurate evidence. Release policy and architecture decisions must be approved before classifying design as completed.
+
 ## Architecture decisions and release order
 
 Read the [repository ADR index](docs/adr/README.md) before proposing changes to public behavior, release contracts, native dialect design, transaction ownership or migrations. ADR 0001 records release governance; ADR 0002 records the failure-evidence contract learned from Python; native architecture ADR 0003 (where applicable) is **Proposed** in the separate draft architecture PR. Do not treat a Proposed ADR as approved. Adopt the release policy before accepting the architecture ADR; require actual tested evidence before claiming implementation or release readiness. Use the [ADR template](docs/adr/TEMPLATE.md) for material new decisions, not for every trivial change.
