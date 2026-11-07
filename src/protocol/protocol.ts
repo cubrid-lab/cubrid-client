@@ -9,6 +9,7 @@
  * returns a parsed result structure.
  */
 
+import { CasReplyError } from "../errors/internal-errors.js";
 import { PacketReader } from "./packet-reader.js";
 import { PacketWriter } from "./packet-writer.js";
 import {
@@ -182,8 +183,10 @@ export function parseOpenDatabase(data: Buffer): OpenDatabaseResult {
   if (responseCode < 0) {
     const remaining = data.length - SIZE_CAS_INFO - SIZE_INT;
     const err = reader.readError(remaining);
-    throw new Error(
+    throw new CasReplyError(
       `CUBRID connection failed (${err.code}): ${err.message || "Unknown error"}`,
+      responseCode,
+      err.code,
     );
   }
 
@@ -253,7 +256,11 @@ export function parsePrepareAndExecute(
   if (responseCode < 0) {
     const remaining = data.length - SIZE_INT;
     const err = reader.readError(remaining);
-    throw new Error(`CUBRID query failed (${err.code}): ${err.message}`);
+    throw new CasReplyError(
+      `CUBRID query failed (${err.code}): ${err.message}`,
+      responseCode,
+      err.code,
+    );
   }
 
   return decodeReply(() => readExecuteReply(reader, responseCode, protoVersion));
@@ -373,7 +380,11 @@ export function parseFetch(
     // response still advertises additional tuples.
     const remaining = data.length - SIZE_INT;
     const err = reader.readError(remaining);
-    throw new Error(`CUBRID fetch failed (${err.code}): ${err.message}`);
+    throw new CasReplyError(
+      `CUBRID fetch failed (${err.code}): ${err.message}`,
+      responseCode,
+      err.code,
+    );
   }
 
   return decodeReply(() => {
@@ -445,7 +456,11 @@ export function parseGetDbVersion(data: Buffer): string {
   if (code < 0) {
     const remaining = data.length - SIZE_INT;
     const err = reader.readError(remaining);
-    throw new Error(`CUBRID getDbVersion failed (${err.code}): ${err.message}`);
+    throw new CasReplyError(
+      `CUBRID getDbVersion failed (${err.code}): ${err.message}`,
+      code,
+      err.code,
+    );
   }
 
   const versionLen = data.length - SIZE_INT;
@@ -498,7 +513,11 @@ export function parseSimpleResponse(data: Buffer): void {
   if (code < 0) {
     const remaining = data.length - SIZE_INT;
     const err = reader.readError(remaining);
-    throw new Error(`CUBRID operation failed (${err.code}): ${err.message}`);
+    throw new CasReplyError(
+      `CUBRID operation failed (${err.code}): ${err.message}`,
+      code,
+      err.code,
+    );
   }
 }
 

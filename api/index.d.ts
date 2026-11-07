@@ -129,14 +129,82 @@ declare class CubridTransaction implements TransactionClient {
     rollback(): Promise<void>;
 }
 
-declare class ConnectionError extends Error {
-    name: string;
-    constructor(message: string, options?: ErrorOptions);
+/**
+ * What a failure was, without parsing its message. Each server-reported value
+ * was observed from a live broker; a code that was not observed has no kind.
+ *
+ * - `unique-violation`, `not-null-violation`, `foreign-key-violation`: a
+ *   constraint rejected the statement.
+ * - `syntax`: the server could not parse the statement. CUBRID also reports an
+ *   unknown table this way.
+ * - `semantic`: the statement parsed but cannot run, such as an unknown column,
+ *   a missing privilege or a constant division by zero.
+ * - `deadlock`: the server picked this transaction as the deadlock victim.
+ * - `lock-timeout`: a server-side lock wait expired. This is not `read-timeout`.
+ * - `interrupted`: the server stopped the statement, for example `cubrid killtran`.
+ * - `authentication`: the broker refused the user or password.
+ * - `connection-lost`: the connection went away, or the server process died and
+ *   took the transaction with it. The outcome of a request in flight is unknown.
+ * - `read-timeout`: the client gave up waiting, see `ReadTimeoutError`.
+ */
+type CubridErrorKind = "unique-violation" | "not-null-violation" | "foreign-key-violation" | "syntax" | "semantic" | "deadlock" | "lock-timeout" | "interrupted" | "authentication" | "connection-lost" | "read-timeout";
+interface CubridErrorDetails {
+    /** Numeric error code of the CAS error reply. Absent for client-side failures. */
+    code?: number;
+    /**
+     * Who assigned `code`: `server` for a database error code, `cas` for one from
+     * the CAS process. The two number ranges overlap, so compare a code only
+     * together with its origin: `-1012` is a different error in each.
+     */
+    origin?: "server" | "cas";
+    /**
+     * Five-character SQLSTATE. CAS error replies do not carry one and CUBRID
+     * documents no mapping from its codes, so this driver never sets it. It is
+     * kept for a custom connection that has a real value to report.
+     */
+    sqlState?: string;
+    /** Classification of a known failure. Absent when the failure is not classified. */
+    kind?: CubridErrorKind;
+}
+interface CubridErrorOptions extends ErrorOptions, CubridErrorDetails {
 }
 
+interface ConnectionError extends Readonly<CubridErrorDetails> {
+}
+declare class ConnectionError extends Error {
+    name: string;
+    constructor(message: string, options?: CubridErrorOptions);
+}
+
+interface QueryError extends Readonly<CubridErrorDetails> {
+}
 declare class QueryError extends Error {
     name: string;
-    constructor(message: string, options?: ErrorOptions);
+    constructor(message: string, options?: CubridErrorOptions);
+}
+/** A unique, NOT NULL or foreign key constraint rejected the statement; see `kind`. */
+declare class ConstraintError extends QueryError {
+    name: string;
+}
+/** The server could not parse the statement, or it names an unknown table. */
+declare class SqlSyntaxError extends QueryError {
+    name: string;
+}
+/**
+ * The server chose this transaction as a deadlock victim. With code `-72` it
+ * already rolled the whole transaction back; with `-967` or `-968`, reported
+ * under a finite lock timeout, only the statement failed and the transaction
+ * stays open. Either way, roll back and retry the transaction from its start.
+ */
+declare class DeadlockError extends QueryError {
+    name: string;
+}
+/**
+ * A server-side lock wait expired. Only the statement failed, and the
+ * transaction stays open. This is not the client-side `ReadTimeoutError`.
+ */
+declare class LockTimeoutError extends QueryError {
+    name: string;
 }
 
 declare class ReadTimeoutError extends ConnectionError {
@@ -145,9 +213,11 @@ declare class ReadTimeoutError extends ConnectionError {
     constructor(timeoutMs: number, options?: ErrorOptions);
 }
 
+interface TransactionError extends Readonly<CubridErrorDetails> {
+}
 declare class TransactionError extends Error {
     name: string;
-    constructor(message: string, options?: ErrorOptions);
+    constructor(message: string, options?: CubridErrorOptions);
 }
 
 interface DriverAdapter extends ConnectionLike {
@@ -224,4 +294,4 @@ declare function buildWhere(conditions: Record<string, unknown>): {
     params: unknown[];
 };
 
-export { type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type CollectionElement, type CollectionValue, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, CubridClient, CubridTransaction, NativeCubridAdapter, QueryError, type QueryParam, type QueryParams, type QueryResultRow, type Queryable, ReadTimeoutError, type TransactionCallback, type TransactionClient, TransactionError, buildWhere, createClient, escapeIdentifier, parseConnectionString };
+export { type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type CollectionElement, type CollectionValue, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridTransaction, DeadlockError, LockTimeoutError, NativeCubridAdapter, QueryError, type QueryParam, type QueryParams, type QueryResultRow, type Queryable, ReadTimeoutError, SqlSyntaxError, type TransactionCallback, type TransactionClient, TransactionError, buildWhere, createClient, escapeIdentifier, parseConnectionString };

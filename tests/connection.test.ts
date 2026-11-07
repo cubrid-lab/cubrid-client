@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer, type Server, type Socket as NetSocket } from "node:net";
 
+import { ConnectionLostError } from "../src/errors/internal-errors.js";
 import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { CASConnection, type CASConnectionConfig } from "../src/protocol/connection.js";
 import {
@@ -486,6 +487,7 @@ test("CASConnection send rejects when remote side closed socket", async () => {
       () => cas.send(Buffer.alloc(8), Buffer.from([0x01])),
       (err: Error) => {
         assert.match(err.message, /closed by the remote side/);
+        assert.ok(err instanceof ConnectionLostError);
         return true;
       },
     );
@@ -851,6 +853,45 @@ function brokerWith(onRequest: (socket: NetSocket, requestIndex: number) => void
 const REQUEST_HEADER = Buffer.alloc(8);
 const REQUEST_PAYLOAD = Buffer.from([0x01]);
 const CAS_INFO = Buffer.from([0x01, 0x02, 0x03, 0x04]);
+
+test("a CAS that goes away during a request is reported as a lost connection", async () => {
+  for (const [end, message] of [
+    [(socket: NetSocket) => socket.end(), /ended while reading/],
+    [(socket: NetSocket) => socket.destroy(), /(ended|closed) while reading/],
+    [(socket: NetSocket) => socket.resetAndDestroy(), /ECONNRESET/],
+  ] as const) {
+    const { server, port } = await brokerWith((socket) => end(socket));
+
+    try {
+      const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+      await cas.connect();
+
+      await assert.rejects(cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD), (error: Error) => {
+        assert.ok(error instanceof ConnectionLostError);
+        assert.match(error.message, message);
+        return true;
+      });
+    } finally {
+      await closeServer(server);
+    }
+  }
+});
+
+test("a corrupt frame is not reported as a lost connection", async () => {
+  const { server, port } = await brokerWith((socket) => socket.write(frameHeader(-1)));
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
+    await cas.connect();
+
+    await assert.rejects(cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD), (error: Error) => {
+      assert.ok(!(error instanceof ConnectionLostError));
+      return true;
+    });
+  } finally {
+    await closeServer(server);
+  }
+});
 
 test("CASConnection rejects a negative frame length and retires the socket", async () => {
   const { server, port } = await brokerWith((socket) => socket.write(frameHeader(-1)));

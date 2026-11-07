@@ -13,6 +13,7 @@
 import { Socket } from "node:net";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
 import { DEFAULT_MAX_FRAME_LENGTH, SIZE_CAS_INFO, SIZE_DATA_LENGTH } from "./constants.js";
+import { ConnectionLostError } from "../errors/internal-errors.js";
 import { ReadTimeoutError } from "../errors/read-timeout-error.js";
 import { parseConnectionString } from "../utils/connection-string.js";
 import {
@@ -176,11 +177,11 @@ export class CASConnection {
    */
   async send(header: Buffer, payload: Buffer): Promise<void> {
     if (!this.socket || !this.connected) {
-      throw new Error("CASConnection is not connected");
+      throw new ConnectionLostError("CASConnection is not connected");
     }
 
     if (this.socketDead) {
-      throw new Error("Socket has been closed by the remote side");
+      throw new ConnectionLostError("Socket has been closed by the remote side");
     }
 
     const combined = Buffer.concat([header, payload]);
@@ -194,7 +195,7 @@ export class CASConnection {
    */
   async recv(): Promise<Buffer> {
     if (!this.socket || !this.connected) {
-      throw new Error("CASConnection is not connected");
+      throw new ConnectionLostError("CASConnection is not connected");
     }
 
     return this.readFrame(this.socket);
@@ -583,7 +584,7 @@ export class CASConnection {
     const write = new Promise<void>((resolve, reject) => {
       socket.write(data, (err) => {
         if (err) {
-          reject(err);
+          reject(new ConnectionLostError(err.message, { cause: err }));
         } else {
           resolve();
         }
@@ -607,7 +608,7 @@ export class CASConnection {
 
       // A destroyed socket emits nothing further, so waiting would never end.
       if (socket.destroyed) {
-        reject(new Error("Connection closed while reading"));
+        reject(new ConnectionLostError("Connection closed while reading"));
         return;
       }
 
@@ -629,17 +630,17 @@ export class CASConnection {
 
       const onError = (err: Error): void => {
         cleanup();
-        reject(err);
+        reject(new ConnectionLostError(err.message, { cause: err }));
       };
 
       const onClose = (): void => {
         cleanup();
-        reject(new Error("Connection closed while reading"));
+        reject(new ConnectionLostError("Connection closed while reading"));
       };
 
       const onEnd = (): void => {
         cleanup();
-        reject(new Error("Connection ended while reading"));
+        reject(new ConnectionLostError("Connection ended while reading"));
       };
 
       const cleanup = (): void => {

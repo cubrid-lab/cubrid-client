@@ -15,6 +15,9 @@ export class ReadTimeoutError extends ConnectionError {
     readonly timeoutMs: number,
     options?: ErrorOptions,
   ) {
-    super(`No activity from the CUBRID server for ${timeoutMs}ms.`, options);
+    super(`No activity from the CUBRID server for ${timeoutMs}ms.`, {
+      ...options,
+      kind: "read-timeout",
+    });
   }
 }

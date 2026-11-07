@@ -28,7 +28,7 @@ A modern CUBRID client that speaks the CAS binary protocol directly over TCP —
 | API style | Pure async/await |
 | TypeScript | Full generics (`query<T>()`) |
 | Results | `Record<string, unknown>[]` objects |
-| Errors | `ConnectionError`, `QueryError`, `TransactionError` |
+| Errors | `ConnectionError`, `QueryError`, `TransactionError`, with the server's numeric `code` and a `kind` |
 | Transactions | `transaction(callback)` with auto commit/rollback |
 | Node.js | 18+ |
 
@@ -264,6 +264,20 @@ try {
 }
 ```
 
+Errors also say what happened without parsing a message. `error.code` is the numeric server code and `error.kind` classifies known failures. Outside a transaction, `ConstraintError`, `SqlSyntaxError`, `DeadlockError` and `LockTimeoutError` extend `QueryError`. See [Error details](docs/API_REFERENCE.md#error-details).
+
+```ts
+import { ConstraintError } from "cubrid-client";
+
+try {
+  await db.query("INSERT INTO users (email) VALUES (?)", [email]);
+} catch (error) {
+  if (error instanceof ConstraintError && error.kind === "unique-violation") {
+    console.error("Already registered:", error.code); // -670
+  }
+}
+```
+
 ## API Reference
 
 ### `createClient(options): CubridClient`
@@ -368,7 +382,7 @@ graph TD
     Src --> Protocol[protocol - CAS binary protocol]
     Src --> ClientModule[client - CubridClient CubridTransaction createClient]
     Src --> Adapters[adapters - ConnectionLike and NativeCubridAdapter]
-    Src --> Errors[errors - ConnectionError QueryError TransactionError]
+    Src --> Errors[errors - ConnectionError QueryError TransactionError and subclasses]
     Src --> Internals[internals - mapError mapResult normalizeConfig]
     Src --> Types[types - TypeScript interfaces and aliases]
 ```
