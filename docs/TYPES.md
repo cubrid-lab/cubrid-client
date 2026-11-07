@@ -11,7 +11,7 @@ convert a runtime value.
 | CUBRID wire type(s) | Current JavaScript value | Status / limitation |
 | --- | --- | --- |
 | CHAR, VARCHAR/STRING, NCHAR, VARNCHAR, ENUM | `string` | Decoded as null-terminated text; validate encoding against a live broker |
-| JSON | `string` | Raw JSON text, not parsed. This driver declares CAS protocol 7, and below protocol 8 the server sends JSON columns as VARCHAR (wire type 2), so wire type 34 does not arrive. Checked on 10.2, 11.0, 11.2 and 11.4; a parsed contract is tracked in [#111](https://github.com/cubrid-lab/cubrid-client/issues/111) |
+| JSON | `string` | Raw JSON text, not parsed. This driver declares CAS protocol 7, and below protocol 8 the server sends JSON columns as VARCHAR (wire type 2), so wire type 34 does not arrive. Checked on 10.2, 11.0, 11.2 and 11.4; see [JSON columns](#json-columns) |
 | SHORT, INTEGER | `number` | Parsed signed 16-bit / 32-bit integers |
 | BIGINT | `bigint` | Lossless signed 64-bit value; corrected by [#126](https://github.com/cubrid-lab/cubrid-client/pull/126); `JSON.stringify` needs explicit bigint conversion |
 | FLOAT, DOUBLE, MONETARY | `number` | IEEE-754 conversion may round decimal values |
@@ -21,7 +21,8 @@ convert a runtime value.
 | BLOB | `Buffer` | Complete content, loaded by the query. See [BLOB and CLOB columns](#blob-and-clob-columns) |
 | CLOB | `string` | Complete content decoded as UTF-8, loaded by the query. See [BLOB and CLOB columns](#blob-and-clob-columns) |
 | SET, MULTISET, SEQUENCE | Array (`CollectionValue`) | See [collection columns](#collection-columns) |
-| OBJECT/OID (19), RESULTSET (20), TIMESTAMPTZ, TIMESTAMPLTZ, DATETIMETZ and DATETIMELTZ (29-32), and unknown codes | Query rejects, including for a zero-byte value | Never coerced to `null`; see [values that cannot be decoded](#values-that-cannot-be-decoded). Future decoding is tracked in [#111](https://github.com/cubrid-lab/cubrid-client/issues/111) |
+| TIMESTAMPTZ, TIMESTAMPLTZ, DATETIMETZ, DATETIMELTZ (29-32) | `ZonedDateTime` | Wall-clock fields and the server's zone text, never a `Date`. See [timezone-aware values](#timezone-aware-values). The zero date rejects the query |
+| OBJECT/OID (19), RESULTSET (20), JSON (34), and unknown codes | Query rejects, including for a zero-byte value | Never coerced to `null`; see [values that cannot be decoded](#values-that-cannot-be-decoded) |
 | SQL NULL | `null` | Sent as cell length `-1`. NULL is distinct from unsupported non-NULL values and from a valid empty string, which is `""` |
 
 ### Values that cannot be decoded
@@ -31,12 +32,12 @@ chain is an error named `UnsupportedValueError` or `MalformedReplyError`, which
 [troubleshooting](TROUBLESHOOTING.md#queryerror-because-a-value-or-reply-could-not-be-decoded)
 shows how to find. When one cell failed, that error names the column, the numeric
 CAS wire type and the value size, for example
-`Failed to decode CUBRID column "tz" (wire type 29, 19 bytes)`. What happens to
+`Failed to decode CUBRID column "o" (wire type 19, 8 bytes)`. What happens to
 the connection depends on whether the server's reply can still be trusted:
 
 | Failure | Example | Connection afterwards |
 | --- | --- | --- |
-| **Unsupported value** (`UnsupportedValueError`) in a reply that is otherwise intact | A TIMESTAMPTZ column, or a zero date | Stays open. The query handle is released, and an open transaction stays open for you to commit or roll back |
+| **Unsupported value** (`UnsupportedValueError`) in a reply that is otherwise intact | An OBJECT/OID column, or a zero date | Stays open. The query handle is released, and an open transaction stays open for you to commit or roll back |
 | **Malformed reply** (`MalformedReplyError`) that contradicts its own structure | A length past the end of the reply, or a value that does not fill its cell | Dropped, because the next reply could not be trusted to line up. Nothing more is sent on it |
 
 The driver reads the rest of a reply, including every remaining and nested
@@ -85,9 +86,74 @@ sends SQL NULL for a non-NULL value, such as a
 [mixed-type collection](#collection-columns) or a type its CAS cannot encode.
 Those are the same bytes as a genuine NULL and return `null`.
 
-Error handling does **not** introduce timezone or OBJECT decoding. See
-[#110](https://github.com/cubrid-lab/cubrid-client/issues/110) and the
+A zero TIMESTAMPTZ, TIMESTAMPLTZ, DATETIMETZ or DATETIMELTZ value (all-zero
+fields with a zone, such as `TIMESTAMPTZ'0000-00-00 00:00:00 +00:00'`) rejects the
+same way, with the cause `Zero date 0000-00-00 cannot be represented as a
+ZonedDateTime`. OBJECT/OID decoding is not part of this contract; see the
 [independent protocol fixture plan](https://github.com/cubrid-lab/cubrid-client/issues/117).
+
+## Timezone-aware values
+
+TIMESTAMPTZ, TIMESTAMPLTZ, DATETIMETZ and DATETIMELTZ columns return a
+`ZonedDateTime`, exported by the package. It holds what the server sent: the
+wall-clock fields (`year`, `month` from 1 to 12, `day`, `hour`, `minute`,
+`second`, `millisecond`), the `type` it was read from and the `zone` text, so the
+zone is never lost. It is **not** a `Date`: a `Date` is an instant, cannot say
+which zone a value was stored in, and for a region zone the instant depends on
+the zone rules of that day. Convert it yourself when you need an instant, for
+example with `Date.UTC(...)` and the offset of a `+09:00` zone, or a zone-rules
+library for a region.
+
+```ts
+const [row] = await db.query<{ at: ZonedDateTime }>(
+  "SELECT DATETIMETZ'2020-07-02 03:04:05.999 America/New_York EDT' AS at",
+);
+row.at.zone; // "America/New_York EDT"
+String(row.at); // "2020-07-02 03:04:05.999 America/New_York EDT"
+```
+
+These results were checked on CUBRID 10.2, 11.0, 11.2 and 11.4, which send
+identical bytes. The wire value is the fields of the plain type (TIMESTAMP six
+int16, DATETIME seven) followed by the zone as NUL-terminated text.
+
+| Column | Fields | `zone` examples | Notes |
+| --- | --- | --- | --- |
+| TIMESTAMPTZ | seconds precision, `millisecond` is `0` | `+09:00`, `-05:30`, `America/New_York EST` | Stored fields and zone as written; a region zone gets the abbreviation of that date |
+| DATETIMETZ | milliseconds | `+09:00`, `America/New_York EDT` | Range checked from `0001-01-01 00:00:00.000 +00:00` to `9999-12-31 23:59:59.999 +14:00` |
+| TIMESTAMPLTZ, DATETIMELTZ | as above | `UTC UTC`, `Asia/Seoul KST` | The server converts the value to the **session** zone, so the zone is that of the connection and not the one written. `SET TIME ZONE` lasts only as long as the broker keeps the session, for example within a transaction |
+
+- `toString()` prints the value as SQL literal text, `YYYY-MM-DD HH:MM:SS[.mmm] <zone>`
+  (milliseconds for DATETIMETZ and DATETIMELTZ only). Writing that text back as
+  `TIMESTAMPTZ'...'`, `DATETIMETZ'...'` and so on reads back the same fields and
+  zone on all four versions. `JSON.stringify` uses the same text.
+- A `ZonedDateTime` is frozen. It cannot be sent as a `query()` parameter; write
+  it as a SQL literal from `toString()`. Sending one is not implemented.
+- `ColumnInfo.type` is the name of the type (`TIMESTAMPTZ`, `DATETIMELTZ`, ...).
+- SQL NULL is `null`. Elements of SET, MULTISET and SEQUENCE columns are
+  `ZonedDateTime` values too.
+- Fields that are not a real date and time (year outside 1 to 9999, a day the month does not have, with leap years checked), a zone that is empty, not valid UTF-8
+  or not one NUL-terminated string, and a value that does not fill its cell reject
+  as a [malformed reply](#values-that-cannot-be-decoded), also for a zero date, so a damaged zero value is never reported as merely unsupported. The server itself refuses such dates (`Invalid utime`), so this only guards a damaged reply.
+- Plain DATE, TIME, TIMESTAMP and DATETIME are unchanged and still decode to a
+  local-time `Date` ([#113](https://github.com/cubrid-lab/cubrid-client/issues/113)).
+
+## JSON columns
+
+A JSON column returns its text as a `string`, not a parsed value: call
+`JSON.parse` yourself, and keep numbers beyond double precision out of it.
+
+The server decides this. CUBRID sends JSON as wire type 34 only to a client that
+declares CAS protocol 8, and this driver declares 7 (the protocol version is part of
+every reply's layout, so changing it is a separate, wider change). Below protocol 8
+the server converts a JSON column to VARCHAR before sending it, so the column
+reports `VARCHAR` and the value is the server's rendering of the document, for
+example `{"a":1}`. Checked on 10.2, 11.0, 11.2 and 11.4 for a JSON column and for
+`JSON_OBJECT()`. A wire type 34 value, should a broker send one, still rejects
+the query as an unsupported value; it is never turned into `null`.
+
+Returning parsed JSON would change what a JSON column returns from `string` to
+`unknown`, so it needs a documented opt-in and a decision recorded in
+[#111](https://github.com/cubrid-lab/cubrid-client/issues/111); it is not done here.
 
 ## BLOB and CLOB columns
 
@@ -166,8 +232,9 @@ These results were checked on CUBRID 10.2, 11.0, 11.2 and 11.4:
 Do not depend on SET or MULTISET order: CUBRID defines both as unordered.
 
 - **Elements** use the same JavaScript types as result columns of that type,
-  including `bigint` for BIGINT, decimal `string` for NUMERIC and local-time
-  `Date` values ([#113](https://github.com/cubrid-lab/cubrid-client/issues/113)).
+  including `bigint` for BIGINT, decimal `string` for NUMERIC, local-time
+  `Date` values ([#113](https://github.com/cubrid-lab/cubrid-client/issues/113))
+  and `ZonedDateTime` for the [timezone-aware types](#timezone-aware-values).
   ENUM elements are strings, and a `SEQUENCE OF JSON` arrives as string elements.
 - **Empty** collections return `[]`. A NULL column returns `null`.
 - **NULL elements** return `null`. A NULL in a MULTISET sorted last in these
@@ -186,8 +253,7 @@ Not supported:
   element type to read it: `CAST(u AS SET OF VARCHAR(20))` returns `["1", "a"]`.
   Consider this before using an untyped `SET`, `MULTISET` or `SEQUENCE` column.
 - **Elements without a decoder reject the query**, naming the column and CAS wire
-  type. That covers OBJECT/OID and the timezone types
-  ([#111](https://github.com/cubrid-lab/cubrid-client/issues/111)), and BLOB/CLOB,
+  type. That covers OBJECT/OID, and BLOB/CLOB,
   whose elements hold a server file locator rather than the content, and which
   [BLOB and CLOB columns](#blob-and-clob-columns) only loads for a whole column.
   The connection stays usable afterwards.

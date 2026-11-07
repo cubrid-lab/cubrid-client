@@ -14,6 +14,7 @@ import { createServer, connect as netConnect, type Server } from "node:net";
 
 import { createClient } from "../src/client/create-client.js";
 import { NativeCubridAdapter } from "../src/adapters/native.js";
+import { ZonedDateTime } from "../src/types/zoned-date-time.js";
 import { ConnectionError } from "../src/errors/connection-error.js";
 import {
   ConstraintError,
@@ -1100,6 +1101,211 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
   });
 
   // -------------------------------------------------------------------------
+  // Timezone-aware values and JSON (#111)
+  // -------------------------------------------------------------------------
+
+  describe("timezone-aware values and JSON", () => {
+    const TABLE = "integration_zoned_values";
+    const COLUMNS = ["tstz", "tsltz", "dttz", "dtltz"] as const;
+
+    /** The value of the first column of the only row of `sql`, on a fresh session. */
+    async function selectValue(sql: string): Promise<unknown> {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+      try {
+        const rows = await adapter.query(sql);
+        assert.equal(rows.length, 1);
+        return Object.values(rows[0] as Record<string, unknown>)[0];
+      } finally {
+        await adapter.close();
+      }
+    }
+
+    const LITERALS: Array<{ literal: string; text: string; type: string }> = [
+      {
+        literal: "TIMESTAMPTZ'2020-01-02 03:04:05 +09:00'",
+        text: "2020-01-02 03:04:05 +09:00",
+        type: "TIMESTAMPTZ",
+      },
+      {
+        literal: "TIMESTAMPTZ'2020-07-02 03:04:05 -05:30'",
+        text: "2020-07-02 03:04:05 -05:30",
+        type: "TIMESTAMPTZ",
+      },
+      {
+        literal: "TIMESTAMPTZ'2020-01-02 03:04:05 America/New_York'",
+        text: "2020-01-02 03:04:05 America/New_York EST",
+        type: "TIMESTAMPTZ",
+      },
+      {
+        literal: "DATETIMETZ'2020-01-02 03:04:05.678 +09:00'",
+        text: "2020-01-02 03:04:05.678 +09:00",
+        type: "DATETIMETZ",
+      },
+      {
+        literal: "DATETIMETZ'2020-07-02 03:04:05.999 America/New_York EDT'",
+        text: "2020-07-02 03:04:05.999 America/New_York EDT",
+        type: "DATETIMETZ",
+      },
+      {
+        literal: "DATETIMETZ'0001-01-01 00:00:00.000 +00:00'",
+        text: "0001-01-01 00:00:00.000 +00:00",
+        type: "DATETIMETZ",
+      },
+      {
+        literal: "DATETIMETZ'9999-12-31 23:59:59.999 +14:00'",
+        text: "9999-12-31 23:59:59.999 +14:00",
+        type: "DATETIMETZ",
+      },
+    ];
+
+    for (const { literal, text, type } of LITERALS) {
+      test(`${literal} keeps its zone and its fields`, async () => {
+        const value = await selectValue(`SELECT ${literal} AS v`);
+        assert.ok(value instanceof ZonedDateTime);
+        assert.equal(value.type, type);
+        assert.equal(String(value), text);
+      });
+
+      test(`${literal} round-trips: its text, written back as a literal, reads the same`, async () => {
+        const first = (await selectValue(`SELECT ${literal} AS v`)) as ZonedDateTime;
+        const again = await selectValue(`SELECT ${first.type}'${first.toString()}' AS v`);
+        assert.ok(again instanceof ZonedDateTime);
+        assert.deepEqual({ ...again }, { ...first });
+      });
+    }
+
+    test("leap days decode, and the server refuses a date that does not exist", async () => {
+      assert.equal(
+        String(await selectValue("SELECT DATETIMETZ'2020-02-29 23:59:59.999 +00:00' AS v")),
+        "2020-02-29 23:59:59.999 +00:00",
+      );
+      assert.equal(
+        String(await selectValue("SELECT DATETIMETZ'2000-02-29 00:00:00.000 +00:00' AS v")),
+        "2000-02-29 00:00:00.000 +00:00",
+      );
+      // The decoder also rejects these as malformed, but the server never sends them.
+      for (const literal of [
+        "DATETIMETZ'2021-02-29 00:00:00.000 +00:00'",
+        "DATETIMETZ'1900-02-29 00:00:00.000 +00:00'",
+        "DATETIMETZ'10000-01-01 00:00:00.000 +00:00'",
+        "TIMESTAMPTZ'2021-04-31 00:00:00 +00:00'",
+      ]) {
+        await assert.rejects(
+          selectValue(`SELECT ${literal} AS v`),
+          (error: Error) => {
+            assert.ok(error instanceof QueryError, literal);
+            assert.match(String((error.cause as Error | undefined)?.message), /Invalid utime/, literal);
+            return true;
+          },
+          literal,
+        );
+      }
+    });
+
+    test("a local-zone value arrives in the session zone and round-trips", async () => {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+      try {
+        // In a transaction the broker keeps the session, and so its time zone.
+        await adapter.beginTransaction();
+        await adapter.query("SET TIME ZONE 'Asia/Seoul'");
+        const [row] = await adapter.query(
+          "SELECT TIMESTAMPLTZ'2020-01-02 03:04:05 +09:00' AS a, " +
+            "DATETIMELTZ'2020-07-02 03:04:05.5 America/New_York' AS b",
+        );
+        const a = row?.a as ZonedDateTime;
+        const b = row?.b as ZonedDateTime;
+        assert.equal(a.type, "TIMESTAMPLTZ");
+        assert.equal(String(a), "2020-01-02 03:04:05 Asia/Seoul KST");
+        assert.equal(b.type, "DATETIMELTZ");
+        assert.equal(String(b), "2020-07-02 16:04:05.500 Asia/Seoul KST");
+
+        const [again] = await adapter.query(
+          `SELECT ${a.type}'${a.toString()}' AS a, ${b.type}'${b.toString()}' AS b`,
+        );
+        assert.deepEqual({ ...(again?.a as ZonedDateTime) }, { ...a });
+        assert.deepEqual({ ...(again?.b as ZonedDateTime) }, { ...b });
+      } finally {
+        await adapter.close();
+      }
+    });
+
+    test("stored values, NULL and a collection read back exactly, with the type names in the columns", async () => {
+      const client = createClient(TEST_CONFIG);
+      try {
+        await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await client.query(
+          `CREATE TABLE ${TABLE} (id INT PRIMARY KEY, tstz TIMESTAMPTZ, tsltz TIMESTAMPLTZ, ` +
+            "dttz DATETIMETZ, dtltz DATETIMELTZ, seq SEQUENCE OF TIMESTAMPTZ, j JSON)",
+        );
+        await client.query(
+          `INSERT INTO ${TABLE} VALUES (1, TIMESTAMPTZ'2020-01-02 03:04:05 +09:00', ` +
+            "TIMESTAMPLTZ'2020-01-02 03:04:05 +09:00', DATETIMETZ'2020-01-02 03:04:05.678 +09:00', " +
+            "DATETIMELTZ'2020-01-02 03:04:05.678 +09:00', " +
+            "{TIMESTAMPTZ'2020-01-02 03:04:05 +09:00', TIMESTAMPTZ'2020-07-02 03:04:05 -05:30'}, " +
+            `'{"a":[1,2.5,null]}')`,
+        );
+        await client.query(`INSERT INTO ${TABLE} (id) VALUES (2)`);
+
+        const { rows, columns } = await client.queryResult(`SELECT * FROM ${TABLE} ORDER BY id`);
+
+        assert.deepEqual(
+          columns.map((column) => column.type),
+          ["INT", "TIMESTAMPTZ", "TIMESTAMPLTZ", "DATETIMETZ", "DATETIMELTZ", "SEQUENCE", "VARCHAR"],
+        );
+        const [first, second] = rows;
+        assert.equal(String(first?.tstz), "2020-01-02 03:04:05 +09:00");
+        assert.equal(String(first?.dttz), "2020-01-02 03:04:05.678 +09:00");
+        for (const column of ["tsltz", "dtltz"] as const) {
+          assert.ok(first?.[column] instanceof ZonedDateTime);
+        }
+        assert.deepEqual(
+          (first?.seq as ZonedDateTime[]).map(String),
+          ["2020-01-02 03:04:05 +09:00", "2020-07-02 03:04:05 -05:30"],
+        );
+        for (const column of [...COLUMNS, "seq", "j"]) {
+          assert.equal(second?.[column], null, column);
+        }
+
+        // JSON is the server's text, not a parsed value, because below protocol 8 the
+        // server sends wire type 2 (VARCHAR) instead of 34.
+        assert.equal(first?.j, '{"a":[1,2.5,null]}');
+        assert.deepEqual(JSON.parse(first?.j as string), { a: [1, 2.5, null] });
+      } finally {
+        await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await client.close();
+      }
+    });
+
+    for (const { type, literal, wireType, size } of [
+      { type: "TIMESTAMPTZ", literal: "TIMESTAMPTZ'0000-00-00 00:00:00 +00:00'", wireType: 29, size: 19 },
+      { type: "DATETIMETZ", literal: "DATETIMETZ'0000-00-00 00:00:00.000 +00:00'", wireType: 31, size: 21 },
+    ]) {
+      test(`a zero ${type} rejects with its column and type, and the session stays usable`, async () => {
+        const adapter = new NativeCubridAdapter(TEST_CONFIG);
+        await adapter.connect();
+        const cas = (adapter as unknown as { cas: CASConnection }).cas;
+        const generation = cas.connectionGeneration;
+
+        try {
+          await assert.rejects(adapter.query(`SELECT ${literal} AS zero_value, 'after' AS t`), (err: Error) => {
+            assert.ok(err instanceof QueryError);
+            assert.match(
+              (err.cause as Error).message,
+              new RegExp(`column "zero_value" \\(wire type ${wireType}, ${size} bytes\\)`),
+            );
+            return true;
+          });
+
+          assert.equal(cas.connectionGeneration, generation);
+          assert.deepEqual(await adapter.query("SELECT 1 AS one"), [{ one: 1 }]);
+        } finally {
+          await adapter.close();
+        }
+      });
+    }
+  });
+
+  // -------------------------------------------------------------------------
   // Collections (#82)
   // -------------------------------------------------------------------------
 
@@ -1107,12 +1313,12 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     const client = createClient(TEST_CONFIG);
     try {
       await assert.rejects(
-        client.query("SELECT TIMESTAMPTZ'2020-01-02 03:04:05 +09:00' AS zoned"),
+        client.query("SELECT DATETIME'0000-00-00 00:00:00' AS zeroed"),
         (error: Error) => {
           const failure = ((error.cause as Error).cause as Error);
           assert.equal(error.name, "QueryError");
           assert.equal(failure.name, "UnsupportedValueError");
-          assert.match(failure.message, /column "zoned" \(wire type 29, /);
+          assert.match(failure.message, /column "zeroed" \(wire type 22, /);
           return true;
         },
       );
@@ -1278,7 +1484,6 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       const client = collectionClient();
       try {
         for (const expression of [
-          "CAST({DATETIMETZ'2024-01-02 03:04:05.678 +09:00'} AS SEQUENCE OF DATETIMETZ)",
           "CAST({X'0f'} AS SEQUENCE OF BLOB)",
         ]) {
           await assert.rejects(
@@ -1341,10 +1546,10 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
   describe("query handle release", () => {
     const TABLE = "integration_test_handles";
     const SELECT_ALL = `SELECT id, val FROM ${TABLE} ORDER BY id`;
-    // Only the last row has a TIMESTAMPTZ value, which has no decoder. Ascending
+    // Only the last row has a zero DATETIME, which has no JavaScript value. Ascending
     // order meets it in a FETCH reply, descending order in the first reply.
-    const UNSUPPORTED_IN_FETCH = `SELECT id, zoned FROM ${TABLE} ORDER BY id`;
-    const UNSUPPORTED_IN_FIRST_REPLY = `SELECT id, zoned FROM ${TABLE} ORDER BY id DESC`;
+    const UNSUPPORTED_IN_FETCH = `SELECT id, zeroed FROM ${TABLE} ORDER BY id`;
+    const UNSUPPORTED_IN_FIRST_REPLY = `SELECT id, zeroed FROM ${TABLE} ORDER BY id DESC`;
     const CAS_ER_SRV_HANDLE = -1006;
 
     /** Enough rows that the first response cannot carry them all. */
@@ -1411,14 +1616,14 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       try {
         await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`);
         await adapter.query(
-          `CREATE TABLE ${TABLE} (id INT PRIMARY KEY, val VARCHAR(40), zoned TIMESTAMPTZ)`,
+          `CREATE TABLE ${TABLE} (id INT PRIMARY KEY, val VARCHAR(40), zeroed DATETIME)`,
         );
         await adapter.beginTransaction();
         for (let id = 0; id < ROW_COUNT; id += 1) {
           await adapter.query(`INSERT INTO ${TABLE} (id, val) VALUES (${id}, 'row ${id}')`);
         }
         await adapter.query(
-          `UPDATE ${TABLE} SET zoned = TIMESTAMPTZ'2020-01-02 03:04:05 +09:00' ` +
+          `UPDATE ${TABLE} SET zeroed = DATETIME'0000-00-00 00:00:00' ` +
             `WHERE id = ${ROW_COUNT - 1}`,
         );
         await adapter.commit();
@@ -2135,7 +2340,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
 
       try {
         const error = await failure(() =>
-          client.query("SELECT TIMESTAMPTZ'2020-01-02 03:04:05 +09:00' AS zoned"),
+          client.query("SELECT DATETIME'0000-00-00 00:00:00' AS zeroed"),
         );
         let current: unknown = error;
         while (current instanceof Error && current.name !== "UnsupportedValueError") {

@@ -111,6 +111,13 @@ The four brokers sent the same layout, with protocol version 7:
   encode, so a client cannot detect that NULL.
 - **JSON** is sent as wire type `2` below protocol 8. This driver declares
   protocol 7, so all four brokers described it as `85 02` in column metadata.
+  A probe that declared protocol 8 on 11.4 received wire type `34` with the same
+  text and NUL (`7b2261223a317d00`), but the driver does not declare 8, so that
+  layout has no decoder and is not exercised (#111).
+- **TIMESTAMPTZ, TIMESTAMPLTZ, DATETIMETZ and DATETIMELTZ** are wire types `29`
+  to `32`: the fields of TIMESTAMP (six int16) or DATETIME (seven int16), then the
+  zone as NUL-terminated text (`+09:00`, `America/New_York EDT`, `UTC UTC`). The
+  zero date is all-zero fields with a zone. Captured in `tests/fixtures/zoned-frames.ts`.
 
 ## Required regression checks
 
@@ -121,8 +128,12 @@ rather than importing the implementation enum as an oracle. It checks:
 - Positive and negative 64-bit BIGINT decode from fixed wire bytes.
 - BIGINT parameter encoding (`0000000915000000000000002a` for 42n).
 - Distinguishing real SQL NULL, empty strings and unsupported non-NULL types,
-  with the captured `timestamptzValue` reply, and rejecting a zero-byte value
+  with the captured `oidValue` reply, and rejecting a zero-byte value
   of any type except BIT and VARBIT.
+- Captured TIMESTAMPTZ, TIMESTAMPLTZ, DATETIMETZ and DATETIMELTZ replies (offset
+  and region zones, year 1 and 9999, session zones, NULL, collections) decode to
+  their fields and zone text; the zero values reject as unsupported; every
+  layout violation (no zone, no NUL, out-of-range fields, bad UTF-8) is malformed.
 - The captured zero DATE, DATETIME and TIMESTAMP replies (all-zero fields, wire
   types 13, 22 and 15 with sizes 6, 14 and 12, identical on 10.2, 11.0, 11.2 and
   11.4) reject as unsupported instead of decoding to an 1899 `Date`. A zero date
@@ -145,7 +156,6 @@ The protocol test runs in the standard required Node.js CI and is
 independent of a database connection. Separate [live CUBRID
 validation](SUPPORT_MATRIX.md) exercises the current integration suite on
 actual server images; it does not guarantee that every SQL type and
-statement has been proven. Unsupported JSON decoding and full parity testing
-remain tracked in
-[#111](https://github.com/cubrid-lab/cubrid-client/issues/111) and
+statement has been proven. Parsed JSON, which needs protocol 8, is tracked in
+[#111](https://github.com/cubrid-lab/cubrid-client/issues/111); full parity testing remains tracked in
 [#118](https://github.com/cubrid-lab/cubrid-client/issues/118).
