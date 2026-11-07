@@ -30,6 +30,8 @@ import {
   parseGetDbVersion,
   writeCheckCas,
   parseCheckCas,
+  parseSimpleResponse,
+  writeSetDbParameter,
   type OpenDatabaseResult,
 } from "./protocol.js";
 
@@ -43,6 +45,12 @@ const CAS_INFO_STATUS_OUT_TRAN = 0;
 
 /** The TCP connection could not be opened; no byte was sent, so a retry is safe. */
 class SocketConnectError extends Error {}
+
+/** One SET_DB_PARAMETER request that every session of a connection must receive. */
+export interface SessionParameter {
+  parameter: number;
+  value: number;
+}
 
 export interface CASConnectionConfig {
   host: string;
@@ -91,6 +99,8 @@ export interface CASConnectionConfig {
   servername?: string;
   /** Largest accepted frame DATA_LENGTH. Default: DEFAULT_MAX_FRAME_LENGTH. */
   maxFrameLength?: number;
+  /** Sent on each new session before anything else. See applySessionParametersUnlocked(). */
+  sessionParameters?: readonly SessionParameter[];
 }
 
 /**
@@ -113,6 +123,11 @@ export class CASConnection {
   private _outOfTransactionReplies = 0;
   /** A probe has answered since the last reply. Never inferred from CAS_INFO. */
   private casVerified = false;
+  /**
+   * The transport is open but the session settings are still being sent. Until
+   * they hold, the session is not usable, so `isConnected` stays false.
+   */
+  private settingUp = false;
 
   /**
    * Per-instance FIFO serialization queue. Public entry points that mutate
@@ -125,8 +140,11 @@ export class CASConnection {
 
   private readonly config: CASConnectionConfig;
 
+  private sessionParameters: readonly SessionParameter[];
+
   constructor(config: CASConnectionConfig | string) {
     this.config = typeof config === "string" ? parseConnectionString(config) : config;
+    this.sessionParameters = this.config.sessionParameters ?? [];
   }
 
   /**
@@ -228,7 +246,12 @@ export class CASConnection {
       this._outOfTransaction = false;
       this.casVerified = false;
       this.connected = true;
+      this.settingUp = true;
+      await this.applySessionParametersUnlocked();
+      this.settingUp = false;
     } catch (error) {
+      this.connected = false;
+      this.settingUp = false;
       brokerSocket.destroy();
       this.socket?.destroy();
       this.socket = null;
@@ -237,6 +260,83 @@ export class CASConnection {
     } finally {
       this.inHandshake = false;
     }
+  }
+
+  /**
+   * Make a session hold `sessionParameters`, before anything else runs on it.
+   *
+   * This belongs to opening a session because a session is replaced in several
+   * places, and the server starts each one from its defaults: on CUBRID 10.2 to
+   * 11.4 nothing carries over after a broker restart, a killed CAS, a database
+   * server restart or the CAS going to another client. All of those arrive here,
+   * so no statement can run on a new session without its settings. A failure
+   * leaves no session behind.
+   *
+   * Every SET_DB_PARAMETER reply says OUT_TRAN, even on a brand-new session, so
+   * the CAS may go to another client from then on. The closing CHECK_CAS holds it
+   * and leaves the session as OPEN_DATABASE did. If the CAS goes in that moment,
+   * this fails rather than run on without the settings.
+   *
+   * Nothing here counts in `failedExchanges` or `outOfTransactionReplies`: it runs
+   * no statement, and no transaction can have ended here.
+   */
+  private async applySessionParametersUnlocked(): Promise<void> {
+    if (this.sessionParameters.length === 0) {
+      return;
+    }
+
+    try {
+      for (const { parameter, value } of this.sessionParameters) {
+        const { header, payload } = writeSetDbParameter(parameter, value, this._casInfo);
+        await this.send(header, payload);
+        const response = await this.recv();
+        response.copy(this._casInfo, 0, 0, SIZE_CAS_INFO);
+        parseSimpleResponse(response.subarray(SIZE_CAS_INFO));
+      }
+
+      const { header, payload } = writeCheckCas(this._casInfo);
+      await this.send(header, payload);
+      const response = await this.recv();
+      response.copy(this._casInfo, 0, 0, SIZE_CAS_INFO);
+      parseCheckCas(response.subarray(SIZE_CAS_INFO));
+    } catch (error) {
+      // mapError() must still see a read timeout at the top.
+      if (error instanceof ReadTimeoutError) {
+        throw error;
+      }
+      throw new Error("The session settings could not be applied, so nothing was sent", {
+        cause: error,
+      });
+    }
+
+    this._outOfTransaction = this._casInfo[0] === CAS_INFO_STATUS_OUT_TRAN;
+    this.casVerified = true;
+  }
+
+  /**
+   * Replace the parameters every session receives, and give them to the open
+   * session if there is one. The caller must not have a transaction open: on
+   * CUBRID 10.2 to 11.4 a change takes effect inside the running transaction.
+   */
+  async setSessionParameters(parameters: readonly SessionParameter[]): Promise<void> {
+    return this.enqueue(async () => {
+      this.sessionParameters = parameters;
+
+      // A CAS that has gone is replaced here, and that new session already has them.
+      const generation = this._connectionGeneration;
+      await this.verifySessionUnlocked();
+      if (!this.connected || this._connectionGeneration !== generation) {
+        return;
+      }
+
+      try {
+        await this.applySessionParametersUnlocked();
+      } catch (error) {
+        // This session may hold some of them, and the next statement must not run on it.
+        this.retireSocket();
+        throw error;
+      }
+    });
   }
 
   /**
@@ -515,9 +615,12 @@ export class CASConnection {
     return this._outOfTransactionReplies;
   }
 
-  /** Whether the connection is currently open. */
+  /** Whether a session is open and ready: its transport is up and its settings hold. */
   get isConnected(): boolean {
-    return this.connected;
+    // Callers outside the queue, such as beginTransaction(), decide from this
+    // whether to wait for connect(). A session whose settings are still being
+    // sent may yet fail, so it must not count as one they can start work on.
+    return this.connected && !this.settingUp;
   }
 
   // ---------------------------------------------------------------------------

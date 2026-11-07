@@ -31,6 +31,7 @@ export type {
   Executable,
   ExecutableTransactionClient,
   ExecuteResult,
+  IsolationLevel,
   PreparedQueryable,
   PreparedTransactionClient,
   Queryable,
@@ -38,6 +39,7 @@ export type {
   ResultTransactionClient,
   TransactionCallback,
   TransactionClient,
+  TransactionOptions,
 } from "./types/client.js";
 export type { QueryParam, QueryParams } from "./types/query.js";
 export type {

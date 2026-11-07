@@ -196,6 +196,11 @@ export function withLogging(factory: ConnectionFactory, logger: unknown): Connec
           executePrepared(sql, params),
         );
     }
+    const setTransactionOptions = inner.setTransactionOptions?.bind(inner);
+    if (setTransactionOptions) {
+      wrapped.setTransactionOptions = (options) =>
+        timed("setTransactionOptions", {}, () => setTransactionOptions(options));
+    }
     const ping = inner.ping?.bind(inner);
     if (ping) {
       wrapped.ping = () => timed("ping", {}, ping);

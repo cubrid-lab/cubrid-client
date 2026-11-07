@@ -1,7 +1,12 @@
-import type { ClientConfig, ClientOptions } from "../types/client.js";
+import type { ClientConfig, ClientOptions, TransactionOptions } from "../types/client.js";
 
 /** Largest delay Node.js timers support. */
 const MAX_READ_TIMEOUT = 2 ** 31 - 1;
+
+/** Largest lock timeout the server's int32 parameter holds, in milliseconds. */
+const MAX_LOCK_TIMEOUT = 2 ** 31 - 1;
+
+const ISOLATION_LEVELS: readonly unknown[] = ["read committed", "repeatable read", "serializable"];
 
 /**
  * NaN or Infinity would retry forever, so the adapter, which is public and skips
@@ -23,6 +28,44 @@ export function assertValidMaxLobBytes(limit: number | undefined): void {
   }
 }
 
+/**
+ * The server reads any negative lock timeout as "no limit", so a typo such as -2
+ * would quietly remove the limit, and an unknown level has no wire value. Every
+ * public way in checks this: createClient(), CubridClient, the adapter and
+ * transaction(). A TypeScript caller can still pass any value from JavaScript.
+ */
+export function assertValidTransactionOptions(
+  options: { [K in keyof TransactionOptions]?: TransactionOptions[K] | undefined } | undefined,
+): void {
+  const { isolationLevel, lockTimeout } = options ?? {};
+
+  if (isolationLevel !== undefined && !ISOLATION_LEVELS.includes(isolationLevel)) {
+    throw new RangeError(
+      'isolationLevel must be "read committed", "repeatable read" or "serializable".',
+    );
+  }
+
+  if (
+    lockTimeout !== undefined &&
+    !(Number.isInteger(lockTimeout) && lockTimeout >= -1 && lockTimeout <= MAX_LOCK_TIMEOUT)
+  ) {
+    throw new RangeError(
+      `lockTimeout must be an integer from -1 to ${MAX_LOCK_TIMEOUT} milliseconds.`,
+    );
+  }
+}
+
+/** The settings among `options`, leaving out the ones not given. */
+export function pickTransactionOptions(
+  options: { [K in keyof TransactionOptions]?: TransactionOptions[K] | undefined } | undefined,
+): TransactionOptions {
+  const { isolationLevel, lockTimeout } = options ?? {};
+  return {
+    ...(isolationLevel !== undefined && { isolationLevel }),
+    ...(lockTimeout !== undefined && { lockTimeout }),
+  };
+}
+
 export function normalizeConfig(options: ClientOptions): ClientConfig {
   const { readTimeout, maxLobBytes } = options;
 
@@ -38,6 +81,7 @@ export function normalizeConfig(options: ClientOptions): ClientConfig {
 
   assertValidRetryCount(options.maxConnectionRetryCount);
   assertValidMaxLobBytes(maxLobBytes);
+  assertValidTransactionOptions(options);
 
   return {
     host: options.host,
@@ -48,6 +92,7 @@ export function normalizeConfig(options: ClientOptions): ClientConfig {
     connectionTimeout: options.connectionTimeout,
     ...(readTimeout !== undefined && { readTimeout }),
     ...(maxLobBytes !== undefined && { maxLobBytes }),
+    ...pickTransactionOptions(options),
     maxConnectionRetryCount: options.maxConnectionRetryCount,
     ssl: options.ssl,
     logger: options.logger,

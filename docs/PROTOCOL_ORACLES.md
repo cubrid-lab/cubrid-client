@@ -45,11 +45,31 @@ pinned by the fake CAS in `tests/concurrent-lifecycle.test.ts`:
 | A statement without the flag, failed or not, including after `-72` | 1 |
 | END_TRAN | 0 |
 | CHECK_CAS | 1, even on an idle session |
+| SET_DB_PARAMETER and GET_DB_PARAMETER outside a statement's transaction | 0, even straight after OPEN_DATABASE |
 
 Status 0 therefore means the last transaction ended, not that the CAS has gone.
 That is the state in which a CAS closes its socket on purpose, and CHECK_CAS holds
 it until the next statement ends, which is what makes the client's check before a
-request safe.
+request safe. For the same reason the `isolationLevel` and `lockTimeout` setup of a
+new session ends with CHECK_CAS.
+
+SET_DB_PARAMETER (function code 5), measured on the same four versions: the request
+is the code byte, then the parameter and the value as length-prefixed int32s, and a
+reply of int32 0 means applied.
+
+| Parameter | Values accepted | Notes |
+| --- | --- | --- |
+| 1, isolation level | 4, 5 and 6 | Anything else fails with `-1157`. SQL `SET TRANSACTION ISOLATION LEVEL` refuses the same levels with `-495`, or `-493` for read uncommitted |
+| 2, lock timeout | Milliseconds | `0` does not wait. Every negative value is stored as `-1`, no limit. SQL `GET TRANSACTION LOCK TIMEOUT` reports seconds |
+| 4, autocommit | Any | Accepted and ignored: the statement's own flag still decides. GET_DB_PARAMETER for it fails with `-1011` |
+
+Both settings belong to the session. COMMIT, ROLLBACK, failed statements and
+autocommit statements keep them; a change inside a transaction applies to that
+transaction at once. A new session, including one on the same CAS after the previous
+client closed or was cut off, starts from the server defaults (4 and `-1` on a stock
+server). The reply to the database server restart case was `-111` and then `-224`
+inside a transaction, after which the CAS closed its socket, so no session lost its
+settings without the client opening a new one.
 
 ## Separate numeric domains
 

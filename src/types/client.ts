@@ -54,6 +54,23 @@ export interface ClientLogger {
   error?(message: string, fields: ClientLogFields): void;
 }
 
+/**
+ * The isolation levels CUBRID 10.2 to 11.4 accept. Every other server level is
+ * refused, so no level reads uncommitted rows. `serializable` behaved like
+ * `repeatable read` on all four and still allows write skew.
+ */
+export type IsolationLevel = "read committed" | "repeatable read" | "serializable";
+
+/** Settings for a whole transaction, applied before it starts. */
+export interface TransactionOptions {
+  isolationLevel?: IsolationLevel;
+  /**
+   * Longest one statement waits for a lock, in milliseconds. `0` does not wait
+   * and `-1` has no limit. Must be an integer from `-1` to `2147483647`.
+   */
+  lockTimeout?: number;
+}
+
 export interface ClientConfig {
   host: string;
   port: number;
@@ -65,6 +82,10 @@ export interface ClientConfig {
   readTimeout?: number | undefined;
   /** See {@link ClientOptions.maxLobBytes}. */
   maxLobBytes?: number | undefined;
+  /** See {@link ClientOptions.isolationLevel}. */
+  isolationLevel?: IsolationLevel | undefined;
+  /** See {@link ClientOptions.lockTimeout}. */
+  lockTimeout?: number | undefined;
   maxConnectionRetryCount?: number | undefined;
   ssl?: boolean | ClientSSLOptions | undefined;
   logger?: unknown;
@@ -93,6 +114,19 @@ export interface ClientOptions {
    * connection stays usable. Must be a positive integer. Default: 64 MiB.
    */
   maxLobBytes?: number;
+  /**
+   * Isolation level of every session this client opens, on the shared connection
+   * and on each `transaction()` connection. A session that replaces one gets it
+   * before its first statement, or that statement fails. Unset leaves the
+   * server's default. A `transaction()` option overrides it for that transaction.
+   */
+  isolationLevel?: IsolationLevel;
+  /**
+   * Longest a statement waits for a lock, in milliseconds, on every session this
+   * client opens and with the same guarantee as `isolationLevel`. `0` does not
+   * wait and `-1` has no limit. Unset leaves the server's default.
+   */
+  lockTimeout?: number;
   maxConnectionRetryCount?: number;
   ssl?: boolean | ClientSSLOptions;
   /**
@@ -233,6 +267,13 @@ export interface ConnectionLike {
   commit(): Promise<void>;
   rollback(): Promise<void>;
   close(): Promise<void>;
+  /**
+   * Keeps these settings on every session of this connection, leaving any option
+   * not given as it is. Optional so 1.x connection factories keep compiling, and
+   * called only when a setting is in effect. Without it such a client or
+   * transaction fails, because running without the setting would hide that.
+   */
+  setTransactionOptions?(options: TransactionOptions): Promise<void>;
   ping?(): Promise<string>;
 }
 

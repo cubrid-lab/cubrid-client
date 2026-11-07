@@ -78,7 +78,7 @@ const client = createClient({ host: "localhost", database: "demodb", user: "dba"
 | Level | Event | Fields |
 |-------|-------|--------|
 | `info` | A connection was created (`operation: "connection"`) | `host`, `port`, `database` |
-| `debug` | `connect`, `query`, `queryResult`, `beginTransaction`, `commit`, `rollback`, `close` or `ping` succeeded | `operation`, `durationMs`; `paramCount` and `rowCount` for `query` |
+| `debug` | `connect`, `query`, `queryResult`, `setTransactionOptions`, `beginTransaction`, `commit`, `rollback`, `close` or `ping` succeeded | `operation`, `durationMs`; `paramCount` and `rowCount` for `query` |
 | `error` | The same operations failed | `operation`, `durationMs`, `errorName`; `paramCount` for `query` |
 | `error` | A connection could not be created (`operation: "connection"`; the original error is rethrown unchanged) | `operation`, `host`, `port`, `database`, `durationMs`, `errorName` |
 
@@ -197,7 +197,7 @@ sequenceDiagram
 
 ### Session Reuse
 
-A connection keeps one CAS session across statements, in autocommit mode too. Anything the session holds therefore carries over to the next statement until the session is replaced: `SET TRANSACTION LOCK TIMEOUT`, `SET TRANSACTION ISOLATION LEVEL`, session variables such as `SET @x = 1`, the last generated `AUTO_INCREMENT` value, and the measured backslash mode.
+A connection keeps one CAS session across statements, in autocommit mode too. Anything the session holds therefore carries over to the next statement until the session is replaced: the [`isolationLevel` and `lockTimeout` options](#isolation-level-and-lock-timeout), `SET TRANSACTION LOCK TIMEOUT`, `SET TRANSACTION ISOLATION LEVEL`, session variables such as `SET @x = 1`, the last generated `AUTO_INCREMENT` value, and the measured backslash mode.
 
 When a statement finishes a transaction the CAS may close its socket afterwards, so the client checks before the next request:
 
@@ -205,7 +205,7 @@ When a statement finishes a transaction the CAS may close its socket afterwards,
 - If the CAS answered, the request runs on the same session.
 - If it did not, for example after a broker restart or because the CAS went to another client, the client opens a new session and sends the request there. This happens at most once per request, before the request is first sent, so the request is not at risk of running twice. No SQL is ever replayed.
 
-A replaced session starts from the server's defaults, so `SET` commands and session variables from the old one are gone. Inside a transaction a replaced session is a [lost transaction](#read-timeout), and the client does not continue on a new one.
+A replaced session starts from the server's defaults, so `SET` commands and session variables from the old one are gone. The client does not track or repeat those. The `isolationLevel` and `lockTimeout` options are different: every new session [receives them before its first statement](#isolation-level-and-lock-timeout). Inside a transaction a replaced session is a [lost transaction](#read-timeout), and the client does not continue on a new one.
 
 The broker's `KEEP_CONNECTION` decides how long a client holds its CAS. Measured on CUBRID 10.2, 11.0, 11.2 and 11.4 with `AUTO` (the default) and `ON`; those brokers refuse to start with `OFF`:
 
@@ -213,6 +213,81 @@ The broker's `KEEP_CONNECTION` decides how long a client holds its CAS. Measured
 |-------------------|--------------------|-------------------------|
 | `AUTO` | The client keeps its CAS | The broker closes the socket of a client that is out of a transaction and gives its CAS to the waiting client. The first client gets a new session on its next request. |
 | `ON` | The client keeps its CAS until it closes | A new client waits until a CAS is free, so idle open clients can block it. Set `MAX_NUM_APPL_SERVER` above your number of open clients. A waiting client fails after `readTimeout`, or after 10 seconds if that is unset. |
+
+### Isolation Level and Lock Timeout
+
+Set these on the client to cover every connection it opens, or on one `transaction()` call to cover that transaction only. An option on `transaction()` replaces the client's value for that option and leaves the other one as it is:
+
+```ts
+const db = createClient({
+  host: "localhost",
+  database: "demodb",
+  user: "dba",
+  isolationLevel: "repeatable read",
+  lockTimeout: 5000, // milliseconds
+});
+
+// repeatable read, and no waiting for locks
+await db.transaction(async (tx) => {
+  await tx.query("UPDATE accounts SET balance = balance - 10 WHERE id = 1");
+}, { lockTimeout: 0 });
+```
+
+Without these options the client sends nothing and the server's configured defaults apply. On a stock server those are `read committed` and an unlimited lock wait.
+
+`lockTimeout` is in milliseconds, and it is the longest one statement waits for a lock. `0` does not wait and `-1` waits without a limit, which is how to undo a finite client setting for one transaction. A statement that runs out of time rejects with `kind` `"lock-timeout"`: a `LockTimeoutError` from `db.query()`, a `TransactionError` from `tx.query()`. Any other value throws a `RangeError`, because the server would quietly read a negative number as an unlimited wait.
+
+**What each level does.** Measured with two sessions on CUBRID 10.2, 11.0, 11.2 and 11.4, which all behaved the same:
+
+| `isolationLevel` | Server level | Sees rows committed by others after its first read | Update of a row someone else changed and committed since its first read |
+|------------------|--------------|-----------------------------------------------------|---------------------------------------------------------------------------|
+| `read committed` | 4 | Yes, on the next statement | Applies to the current row |
+| `repeatable read` | 5 | No, it reads one snapshot | Fails with `code` `-1158` |
+| `serializable` | 6 | No, it reads one snapshot | Fails with `code` `-1158` |
+
+- **No level shows uncommitted rows.** The servers refuse every other level, including read uncommitted, so these three are the only values accepted.
+- **`serializable` behaved exactly like `repeatable read` in every comparison, and it does not make transactions serializable.** Two transactions that each read the same rows and then change different ones can both commit, which is a write skew. If your rules depend on rows you only read, take a lock by writing to a row both transactions share.
+- **`-1158` fails the statement, not the transaction.** The transaction stays open and can still commit its other work. The error has `code` `-1158` and no `kind`: a `QueryError` from `db.query()`, a `TransactionError` from `tx.query()`. To apply the change on current data, retry the whole transaction.
+
+**Where the settings live.** They belong to the session, and the client applies them when it opens one, so they hold however the session came to be replaced:
+
+| Event | What the server does | What the client does |
+|-------|----------------------|----------------------|
+| A new session opens, or replaces one after a broker restart, a stopped or killed CAS, a database server restart, or the CAS going to another client | Starts from its defaults, every time | Sends the settings before anything else runs on that session |
+| A setting cannot be applied to a new session | | Drops that session and rejects the statement without sending it. The next statement tries a new session. A statement never runs on a session without the settings |
+| `commit()`, `rollback()`, a failed statement, an autocommit statement | Keeps the settings | Nothing to do |
+| A connection closes | The next client on that CAS gets the defaults, whether the socket was closed cleanly or cut | Nothing to reset. `transaction()` options end with the transaction's connection |
+
+Setting up a session costs one `SET_DB_PARAMETER` round trip per option and one CHECK_CAS, because that reply leaves the CAS free to go to another client until the check holds it. On a broker with no free CAS, a client that loses its CAS in that moment gets a rejection, not a session without the settings.
+
+**Choose the option over `SET`.** `SET TRANSACTION ISOLATION LEVEL` and `SET TRANSACTION LOCK TIMEOUT` sent with `query()` still work, but they reach only the current session: they are gone after a replacement, and `transaction()` does not inherit them because it uses its own connection. Sending them inside a transaction changes the running transaction at once, without committing, so its earlier reads and later reads can follow different levels. The options are applied before a transaction starts, which is why there is no way to change them through `tx`.
+
+**Reading the values back.** Ask the server inside the transaction or on the client:
+
+```ts
+const level = await db.transaction(async (tx) => {
+  await tx.query("GET TRANSACTION ISOLATION LEVEL TO cc_level");
+  const [row] = await tx.query<{ level: number }>("SELECT cc_level AS level");
+  return row.level; // 4, 5 or 6
+});
+```
+
+`GET TRANSACTION LOCK TIMEOUT` works the same way and reports seconds, with `-1` for no limit.
+
+**Manual transactions** run under the client's settings. `beginTransaction()` takes no options: it uses the one shared connection, so a setting passed to it would also apply to every caller sharing the client. Use `transaction()` when one unit of work needs its own settings.
+
+**Custom connections.** The settings reach a connection through its optional [`setTransactionOptions()`](API_REFERENCE.md#connectionlike). If a connection from a `connectionFactory` does not have that method, a client or transaction with settings fails instead of running without them, and nothing else changes for connections used without settings.
+
+### Autocommit
+
+There is no autocommit option. Autocommit is the state of a connection with no transaction open, and CUBRID decides it per request, from a flag on each statement. The broker has nothing to remember: on 10.2, 11.0, 11.2 and 11.4 `SET_DB_PARAMETER` accepts the autocommit parameter but changes nothing, the statement's own flag still decides, and reading the parameter back fails with `-1011`.
+
+- Outside a transaction each statement commits on its own.
+- `beginTransaction()` turns autocommit off for the connection, and `commit()` or `rollback()` turns it back on.
+- `transaction()` does the same on its own connection, so it never changes autocommit on the shared one.
+- **After a reconnect** autocommit is unchanged, because the client keeps this state itself and sends it with every statement. With no transaction open, the next statement runs on the new session and commits on its own. Inside a transaction the client refuses to continue on a new session, because the earlier statements are gone. It rejects until you call `rollback()`, which leaves the connection in autocommit.
+
+A permanent "autocommit off" mode is left out on purpose: on the shared connection it would keep a transaction open that every async caller joins. See [Manual Transaction on Shared Connection](#manual-transaction-on-shared-connection).
 
 ### Concurrent Statements on One Connection
 
@@ -253,6 +328,7 @@ sequenceDiagram
 
     App->>Client: transaction(async tx => ...)
     Client->>Conn2: Create isolated connection
+    Client->>Conn2: Apply isolationLevel and lockTimeout, if any
     Client->>Conn2: beginTransaction()
     App->>Client: tx.query("INSERT ...")
     Client->>Conn2: Execute on Connection #2

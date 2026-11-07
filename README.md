@@ -29,7 +29,7 @@ A modern CUBRID client that speaks the CAS binary protocol directly over TCP —
 | TypeScript | Full generics (`query<T>()`) |
 | Results | `Record<string, unknown>[]` objects |
 | Errors | `ConnectionError`, `QueryError`, `TransactionError`, with the server's numeric `code` and a `kind` |
-| Transactions | `transaction(callback)` with auto commit/rollback |
+| Transactions | `transaction(callback, options?)` with auto commit/rollback, and `isolationLevel` and `lockTimeout` options |
 | Node.js | 18+ |
 
 ## Versioning and compatibility
@@ -270,6 +270,20 @@ rolls the transaction back. See the
 [transaction lifecycle](docs/API_REFERENCE.md#transaction-lifecycle) for every
 outcome and the [compatibility notes](docs/API_STABILITY.md#transaction-callback-guards).
 
+### Isolation level and lock timeout
+
+Set them on the client, or on one transaction. They are applied before the transaction starts, and again on any session that replaces the first one, so they never disappear silently after a reconnect.
+
+```typescript
+const db = createClient({ host, database, user, lockTimeout: 5000 });
+
+await db.transaction(async (tx) => {
+  await tx.query('UPDATE stock SET qty = qty - 1 WHERE id = ?', [1]);
+}, { isolationLevel: 'repeatable read', lockTimeout: 0 });
+```
+
+`serializable` behaves like `repeatable read` on CUBRID 10.2 to 11.4, and it still allows write skew. See [what each level does](docs/CONNECTION.md#isolation-level-and-lock-timeout), and [Autocommit](docs/CONNECTION.md#autocommit) for its behavior after a reconnect.
+
 ### Manual
 
 For fine-grained control on the shared connection:
@@ -388,15 +402,17 @@ Creates a client instance. Connection is established lazily on first query.
 | `maxConnectionRetryCount` | `number` | `0` | Retries after a failed TCP connect to the broker (see [Connection retries](docs/CONNECTION.md#connection-retries)) |
 | `readTimeout` | `number` | — | Fail a query after this many ms with no activity from the server (see [Read timeout](docs/CONNECTION.md#read-timeout)). Unset means no timeout for queries; the connect handshake still gives up after 10 s |
 | `maxLobBytes` | `number` | 64 MiB | Most BLOB and CLOB content one query may load, in bytes. A query over it rejects (see [BLOB and CLOB columns](docs/TYPES.md#blob-and-clob-columns)) |
+| `isolationLevel` | `"read committed" \| "repeatable read" \| "serializable"` | Server default | Isolation level of every session this client opens, restored after a reconnect (see [Isolation Level and Lock Timeout](docs/CONNECTION.md#isolation-level-and-lock-timeout)) |
+| `lockTimeout` | `number` | Server default | Longest a statement waits for a lock, in ms. `0` does not wait and `-1` has no limit. Restored after a reconnect |
 | `ssl` | `boolean \| ClientSSLOptions` | `false` | Enable TLS. `true` for defaults, or an object for cert/verification control (see [TLS/SSL](#tlsssl)) |
 
 ### `client.query<T>(sql, params?): Promise<T[]>`
 
 Executes SQL and returns typed row objects. DDL/DML statements return `[]`. BLOB columns return a complete `Buffer` and CLOB columns a complete `string`.
 
-### `client.transaction<T>(callback): Promise<T>`
+### `client.transaction<T>(callback, options?): Promise<T>`
 
-Runs `callback` in an isolated transaction with exactly one commit or rollback.
+Runs `callback` in an isolated transaction with exactly one commit or rollback. `options` can set `isolationLevel` and `lockTimeout` for that transaction.
 
 ### `client.beginTransaction(): Promise<void>`
 

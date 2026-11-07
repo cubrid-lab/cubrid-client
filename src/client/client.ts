@@ -2,6 +2,10 @@ import * as schema from "./schema.js";
 import { CallbackTransaction } from "./transaction.js";
 import { TransactionError } from "../errors/transaction-error.js";
 import { mapError, toError } from "../internals/map-error.js";
+import {
+  assertValidTransactionOptions,
+  pickTransactionOptions,
+} from "../internals/normalize-config.js";
 import type {
   ClientConfig,
   ConnectionFactory,
@@ -15,6 +19,7 @@ import type {
   ResultQueryable,
   ResultTransactionClient,
   TransactionCallback,
+  TransactionOptions,
 } from "../types/client.js";
 import type { QueryParams } from "../types/query.js";
 import type { QueryResult, QueryResultRow } from "../types/result.js";
@@ -34,7 +39,9 @@ export class CubridClient implements Queryable, ResultQueryable, Executable, Pre
   constructor(
     private readonly config: ClientConfig,
     private readonly connectionFactory: ConnectionFactory,
-  ) {}
+  ) {
+    assertValidTransactionOptions(config);
+  }
 
   async query<T extends QueryResultRow = QueryResultRow>(
     sql: string,
@@ -122,7 +129,10 @@ export class CubridClient implements Queryable, ResultQueryable, Executable, Pre
       T,
       ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient
     >,
+    options?: TransactionOptions,
   ): Promise<T> {
+    assertValidTransactionOptions(options);
+
     if (this.closed) {
       throw mapError("transaction", new Error("Client is closed."), "Transaction failed.");
     }
@@ -133,6 +143,10 @@ export class CubridClient implements Queryable, ResultQueryable, Executable, Pre
     let details: TransactionError | undefined;
 
     try {
+      await this.applyTransactionOptions(connection, {
+        ...pickTransactionOptions(this.config),
+        ...pickTransactionOptions(options),
+      });
       await connection.beginTransaction();
       transaction = new CallbackTransaction(connection);
       const result = await callback(transaction);
@@ -299,14 +313,45 @@ export class CubridClient implements Queryable, ResultQueryable, Executable, Pre
     }
 
     if (!this.sharedConnectionPromise) {
-      this.sharedConnectionPromise = Promise.resolve(
-        this.connectionFactory(this.config),
-      ).catch((error) => {
-        this.sharedConnectionPromise = undefined;
-        throw error;
-      });
+      this.sharedConnectionPromise = Promise.resolve(this.connectionFactory(this.config))
+        .then((connection) => this.prepareSharedConnection(connection))
+        .catch((error) => {
+          this.sharedConnectionPromise = undefined;
+          throw error;
+        });
     }
 
     return this.sharedConnectionPromise;
+  }
+  private async prepareSharedConnection(connection: ConnectionLike): Promise<ConnectionLike> {
+    try {
+      await this.applyTransactionOptions(connection, pickTransactionOptions(this.config));
+      return connection;
+    } catch (error) {
+      await connection.close().catch(() => {
+        // The failure that decided this connection's fate is the one to report.
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Hands `options` to a new connection before anything runs on it. A connection
+   * that cannot take them fails here: the statements would otherwise run, with no
+   * sign of it, under the server's defaults.
+   */
+  private async applyTransactionOptions(
+    connection: ConnectionLike,
+    options: TransactionOptions,
+  ): Promise<void> {
+    if (Object.keys(options).length === 0) {
+      return;
+    }
+
+    if (!connection.setTransactionOptions) {
+      throw new Error("Underlying connection does not support transaction options.");
+    }
+
+    await connection.setTransactionOptions(options);
   }
 }

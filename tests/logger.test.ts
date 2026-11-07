@@ -333,6 +333,34 @@ test("logger reports execute without SQL, parameters or the insert id", async ()
   assert.equal(logged.includes(PARAM), false);
 });
 
+test("logger reports setTransactionOptions and the wrapper keeps the method", async () => {
+  const { logger, entries } = recorder();
+  const connection = fakeConnection();
+  let applied: unknown;
+  connection.setTransactionOptions = async (options) => {
+    applied = options;
+  };
+  const c = client(logger, connection);
+
+  await c.transaction(async () => undefined, { isolationLevel: "serializable" });
+
+  assert.deepEqual(applied, { isolationLevel: "serializable" });
+  const entry = entries.find((e) => e.fields.operation === "setTransactionOptions");
+  assert.equal(entry?.level, "debug");
+});
+
+test("the logging wrapper does not claim setTransactionOptions for a connection without it", async () => {
+  const { logger } = recorder();
+  const c = client(logger, fakeConnection());
+
+  await assert.rejects(
+    c.transaction(async () => undefined, { isolationLevel: "serializable" }),
+    (error: unknown) =>
+      error instanceof TransactionError &&
+      /does not support transaction options/.test(String(error.cause)),
+  );
+});
+
 test("logger reports the prepared methods without SQL, parameters or rows", async () => {
   const { logger, entries } = recorder();
   const connection = fakeConnection();

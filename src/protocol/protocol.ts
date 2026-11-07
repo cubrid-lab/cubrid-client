@@ -582,6 +582,25 @@ export function writeEndTran(
 }
 
 // ---------------------------------------------------------------------------
+// SetDbParameter (FC=5)
+// ---------------------------------------------------------------------------
+
+export function writeSetDbParameter(
+  parameter: number,
+  value: number,
+  casInfo: Buffer,
+): { header: Buffer; payload: Buffer } {
+  const w = new PacketWriter(32);
+  w.writeByte(CASFunctionCode.SET_DB_PARAMETER);
+  w.addInt(parameter);
+  w.addInt(value);
+
+  const payload = w.toBuffer();
+  const header = PacketWriter.buildHeader(payload.length, casInfo);
+  return { header, payload };
+}
+
+// ---------------------------------------------------------------------------
 // GetDbVersion (FC=15)
 // ---------------------------------------------------------------------------
 

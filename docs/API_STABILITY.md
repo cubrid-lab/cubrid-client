@@ -78,6 +78,18 @@ the instance `transaction()` creates is guarded. Removing `commit()` and
 `rollback()` from the callback's `tx`, if ever wanted, would be a MAJOR change
 under the policy above.
 
+### Isolation level and lock timeout
+
+`isolationLevel` and `lockTimeout` on `ClientOptions`, the optional second argument
+of `transaction()`, and the optional `ConnectionLike.setTransactionOptions()` are
+additive, so this is a MINOR change. Without the options nothing new is sent and the
+server's defaults apply as before. `TransactionClient`, `ExecutableTransactionClient`
+and `ResultTransactionClient` are unchanged, and a 1.x connection factory keeps
+working as long as no setting is requested. Requesting one from a connection without
+`setTransactionOptions()` fails rather than running without it. The accepted levels
+and the meaning of `lockTimeout` are public behavior; see
+[Isolation Level and Lock Timeout](CONNECTION.md#isolation-level-and-lock-timeout).
+
 ## Node.js, TypeScript and distribution
 
 - **Current runtime declaration:** `engines.node >=18` in
