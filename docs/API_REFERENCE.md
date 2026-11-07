@@ -477,6 +477,9 @@ All types are exported as TypeScript type-only exports and are available for imp
 import type {
   ClientOptions,
   ClientConfig,
+  ClientLogger,
+  ClientLogFields,
+  ClientLogLevel,
   ConnectionFactory,
   ConnectionLike,
   Queryable,
@@ -517,7 +520,7 @@ interface ClientOptions {
 | `connectionTimeout` | `number` | `undefined` | Connection timeout in milliseconds |
 | `readTimeout` | `number` | `undefined` | Milliseconds of server inactivity before a request fails with [`ReadTimeoutError`](#readtimeouterror) and the connection is discarded. `undefined` or `0` means no timeout. Other values must be between 1 and 2147483647, or `createClient()` throws a `RangeError`. See [Read timeout](CONNECTION.md#read-timeout) |
 | `maxConnectionRetryCount` | `number` | `undefined` | Maximum number of connection retry attempts |
-| `logger` | `unknown` | `undefined` | Logger instance (passed to the underlying driver) |
+| `logger` | `unknown` (see `ClientLogger`) | `undefined` | Receives redacted diagnostics for connections, queries and transactions. See [Logging](CONNECTION.md#logging) |
 | `connectionFactory` | [`ConnectionFactory`](#connectionfactory) | Built-in `NodeCubridAdapter` | Custom factory for creating connections |
 
 ### ClientConfig

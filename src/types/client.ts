@@ -18,6 +18,42 @@ export interface ClientSSLOptions {
   servername?: string;
 }
 
+export type ClientLogLevel = "debug" | "info" | "error";
+
+/**
+ * Redacted fields passed to a logger. They never contain SQL text, bound
+ * parameter values, row data, credentials or error messages.
+ */
+export interface ClientLogFields {
+  /** `connection`, `connect`, `query`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`. */
+  operation?: string;
+  host?: string;
+  port?: number;
+  database?: string;
+  /** Elapsed milliseconds of the operation. */
+  durationMs?: number;
+  /** Number of bound parameters of a `query`, not their values. */
+  paramCount?: number;
+  /** Number of rows a successful `query` returned. */
+  rowCount?: number;
+  /**
+   * Class of the error of a failed operation: one of this library's error
+   * classes or a standard `Error` subclass, otherwise `Error`. A custom
+   * `name` is never reported.
+   */
+  errorName?: string;
+}
+
+/**
+ * Console-compatible logger accepted by {@link ClientOptions.logger}. Every
+ * method is optional and receives `(message, fields)`.
+ */
+export interface ClientLogger {
+  debug?(message: string, fields: ClientLogFields): void;
+  info?(message: string, fields: ClientLogFields): void;
+  error?(message: string, fields: ClientLogFields): void;
+}
+
 export interface ClientConfig {
   host: string;
   port: number;
@@ -49,6 +85,13 @@ export interface ClientOptions {
   readTimeout?: number;
   maxConnectionRetryCount?: number;
   ssl?: boolean | ClientSSLOptions;
+  /**
+   * Receives redacted diagnostics: `info` when a connection is created,
+   * `debug` for each successful operation and `error` for each failed one (see
+   * {@link ClientLogFields}). Use a {@link ClientLogger}, `console` or any
+   * object with those methods; other values are ignored. A logger that throws
+   * never affects a request. Declared `unknown` so 1.x code keeps compiling.
+   */
   logger?: unknown;
   connectionFactory?: ConnectionFactory;
 }

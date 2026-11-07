@@ -27,6 +27,39 @@ interface ClientSSLOptions {
     /** Server name for SNI and certificate hostname verification. */
     servername?: string;
 }
+type ClientLogLevel = "debug" | "info" | "error";
+/**
+ * Redacted fields passed to a logger. They never contain SQL text, bound
+ * parameter values, row data, credentials or error messages.
+ */
+interface ClientLogFields {
+    /** `connection`, `connect`, `query`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`. */
+    operation?: string;
+    host?: string;
+    port?: number;
+    database?: string;
+    /** Elapsed milliseconds of the operation. */
+    durationMs?: number;
+    /** Number of bound parameters of a `query`, not their values. */
+    paramCount?: number;
+    /** Number of rows a successful `query` returned. */
+    rowCount?: number;
+    /**
+     * Class of the error of a failed operation: one of this library's error
+     * classes or a standard `Error` subclass, otherwise `Error`. A custom
+     * `name` is never reported.
+     */
+    errorName?: string;
+}
+/**
+ * Console-compatible logger accepted by {@link ClientOptions.logger}. Every
+ * method is optional and receives `(message, fields)`.
+ */
+interface ClientLogger {
+    debug?(message: string, fields: ClientLogFields): void;
+    info?(message: string, fields: ClientLogFields): void;
+    error?(message: string, fields: ClientLogFields): void;
+}
 interface ClientConfig {
     host: string;
     port: number;
@@ -191,4 +224,4 @@ declare function buildWhere(conditions: Record<string, unknown>): {
     params: unknown[];
 };
 
-export { type ClientConfig, type ClientOptions, type CollectionElement, type CollectionValue, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, CubridClient, CubridTransaction, NativeCubridAdapter, QueryError, type QueryParam, type QueryParams, type QueryResultRow, type Queryable, ReadTimeoutError, type TransactionCallback, type TransactionClient, TransactionError, buildWhere, createClient, escapeIdentifier, parseConnectionString };
+export { type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type CollectionElement, type CollectionValue, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, CubridClient, CubridTransaction, NativeCubridAdapter, QueryError, type QueryParam, type QueryParams, type QueryResultRow, type Queryable, ReadTimeoutError, type TransactionCallback, type TransactionClient, TransactionError, buildWhere, createClient, escapeIdentifier, parseConnectionString };
