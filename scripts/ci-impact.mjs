@@ -4,7 +4,9 @@
  *
  * Only known non-executable documentation and the release-note verifier are
  * eligible to skip the full Node matrix. Any unknown path selects runtime.
- * Renames must be fed as both old and new paths; an unreadable diff fails closed.
+ * Read `git diff --no-renames --name-status`, not only file names. Deletions,
+ * renames (represented as D+A) and unrecognized statuses must run the full CI.
+ * An unreadable diff fails closed.
  */
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
@@ -22,16 +24,23 @@ export function classify(event, paths) {
 
   let runtime = false;
   let docs = false;
-  for (const path of paths) {
+  for (const change of paths) {
+    // A status is required: accepting bare paths silently treats a deleted
+    // Markdown file or a renamed doc as documentation-only validation.
+    const match = /^(A|M|D)\\t(.+)$/.exec(change);
+    if (!match) {
+      return { runtime: true, docs: true, reason: "unrecognized change status: fail closed" };
+    }
+    const [, status, path] = match;
     const doc = DOC_EXT.test(path) &&
       (path.startsWith("docs/") || !path.includes("/") ||
         path.startsWith(".github/ISSUE_TEMPLATE/") ||
         path.startsWith(".github/PULL_REQUEST_TEMPLATE/"));
-    if (doc || RELEASE_TOOL.has(path)) {
-      docs = true;
-    } else {
-      runtime = true;
-    }
+    if (doc || RELEASE_TOOL.has(path)) docs = true;
+    else runtime = true;
+    // Do not skip executable/source tests for deletions or a rename split into
+    // D and A by --no-renames, even if both path names have a docs extension.
+    if (status === "D") runtime = true;
   }
   return {
     runtime,
