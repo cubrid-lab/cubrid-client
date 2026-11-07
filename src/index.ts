@@ -32,6 +32,8 @@ export type {
   ExecutableTransactionClient,
   ExecuteResult,
   IsolationLevel,
+  PreparedQueryable,
+  PreparedTransactionClient,
   Queryable,
   ResultQueryable,
   ResultTransactionClient,
@@ -47,5 +49,13 @@ export type {
   QueryResult,
   QueryResultRow,
 } from "./types/result.js";
+export type {
+  SchemaColumn,
+  SchemaIndex,
+  SchemaIndexColumn,
+  SchemaOptions,
+  SchemaPrimaryKey,
+  SchemaTable,
+} from "./types/schema.js";
 export type { ZonedDateTimeFields, ZonedDateTimeType } from "./types/zoned-date-time.js";
 export type { ConnectionConfig } from "./utils/connection-string.js";

@@ -23,6 +23,8 @@ Complete reference for every public export of `cubrid-client`.
   - [Queryable](#queryable)
   - [Executable](#executable)
   - [ExecutableTransactionClient](#executabletransactionclient)
+  - [PreparedQueryable](#preparedqueryable)
+  - [PreparedTransactionClient](#preparedtransactionclient)
   - [ExecuteResult](#executeresult)
   - [TransactionClient](#transactionclient-interface)
   - [TransactionCallback](#transactioncallback)
@@ -32,6 +34,7 @@ Complete reference for every public export of `cubrid-client`.
   - [QueryResultRow](#queryresultrow)
   - [QueryResult](#queryresult)
   - [ColumnInfo](#columninfo)
+  - [Schema introspection types](#schema-introspection-types)
 
 ---
 
@@ -207,20 +210,50 @@ What the server reports, checked on CUBRID 10.2, 11.0, 11.2 and 11.4 (the replie
 
 ---
 
+#### `queryPrepared<T>(sql, params?)`, `queryResultPrepared<T>(sql, params?)`, `executePrepared(sql, params?)`
+
+Opt-in server-side binding: the same results as `query()`, `queryResult()` and `execute()`, with the values sent as typed binds instead of SQL text.
+
+```ts
+async queryPrepared<T extends QueryResultRow = QueryResultRow>(
+  sql: string,
+  params?: QueryParams,
+): Promise<T[]>
+
+async queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
+  sql: string,
+  params?: QueryParams,
+): Promise<QueryResult<T>>
+
+async executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>
+```
+
+**Throws:** [`QueryError`](#queryerror) if execution fails, if a value is refused, if the number of values differs from the statement's markers, or if a custom `connectionFactory` connection does not provide the method. They never fall back to SQL literals.
+
+```ts
+const rows = await db.queryPrepared<{ id: number }>("SELECT id FROM users WHERE name = ?", [name]);
+const { affectedRows } = await db.executePrepared("UPDATE users SET name = ? WHERE id = ?", [name, 1]);
+```
+
+- **Types.** [Prepared binding](TYPES.md#prepared-binding) lists each JavaScript type, what is refused and how the result can differ from the literal path.
+- **Lifecycle.** Each call prepares, executes and releases its own handle, so a handle is never kept between calls or carried to another session. There is no reusable statement object.
+- **Autocommit.** The statement runs in a transaction of its own that ends with an explicit commit, or a rollback if anything failed.
+- **Cost.** A call takes more round trips than `query()`; see the [measurements](PERFORMANCE.md#prepared-binding). Do not expect it to be faster.
+
 #### `transaction<T>(callback, options?)`
 
 Executes a callback within an isolated transactional connection. Commits on success, rolls back on failure.
 
 ```ts
 async transaction<T>(
-  callback: TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient>,
+  callback: TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient>,
   options?: TransactionOptions,
 ): Promise<T>
 ```
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `callback` | [`TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient>`](#transactioncallback) | Async function receiving a [`ResultTransactionClient`](#resulttransactionclient) (a [`TransactionClient`](#transactionclient-interface) that also has `queryResult()`) that is also an [`ExecutableTransactionClient`](#executabletransactionclient) (it also has `execute()`). A callback written against `TransactionClient` is still accepted. |
+| `callback` | [`TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient>`](#transactioncallback) | Async function receiving a [`ResultTransactionClient`](#resulttransactionclient) (a [`TransactionClient`](#transactionclient-interface) that also has `queryResult()`) that is also an [`ExecutableTransactionClient`](#executabletransactionclient) (it also has `execute()`). A callback written against `TransactionClient` is still accepted. |
 | `options` | [`TransactionOptions`](#transactionoptions) | Optional `isolationLevel` and `lockTimeout` for this transaction only. Each one replaces the client's value, and the shared connection is not affected. They are applied before the transaction begins, so they cover all of it. See [Isolation Level and Lock Timeout](CONNECTION.md#isolation-level-and-lock-timeout) |
 
 **Returns:** `Promise<T>` — The return value of the callback.
@@ -377,9 +410,39 @@ It sends the same requests as [`ping()`](#ping), so it has the same effect on a 
 
 ---
 
+#### Schema introspection: `getTables()`, `getColumns()`, `getPrimaryKey()`, `getIndexes()`
+
+Read-only, typed metadata for tables, views, columns, primary keys and indexes.
+
+```ts
+getTables(options?: SchemaOptions): Promise<SchemaTable[]>
+getColumns(table: string, options?: SchemaOptions): Promise<SchemaColumn[]>
+getPrimaryKey(table: string, options?: SchemaOptions): Promise<SchemaPrimaryKey | null>
+getIndexes(table: string, options?: SchemaOptions): Promise<SchemaIndex[]>
+```
+
+See [Schema introspection types](#schema-introspection-types) for the result shapes. The methods are on `CubridClient` only; `TransactionClient` and the `tx` of `transaction()` do not have them. Inside a manual transaction started with `beginTransaction()` they run in that transaction like `query()`.
+
+- **How it reads.** They run bound `SELECT` statements over the catalog views `db_class`, `db_attribute`, `db_index` and `db_index_key`, not the CAS `SCHEMA_INFO` request. The views return the same columns on CUBRID 10.2, 11.0, 11.2 and 11.4, and a catalog query needs no result handle to consume or close. `getColumns`, `getPrimaryKey` and `getIndexes` send a first query to find the table, so each call takes two or three round trips and the answer is not one atomic snapshot if other sessions change the schema meanwhile.
+- **Names.** Pass the bare table name, without quotes or brackets. CUBRID stores identifiers in lower case whatever case or quoting the `CREATE` used (`CREATE TABLE "MixedCase"` creates `mixedcase`), so names are matched without regard to case. Quote characters are not stripped: `"mixedcase"` finds nothing. A name with spaces or other characters is taken literally. Names are only ever sent as bound parameters, never joined into SQL text.
+- **Schema.** CUBRID calls the owner of a table its schema. `SchemaOptions.schema` selects one owner, without regard to case. Since CUBRID 11.2 two users may own a table with the same name; if the name is ambiguous and `schema` is omitted, the call rejects with a `QueryError` that lists the owners. Before 11.2 a table name is unique, so `schema` only has to match the owner (`CREATE TABLE other_user.t` there still creates a table owned by the creator).
+- **Permissions.** The catalog views list only what the connected user may `SELECT`, and the server returns no error for the rest. `getTables()` leaves an inaccessible table out, and `getColumns()`, `getPrimaryKey()` and `getIndexes()` reject with a `QueryError` whose message says the table "was not found, or the connected user may not SELECT from it": the two cases cannot be told apart. A failure of the catalog query itself, such as a lost connection, is mapped like any `query()` failure.
+- **Scope.** System classes (`db_class`, `_db_class`, ...) are not listed by `getTables()`. Foreign keys appear as indexes (`foreignKey: true`) without their referenced table. Auto-increment, comments, partitions, triggers, collection element types, schema diffing and DDL generation are not included.
+
+**Throws:** `TypeError` for an empty `table` or `schema`. [`QueryError`](#queryerror) for an unknown, inaccessible or ambiguous table, or when the catalog query fails (the same mapping as `query()`, so a lost connection is reported as for `query()`).
+
+```ts
+const tables = await db.getTables(); // [{ name: "athlete", schema: "DBA", type: "table" }, ...]
+const columns = await db.getColumns("athlete");
+const pk = await db.getPrimaryKey("athlete"); // { name: "pk_athlete_code", columns: ["code"] }
+const indexes = await db.getIndexes("athlete", { schema: "dba" });
+```
+
+---
+
 #### `close()`
 
-Closes the shared connection after the statements issued before it have finished. After calling `close()`, the client can no longer execute queries: a `query()`, `queryResult()`, `execute()`, `ping()`, `getServerVersion()`, `transaction()`, `beginTransaction()`, `commit()` or `rollback()` issued after `close()` is called, even in the same tick, rejects with an error whose `cause` is `Client is closed.`, and no connection is opened. A `transaction()` already started runs to its end on its own connection. If no connection was opened, closing it is a no-op.
+Closes the shared connection after statements and multi-query schema inspections started before it have finished. After calling `close()`, the client can no longer execute queries: a `query()`, `queryResult()`, `execute()`, `ping()`, `getServerVersion()`, `getTables()`, `getColumns()`, `getPrimaryKey()`, `getIndexes()`, `transaction()`, `beginTransaction()`, `commit()` or `rollback()` issued after `close()` is called, even in the same tick, rejects with an error whose `cause` is `Client is closed.`, and no connection is opened. A `transaction()` already started runs to its end on its own connection. If no connection was opened, closing it is a no-op.
 
 ```ts
 async close(): Promise<void>
@@ -409,7 +472,8 @@ A transaction-scoped client that delegates queries to the isolated transactional
 The exported constructor stays available in 1.x for compatibility. An instance you construct yourself only forwards to the connection you gave it and has no lifecycle guards.
 
 ```ts
-class CubridTransaction implements ResultTransactionClient, ExecutableTransactionClient
+class CubridTransaction
+  implements ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient
 ```
 
 ### Methods
@@ -434,6 +498,12 @@ Same signature and behavior as [`CubridClient.execute()`](#executesql-params), b
 ```ts
 async execute(sql: string, params?: QueryParams): Promise<ExecuteResult>
 ```
+
+**Throws:** [`TransactionError`](#transactionerror) if execution fails.
+
+#### `queryPrepared<T>(sql, params?)`, `queryResultPrepared<T>(sql, params?)`, `executePrepared(sql, params?)`
+
+Same signatures and behavior as the [`CubridClient` methods](#querypreparedtsql-params-queryresultpreparedtsql-params-executepreparedsql-params), but run within the transaction's isolated connection. Nothing is committed until the transaction is.
 
 **Throws:** [`TransactionError`](#transactionerror) if execution fails.
 
@@ -936,6 +1006,32 @@ The type `transaction()` passes to its callback and `CubridTransaction` implemen
 interface ExecutableTransactionClient extends TransactionClient, Executable {}
 ```
 
+### PreparedQueryable
+
+Interface for any object that can run a statement with [server-side binding](TYPES.md#prepared-binding). `CubridClient` and `CubridTransaction` implement it.
+
+```ts
+interface PreparedQueryable {
+  queryPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<T[]>;
+  queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>>;
+  executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+}
+```
+
+### PreparedTransactionClient
+
+A `TransactionClient` that can also bind on the server. It is a separate type so that code implementing `TransactionClient` keeps compiling.
+
+```ts
+interface PreparedTransactionClient extends TransactionClient, PreparedQueryable {}
+```
+
 ### TransactionCallback
 
 Type for the callback function passed to `transaction()`.
@@ -955,7 +1051,7 @@ The transaction client that `transaction()` passes to its callback: a `Transacti
 interface ResultTransactionClient extends TransactionClient, ResultQueryable {}
 ```
 
-`CubridClient.transaction()` accepts a `TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient>`, so the callback's `tx` has `queryResult()` and `execute()`; a callback written against `TransactionClient` is still accepted.
+`CubridClient.transaction()` accepts a `TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient>`, so the callback's `tx` has `queryResult()` and `execute()`; a callback written against `TransactionClient` is still accepted.
 
 ### QueryParam
 
@@ -1079,3 +1175,65 @@ interface ColumnInfo {
 | `elementType` | Set only for `SET`, `MULTISET` and `SEQUENCE`, which are the `type`. It is the declared element type, or `NULL` for a collection declared without one. |
 | `precision`, `scale` | The values the server reports. They depend on the type: `VARCHAR(20)` is precision 20, `NUMERIC(10,3)` is 10 and 3, `INT` is 10 and `DATETIME` is 23 and 3. Types without a meaningful size report `0`, and a `CHAR` expression such as a string literal can report `-1`. |
 | `nullable` | `false` only when the server reports the column as NOT NULL. It is `true` for a nullable table column, for the right side of an outer join and for expressions. |
+
+### Schema introspection types
+
+Results and options of [`getTables()`, `getColumns()`, `getPrimaryKey()` and `getIndexes()`](#schema-introspection-gettables-getcolumns-getprimarykey-getindexes).
+
+```ts
+interface SchemaOptions {
+  schema?: string;
+}
+
+interface SchemaTable {
+  name: string;
+  schema: string;
+  type: "table" | "view";
+}
+
+interface SchemaColumn {
+  name: string;
+  position: number;
+  dataType: string;
+  precision: number;
+  scale: number;
+  nullable: boolean;
+  defaultValue: string | null;
+}
+
+interface SchemaPrimaryKey {
+  name: string;
+  columns: string[];
+}
+
+interface SchemaIndexColumn {
+  name: string | null;
+  expression?: string;
+  order: "asc" | "desc";
+  prefixLength?: number;
+}
+
+interface SchemaIndex {
+  name: string;
+  unique: boolean;
+  reverse: boolean;
+  primaryKey: boolean;
+  foreignKey: boolean;
+  filter: string | null;
+  columns: SchemaIndexColumn[];
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `SchemaTable.name`, `SchemaColumn.name`, index and column names | As the catalog stores them: lower case, except that `schema` (the owner) is upper case, for example `DBA`. |
+| `SchemaTable.type` | `view` for a view (catalog class type `VCLASS`), otherwise `table`. |
+| `SchemaColumn.position` | 1-based position in the table. Only instance columns are listed. |
+| `SchemaColumn.dataType` | The catalog's type name, for example `INTEGER`, `BIGINT`, `STRING` (every `VARCHAR`), `CHAR`, `NUMERIC`, `DATETIME` or `SET`. It is not the wire type name of [`ColumnInfo.type`](#columninfo). |
+| `SchemaColumn.precision`, `scale` | The catalog's values: `VARCHAR(10)` is 10 and 0, `NUMERIC(8,3)` is 8 and 3, `INT` is 10 and 0, and a `SET` is 0 and 0. |
+| `SchemaColumn.defaultValue` | The default as the catalog's text, for example `zz` or `SYS_DATETIME`; `null` when the column has none. |
+| `SchemaPrimaryKey.columns` | Column names in key order, which can differ from table order. |
+| `SchemaIndexColumn.name` | `null` for a function-based index key, whose text is in `expression`. |
+| `SchemaIndexColumn.prefixLength` | Set only for a prefix index such as `c(5)`. |
+| `SchemaIndex.filter` | The condition of a filtered index as the catalog prints it, or `null`. |
+| `SchemaIndex.primaryKey`, `foreignKey` | The primary key and each foreign key are listed by `getIndexes()` as indexes of their own. |

@@ -22,11 +22,12 @@ import type {
   ClientOptions,
   ConnectionLike,
   ExecuteResult,
-  TransactionClient,
   TransactionOptions,
+  PreparedTransactionClient,
+  TransactionClient,
 } from "../src/types/client.js";
 import type { QueryParams } from "../src/types/query.js";
-import type { QueryResult } from "../src/types/result.js";
+import type { QueryResult, QueryResultRow } from "../src/types/result.js";
 
 class FakeConnection implements ConnectionLike {
   queries: Array<{ sql: string; params: QueryParams | undefined }> = [];
@@ -1976,6 +1977,9 @@ const TRANSACTION_STATEMENTS: Array<
   ["query", (tx, sql) => tx.query(sql)],
   ["queryResult", (tx, sql) => tx.queryResult(sql)],
   ["execute", (tx, sql) => tx.execute(sql)],
+  ["queryPrepared", (tx, sql) => tx.queryPrepared(sql)],
+  ["queryResultPrepared", (tx, sql) => tx.queryResultPrepared(sql)],
+  ["executePrepared", (tx, sql) => tx.executePrepared(sql)],
 ];
 
 /** Sends all three statement methods through the recorded, gated query(). */
@@ -1990,6 +1994,24 @@ class RecordingStatementConnection extends RecordingConnection {
   async execute(sql: string, params?: QueryParams): Promise<ExecuteResult> {
     await this.query(sql, params);
     return { affectedRows: 1 };
+  }
+
+  async queryPrepared<T extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<T[]> {
+    return this.query<T>(sql, params);
+  }
+
+  async queryResultPrepared<T extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>> {
+    return this.queryResult<T>(sql, params);
+  }
+
+  async executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult> {
+    return this.execute(sql, params);
   }
 }
 
@@ -2016,6 +2038,24 @@ class FailingStatementConnection extends FakeConnection {
     }
 
     return { affectedRows: 0 };
+  }
+
+  async queryPrepared<T extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<T[]> {
+    return (await this.queryResult<T>(sql, params)).rows;
+  }
+
+  async queryResultPrepared<T extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>> {
+    return this.queryResult<T>(sql, params);
+  }
+
+  async executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult> {
+    return this.execute(sql, params);
   }
 }
 
@@ -2191,7 +2231,7 @@ test("Promise.all of every statement method commits once after all of them", asy
     Promise.all(TRANSACTION_STATEMENTS.map(([name, run]) => run(tx, name))),
   );
 
-  assert.equal(results.length, 3);
+  assert.equal(results.length, TRANSACTION_STATEMENTS.length);
   assert.deepEqual(connection.calls.slice(-2), ["commit", "close"]);
   assert.equal(connection.commitCalls, 1);
   assert.equal(connection.rollbackCalls, 0);
@@ -2295,6 +2335,69 @@ test("close does not stop a transaction already running on its own connection", 
     "commit",
     "close",
   ]);
+});
+
+test("the prepared methods never fall back to SQL literals on a connection without them", async () => {
+  const connection = new FakeConnection();
+  const client = createClient(baseOptions({ connectionFactory: () => connection }));
+
+  for (const [name, run] of [
+    ["queryPrepared", () => client.queryPrepared("SELECT ?", [1])],
+    ["queryResultPrepared", () => client.queryResultPrepared("SELECT ?", [1])],
+    ["executePrepared", () => client.executePrepared("DELETE FROM t WHERE a = ?", [1])],
+  ] as const) {
+    await assert.rejects(
+      run,
+      (error: Error) => error instanceof QueryError && error.cause instanceof Error &&
+        error.cause.message === `Underlying connection does not support ${name}.`,
+    );
+  }
+  const inTransaction: Array<(tx: PreparedTransactionClient) => Promise<unknown>> = [
+    (tx) => tx.queryPrepared("SELECT ?", [1]),
+    (tx) => tx.queryResultPrepared("SELECT ?", [1]),
+    (tx) => tx.executePrepared("DELETE FROM t WHERE a = ?", [1]),
+  ];
+  for (const run of inTransaction) {
+    await assert.rejects(() => client.transaction(run), TransactionError);
+  }
+});
+
+test("the prepared methods reach the connection's own on a client and in a transaction", async () => {
+  const calls: string[] = [];
+  const connection = Object.assign(new FakeConnection(), {
+    async queryPrepared<T>(sql: string): Promise<T[]> {
+      calls.push(`queryPrepared ${sql}`);
+      return [];
+    },
+    async queryResultPrepared<T>(sql: string): Promise<QueryResult<T & QueryResultRow>> {
+      calls.push(`queryResultPrepared ${sql}`);
+      return { rows: [], columns: [] };
+    },
+    async executePrepared(sql: string): Promise<ExecuteResult> {
+      calls.push(`executePrepared ${sql}`);
+      return { affectedRows: 1 };
+    },
+  });
+  const client = createClient(baseOptions({ connectionFactory: () => connection }));
+
+  await client.queryPrepared("a");
+  await client.queryResultPrepared("b");
+  assert.deepEqual(await client.executePrepared("c"), { affectedRows: 1 });
+  await client.transaction(async (tx) => {
+    await tx.queryPrepared("d");
+    await tx.queryResultPrepared("e");
+    await tx.executePrepared("f");
+  });
+
+  assert.deepEqual(calls, [
+    "queryPrepared a",
+    "queryResultPrepared b",
+    "executePrepared c",
+    "queryPrepared d",
+    "queryResultPrepared e",
+    "executePrepared f",
+  ]);
+  assert.deepEqual(connection.queries, []);
 });
 
 // ---------------------------------------------------------------------------

@@ -25,7 +25,7 @@ export type ClientLogLevel = "debug" | "info" | "error";
  * parameter values, row data, credentials or error messages.
  */
 export interface ClientLogFields {
-  /** `connection`, `connect`, `query`, `queryResult`, `execute`, `setTransactionOptions`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`. */
+  /** `connection`, `connect`, `query`, `queryResult`, `execute`, `queryPrepared`, `queryResultPrepared`, `executePrepared`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`. */
   operation?: string;
   host?: string;
   port?: number;
@@ -177,6 +177,25 @@ export interface Executable {
   execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
 }
 
+/**
+ * Runs statements with server-side prepared binding: the values travel as typed
+ * binds, never as SQL text. Each call prepares, executes and releases its own
+ * handle, so nothing is reused between calls. The results match `query()`,
+ * `queryResult()` and `execute()`; the differences in how values convert are in
+ * docs/TYPES.md. The methods without `Prepared` keep rendering SQL literals.
+ */
+export interface PreparedQueryable {
+  queryPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<T[]>;
+  queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>>;
+  executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+}
+
 export interface TransactionClient extends Queryable {
   commit(): Promise<void>;
   rollback(): Promise<void>;
@@ -204,6 +223,13 @@ export type TransactionCallback<
  */
 export interface ResultTransactionClient extends TransactionClient, ResultQueryable {}
 
+/**
+ * The transaction client `CubridClient.transaction()` passes in: a
+ * {@link TransactionClient} that can also bind on the server. Kept apart from
+ * `TransactionClient` so 1.x code that implements that interface keeps compiling.
+ */
+export interface PreparedTransactionClient extends TransactionClient, PreparedQueryable {}
+
 export interface ConnectionLike {
   connect(): Promise<void>;
   query<T extends QueryResultRow = QueryResultRow>(
@@ -224,16 +250,30 @@ export interface ConnectionLike {
    */
   execute?(sql: string, params?: QueryParams): Promise<ExecuteResult>;
   /**
+   * Optional so 1.x connection factories keep compiling. The prepared methods
+   * on a client or transaction fail when their connection does not provide
+   * them, rather than falling back to SQL literals.
+   */
+  queryPrepared?<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<T[]>;
+  queryResultPrepared?<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>>;
+  executePrepared?(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+  beginTransaction(): Promise<void>;
+  commit(): Promise<void>;
+  rollback(): Promise<void>;
+  close(): Promise<void>;
+  /**
    * Keeps these settings on every session of this connection, leaving any option
    * not given as it is. Optional so 1.x connection factories keep compiling, and
    * called only when a setting is in effect. Without it such a client or
    * transaction fails, because running without the setting would hide that.
    */
   setTransactionOptions?(options: TransactionOptions): Promise<void>;
-  beginTransaction(): Promise<void>;
-  commit(): Promise<void>;
-  rollback(): Promise<void>;
-  close(): Promise<void>;
   ping?(): Promise<string>;
 }
 
