@@ -33,3 +33,9 @@ Describe potential breaking changes, affected CUBRID versions, and rollback/reco
 ## Reviewers
 
 Mention relevant reviewers, or state that they are not assigned.
+
+## Repository-owned change and reference review
+
+- [ ] This PR stays within **cubrid-client** responsibilities (Node.js/TypeScript CAS driver and npm consumer contract), rather than copying another project's API or release process.
+- [ ] Cross-repository references have a genuine driver/ORM dependency, independent JDBC comparison, or coordination purpose; they are not substitutes for this repository's test evidence.
+- [ ] Issue/PR/ADR text does not contain copied tooling, version commitments or test claims from an unrelated language or repository.
