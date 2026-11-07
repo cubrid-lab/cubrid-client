@@ -243,21 +243,8 @@ try {
 
 ## Driver Issues
 
-If using the legacy `NodeCubridAdapter`, install `node-cubrid` separately:
-
-```bash
-npm install node-cubrid
-```
-
-The default `NativeCubridAdapter` does not require any external driver dependencies.
-
-If using the legacy `NodeCubridAdapter` with an older version of `node-cubrid`, update to the latest version:
-
-```bash
-npm install node-cubrid@latest
-```
-
-The default `NativeCubridAdapter` does not expose this limitation.
+`cubrid-client` speaks the CAS protocol itself through `NativeCubridAdapter`
+and does not require or load any external driver such as `node-cubrid`.
 
 ### ESM vs CommonJS import issues
 

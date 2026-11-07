@@ -4,7 +4,6 @@ import assert from "node:assert/strict";
 import { createClient } from "../src/client/create-client.js";
 import { CubridClient } from "../src/client/client.js";
 import { CubridTransaction } from "../src/client/transaction.js";
-import { NodeCubridAdapter } from "../src/adapters/node-cubrid.js";
 import { ConnectionError } from "../src/errors/connection-error.js";
 import { CasReplyError, ConnectionLostError } from "../src/errors/internal-errors.js";
 import {
@@ -18,20 +17,14 @@ import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { TransactionError } from "../src/errors/transaction-error.js";
 import { mapError } from "../src/internals/map-error.js";
 import { MalformedReplyError, UnsupportedValueError } from "../src/protocol/protocol.js";
-import { mapResult } from "../src/internals/map-result.js";
 import { normalizeConfig } from "../src/internals/normalize-config.js";
 import type {
-  ClientConfig,
   ClientOptions,
   ConnectionLike,
   ExecuteResult,
   TransactionClient,
 } from "../src/types/client.js";
 import type { QueryParams } from "../src/types/query.js";
-import type {
-  NodeCubridDriver,
-  NodeCubridRawConnection,
-} from "../src/adapters/node-cubrid.js";
 
 class FakeConnection implements ConnectionLike {
   queries: Array<{ sql: string; params: QueryParams | undefined }> = [];
@@ -95,96 +88,6 @@ class FakeConnection implements ConnectionLike {
   }
 }
 
-class FakeRawConnection implements NodeCubridRawConnection {
-  connectCalls = 0;
-  queryAllAsObjectsCalls = 0;
-  queryAllCalls = 0;
-  executeCalls = 0;
-  executedStatements: string[] = [];
-  autoCommitValues: boolean[] = [];
-  commitCalls = 0;
-  rollbackCalls = 0;
-  endCalls = 0;
-  queryAllAsObjectsResult: Record<string, unknown>[] = [];
-  queryAllResult: unknown;
-  connectError?: Error;
-  queryError?: Error;
-  autoCommitError?: Error;
-  commitError?: Error;
-  rollbackError?: Error;
-  endError?: Error;
-  useQueryAllAsObjects = true;
-
-  async connect(): Promise<void> {
-    this.connectCalls += 1;
-
-    if (this.connectError) {
-      throw this.connectError;
-    }
-  }
-
-  queryAllAsObjects: NodeCubridRawConnection["queryAllAsObjects"] = async () => {
-    this.queryAllAsObjectsCalls += 1;
-
-    if (!this.useQueryAllAsObjects) {
-      throw new Error("queryAllAsObjects should not be called");
-    }
-
-    if (this.queryError) {
-      throw this.queryError;
-    }
-
-    return this.queryAllAsObjectsResult;
-  };
-
-  queryAll: NodeCubridRawConnection["queryAll"] = async () => {
-    this.queryAllCalls += 1;
-
-    if (this.queryError) {
-      throw this.queryError;
-    }
-
-    return this.queryAllResult;
-  };
-
-  execute: NodeCubridRawConnection["execute"] = async (sql: string) => {
-    this.executeCalls += 1;
-    this.executedStatements.push(sql);
-  };
-
-  async setAutoCommitMode(enabled: boolean): Promise<void> {
-    this.autoCommitValues.push(enabled);
-
-    if (this.autoCommitError) {
-      throw this.autoCommitError;
-    }
-  }
-
-  async commit(): Promise<void> {
-    this.commitCalls += 1;
-
-    if (this.commitError) {
-      throw this.commitError;
-    }
-  }
-
-  async rollback(): Promise<void> {
-    this.rollbackCalls += 1;
-
-    if (this.rollbackError) {
-      throw this.rollbackError;
-    }
-  }
-
-  async end(): Promise<void> {
-    this.endCalls += 1;
-
-    if (this.endError) {
-      throw this.endError;
-    }
-  }
-}
-
 function baseOptions(overrides: Partial<ClientOptions> = {}): ClientOptions {
   return {
     host: "localhost",
@@ -192,10 +95,6 @@ function baseOptions(overrides: Partial<ClientOptions> = {}): ClientOptions {
     user: "dba",
     ...overrides,
   };
-}
-
-function baseConfig(): ClientConfig {
-  return normalizeConfig(baseOptions());
 }
 
 test("normalizeConfig applies default values", () => {
@@ -243,24 +142,6 @@ test("ReadTimeoutError is a ConnectionError and survives every mapError kind", (
   for (const kind of ["connection", "query", "transaction"] as const) {
     assert.equal(mapError(kind, timeout, "wrapped"), timeout);
   }
-});
-
-test("mapResult maps driver column payloads to object rows", () => {
-  assert.deepEqual(
-    mapResult({
-      ColumnNames: ["id", "name"],
-      ColumnValues: [[1, "Alice"], [2, "Bob"]],
-    }),
-    [
-      { id: 1, name: "Alice" },
-      { id: 2, name: "Bob" },
-    ],
-  );
-});
-
-test("mapResult returns an empty array for unsupported payloads", () => {
-  assert.deepEqual(mapResult(undefined), []);
-  assert.deepEqual(mapResult({ ok: true }), []);
 });
 
 test("mapError returns package-owned error classes", () => {
@@ -504,245 +385,6 @@ test("transaction wrapper forwards commit and rollback", async () => {
   assert.equal(connection.rollbackCalls, 1);
 });
 
-test("node-cubrid adapter executes object queries", async () => {
-  const raw = new FakeRawConnection();
-  raw.queryAllAsObjectsResult = [{ id: 1 }];
-  const driver: NodeCubridDriver = {
-    createConnection: () => raw,
-  };
-  const adapter = new NodeCubridAdapter(baseConfig(), async () => driver);
-
-  const rows = await adapter.query<{ id: number }>("SELECT id FROM athlete");
-
-  assert.deepEqual(rows, [{ id: 1 }]);
-  assert.equal(raw.queryAllAsObjectsCalls, 1);
-});
-
-test("node-cubrid adapter falls back to queryAll mapping when needed", async () => {
-  const raw = new FakeRawConnection();
-  raw.useQueryAllAsObjects = false;
-  raw.queryAllResult = {
-    ColumnNames: ["id", "name"],
-    ColumnValues: [[1, "Alice"]],
-  };
-  raw.queryAllAsObjects = undefined as unknown as NodeCubridRawConnection["queryAllAsObjects"];
-  const driver: NodeCubridDriver = {
-    createConnection: () => raw,
-  };
-  const adapter = new NodeCubridAdapter(baseConfig(), async () => driver);
-
-  const rows = await adapter.query("SELECT id, name FROM users");
-
-  assert.deepEqual(rows, [{ id: 1, name: "Alice" }]);
-  assert.equal(raw.queryAllCalls, 1);
-});
-
-test("node-cubrid adapter connects only once across multiple queries", async () => {
-  const raw = new FakeRawConnection();
-  raw.queryAllAsObjectsResult = [{ id: 1 }];
-  const driver: NodeCubridDriver = {
-    createConnection: () => raw,
-  };
-  const adapter = new NodeCubridAdapter(baseConfig(), async () => driver);
-
-  await adapter.query("SELECT 1");
-  await adapter.query("SELECT 2");
-
-  assert.equal(raw.connectCalls, 1);
-  assert.equal(raw.queryAllAsObjectsCalls, 2);
-});
-
-test("node-cubrid adapter throws when no query method is available", async () => {
-  const raw = new FakeRawConnection();
-  raw.queryAllAsObjects = undefined as unknown as NodeCubridRawConnection["queryAllAsObjects"];
-  raw.queryAll = undefined as unknown as NodeCubridRawConnection["queryAll"];
-  const driver: NodeCubridDriver = {
-    createConnection: () => raw,
-  };
-  const adapter = new NodeCubridAdapter(baseConfig(), async () => driver);
-
-  await assert.rejects(
-    adapter.query("SELECT 1"),
-    (error: unknown) => error instanceof QueryError,
-  );
-});
-
-test("node-cubrid adapter maps connection failures", async () => {
-  const raw = new FakeRawConnection();
-  raw.connectError = new Error("connect");
-  const driver: NodeCubridDriver = {
-    createConnection: () => raw,
-  };
-  const adapter = new NodeCubridAdapter(baseConfig(), async () => driver);
-
-  await assert.rejects(
-    adapter.connect(),
-    (error: unknown) =>
-      error instanceof ConnectionError &&
-      error.cause instanceof Error &&
-      error.cause.message === "connect",
-  );
-});
-
-test("node-cubrid adapter maps query failures", async () => {
-  const raw = new FakeRawConnection();
-  raw.queryError = new Error("query");
-  const driver: NodeCubridDriver = {
-    createConnection: () => raw,
-  };
-  const adapter = new NodeCubridAdapter(baseConfig(), async () => driver);
-
-  await assert.rejects(
-    adapter.query("SELECT 1"),
-    (error: unknown) =>
-      error instanceof QueryError &&
-      error.cause instanceof Error &&
-      error.cause.message === "query",
-  );
-});
-
-test("node-cubrid adapter begins transactions through auto-commit control", async () => {
-  const raw = new FakeRawConnection();
-  const driver: NodeCubridDriver = {
-    createConnection: () => raw,
-  };
-  const adapter = new NodeCubridAdapter(baseConfig(), async () => driver);
-
-  await adapter.beginTransaction();
-
-  assert.deepEqual(raw.autoCommitValues, [false]);
-});
-
-test("node-cubrid adapter maps beginTransaction failures", async () => {
-  const raw = new FakeRawConnection();
-  raw.autoCommitError = new Error("begin");
-  const driver: NodeCubridDriver = {
-    createConnection: () => raw,
-  };
-  const adapter = new NodeCubridAdapter(baseConfig(), async () => driver);
-
-  await assert.rejects(
-    adapter.beginTransaction(),
-    (error: unknown) =>
-      error instanceof TransactionError &&
-      error.cause instanceof Error &&
-      error.cause.message === "begin",
-  );
-});
-
-test("node-cubrid adapter maps commit and rollback failures", async () => {
-  const commitRaw = new FakeRawConnection();
-  commitRaw.commitError = new Error("commit");
-  const rollbackRaw = new FakeRawConnection();
-  rollbackRaw.rollbackError = new Error("rollback");
-
-  const commitAdapter = new NodeCubridAdapter(baseConfig(), async () => ({
-    createConnection: () => commitRaw,
-  }));
-  const rollbackAdapter = new NodeCubridAdapter(baseConfig(), async () => ({
-    createConnection: () => rollbackRaw,
-  }));
-
-  await assert.rejects(
-    commitAdapter.commit(),
-    (error: unknown) =>
-      error instanceof TransactionError &&
-      error.cause instanceof Error &&
-      error.cause.message === "commit",
-  );
-
-  await assert.rejects(
-    rollbackAdapter.rollback(),
-    (error: unknown) =>
-      error instanceof TransactionError &&
-      error.cause instanceof Error &&
-      error.cause.message === "rollback",
-  );
-});
-
-test("node-cubrid adapter closes raw connections and maps close failures", async () => {
-  const raw = new FakeRawConnection();
-  const adapter = new NodeCubridAdapter(baseConfig(), async () => ({
-    createConnection: () => raw,
-  }));
-
-  await adapter.connect();
-  await adapter.close();
-
-  assert.equal(raw.endCalls, 1);
-
-  const broken = new FakeRawConnection();
-  broken.endError = new Error("end");
-  const brokenAdapter = new NodeCubridAdapter(baseConfig(), async () => ({
-    createConnection: () => broken,
-  }));
-
-  await brokenAdapter.connect();
-
-  await assert.rejects(
-    brokenAdapter.close(),
-    (error: unknown) =>
-      error instanceof ConnectionError &&
-      error.cause instanceof Error &&
-      error.cause.message === "end",
-  );
-});
-
-test("node-cubrid adapter routes DDL/DML to execute instead of queryAllAsObjects", async () => {
-  const raw = new FakeRawConnection();
-  raw.queryAllAsObjectsResult = [{ id: 1 }];
-  const driver: NodeCubridDriver = {
-    createConnection: () => raw,
-  };
-  const adapter = new NodeCubridAdapter(baseConfig(), async () => driver);
-
-  // DDL statements should use execute(), not queryAllAsObjects()
-  await adapter.query("CREATE TABLE test_ddl (id INT)");
-  assert.equal(raw.executeCalls, 1);
-  assert.equal(raw.queryAllAsObjectsCalls, 0);
-
-  // DML statements should also use execute()
-  await adapter.query("INSERT INTO test_ddl (id) VALUES (1)");
-  assert.equal(raw.executeCalls, 2);
-
-  await adapter.query("UPDATE test_ddl SET id = 2 WHERE id = 1");
-  assert.equal(raw.executeCalls, 3);
-
-  await adapter.query("DELETE FROM test_ddl WHERE id = 2");
-  assert.equal(raw.executeCalls, 4);
-
-  await adapter.query("DROP TABLE test_ddl");
-  assert.equal(raw.executeCalls, 5);
-
-  // SELECT should still use queryAllAsObjects()
-  await adapter.query("SELECT 1");
-  assert.equal(raw.queryAllAsObjectsCalls, 1);
-  assert.equal(raw.executeCalls, 5);
-});
-
-test("node-cubrid adapter DDL/DML returns empty array", async () => {
-  const raw = new FakeRawConnection();
-  const driver: NodeCubridDriver = {
-    createConnection: () => raw,
-  };
-  const adapter = new NodeCubridAdapter(baseConfig(), async () => driver);
-
-  const result = await adapter.query("CREATE TABLE ddl_test (id INT)");
-  assert.deepEqual(result, []);
-});
-
-test("node-cubrid adapter handles DDL with leading whitespace", async () => {
-  const raw = new FakeRawConnection();
-  const driver: NodeCubridDriver = {
-    createConnection: () => raw,
-  };
-  const adapter = new NodeCubridAdapter(baseConfig(), async () => driver);
-
-  await adapter.query("  \n  INSERT INTO t (id) VALUES (1)");
-  assert.equal(raw.executeCalls, 1);
-  assert.equal(raw.queryAllAsObjectsCalls, 0);
-});
-
 // ---------------------------------------------------------------------------
 // CubridClient.beginTransaction / commit / rollback / close coverage
 // ---------------------------------------------------------------------------
@@ -855,28 +497,6 @@ test("client close is a no-op when no connection was opened", async () => {
 
   // close without ever querying - should not throw
   await client.close();
-});
-
-// ---------------------------------------------------------------------------
-// mapResult edge case: array input passthrough
-// ---------------------------------------------------------------------------
-
-test("mapResult passes through array input unchanged", () => {
-  const input = [{ id: 1 }, { id: 2 }];
-  assert.deepEqual(mapResult(input), input);
-});
-
-// ---------------------------------------------------------------------------
-// NodeCubridAdapter close when no connection exists
-// ---------------------------------------------------------------------------
-
-test("node-cubrid adapter close is a no-op when no connection was created", async () => {
-  const adapter = new NodeCubridAdapter(baseConfig(), async () => ({
-    createConnection: () => new FakeRawConnection(),
-  }));
-
-  // close without ever connecting - should not throw
-  await adapter.close();
 });
 
 // ---------------------------------------------------------------------------

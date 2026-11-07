@@ -78,7 +78,7 @@ await db.close();
 ### How It Works
 
 1. `options` are normalized into a full `ClientConfig` (defaults applied for `port`, `password`).
-2. A `connectionFactory` is resolved — either from `options.connectionFactory` or the built-in `NodeCubridAdapter`.
+2. A `connectionFactory` is resolved — either from `options.connectionFactory` or the built-in `NativeCubridAdapter`.
 3. A `CubridClient` is returned with lazy connection initialization.
 
 ---
@@ -701,7 +701,7 @@ interface ClientOptions {
 | `readTimeout` | `number` | `undefined` | Milliseconds of server inactivity before a request fails with [`ReadTimeoutError`](#readtimeouterror) and the connection is discarded. `undefined` or `0` means no timeout for requests; the connect handshake then still gives up after 10 seconds of inactivity. Other values must be between 1 and 2147483647, or `createClient()` throws a `RangeError`. See [Read timeout](CONNECTION.md#read-timeout) |
 | `maxConnectionRetryCount` | `number` | `undefined` | Retries after a failed first attempt to open the TCP connection to the broker (refused, unreachable, timed out). Non-negative integer, default `0`; anything else throws a `RangeError`. See [Connection retries](CONNECTION.md#connection-retries) |
 | `logger` | `unknown` (see `ClientLogger`) | `undefined` | Receives redacted diagnostics for connections, queries and transactions. See [Logging](CONNECTION.md#logging) |
-| `connectionFactory` | [`ConnectionFactory`](#connectionfactory) | Built-in `NodeCubridAdapter` | Custom factory for creating connections |
+| `connectionFactory` | [`ConnectionFactory`](#connectionfactory) | Built-in `NativeCubridAdapter` | Custom factory for creating connections |
 
 ### ClientConfig
 
