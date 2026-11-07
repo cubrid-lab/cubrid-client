@@ -67,7 +67,9 @@ The integration suite now also asserts decoded SET, MULTISET and SEQUENCE values
 29/29 passed with 0 skipped against local `cubrid/cubrid` 10.2, 11.0, 11.2 and
 11.4 containers when that decoder was added
 ([#82](https://github.com/cubrid-lab/cubrid-client/issues/82)). The table above
-records the earlier CI runs and has not been re-recorded with these cases.
+is a **historical record of the 2026-11-06 run** (23 tests per version), not the
+current case count: integration cases were added afterwards. A current count is
+recorded here only when backed by a linked CI job; none has been re-recorded.
 
 ## Release-blocking coverage still needed
 
@@ -82,4 +84,4 @@ records the earlier CI runs and has not been re-recorded with these cases.
   package/API/type/live-DB release decision, not just a green offline job.
 
 Until those are complete, describe the documented live matrix as **verified
-for the 23 named integration tests only**, not broadly production-ready.
+for the named integration tests of the linked runs only**, not broadly production-ready.

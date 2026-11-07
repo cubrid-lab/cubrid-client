@@ -190,10 +190,11 @@ export class CASConnection {
       }
 
       // Step 3.5 (SSL only): STARTTLS-style upgrade on the resolved CAS socket.
-      // Per CUBRID source (src/broker/cas_common_main.c) the CAS sends a
-      // plaintext 4-byte NO_ERROR int, then runs SSL_accept, then reads the
-      // OpenDatabase credentials over TLS. This step is SSL-only; the non-SSL
-      // path is intentionally left byte-for-byte unchanged.
+      // The only plaintext word the broker sends is the redirect/status int
+      // already consumed in step 2; there is no second NO_ERROR word (see
+      // upgradeToTls). The CAS then runs SSL_accept and reads the OpenDatabase
+      // credentials over TLS. This step is SSL-only; the non-SSL path is
+      // intentionally left byte-for-byte unchanged.
       if (this.config.ssl) {
         this.socket = await this.upgradeToTls(this.socket);
       }
