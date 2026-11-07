@@ -149,6 +149,23 @@ await db.query("INSERT INTO data (a, b, c, d, e, f, g) VALUES (?, ?, ?, ?, ?, ?,
 ]);
 ```
 
+### Affected rows and generated ids
+
+`query()` returns `[]` for `INSERT`, `UPDATE` and `DELETE`. Use `execute()` to
+learn how many rows changed and the generated `AUTO_INCREMENT` value:
+
+```ts
+const { affectedRows, lastInsertId } = await db.execute(
+  "INSERT INTO users (name) VALUES (?)",
+  ["Alice"],
+);
+// affectedRows: 1, lastInsertId: 1 (a bigint beyond Number.MAX_SAFE_INTEGER)
+```
+
+`db.transaction((tx) => tx.execute(...))` works the same way. See
+[`execute()`](docs/API_REFERENCE.md#executesql-params) for what the server
+reports for multi-row and multi-statement inserts.
+
 ### Date parameters are serialized in UTC
 
 `Date` parameters are rendered as a `DATETIME'YYYY-MM-DD HH:MM:SS.mmm'`

@@ -24,6 +24,8 @@ import type {
   ClientConfig,
   ClientOptions,
   ConnectionLike,
+  ExecuteResult,
+  TransactionClient,
 } from "../src/types/client.js";
 import type { QueryParams } from "../src/types/query.js";
 import type {
@@ -1214,4 +1216,98 @@ test("decode failures stay reachable by name and never gain server details", () 
       assert.equal("kind" in outer, false);
     }
   }
+});
+
+// ---------------------------------------------------------------------------
+// execute() — affected rows and last insert ID
+// ---------------------------------------------------------------------------
+
+function executingConnection(result: ExecuteResult): {
+  connection: ConnectionLike;
+  executed: Array<{ sql: string; params: QueryParams | undefined }>;
+} {
+  const executed: Array<{ sql: string; params: QueryParams | undefined }> = [];
+  const base = new FakeConnection();
+  const connection: ConnectionLike = {
+    connect: () => base.connect(),
+    query: () => Promise.resolve([]),
+    execute: async (sql, params) => {
+      executed.push({ sql, params });
+      return result;
+    },
+    beginTransaction: () => base.beginTransaction(),
+    commit: () => base.commit(),
+    rollback: () => base.rollback(),
+    close: () => base.close(),
+  };
+  return { connection, executed };
+}
+
+test("client.execute returns the connection's affected rows and insert id", async () => {
+  const { connection, executed } = executingConnection({ affectedRows: 1, lastInsertId: 7 });
+  const client = createClient(baseOptions({ connectionFactory: () => connection }));
+
+  const result = await client.execute("INSERT INTO users (name) VALUES (?)", ["Alice"]);
+
+  assert.deepEqual(result, { affectedRows: 1, lastInsertId: 7 });
+  assert.deepEqual(executed, [{ sql: "INSERT INTO users (name) VALUES (?)", params: ["Alice"] }]);
+});
+
+test("tx.execute runs on the transaction's own connection", async () => {
+  const { connection, executed } = executingConnection({ affectedRows: 2 });
+  const client = createClient(baseOptions({ connectionFactory: () => connection }));
+
+  const result = await client.transaction((tx) => tx.execute("DELETE FROM users"));
+
+  assert.deepEqual(result, { affectedRows: 2 });
+  assert.equal(executed.length, 1);
+});
+
+test("client.execute wraps a failure in QueryError", async () => {
+  const { connection } = executingConnection({ affectedRows: 0 });
+  connection.execute = () => Promise.reject(new Error("boom"));
+  const client = createClient(baseOptions({ connectionFactory: () => connection }));
+
+  await assert.rejects(() => client.execute("DELETE FROM users"), QueryError);
+});
+
+test("tx.execute wraps a failure in TransactionError", async () => {
+  const { connection } = executingConnection({ affectedRows: 0 });
+  connection.execute = () => Promise.reject(new Error("boom"));
+  const client = createClient(baseOptions({ connectionFactory: () => connection }));
+
+  await assert.rejects(
+    () => client.transaction((tx) => tx.execute("DELETE FROM users")),
+    TransactionError,
+  );
+});
+
+test("execute reports a connection that lacks it, and query keeps working", async () => {
+  const connection = new FakeConnection();
+  const client = createClient(baseOptions({ connectionFactory: () => connection }));
+
+  await assert.rejects(
+    () => client.execute("DELETE FROM users"),
+    (error: Error) => error instanceof QueryError && error.cause instanceof Error &&
+      /does not support execute/.test(error.cause.message),
+  );
+  assert.deepEqual(await client.query("SELECT 1"), []);
+  await assert.rejects(
+    () => client.transaction((tx) => tx.execute("DELETE FROM users")),
+    TransactionError,
+  );
+});
+
+test("a 1.x class implementing TransactionClient without execute still compiles", () => {
+  // Type-level check: `execute` must not become mandatory on TransactionClient.
+  class LegacyTransaction implements TransactionClient {
+    async query<T extends Record<string, unknown> = Record<string, unknown>>(): Promise<T[]> {
+      return [];
+    }
+    async commit(): Promise<void> {}
+    async rollback(): Promise<void> {}
+  }
+  const legacy: TransactionClient = new LegacyTransaction();
+  assert.equal(typeof legacy.commit, "function");
+  assert.equal("execute" in legacy, false);
 });

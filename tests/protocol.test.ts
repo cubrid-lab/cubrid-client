@@ -39,8 +39,12 @@ import {
   encodeBindParams,
   interpolateParams,
   formatValue,
+  writeGetLastInsertId,
+  parseGetLastInsertId,
+  MalformedReplyError,
   type ColumnMeta,
 } from "../src/protocol/protocol.js";
+import { DML_FRAMES, LAST_INSERT_ID_FRAMES } from "./fixtures/dml-frames.js";
 
 // ---------------------------------------------------------------------------
 // PacketWriter tests
@@ -1969,6 +1973,84 @@ test("a server error reply is never reported as a malformed reply", () => {
     assert.throws(
       () => parse(errorReply(-2, -493, "Syntax: unexpected")),
       (error: Error) => error instanceof CasReplyError && error.name !== "MalformedReplyError",
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// DML results and GET_LAST_INSERT_ID (replies captured from live brokers)
+// ---------------------------------------------------------------------------
+
+test("parsePrepareAndExecute keeps the row count of each DML statement", () => {
+  const counts = (frame: { hex: string }) =>
+    parsePrepareAndExecute(Buffer.from(frame.hex, "hex"), 7).resultInfos;
+
+  assert.deepEqual(counts(DML_FRAMES.insertOneRow), [{ statementType: 20, resultCount: 1 }]);
+  assert.deepEqual(counts(DML_FRAMES.insertThreeRows), [{ statementType: 20, resultCount: 3 }]);
+  assert.deepEqual(counts(DML_FRAMES.updateThreeRows), [{ statementType: 22, resultCount: 3 }]);
+  assert.deepEqual(counts(DML_FRAMES.updateNoMatch), [{ statementType: 22, resultCount: 0 }]);
+  assert.deepEqual(counts(DML_FRAMES.deleteThreeRows), [{ statementType: 23, resultCount: 3 }]);
+  assert.deepEqual(counts(DML_FRAMES.createTable), [{ statementType: 4, resultCount: 0 }]);
+});
+
+test("parsePrepareAndExecute returns one result per statement of a multi-statement string", () => {
+  const result = parsePrepareAndExecute(Buffer.from(DML_FRAMES.twoInserts.hex, "hex"), 7);
+
+  assert.deepEqual(result.resultInfos, [
+    { statementType: 20, resultCount: 1 },
+    { statementType: 20, resultCount: 2 },
+  ]);
+});
+
+test("writeGetLastInsertId sends only the function code", () => {
+  const { payload, header } = writeGetLastInsertId(Buffer.from([1, 2, 3, 4]));
+
+  assert.equal(payload.readInt8(payload.length - 1), 40);
+  assert.equal(header.readInt32BE(0), payload.length);
+});
+
+test("parseGetLastInsertId reads the generated value of a captured reply", () => {
+  const parse = (hex: string) => parseGetLastInsertId(Buffer.from(hex, "hex"));
+
+  assert.equal(parse(LAST_INSERT_ID_FRAMES.one), "1");
+  assert.equal(parse(LAST_INSERT_ID_FRAMES.firstOfThreeRows), "2");
+});
+
+test("parseGetLastInsertId returns undefined when the session holds no value", () => {
+  assert.equal(parseGetLastInsertId(Buffer.from(LAST_INSERT_ID_FRAMES.none, "hex")), undefined);
+});
+
+test("parseGetLastInsertId accepts the one-byte type header of older brokers", () => {
+  // size 3: type 0x07, the digit "7" and the terminating NUL
+  assert.equal(parseGetLastInsertId(Buffer.from("00000000000000030737" + "00", "hex")), "7");
+});
+
+test("parseGetLastInsertId raises a server error", () => {
+  const reply = Buffer.concat([
+    Buffer.from("fffffffc", "hex"), // response code -4
+    Buffer.from("fffffc18", "hex"), // error code -1000
+    Buffer.from("bad\0"),
+  ]);
+
+  assert.throws(
+    () => parseGetLastInsertId(reply),
+    (error: Error) => error instanceof CasReplyError && error.message.includes("bad"),
+  );
+});
+
+test("parseGetLastInsertId rejects a reply that overruns its declared size", () => {
+  // size 9 but only 4 bytes follow
+  assert.throws(
+    () => parseGetLastInsertId(Buffer.from("000000000000000983073100", "hex")),
+    MalformedReplyError,
+  );
+});
+
+test("parseGetLastInsertId rejects every nonpositive size except -1", () => {
+  for (const size of ["00000000", "fffffffe", "80000000"]) {
+    assert.throws(
+      () => parseGetLastInsertId(Buffer.from("00000000" + size, "hex")),
+      MalformedReplyError,
     );
   }
 });

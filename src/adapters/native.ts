@@ -19,6 +19,8 @@ import {
   writeConClose,
   interpolateParams,
   type ColumnMeta,
+  writeGetLastInsertId,
+  parseGetLastInsertId,
   type PrepareAndExecuteResult,
 } from "../protocol/protocol.js";
 import { EndTranType, StatementType, TYPE_NAMES } from "../protocol/constants.js";
@@ -30,7 +32,7 @@ import {
 import { mapError } from "../internals/map-error.js";
 import { assertValidRetryCount } from "../internals/normalize-config.js";
 import type { DriverAdapter } from "./base.js";
-import type { ClientConfig } from "../types/client.js";
+import type { ClientConfig, ExecuteResult } from "../types/client.js";
 import type { QueryParams } from "../types/query.js";
 import type { ColumnInfo, QueryResult, QueryResultRow } from "../types/result.js";
 
@@ -89,6 +91,13 @@ export class NativeCubridAdapter implements DriverAdapter {
   private transactionAbort: CasReplyError | null = null;
 
   /**
+   * The server's last generated AUTO_INCREMENT value as this adapter last saw it
+   * inside the open transaction: `undefined` for none, `null` when a query()
+   * INSERT may have changed it unseen. See readExecuteResult().
+   */
+  private insertIdBaseline: string | undefined | null;
+
+  /**
    * Tail of the statement queue; see inTurn(). It never rejects, so one failed
    * statement cannot block the ones behind it.
    */
@@ -122,6 +131,33 @@ export class NativeCubridAdapter implements DriverAdapter {
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
     return this.inTurn(() => this.queryNow<T>(sql, params, issued));
+  }
+
+  async execute(sql: string, params?: QueryParams): Promise<ExecuteResult> {
+    const cas = this.getOrCreateCAS();
+    const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
+    return this.inTurn(() => this.executeNow(sql, params, issued));
+  }
+
+  private async executeNow(
+    sql: string,
+    params: QueryParams | undefined,
+    issued: IssuedOn,
+  ): Promise<ExecuteResult> {
+    try {
+      await this.readInsertIdBaseline();
+      return await this.runStatement(
+        sql,
+        params,
+        issued,
+        (cas, result) => this.readExecuteResult(cas, result),
+        true,
+      );
+    } catch (error) {
+      this.bindSessionLostByFirstStatement();
+      this.recordTransactionAbort(error);
+      throw mapError("query", error, "Failed to execute CUBRID statement.");
+    }
   }
 
   private async queryNow<T extends QueryResultRow>(
@@ -293,11 +329,98 @@ export class NativeCubridAdapter implements DriverAdapter {
     return turn;
   }
 
-  private async executeQuery<T extends QueryResultRow>(
+  private executeQuery<T extends QueryResultRow>(
     sql: string,
     params: QueryParams | undefined,
     issued: IssuedOn,
   ): Promise<QueryResult<T>> {
+    return this.runStatement(sql, params, issued, async (cas, result) => {
+      // An INSERT here may generate a value that nobody reads, so a later
+      // execute() in this transaction cannot tell it from its own.
+      if (
+        !this.autoCommit &&
+        result.resultInfos.some((info) => info.statementType === StatementType.INSERT)
+      ) {
+        this.insertIdBaseline = null;
+      }
+
+      if (result.statementType !== StatementType.SELECT) {
+        return { rows: [], columns: [] };
+      }
+
+      const allRows = [...result.rows];
+
+      if (result.totalTupleCount > allRows.length) {
+        await this.fetchRemaining(cas, result, allRows);
+      }
+
+      return { rows: allRows as T[], columns: result.columns.map(toColumnInfo) };
+    });
+  }
+
+  /**
+   * Counts a statement's affected rows and, after an INSERT, asks for the
+   * session's last generated AUTO_INCREMENT value. See ExecuteResult.
+   */
+  private async readExecuteResult(
+    cas: CASConnection,
+    result: PrepareAndExecuteResult,
+  ): Promise<ExecuteResult> {
+    let affectedRows = 0;
+    for (const { statementType, resultCount } of result.resultInfos) {
+      if (statementType !== StatementType.SELECT && resultCount > 0) {
+        affectedRows += resultCount;
+      }
+    }
+
+    const executed: ExecuteResult = { affectedRows };
+    if (!result.resultInfos.some((info) => info.statementType === StatementType.INSERT)) {
+      return executed;
+    }
+
+    const text = await this.fetchLastInsertId(cas);
+    // The server keeps the value of an earlier INSERT of the same transaction,
+    // reports it again after an INSERT into a table without AUTO_INCREMENT, and
+    // two tables can generate the same number, so nothing in the reply says
+    // whether this statement generated it. Inside a transaction a value that
+    // differs from the one seen before the statement is certainly new; an equal
+    // one is ambiguous and reported as no id, because a wrong id is worse than
+    // none. An autocommit statement runs in a transaction of its own (see
+    // runStatement), which starts with no value, so any value is its own.
+    let generated = text !== undefined;
+    if (!this.autoCommit) {
+      generated = text !== undefined && text !== this.insertIdBaseline;
+      if (text !== undefined) {
+        this.insertIdBaseline = text;
+      }
+    }
+    if (text !== undefined && generated) {
+      const id = BigInt(text);
+      executed.lastInsertId =
+        id >= BigInt(Number.MIN_SAFE_INTEGER) && id <= BigInt(Number.MAX_SAFE_INTEGER)
+          ? Number(id)
+          : id;
+    }
+    return executed;
+  }
+
+  /**
+   * Sends one statement and hands its decoded reply to `use` while the handle
+   * is open.
+   *
+   * `commitAfter` runs an autocommit statement as a transaction that ends only
+   * after `use`: the server forgets the generated AUTO_INCREMENT value when it
+   * commits, so a statement sent with the autocommit flag could never be asked
+   * for it (verified on CUBRID 10.2, 11.0, 11.2 and 11.4). The statement is
+   * then committed with END_TRAN, or rolled back if anything failed.
+   */
+  private async runStatement<R>(
+    sql: string,
+    params: QueryParams | undefined,
+    issued: IssuedOn,
+    use: (cas: CASConnection, result: PrepareAndExecuteResult) => Promise<R>,
+    commitAfter = false,
+  ): Promise<R> {
     const cas = this.getOrCreateCAS();
 
     // Reconnecting here would drop the earlier statements of this transaction
@@ -330,33 +453,88 @@ export class NativeCubridAdapter implements DriverAdapter {
           )
         : sql;
 
+    const deferCommit = commitAfter && this.autoCommit;
     const { header, payload } = writePrepareAndExecute(
       resolvedSql,
-      this.autoCommit,
+      this.autoCommit && !deferCommit,
       cas.casInfo,
     );
-    const responsePayload = await cas.sendAndRecv(header, payload);
 
-    return this.withQueryHandle(cas, responsePayload, async () => {
-      await this.bindTransactionSession(cas);
+    // Taken after the exchange: sending can replace a released CAS, and the
+    // statement then ran on the new session that COMMIT must reach.
+    let generation = cas.connectionGeneration;
+    try {
+      const responsePayload = await cas.sendAndRecv(header, payload);
+      generation = cas.connectionGeneration;
 
-      const result: PrepareAndExecuteResult = parsePrepareAndExecute(
-        responsePayload,
-        cas.protoVersion,
-      );
+      return await this.withQueryHandle(cas, responsePayload, async () => {
+        await this.bindTransactionSession(cas);
 
-      if (result.statementType !== StatementType.SELECT) {
-        return { rows: [], columns: [] };
+        const result: PrepareAndExecuteResult = parsePrepareAndExecute(
+          responsePayload,
+          cas.protoVersion,
+        );
+
+        const value = await use(cas, result);
+        if (deferCommit) {
+          await this.endStatementTransaction(cas, EndTranType.COMMIT, generation);
+        }
+        return value;
+      });
+    } catch (error) {
+      if (deferCommit) {
+        await this.endStatementTransaction(cas, EndTranType.ROLLBACK, generation).catch(
+          () => undefined,
+        );
       }
+      throw error;
+    }
+  }
 
-      const allRows = [...result.rows];
+  /** Ends the transaction of a statement run by runStatement(commitAfter), on its own session. */
+  private async endStatementTransaction(
+    cas: CASConnection,
+    type: EndTranType,
+    generation: number,
+  ): Promise<void> {
+    const { header, payload } = writeEndTran(type, cas.casInfo);
+    const responsePayload = await cas.sendAndRecvOnSession(generation, header, payload);
+    if (responsePayload) {
+      parseSimpleResponse(responsePayload);
+    } else if (type === EndTranType.COMMIT) {
+      // The session that ran the statement is gone, and so are its changes.
+      throw new ConnectionLostError("Connection lost before the statement was committed");
+    }
+  }
 
-      if (result.totalTupleCount > allRows.length) {
-        await this.fetchRemaining(cas, result, allRows);
+  /** Sends GET_LAST_INSERT_ID and returns the session's value, or undefined if it has none. */
+  private async fetchLastInsertId(cas: CASConnection): Promise<string | undefined> {
+    const { header, payload } = writeGetLastInsertId(cas.casInfo);
+    return parseGetLastInsertId(await cas.sendAndRecv(header, payload));
+  }
+
+  /**
+   * After a query() INSERT inside a transaction the baseline is unknown, so read
+   * the server's value before the next execute() statement to have one.
+   */
+  private async readInsertIdBaseline(): Promise<void> {
+    if (this.autoCommit || this.insertIdBaseline !== null) {
+      return;
+    }
+    const cas = this.getOrCreateCAS();
+    this.assertTransactionSession(cas);
+    if (cas.isConnected) {
+      try {
+        this.insertIdBaseline = await this.fetchLastInsertId(cas);
+      } catch (error) {
+        // This read is outside withQueryHandle(), so a damaged reply, which may
+        // not have ended where its frame said, must drop the session here.
+        if (error instanceof MalformedReplyError) {
+          await cas.discardSession();
+        }
+        throw error;
       }
-
-      return { rows: allRows as T[], columns: result.columns.map(toColumnInfo) };
-    });
+    }
   }
 
   /**
@@ -459,6 +637,7 @@ export class NativeCubridAdapter implements DriverAdapter {
   }
 
   private endTransaction(): void {
+    this.insertIdBaseline = undefined;
     this.autoCommit = true;
     this.transactionGeneration = null;
     this.transactionAbort = null;

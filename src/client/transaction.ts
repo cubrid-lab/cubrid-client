@@ -1,9 +1,14 @@
 import { mapError } from "../internals/map-error.js";
-import type { ConnectionLike, ResultTransactionClient } from "../types/client.js";
+import type {
+  ConnectionLike,
+  ExecuteResult,
+  ExecutableTransactionClient,
+  ResultTransactionClient,
+} from "../types/client.js";
 import type { QueryParams } from "../types/query.js";
 import type { QueryResult, QueryResultRow } from "../types/result.js";
 
-export class CubridTransaction implements ResultTransactionClient {
+export class CubridTransaction implements ResultTransactionClient, ExecutableTransactionClient {
   constructor(private readonly connection: ConnectionLike) {}
 
   async query<T extends QueryResultRow = QueryResultRow>(
@@ -28,6 +33,17 @@ export class CubridTransaction implements ResultTransactionClient {
       return await this.connection.queryResult<T>(sql, params);
     } catch (error) {
       throw mapError("transaction", error, "Transaction query failed.");
+    }
+  }
+
+  async execute(sql: string, params?: QueryParams): Promise<ExecuteResult> {
+    try {
+      if (!this.connection.execute) {
+        throw new Error("Underlying connection does not support execute.");
+      }
+      return await this.connection.execute(sql, params);
+    } catch (error) {
+      throw mapError("transaction", error, "Transaction statement failed.");
     }
   }
 

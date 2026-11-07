@@ -21,6 +21,15 @@ is a second, separate oracle: complete replies captured from live 10.2, 11.0,
 The offline tests replace single fields in those frames to build the malformed
 cases.
 
+[`tests/fixtures/dml-frames.ts`](../tests/fixtures/dml-frames.ts) holds the
+replies to INSERT, UPDATE, DELETE, DDL and a two-statement string, and to
+GET_LAST_INSERT_ID (function code 40), captured the same way. Facts they pin
+down: the per-statement row count is in the execute result list (one entry per
+statement of a multi-statement string); GET_LAST_INSERT_ID answers size `-1`
+after an autocommit statement because the commit clears the value; after a
+multi-row INSERT it is the first generated id; and after an INSERT into a table
+without AUTO_INCREMENT it still holds an earlier INSERT's value. The INSERT reply is the same bytes for a table with and without AUTO_INCREMENT, and two fresh AUTO_INCREMENT tables both answer `1` in one transaction, so the wire holds no signal that a statement generated the value; a commit or a rollback clears it (CUBRID 10.2 and 11.4).
+
 ## Separate numeric domains
 
 | Domain | Named constant | Literal decimal / hex |

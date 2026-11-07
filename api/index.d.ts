@@ -68,7 +68,7 @@ type ClientLogLevel = "debug" | "info" | "error";
  * parameter values, row data, credentials or error messages.
  */
 interface ClientLogFields {
-    /** `connection`, `connect`, `query`, `queryResult`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`. */
+    /** `connection`, `connect`, `query`, `queryResult`, `execute`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`. */
     operation?: string;
     host?: string;
     port?: number;
@@ -127,9 +127,36 @@ interface Queryable {
 interface ResultQueryable {
     queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
 }
+/**
+ * Outcome of a statement run with `execute()`.
+ *
+ * `affectedRows` is the number of rows an INSERT, UPDATE, DELETE or MERGE
+ * changed, added over every statement of a multi-statement string. It is 0 for
+ * DDL and SELECT, and 0 when an UPDATE or DELETE matched nothing.
+ *
+ * `lastInsertId` is set only when an INSERT ran and the session then holds a
+ * generated AUTO_INCREMENT value: a `number` while it is a safe integer and a
+ * `bigint` beyond that, so no precision is lost. It is absent otherwise.
+ */
+interface ExecuteResult {
+    affectedRows: number;
+    lastInsertId?: number | bigint;
+}
+/** Runs a statement and reports its {@link ExecuteResult} instead of rows. */
+interface Executable {
+    execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+}
 interface TransactionClient extends Queryable {
     commit(): Promise<void>;
     rollback(): Promise<void>;
+}
+/**
+ * The transaction client `CubridClient.transaction()` hands to its callback: a
+ * {@link TransactionClient} that can also `execute()`. A separate type keeps
+ * `TransactionClient` as it was, so 1.x classes and test doubles implementing
+ * it still compile.
+ */
+interface ExecutableTransactionClient extends TransactionClient, Executable {
 }
 type TransactionCallback<T, Tx extends TransactionClient = TransactionClient> = (tx: Tx) => Promise<T>;
 /**
@@ -149,6 +176,11 @@ interface ConnectionLike {
      * client or transaction fails when its connection does not provide it.
      */
     queryResult?<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
+    /**
+     * Optional so 1.x connection factories keep compiling. `execute()` on a
+     * client or transaction fails when its connection does not provide it.
+     */
+    execute?(sql: string, params?: QueryParams): Promise<ExecuteResult>;
     beginTransaction(): Promise<void>;
     commit(): Promise<void>;
     rollback(): Promise<void>;
@@ -157,14 +189,15 @@ interface ConnectionLike {
 }
 type ConnectionFactory = (config: ClientConfig) => ConnectionLike | Promise<ConnectionLike>;
 
-declare class CubridClient implements Queryable, ResultQueryable {
+declare class CubridClient implements Queryable, ResultQueryable, Executable {
     private readonly config;
     private readonly connectionFactory;
     private sharedConnectionPromise;
     constructor(config: ClientConfig, connectionFactory: ConnectionFactory);
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
     queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
-    transaction<T>(callback: TransactionCallback<T, ResultTransactionClient>): Promise<T>;
+    execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+    transaction<T>(callback: TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient>): Promise<T>;
     beginTransaction(): Promise<void>;
     commit(): Promise<void>;
     rollback(): Promise<void>;
@@ -181,11 +214,12 @@ declare class CubridClient implements Queryable, ResultQueryable {
 
 declare function createClient(options: ClientOptions): CubridClient;
 
-declare class CubridTransaction implements ResultTransactionClient {
+declare class CubridTransaction implements ResultTransactionClient, ExecutableTransactionClient {
     private readonly connection;
     constructor(connection: ConnectionLike);
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
     queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
+    execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
     commit(): Promise<void>;
     rollback(): Promise<void>;
 }
@@ -308,6 +342,7 @@ declare class NativeCubridAdapter implements DriverAdapter {
     connect(): Promise<void>;
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
     queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
+    execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
     beginTransaction(): Promise<void>;
     commit(): Promise<void>;
     rollback(): Promise<void>;
@@ -358,4 +393,4 @@ declare function buildWhere(conditions: Record<string, unknown>): {
     params: unknown[];
 };
 
-export { type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridTransaction, DeadlockError, LockTimeoutError, NativeCubridAdapter, QueryError, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, SqlSyntaxError, type TransactionCallback, type TransactionClient, TransactionError, buildWhere, createClient, escapeIdentifier, parseConnectionString };
+export { type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteResult, LockTimeoutError, NativeCubridAdapter, QueryError, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, SqlSyntaxError, type TransactionCallback, type TransactionClient, TransactionError, buildWhere, createClient, escapeIdentifier, parseConnectionString };

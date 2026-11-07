@@ -21,6 +21,9 @@ Complete reference for every public export of `cubrid-client`.
   - [ConnectionFactory](#connectionfactory)
   - [ConnectionLike](#connectionlike)
   - [Queryable](#queryable)
+  - [Executable](#executable)
+  - [ExecutableTransactionClient](#executabletransactionclient)
+  - [ExecuteResult](#executeresult)
   - [TransactionClient](#transactionclient-interface)
   - [TransactionCallback](#transactioncallback)
   - [ResultTransactionClient](#resulttransactionclient)
@@ -85,7 +88,7 @@ await db.close();
 The main client class. Manages a shared connection for non-transactional queries and creates isolated connections for transactions.
 
 ```ts
-class CubridClient implements Queryable
+class CubridClient implements Queryable, Executable
 ```
 
 ### Connection Model
@@ -143,7 +146,7 @@ await db.query(
 await db.query("CREATE TABLE IF NOT EXISTS logs (id INT AUTO_INCREMENT, msg VARCHAR(200))");
 ```
 
-> **Note:** DDL and DML statements (`INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP`, `ALTER`, etc.) are automatically routed through the driver's `execute()` method to avoid fetch-phase errors. They return an empty array `[]`.
+> **Note:** DDL and DML statements (`INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP`, `ALTER`, etc.) are handled without a fetch phase. `query()` returns an empty array `[]` for them; call [`execute()`](#executesql-params) instead to get the affected row count and generated id.
 
 ---
 
@@ -173,6 +176,33 @@ const { rows, columns } = await db.queryResult(
 // ]
 ```
 
+#### `execute(sql, params?)`
+
+Runs a statement and returns how many rows it changed and, after an `INSERT`, the generated `AUTO_INCREMENT` value, instead of rows. Use it for `INSERT`, `UPDATE`, `DELETE`, `MERGE` and DDL; use [`query()`](#queryt-sql-params) for `SELECT`. `query()` is unchanged and still returns `[]` for those statements.
+
+```ts
+async execute(sql: string, params?: QueryParams): Promise<ExecuteResult>
+```
+
+**Returns:** [`ExecuteResult`](#executeresult) `{ affectedRows, lastInsertId? }`.
+
+**Throws:** [`QueryError`](#queryerror) if execution fails, or if the connection returned by a custom `connectionFactory` has no `execute()` method.
+
+```ts
+const created = await db.execute("INSERT INTO users (name) VALUES (?)", ["Alice"]);
+console.log(created); // { affectedRows: 1, lastInsertId: 1 }
+
+const updated = await db.execute("UPDATE users SET name = ? WHERE id = ?", ["Alicia", 1]);
+console.log(updated.affectedRows); // 1, or 0 when no row matched
+```
+
+What the server reports, checked on CUBRID 10.2, 11.0, 11.2 and 11.4 (the replies are byte for byte identical):
+
+- `affectedRows` is the server's count for `INSERT`, `UPDATE`, `DELETE` and `MERGE`, and 0 for DDL and `SELECT`. A multi-statement string (`"INSERT ...; INSERT ..."`) reports the sum over its statements. `REPLACE` over an existing row counts the deleted row and the inserted one (2).
+- `lastInsertId` is present only when the string contained an `INSERT` and the session then holds a generated value. An `INSERT` into a table with no `AUTO_INCREMENT` column, or one that supplies the key itself, has none. Inside a transaction the server keeps an earlier INSERT's value and answers with the same bytes whether or not this statement generated one, and two tables can generate the same number, so `execute()` reports an id only when the server's value differs from the one seen before the statement, and otherwise reports none: a wrong id is worse than none. After a `query()` INSERT in the same transaction, `execute()` reads the server's value once before its next statement to have that comparison. Two fresh tables that both generate `1` in one transaction therefore report an id for the first and none for the second; use separate transactions, or read the key back, when you need both. Outside a transaction every statement starts clean and its id is always reported. A multi-row `INSERT` reports the **first** id it generated, not the last. The value is a `number` while it is a safe integer and a `bigint` beyond `Number.MAX_SAFE_INTEGER`, so no precision is lost. In a multi-statement string it is the one of the last `INSERT`.
+- The server forgets the generated value when a transaction ends, so in autocommit mode `execute()` sends the statement without the autocommit flag, reads the value, then commits with a separate `END_TRAN` request (rolling back if anything failed). The statement is committed before `execute()` resolves, as with `query()`, at the cost of one more round trip. Inside a transaction nothing is committed until you commit.
+- Statements issued at the same time still run one at a time, in the order issued, whether they use `query()` or `execute()`.
+
 ---
 
 #### `transaction<T>(callback)`
@@ -180,12 +210,14 @@ const { rows, columns } = await db.queryResult(
 Executes a callback within an isolated transactional connection. Commits on success, rolls back on failure.
 
 ```ts
-async transaction<T>(callback: TransactionCallback<T, ResultTransactionClient>): Promise<T>
+async transaction<T>(
+  callback: TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient>,
+): Promise<T>
 ```
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `callback` | [`TransactionCallback<T, ResultTransactionClient>`](#transactioncallback) | Async function receiving a [`ResultTransactionClient`](#resulttransactionclient), a [`TransactionClient`](#transactionclient-interface) that also has `queryResult()`. A callback written against `TransactionClient` is still accepted. |
+| `callback` | [`TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient>`](#transactioncallback) | Async function receiving a [`ResultTransactionClient`](#resulttransactionclient) (a [`TransactionClient`](#transactionclient-interface) that also has `queryResult()`) that is also an [`ExecutableTransactionClient`](#executabletransactionclient) (it also has `execute()`). A callback written against `TransactionClient` is still accepted. |
 
 **Returns:** `Promise<T>` — The return value of the callback.
 
@@ -342,7 +374,7 @@ try {
 A transaction-scoped client that delegates queries to the isolated transactional connection. You do **not** create this class directly — it is provided to you inside the `transaction()` callback.
 
 ```ts
-class CubridTransaction implements ResultTransactionClient
+class CubridTransaction implements ResultTransactionClient, ExecutableTransactionClient
 ```
 
 ### Methods
@@ -356,6 +388,16 @@ async query<T extends QueryResultRow = QueryResultRow>(
   sql: string,
   params?: QueryParams,
 ): Promise<T[]>
+```
+
+**Throws:** [`TransactionError`](#transactionerror) if execution fails.
+
+#### `execute(sql, params?)`
+
+Same signature and behavior as [`CubridClient.execute()`](#executesql-params), but runs within the transaction's isolated connection. Nothing is committed until the transaction commits, and the generated id is the one the server reports inside the open transaction.
+
+```ts
+async execute(sql: string, params?: QueryParams): Promise<ExecuteResult>
 ```
 
 **Throws:** [`TransactionError`](#transactionerror) if execution fails.
@@ -616,6 +658,9 @@ import type {
   ClientLogLevel,
   ConnectionFactory,
   ConnectionLike,
+  Executable,
+  ExecutableTransactionClient,
+  ExecuteResult,
   Queryable,
   TransactionClient,
   TransactionCallback,
@@ -722,6 +767,7 @@ interface ConnectionLike {
     sql: string,
     params?: QueryParams,
   ): Promise<QueryResult<T>>;
+  execute?(sql: string, params?: QueryParams): Promise<ExecuteResult>;
   beginTransaction(): Promise<void>;
   commit(): Promise<void>;
   rollback(): Promise<void>;
@@ -729,7 +775,7 @@ interface ConnectionLike {
 }
 ```
 
-`queryResult` is optional so existing custom adapters keep compiling. Calling `queryResult()` on a client or transaction fails when its connection does not provide it.
+`queryResult` and `execute` are optional so existing custom adapters keep compiling. Calling `queryResult()` or `execute()` on a client or transaction fails when its connection does not provide it.
 
 ### Queryable
 
@@ -771,15 +817,49 @@ interface ResultQueryable {
 }
 ```
 
+### Executable
+
+Interface for any object that can run a statement and report its [`ExecuteResult`](#executeresult). `CubridClient` and `CubridTransaction` implement it. It is separate from `Queryable` and `TransactionClient` so code that implements those keeps compiling.
+
+```ts
+interface Executable {
+  execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+}
+```
+
+### ExecuteResult
+
+The outcome of [`execute()`](#executesql-params).
+
+```ts
+interface ExecuteResult {
+  affectedRows: number;
+  lastInsertId?: number | bigint;
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `affectedRows` | Rows changed by `INSERT`, `UPDATE`, `DELETE` or `MERGE`, summed over a multi-statement string; 0 for DDL, `SELECT` and a statement that matched nothing. |
+| `lastInsertId` | The generated `AUTO_INCREMENT` value after an `INSERT`: a `number` if it is a safe integer, otherwise a `bigint`. Absent when no value was generated. For a multi-row `INSERT` it is the first generated id. |
+
 ### TransactionClient (Interface)
 
-Interface for the transaction-scoped client provided to `transaction()` callbacks.
+Interface for a transaction-scoped client. It has not changed since 1.0, so classes and test doubles that implement it still compile.
 
 ```ts
 interface TransactionClient extends Queryable {
   commit(): Promise<void>;
   rollback(): Promise<void>;
 }
+```
+
+### ExecutableTransactionClient
+
+The type `transaction()` passes to its callback and `CubridTransaction` implements: a `TransactionClient` that can also [`execute()`](#executesql-params).
+
+```ts
+interface ExecutableTransactionClient extends TransactionClient, Executable {}
 ```
 
 ### TransactionCallback
@@ -800,6 +880,8 @@ The transaction client that `transaction()` passes to its callback: a `Transacti
 ```ts
 interface ResultTransactionClient extends TransactionClient, ResultQueryable {}
 ```
+
+`CubridClient.transaction()` accepts a `TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient>`, so the callback's `tx` has `queryResult()` and `execute()`; a callback written against `TransactionClient` is still accepted.
 
 ### QueryParam
 

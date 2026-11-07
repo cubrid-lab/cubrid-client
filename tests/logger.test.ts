@@ -269,3 +269,22 @@ test("errorName reports a fixed class name, never a custom Error.name", async ()
   assert.equal(entries[0]?.fields.errorName, "Error");
   assert.ok(!JSON.stringify(entries).includes(PARAM));
 });
+
+test("logger reports execute without SQL, parameters or the insert id", async () => {
+  const { logger, entries } = recorder();
+  const connection = fakeConnection();
+  connection.execute = async () => ({ affectedRows: 5, lastInsertId: 99 });
+  const c = client(logger, connection);
+
+  await c.execute(`INSERT INTO t VALUES ('${SQL_LITERAL}', ?)`, [PARAM]);
+
+  const entry = entries.find((e) => e.fields.operation === "execute");
+  assert.ok(entry);
+  assert.equal(entry.level, "debug");
+  assert.equal(entry.fields.paramCount, 1);
+  // Only these fields may appear: no SQL, parameters, row counts or ids.
+  assert.deepEqual(Object.keys(entry.fields).sort(), ["durationMs", "operation", "paramCount"]);
+  const logged = JSON.stringify(entries);
+  assert.equal(logged.includes(SQL_LITERAL), false);
+  assert.equal(logged.includes(PARAM), false);
+});
