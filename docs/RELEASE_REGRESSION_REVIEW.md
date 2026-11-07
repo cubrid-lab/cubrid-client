@@ -9,7 +9,7 @@ loss. Source, historical CI, and unknowns are separated below.
 | UTC date | Evidence | Meaning |
 | --- | --- | --- |
 | 2026-03-14 12:42 | [Native CAS implementation commit](https://github.com/cubrid-lab/cubrid-client/commit/37525d0c53f2a2b976b9b1c5d60df0160337188a) | Replaced the default adapter; introduced an independent TypeScript CAS constant table with BIGINT 26, SET 33, MULTISET 34, SEQUENCE 35, and incorrect statement codes |
-| 2026-03-14 13:25 | [v1.0.0 published release](https://github.com/cubrid-lab/cubrid-client/releases/tag/v1.0.0) | Published about 43 minutes after the implementation commit; the *original* release description cited 99.33% coverage and an integration test count |
+| 2026-03-14 13:25 | [v1.0.0 published release](https://github.com/cubrid-lab/cubrid-client/releases/tag/v1.0.0) | Published about 43 minutes after the implementation commit; commit `37525d0` cited 99.33% coverage and 14 integration tests. The original Release wording is unknown because the body was later rewritten |
 | 2026-11-05/06 | [BIGINT/CAS type correction #126](https://github.com/cubrid-lab/cubrid-client/pull/126), [statement code correction #130](https://github.com/cubrid-lab/cubrid-client/pull/130) | Later review established official CCI/CAS literal codes and regression tests; targeted live-broker cases were reported, but full version matrix remains pending |
 | 2026-11-06 | [FETCH fail-closed #137](https://github.com/cubrid-lab/cubrid-client/pull/137), [unsupported value handling #140](https://github.com/cubrid-lab/cubrid-client/pull/140) | Added defensive behavior to reject partial/unsupported values rather than fabricate normal results; final combined live verification is still required |
 
@@ -54,8 +54,9 @@ not proof that it actually ran against a broker.
 3. Live integration assertions did not cover the affected scalar values.
 4. The release pipeline had no required, non-skippable real broker job or
    independent fixture gate.
-5. Release communication emphasized counts/coverage without tying support
-   claims to reproducible server-version, type and API evidence.
+5. The implementation commit emphasized counts/coverage without tying support
+   claims to reproducible server-version, type and API evidence. The original
+   Release wording is unknown.
 
 The near-term root cause is **wrong constants**; the systemic escape point is
 **insufficiently independent oracle and required live validation**. Do not
