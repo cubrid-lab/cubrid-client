@@ -29,7 +29,7 @@ For **every `cubrid-client@1.x` release**, preserve `engines.node >=18` and the 
 
 ## Development setup before design and TDD implementation
 
-Use the repository-specific [development setup guide](docs/DEVELOPMENT_SETUP.md) and [setup ADR 0005](docs/adr/0005-development-setup.md) (**Proposed**) before attempting new runtime or ORM work. Verify the **actual** manifest, supported developer toolchain, dependency resolution, read-only offline checks, and availability/absence of real CUBRID integration separately. Do not invent an unavailable Docker Compose file, integration test, linter, Cargo registry artifact, or Go module import path. A successful unit build is not a successful real-database test or a published package. Record observed setup blockers as issues; do not silently change public consumer engine/Go module paths/Rust MSRV, weaken CI, or modify release credentials to make onboarding appear green.
+Use the repository-specific [development setup guide](docs/DEVELOPMENT_SETUP.md) and [setup ADR 0005](docs/adr/0005-development-setup.md) (**Proposed**) before changing driver behavior or development tooling. Verify the **actual** manifest, supported developer toolchain, dependency resolution, read-only offline checks, and availability/absence of real CUBRID integration separately. Do not invent an unavailable Docker Compose file, integration test, lint command, or npm package artifact. A successful unit build is not a successful real-database test or a published package. Record observed setup blockers as issues; do not silently change the published Node.js engine minimum, package exports, or dependency compatibility, weaken CI, or modify release credentials to make onboarding appear green.
 
 ## Test-first implementation after architecture review
 
@@ -37,11 +37,11 @@ Before implementing a CUBRID behavior change, check the approved API/SQL/protoco
 
 ## Architecture decisions and release order
 
-Read the [repository ADR index](docs/adr/README.md) before proposing changes to public behavior, release contracts, native dialect design, transaction ownership or migrations. ADR 0001 records release governance; ADR 0002 records the failure-evidence contract learned from Python; native architecture ADR 0003 (where applicable) is **Proposed** in the separate draft architecture PR. Do not treat a Proposed ADR as approved. Adopt the release policy before accepting the architecture ADR; require actual tested evidence before claiming implementation or release readiness. Use the [ADR template](docs/adr/TEMPLATE.md) for material new decisions, not for every trivial change.
+Read the [repository ADR index](docs/adr/README.md) before proposing changes to public behavior, release contracts, Node.js driver design, transaction ownership or package compatibility. ADR 0001 records release governance; ADR 0002 records this driver's correctness and evidence requirements; native Node.js architecture ADR 0003 remains **Proposed** in this PR. Do not treat a Proposed ADR as approved. Adopt the release policy before accepting the architecture ADR; require actual tested evidence before claiming implementation or release readiness. Use the [ADR template](docs/adr/TEMPLATE.md) for material new decisions, not for every trivial change.
 
 ## CUBRID correctness lessons and native regression review
 
-Before changing protocol, SQL generation, transaction handling, schema migrations, type codecs, connection recovery or release claims, review [the repository-specific engineering invariants](docs/ENGINEERING_INVARIANTS.md). These are based on concrete pycubrid/sqlalchemy-cubrid failure cases but must be implemented and tested using **this language's native interfaces**, not copied Python APIs. Distinguish mock tests, live CUBRID execution and independent differential evidence; never claim a check ran without its actual CI result. For an unrelated docs-only change, the checklist is advisory and does not mandate unnecessary database jobs. Existing repository review and merge requirements remain authoritative.
+Before changing protocol, SQL generation, transaction handling, result handling, type codecs, connection recovery or release claims, review [the repository-specific engineering invariants](docs/ENGINEERING_INVARIANTS.md). These requirements address this driver's own CAS protocol and public Node.js/TypeScript contracts. Verify them with repository-specific tests and observed CUBRID behavior. Distinguish mock tests, live CUBRID execution and independent differential evidence; never claim a check ran without its actual CI result. For an unrelated docs-only change, the checklist is advisory and does not mandate unnecessary database jobs. Existing repository review and merge requirements remain authoritative.
 
 ## Development Workflow (cubrid-lab org standard)
 
@@ -106,7 +106,7 @@ documentation, presentations, and other maintainer-facing writing.
   Do not substitute `P1`/`P2` for repository priority labels.
 - When an internal identifier is necessary for accurate cross-reference,
   **describe the subject first**, then add the identifier in context:
-  `pycubrid introduction (0:20; storyboard shot P1)`. Use descriptive
+  `driver introduction (0:20; storyboard shot 1)`. Use descriptive
   names and timestamps, section titles, or paths wherever practical.
 - Use natural, actionable wording. Prefer `Listen to the full narration and
   verify the pronunciation of each project name` to `Maintainer full listen`.
