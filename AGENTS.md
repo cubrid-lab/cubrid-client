@@ -21,6 +21,11 @@ See [cubrid-lab issue, PR, and commit standard](https://github.com/cubrid-lab/.g
 - Add or update tests for any protocol or public client behavior change.
 
 
+
+## Architecture decisions and release order
+
+Read the [repository ADR index](docs/adr/README.md) before proposing changes to public behavior, release contracts, native dialect design, transaction ownership or migrations. ADR 0001 records release governance; ADR 0002 records the failure-evidence contract learned from Python; native architecture ADR 0003 (where applicable) is **Proposed** in the separate draft architecture PR. Do not treat a Proposed ADR as approved. Adopt the release policy before accepting the architecture ADR; require actual tested evidence before claiming implementation or release readiness. Use the [ADR template](docs/adr/TEMPLATE.md) for material new decisions, not for every trivial change.
+
 ## CUBRID correctness lessons and native regression review
 
 Before changing protocol, SQL generation, transaction handling, schema migrations, type codecs, connection recovery or release claims, review [the repository-specific engineering invariants](docs/ENGINEERING_INVARIANTS.md). These are based on concrete pycubrid/sqlalchemy-cubrid failure cases but must be implemented and tested using **this language's native interfaces**, not copied Python APIs. Distinguish mock tests, live CUBRID execution and independent differential evidence; never claim a check ran without its actual CI result. For an unrelated docs-only change, the checklist is advisory and does not mandate unnecessary database jobs. Existing repository review and merge requirements remain authoritative.
