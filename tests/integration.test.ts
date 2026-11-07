@@ -841,6 +841,34 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       });
     }
 
+    test("leap days decode, and the server refuses a date that does not exist", async () => {
+      assert.equal(
+        String(await selectValue("SELECT DATETIMETZ'2020-02-29 23:59:59.999 +00:00' AS v")),
+        "2020-02-29 23:59:59.999 +00:00",
+      );
+      assert.equal(
+        String(await selectValue("SELECT DATETIMETZ'2000-02-29 00:00:00.000 +00:00' AS v")),
+        "2000-02-29 00:00:00.000 +00:00",
+      );
+      // The decoder also rejects these as malformed, but the server never sends them.
+      for (const literal of [
+        "DATETIMETZ'2021-02-29 00:00:00.000 +00:00'",
+        "DATETIMETZ'1900-02-29 00:00:00.000 +00:00'",
+        "DATETIMETZ'10000-01-01 00:00:00.000 +00:00'",
+        "TIMESTAMPTZ'2021-04-31 00:00:00 +00:00'",
+      ]) {
+        await assert.rejects(
+          selectValue(`SELECT ${literal} AS v`),
+          (error: Error) => {
+            assert.ok(error instanceof QueryError, literal);
+            assert.match(String((error.cause as Error | undefined)?.message), /Invalid utime/, literal);
+            return true;
+          },
+          literal,
+        );
+      }
+    });
+
     test("a local-zone value arrives in the session zone and round-trips", async () => {
       const adapter = new NativeCubridAdapter(TEST_CONFIG);
       try {

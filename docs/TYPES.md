@@ -131,9 +131,9 @@ int16, DATETIME seven) followed by the zone as NUL-terminated text.
 - `ColumnInfo.type` is the name of the type (`TIMESTAMPTZ`, `DATETIMELTZ`, ...).
 - SQL NULL is `null`. Elements of SET, MULTISET and SEQUENCE columns are
   `ZonedDateTime` values too.
-- Fields outside the range of a real value, a zone that is empty, not valid UTF-8
+- Fields that are not a real date and time (year outside 1 to 9999, a day the month does not have, with leap years checked), a zone that is empty, not valid UTF-8
   or not one NUL-terminated string, and a value that does not fill its cell reject
-  as a [malformed reply](#values-that-cannot-be-decoded).
+  as a [malformed reply](#values-that-cannot-be-decoded), also for a zero date, so a damaged zero value is never reported as merely unsupported. The server itself refuses such dates (`Invalid utime`), so this only guards a damaged reply.
 - Plain DATE, TIME, TIMESTAMP and DATETIME are unchanged and still decode to a
   local-time `Date` ([#113](https://github.com/cubrid-lab/cubrid-client/issues/113)).
 

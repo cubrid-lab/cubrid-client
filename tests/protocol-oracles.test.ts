@@ -829,6 +829,10 @@ test("a zoned cell that breaks its layout is malformed and never a value", () =>
     ["an hour of 24", 29, Buffer.concat([fields(2020, 1, 2, 24, 4, 5), zone("+09:00\0")])],
     ["a negative year", 29, Buffer.concat([fields(-1, 1, 2, 3, 4, 5), zone("+09:00\0")])],
     ["milliseconds of 1000", 31, Buffer.concat([fields(2020, 1, 2, 3, 4, 5, 1000), zone("+09:00\0")])],
+    ["year 10000", 31, Buffer.concat([fields(10000, 1, 2, 3, 4, 5, 6), zone("+09:00\0")])],
+    ["February 29 of a common year", 29, Buffer.concat([fields(2021, 2, 29, 3, 4, 5), zone("+09:00\0")])],
+    ["February 29 of 1900", 29, Buffer.concat([fields(1900, 2, 29, 3, 4, 5), zone("+09:00\0")])],
+    ["April 31", 29, Buffer.concat([fields(2020, 4, 31, 3, 4, 5), zone("+09:00\0")])],
     ["a DATETIME shaped cell with no zone", 31, datetime],
     ["a TIMESTAMP shaped cell in a DATETIMETZ column", 32, Buffer.concat([timestamp, zone("+9\0")])],
   ];
@@ -838,6 +842,15 @@ test("a zoned cell that breaks its layout is malformed and never a value", () =>
       (error: Error) => error instanceof MalformedReplyError && error.message.includes(`wire type ${type}`),
       name,
     );
+  }
+
+  // Real leap days and month ends decode.
+  for (const [y, m, d] of [[2020, 2, 29], [2000, 2, 29], [2021, 2, 28], [1900, 2, 28], [9999, 12, 31], [1, 1, 1]]) {
+    const value = parsePrepareAndExecute(
+      selectWire(29, Buffer.concat([fields(y!, m!, d!, 3, 4, 5), zone("+09:00\0")])),
+      1,
+    ).rows[0]?.value;
+    assert.ok(value instanceof ZonedDateTime, `${y}-${m}-${d}`);
   }
 
   // The same layouts that are valid decode, so the cases above fail for their stated reason.
@@ -853,4 +866,43 @@ test("JSON is returned as its text, because the server sends it as VARCHAR below
   // Wire type 2 is VARCHAR, not the JSON code 34, and the value is not parsed.
   assert.equal(result.columns[0]?.type, 2);
   assert.deepEqual(result.rows, [{ j: '{"a":1}', t: "after" }]);
+});
+
+test("a damaged zero zoned value is malformed, never an unsupported value, in a column and a collection", () => {
+  const zeroFields = (...tail: number[]): Buffer => Buffer.concat([0, 0, 0, ...tail].map(i16));
+  const zone = (bytes: number[]): Buffer => Buffer.from(bytes);
+  const good = [0x2b, 0x30, 0x30, 0x3a, 0x30, 0x30, 0]; // "+00:00\0"
+  const cases: Array<[string, number, Buffer]> = [
+    ["an unterminated zone", 29, Buffer.concat([zeroFields(0, 0, 0), zone([0x2b, 0x30, 0x30])])],
+    ["a zone that is not UTF-8", 29, Buffer.concat([zeroFields(0, 0, 0), zone([0xff, 0xfe, 0])])],
+    ["an empty zone", 29, Buffer.concat([zeroFields(0, 0, 0), zone([0, 0])])],
+    ["an hour of 24", 29, Buffer.concat([zeroFields(24, 0, 0), zone(good)])],
+    ["milliseconds of 1000", 31, Buffer.concat([zeroFields(0, 0, 0, 1000), zone(good)])],
+  ];
+  const element = (cell: Buffer, type: number): Buffer =>
+    Buffer.concat([Buffer.from([type]), i32(1), i32(cell.length), cell]);
+  for (const [name, type, cell] of cases) {
+    assert.throws(
+      () => parsePrepareAndExecute(selectWire(type, cell), 1),
+      (error: Error) => error instanceof MalformedReplyError,
+      name,
+    );
+    const cellInSequence = element(cell, type);
+    assert.throws(
+      () => parsePrepareAndExecute(selectWire(18, cellInSequence), 1),
+      (error: Error) => error instanceof MalformedReplyError,
+      `${name} in a SEQUENCE`,
+    );
+  }
+
+  // The same zero date with its time and zone intact is still only unsupported.
+  const intact = Buffer.concat([zeroFields(0, 0, 0), zone(good)]);
+  assert.throws(
+    () => parsePrepareAndExecute(selectWire(29, intact), 1),
+    (error: Error) => error instanceof UnsupportedValueError,
+  );
+  assert.throws(
+    () => parsePrepareAndExecute(selectWire(18, element(intact, 29)), 1),
+    (error: Error) => error instanceof UnsupportedValueError,
+  );
 });
