@@ -58,12 +58,15 @@ automatically satisfied by a passing PR, version bump, or test count.
    severity dependency audit and the complete four-version live database,
    TLS and packed npm consumer validation on the **exact main commit**.
    Any failure blocks tag creation and npm publication.
-5. After every gate succeeds, the protected `npm-publish` environment is
-   used for Release Please GitHub Release/tag creation and the npm
-   publication. Configure `NPM_TOKEN` appropriately. **If the environment
-   requires reviewers, GitHub will still request approval**: the release
-   trigger and checks are automatic, but repository approval rules are
-   respected rather than bypassed.
+5. After every gate succeeds, the protected `npm-publish` environment
+   creates the exact version tag from the validated main commit using
+   `gh release create` and publishes npm. **Release Please remains the
+   version/changelog PR generator**, while the publication job independently
+   checks the reviewed PR/title and version files. This avoids relying on the
+   mutable explanatory text of a human-reviewed Release Please PR.
+   Configure `NPM_TOKEN` appropriately. **If the environment requires
+   reviewers, GitHub still requests approval**; the automated trigger
+   respects repository approval rules.
 6. The release job checks out the immutable tag and re-verifies the
    versions, API declarations, tests, package and audited dependencies,
    publishes the emoji-free curated Release notes under the title
