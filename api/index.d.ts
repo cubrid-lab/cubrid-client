@@ -240,8 +240,9 @@ interface ResultQueryable {
  * DDL and SELECT, and 0 when an UPDATE or DELETE matched nothing.
  *
  * `lastInsertId` is set only when an INSERT ran and the session then holds a
- * generated AUTO_INCREMENT value: a `number` while it is a safe integer and a
- * `bigint` beyond that, so no precision is lost. It is absent otherwise.
+ * new generated AUTO_INCREMENT value: a `number` while it is a safe integer and
+ * a `bigint` beyond that, so no precision is lost. It is absent otherwise,
+ * including when the value equals the one seen before the statement.
  */
 interface ExecuteResult {
     affectedRows: number;
@@ -313,6 +314,10 @@ interface ConnectionLike {
     queryPrepared?<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
     queryResultPrepared?<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
     executePrepared?(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+    beginTransaction(): Promise<void>;
+    commit(): Promise<void>;
+    rollback(): Promise<void>;
+    close(): Promise<void>;
     /**
      * Keeps these settings on every session of this connection, leaving any option
      * not given as it is. Optional so 1.x connection factories keep compiling, and
@@ -320,10 +325,6 @@ interface ConnectionLike {
      * transaction fails, because running without the setting would hide that.
      */
     setTransactionOptions?(options: TransactionOptions): Promise<void>;
-    beginTransaction(): Promise<void>;
-    commit(): Promise<void>;
-    rollback(): Promise<void>;
-    close(): Promise<void>;
     ping?(): Promise<string>;
 }
 type ConnectionFactory = (config: ClientConfig) => ConnectionLike | Promise<ConnectionLike>;
@@ -408,9 +409,9 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
     close(): Promise<void>;
     ping(): Promise<string>;
     /**
-     * Return the CUBRID server version, for example `11.4.6.1963`. It is the same
-     * single GET_DB_VERSION request as `ping()` and shares its transaction and
-     * reconnect behavior; only the failure message differs.
+     * Return the CUBRID server version, for example `11.4.6.1963`. It sends the
+     * same requests as `ping()` and shares its transaction and reconnect behavior;
+     * only the failure message differs.
      */
     getServerVersion(): Promise<string>;
     /**
@@ -424,6 +425,7 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
     getPrimaryKey(table: string, options?: SchemaOptions): Promise<SchemaPrimaryKey | null>;
     /** List the indexes of a table, including its primary and foreign keys. */
     getIndexes(table: string, options?: SchemaOptions): Promise<SchemaIndex[]>;
+    /** Run catalog inspections on a captured shared connection until completion. */
     private runSchemaOperation;
     private getSharedConnection;
     private prepareSharedConnection;
@@ -586,10 +588,16 @@ declare class NativeCubridAdapter implements DriverAdapter {
     private backslashModeGeneration;
     /**
      * Session that holds the open transaction's statements. Set by the first
-     * statement rather than by beginTransaction(): a released CAS legitimately
-     * reconnects on that first statement, before there is any work to lose.
+     * statement rather than by beginTransaction(): a CAS that went away between
+     * transactions is legitimately replaced on that first statement, before there
+     * is any work to lose.
      */
     private transactionGeneration;
+    /**
+     * `cas.outOfTransactionReplies` just before the transaction's first statement,
+     * or null with no statement sent yet. See transactionEnded().
+     */
+    private transactionEndReplies;
     /**
      * The reply that said the server rolled back the open transaction on its own.
      * The session is still healthy, but its next statement would start a new
@@ -598,11 +606,13 @@ declare class NativeCubridAdapter implements DriverAdapter {
      */
     private transactionAbort;
     /**
-     * The server's last generated AUTO_INCREMENT value as this adapter last saw it
-     * inside the open transaction: `undefined` for none, `null` when a query()
-     * INSERT may have changed it unseen. See readExecuteResult().
+     * The session's last generated AUTO_INCREMENT value as this adapter last saw
+     * it: `undefined` for none, `null` when a statement may have changed it unseen.
+     * See readExecuteResult().
      */
     private insertIdBaseline;
+    /** Session (`connectionGeneration`) that `insertIdBaseline` describes. */
+    private insertIdGeneration;
     /**
      * Tail of the statement queue; see inTurn(). It never rejects, so one failed
      * statement cannot block the ones behind it.
@@ -646,10 +656,10 @@ declare class NativeCubridAdapter implements DriverAdapter {
      * CASConnection only keeps those frames apart. A statement that ran between
      * them would be unsafe: on CUBRID 10.2 to 11.4 the end of a transaction closes
      * every other cursor on the session, and in autocommit mode that end comes
-     * with DML, an error, a ping or another query's last row. The CAS_INFO status
-     * of that reply then sends the next FETCH to a new session, where the same
-     * handle number can be another query's result. So at most one query
-     * lifecycle is live at a time. Autocommit could not do better; an open
+     * with DML, an error, a ping or another query's last row. The next FETCH of
+     * the first query would then fail, or read whatever now has that handle
+     * number. So at most one query lifecycle is live at a time. Autocommit could
+     * not do better; an open
      * transaction could, but its commit and rollback would still have to wait.
      *
      * Nothing runs here but this adapter's own statements, so a statement can
@@ -667,19 +677,37 @@ declare class NativeCubridAdapter implements DriverAdapter {
      * is open.
      *
      * `commitAfter` runs an autocommit statement as a transaction that ends only
-     * after `use`: the server forgets the generated AUTO_INCREMENT value when it
-     * commits, so a statement sent with the autocommit flag could never be asked
-     * for it (verified on CUBRID 10.2, 11.0, 11.2 and 11.4). The statement is
-     * then committed with END_TRAN, or rolled back if anything failed.
+     * after `use`: the generated AUTO_INCREMENT value lives in the session, and a
+     * commit lets the CAS go, so a question asked after the autocommit flag could
+     * reach a new session that holds no value. The statement is then committed with
+     * END_TRAN, or rolled back if anything failed.
+     *
+     * `binds`, encoded when the call was made, sends PREPARE and EXECUTE with
+     * typed binds instead of SQL text holding the values. The handle belongs to this one call and is released
+     * like any other, so it can never outlive its session or be reused. Prepared
+     * statements always end by END_TRAN in autocommit mode, so a failed PREPARE,
+     * which leaves the session in a transaction, is rolled back.
      */
     private runStatement;
+    /**
+     * Sends EXECUTE for the handle in a PREPARE reply. It must reach the session
+     * that prepared it: on any other session the same number is another statement
+     * or nothing. The CAS ignores extra values and the literal path ignores extra
+     * parameters, so the count is checked against the server's here.
+     */
+    private executeHandle;
+    private exchangeOnSession;
     /** Ends the transaction of a statement run by runStatement(commitAfter), on its own session. */
     private endStatementTransaction;
     /** Sends GET_LAST_INSERT_ID and returns the session's value, or undefined if it has none. */
     private fetchLastInsertId;
+    /** A new session starts with no value, whatever the last one held. */
+    private followInsertIdSession;
+    /** The statement that just ran or failed may have changed the session's value. */
+    private forgetInsertId;
     /**
-     * After a query() INSERT inside a transaction the baseline is unknown, so read
-     * the server's value before the next execute() statement to have one.
+     * When the baseline is unknown, read the server's value before a statement that
+     * may ask for it. REPLACE replies as an INSERT, and no other SQL text does.
      */
     private readInsertIdBaseline;
     /**
@@ -698,8 +726,22 @@ declare class NativeCubridAdapter implements DriverAdapter {
      * Called after a statement ran. If the session changed underneath it, that
      * statement is open on the new session, so drop the session rather than
      * let a later autocommit query persist work reported here as failed.
+     *
+     * The same goes for a transaction the server reports as over. See
+     * transactionEnded().
      */
     private bindTransactionSession;
+    /**
+     * Whether any reply since the transaction's first statement, END_TRAN aside,
+     * said no transaction is open. Every reply inside a transaction says IN_TRAN on
+     * CUBRID 10.2 to 11.4, even after -72, so this would mean the earlier statements
+     * are gone and the next one would start over on a healthy session. It covers
+     * FETCH, handle releases and pings too, because any later reply overwrites the
+     * status, and a later statement would make it look open again.
+     */
+    private transactionEnded;
+    /** Dropping the session turns this into a lost transaction, which everything checks. */
+    private dropSessionIfTransactionEnded;
     /** Retain a failed first statement's session so reconnection cannot hide it. */
     private bindSessionLostByFirstStatement;
     private recordTransactionAbort;
@@ -740,7 +782,7 @@ declare class NativeCubridAdapter implements DriverAdapter {
      * CUBRID 10.2 to 11.4 a later commit of a DELETE or UPDATE, or a rollback,
      * deletes the file it names, and there is no request that holds it or releases
      * it. The session is pinned for the same reason a query handle's release is:
-     * sendAndRecv() would open a new session after an autocommit reply.
+     * sendAndRecv() could move to a new session after an autocommit reply.
      *
      * The sizes are checked before the first read, so a result over the limit
      * costs no LOB transfer and no memory.
