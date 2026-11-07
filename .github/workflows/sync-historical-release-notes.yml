@@ -1,4 +1,4 @@
-name: Sync corrected historical release notes
+name: Sync published GitHub Release notes
 
 on:
   push:
@@ -6,6 +6,7 @@ on:
     paths:
       - "docs/releases/v1.0.0.md"
       - "docs/releases/v1.1.0.md"
+      - "docs/releases/v1.2.0.md"
       - ".github/workflows/sync-historical-release-notes.yml"
 
 permissions:
@@ -35,8 +36,8 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          # Only these published historical releases can be updated.
-          for tag in v1.0.0 v1.1.0; do
+          # Update existing published releases only; never create or change a tag.
+          for tag in v1.0.0 v1.1.0 v1.2.0; do
             file="docs/releases/${tag}.md"
             test -s "$file"
             gh release view "$tag" --repo "$GH_REPO" > /dev/null

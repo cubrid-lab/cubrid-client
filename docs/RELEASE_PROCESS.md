@@ -38,6 +38,19 @@ exact evidence, supported scope and unresolved **maintainer sign-off** needed
 before this candidate can be published. Its approval checklist is not
 automatically satisfied by a passing PR, version bump, or test count.
 
+## GitHub Release note formatting
+
+Write each paragraph as one logical Markdown source line, separated by a
+blank line from the next paragraph. Write each bullet and its associated
+issue/PR links on the **same source line**. Let GitHub wrap text to the
+reader's screen width instead of adding hard line breaks in the middle
+of a sentence or putting the citation on a continuation line.
+Check the **published GitHub Release page**, not only the Markdown file,
+after updating an existing release. The
+[`sync-historical-release-notes.yml`](../.github/workflows/sync-historical-release-notes.yml)
+workflow resynchronizes the corrected existing v1.0.0, v1.1.0 and v1.2.0
+descriptions without changing tags or packages.
+
 ## Automated publication and recovery
 
 1. Release Please proposes a reviewable PR that bumps `package.json`,
