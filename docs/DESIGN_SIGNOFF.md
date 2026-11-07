@@ -2,6 +2,20 @@
 
 > **Status: Not signed off / design under review.** This plan captures *expected* test behavior, not tests already written or run. The repository release policy and ADR 0001/0002/0004 are proposed in the earlier policy PR. The native architecture ADR 0003 (for this repository, if applicable) is proposed in this design draft. No implementation, CI success, approved public API or live DB outcome is implied.
 
+## Project setup prerequisite
+
+**ADR 0005 and the development setup guide** are proposed in this branch; check [the setup documentation](DEVELOPMENT_SETUP.md) and the manifest/CI before checking these boxes.
+
+- [ ] **Clean checkout verified:** language-native runtime/compiler and tooling are selected with a documented developer versus published consumer support distinction.
+- [ ] **Dependency resolution verified:** exact lockfile/Go module/Cargo graph installs without undocumented replacement, incompatible version or incorrect import path.
+- [ ] **Read-only setup checks executed:** record **actual** build/type/lint/unit results, not command examples; all known missing config/scripts have explicit blockers.
+- [ ] **Real DB harness decided:** identify a disposable real CUBRID service and concrete test selection, or mark missing harness as blocked. A Docker healthcheck, fake broker or zero/fully skipped suite is not evidence.
+- [ ] **External package consumer planned:** npm packed ESM/CJS/TypeScript, Go module imports or Cargo crate package resolution (as appropriate), with release preflight separate from initial setup.
+- [ ] **Repository developer guidance consistent:** README, CONTRIBUTING, AGENTS, tooling and CI refer to commands that actually exist and do not silently raise the supported runtime floor.
+- [ ] **Maintainer approval recorded** for ADR 0005 and any associated module-path, MSRV, dependency or CI changes.
+
+These are **not completed** merely because the files are written. If setup is blocked, fix or explicitly scope it in a separate reviewed task before claiming the design is ready for implementation.
+
 ## Design-first gate
 
 Before implementation changes are treated as approved, establish each of the following in reviewed project documentation and link the evidence. Check only when genuinely resolved, not merely because this template exists.
