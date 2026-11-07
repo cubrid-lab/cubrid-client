@@ -142,7 +142,9 @@ The existing public `query(sql, params)` method renders values into SQL text
 **client-side**. It is not a server-side prepared-statement binding API;
 native opt-in binding is a separate proposal ([#85](https://github.com/cubrid-lab/cubrid-client/issues/85)).
 The SQL literal escaping rules depend on the server's `no_backslash_escapes`
-setting, negotiated on each physical connection.
+setting, negotiated on each physical session: a reconnect measures it again
+before a string containing a backslash, CR or LF is bound on the new session.
+Other parameters render the same in both modes and are sent without that probe.
 
 | JavaScript parameter | Current SQL literal behavior |
 | --- | --- |

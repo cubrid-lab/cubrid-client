@@ -470,17 +470,32 @@ test("one query finishes its requests before the next query starts", { timeout: 
   });
 });
 
-test("parameterized concurrent queries probe the backslash mode once and keep their rows", { timeout: 10000 }, async () => {
+test("parameterized concurrent queries probe the backslash mode once per session and keep their rows", { timeout: 10000 }, async () => {
   await withClient(async (client, cas) => {
     const owners = ["a", "b", "c"];
 
     const results = await Promise.all(
-      owners.map((owner) => client.query("SELECT id, owner FROM items WHERE owner = ?", [owner])),
+      owners.map((owner) =>
+        client.query("SELECT id, owner FROM items WHERE owner = ? AND note = ?", [owner, "x\\y"]),
+      ),
     );
 
     owners.forEach((owner, index) => assert.deepEqual(results[index], rowsOf(owner)));
     const probes = cas.requests.filter((request) => request.sql?.includes("CHAR_LENGTH"));
-    assert.equal(probes.length, 1);
+    const statements = cas.requests.filter((request) => request.sql?.includes("note = "));
+    assert.equal(statements.length, owners.length);
+    for (const statement of statements) {
+      const onSession = probes.filter((probe) => probe.session === statement.session);
+      assert.equal(onSession.length, 1, "each statement's own session is probed before it");
+    }
+  });
+});
+
+test("parameters that both backslash modes render alike are sent without a probe", { timeout: 10000 }, async () => {
+  await withClient(async (client, cas) => {
+    await client.query("SELECT id, owner FROM items WHERE owner = ? AND n = ?", ["a", 7]);
+
+    assert.equal(cas.requests.filter((request) => request.sql?.includes("CHAR_LENGTH")).length, 0);
   });
 });
 

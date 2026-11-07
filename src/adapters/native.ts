@@ -36,16 +36,36 @@ interface IssuedOn {
   failedExchanges: number;
 }
 
+/** Whether any parameter renders differently under the two backslash modes. */
+function needsBackslashMode(params: QueryParams): boolean {
+  return params.some((value) => {
+    if (
+      value === null ||
+      value === undefined ||
+      typeof value === "boolean" ||
+      typeof value === "number" ||
+      typeof value === "bigint" ||
+      value instanceof Date ||
+      Buffer.isBuffer(value)
+    ) {
+      return false;
+    }
+    return /[\\\r\n]/.test(String(value));
+  });
+}
+
 export class NativeCubridAdapter implements DriverAdapter {
   private cas: CASConnection | null = null;
   private autoCommit = true;
   /**
-   * Server backslash-escaping mode, negotiated once per physical connection via
+   * Server backslash-escaping mode, negotiated once per physical session via
    * `SELECT CHAR_LENGTH('\\')`. `null` until negotiated. `true` means the CUBRID
    * default `no_backslash_escapes=yes` (backslash is a literal char); `false`
    * means backslash-escape processing is active. See `negotiateBackslashEscapes`.
    */
   private noBackslashEscapes: boolean | null = null;
+  /** Session (`connectionGeneration`) that `noBackslashEscapes` was measured on. */
+  private backslashModeGeneration: number | null = null;
 
   /**
    * Session that holds the open transaction's statements. Set by the first
@@ -184,6 +204,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     const cas = this.cas;
     this.cas = null;
     this.noBackslashEscapes = null;
+    this.backslashModeGeneration = null;
     this.endTransaction();
 
     try {
@@ -266,13 +287,20 @@ export class NativeCubridAdapter implements DriverAdapter {
       throw new Error("CASConnection is not connected");
     }
 
-    if (!cas.isConnected) {
-      await cas.connect();
-    }
+    // Settle the session before binding: a released CAS is replaced by the next
+    // request, which could otherwise be a different session than the one the
+    // backslash mode was measured on.
+    await cas.ensureSession();
 
+    // Only a backslash, CR or LF is escaped differently by the two modes, so any
+    // other parameters bind the same on every session and skip the probe.
     const resolvedSql =
       params && params.length > 0
-        ? interpolateParams(sql, params, await this.ensureBackslashMode(cas))
+        ? interpolateParams(
+            sql,
+            params,
+            needsBackslashMode(params) ? await this.ensureBackslashMode(cas) : true,
+          )
         : sql;
 
     const { header, payload } = writePrepareAndExecute(
@@ -448,11 +476,13 @@ export class NativeCubridAdapter implements DriverAdapter {
 
   /**
    * Return the negotiated backslash-escaping mode for the current connection,
-   * running the one-time probe on first use.
+   * probing again whenever the session has changed since it was measured.
    */
   private async ensureBackslashMode(cas: CASConnection): Promise<boolean> {
-    if (this.noBackslashEscapes === null) {
+    if (this.noBackslashEscapes === null || this.backslashModeGeneration !== cas.connectionGeneration) {
+      const generation = cas.connectionGeneration;
       this.noBackslashEscapes = await this.negotiateBackslashEscapes(cas);
+      this.backslashModeGeneration = generation;
     }
     return this.noBackslashEscapes;
   }
@@ -472,7 +502,9 @@ export class NativeCubridAdapter implements DriverAdapter {
   private async negotiateBackslashEscapes(cas: CASConnection): Promise<boolean> {
     const { header, payload } = writePrepareAndExecute(
       "SELECT CHAR_LENGTH('\\\\')",
-      this.autoCommit,
+      // Never autocommit: that would end the session's turn and make the very next
+      // request replace it, so the statement would bind on another session.
+      false,
       cas.casInfo,
     );
     const responsePayload = await cas.sendAndRecv(header, payload);

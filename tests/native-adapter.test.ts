@@ -42,6 +42,8 @@ function createAdapterWithFakeCAS(
   // Dedicated tests below exercise negotiation explicitly.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (adapter as any).noBackslashEscapes = true;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (adapter as any).backslashModeGeneration = fakeCAS.connectionGeneration;
 
   return { adapter, fakeCAS };
 }
@@ -101,6 +103,16 @@ class FakeCASConnection {
     }
     this._isConnected = true;
     this.connectionGeneration += 1;
+  }
+
+  /** The broker released the CAS: the next request opens a new session. */
+  released = false;
+
+  async ensureSession(): Promise<void> {
+    if (!this._isConnected || this.released) {
+      this.released = false;
+      await this.connect();
+    }
   }
 
   async discardSession(): Promise<void> {
@@ -698,6 +710,43 @@ test("NativeCubridAdapter query interpolates parameters", async () => {
   assert.deepEqual(result, []);
   // The adapter should have called sendAndRecv with the interpolated SQL
   assert.equal(fakeCAS.sendAndRecvCalls, 2); // PrepareAndExecute + CloseReqHandle
+});
+
+test("a new session is probed again, so a changed backslash mode escapes its SQL", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(); // measured: literal mode
+  const sql = "INSERT INTO t (val) VALUES (?)";
+  const sentSql = (): string[] =>
+    fakeCAS.sentPayloads
+      .filter((payload) => payload[0] === CASFunctionCode.PREPARE_AND_EXECUTE)
+      .map((payload) => payload.toString("latin1"));
+
+  fakeCAS.queueResponse(buildDMLResponse(20, 1));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+  await adapter.query(sql, ["a\\b"]);
+  assert.match(sentSql()[0]!, /'a\\b'/);
+
+  // The server now runs with backslash escapes, and the next request reconnects.
+  fakeCAS.released = true;
+  queueProbeResponse(fakeCAS, "1");
+  fakeCAS.queueResponse(buildDMLResponse(20, 1));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+  await adapter.query(sql, ["a\\b"]);
+  const sent = sentSql();
+  assert.match(sent[1]!, /CHAR_LENGTH/);
+  assert.match(sent[2]!, /'a\\\\b'/);
+
+  // The same session is not probed again.
+  fakeCAS.queueResponse(buildDMLResponse(20, 1));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+  await adapter.query(sql, ["a\\b"]);
+  assert.equal(sentSql().length, 4);
+
+  // A parameter both modes render alike needs no probe on a new session.
+  fakeCAS.released = true;
+  fakeCAS.queueResponse(buildDMLResponse(20, 1));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+  await adapter.query(sql, ["plain"]);
+  assert.equal(sentSql().length, 5);
 });
 
 // ---------------------------------------------------------------------------
