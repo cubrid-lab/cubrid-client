@@ -62,6 +62,16 @@ const DEFAULT_FETCH_SIZE = 100;
 
 const QUERY_FAILED = "Failed to execute CUBRID query.";
 
+/** Internal control-flow signal: an orderly iterator close is not a query error. */
+const STREAM_STOPPED = Symbol("stream stopped");
+
+/** A cancelled stream must not issue another CAS request after an in-flight reply. */
+function assertStreamWanted(cursor?: StreamCursor): void {
+  if (!cursor) return;
+  cursor.assertNotCancelled();
+  if (cursor.isStopped) throw STREAM_STOPPED;
+}
+
 /** How long a statement waits for a stream whose consumer has stopped asking for rows. */
 const DEFAULT_CONSUMER_TIMEOUT_MS = 5000;
 
@@ -627,8 +637,14 @@ export class NativeCubridAdapter implements DriverAdapter {
             if (cursor.isStopped) {
               return;
             }
-            lobsRead = (await this.loadRowLobs(cas, generation, row)) || lobsRead;
-            await this.offerRows(cursor, [row], !lastWindow || index < rows.length - 1);
+            // Detach the delivered row: decoded FETCH windows may remain referenced
+            // by the query response while the consumer holds a large BLOB/CLOB.
+            const delivered = { ...row };
+            // Mark LOB activity before awaiting a read: a server error or abort
+            // must still release the autocommit read transaction.
+            lobsRead = this.measureLobs([delivered], "row").total > 0 || lobsRead;
+            await this.loadRowLobs(cas, generation, delivered, cursor);
+            await this.offerRows(cursor, [delivered], !lastWindow || index < rows.length - 1);
           }
         } else if (rows.length > 0) {
           await this.offerRows(cursor, rows, !lastWindow);
@@ -642,6 +658,7 @@ export class NativeCubridAdapter implements DriverAdapter {
         fetched += rows.length;
       }
     } catch (error) {
+      if (error === STREAM_STOPPED) return;
       replyDamaged = error instanceof MalformedReplyError;
       throw error;
     } finally {
@@ -1230,11 +1247,13 @@ export class NativeCubridAdapter implements DriverAdapter {
     cas: CASConnection,
     generation: number,
     row: Record<string, unknown>,
+    cursor?: StreamCursor,
   ): Promise<boolean> {
     const { cells, total } = this.measureLobs([row], "row");
 
     for (const { name, lob } of cells) {
-      setColumn(row, name, decodeLob(name, lob, await this.readLob(cas, generation, name, lob)));
+      assertStreamWanted(cursor);
+      setColumn(row, name, decodeLob(name, lob, await this.readLob(cas, generation, name, lob, cursor)));
     }
 
     return total > 0;
@@ -1276,11 +1295,13 @@ export class NativeCubridAdapter implements DriverAdapter {
     generation: number,
     name: string,
     lob: LobLocator,
+    cursor?: StreamCursor,
   ): Promise<Buffer> {
     const chunks: Buffer[] = [];
     let received = 0;
 
     while (received < lob.size) {
+      assertStreamWanted(cursor);
       const length = Math.min(lob.size - received, LOB_READ_CHUNK_SIZE);
       const { header, payload } = writeLobRead(lob.handle, received, length, cas.casInfo);
       const response = await cas.sendAndRecvOnSession(generation, header, payload);
@@ -1290,6 +1311,9 @@ export class NativeCubridAdapter implements DriverAdapter {
       }
 
       const chunk = parseLobRead(response, length);
+      // The reply has now been consumed; cancellation may interrupt before
+      // any subsequent LOB_READ or another column, never mid-frame.
+      assertStreamWanted(cursor);
       if (chunk.length === 0) {
         throw new UnsupportedValueError(
           `CUBRID column "${name}" holds ${received} of its declared ${lob.size} LOB bytes`,
