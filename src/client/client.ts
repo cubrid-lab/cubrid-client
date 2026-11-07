@@ -105,6 +105,23 @@ export class CubridClient implements Queryable {
     }
   }
 
+  /**
+   * Return the CUBRID server version, for example `11.4.6.1963`. It is the same
+   * single GET_DB_VERSION request as `ping()` and shares its transaction and
+   * reconnect behavior; only the failure message differs.
+   */
+  async getServerVersion(): Promise<string> {
+    try {
+      const connection = await this.getSharedConnection();
+      if (connection.ping) {
+        return await connection.ping();
+      }
+      throw new Error("Underlying connection does not support querying the server version.");
+    } catch (error) {
+      throw mapError("connection", error, "Failed to get the server version.");
+    }
+  }
+
   private getSharedConnection(): Promise<ConnectionLike> {
     if (!this.sharedConnectionPromise) {
       this.sharedConnectionPromise = Promise.resolve(

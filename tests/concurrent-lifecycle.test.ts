@@ -549,6 +549,28 @@ test("a ping commits only outside a transaction, by its exact bytes", { timeout:
   });
 });
 
+test("getServerVersion keeps a transaction open, by its exact bytes", { timeout: 10000 }, async () => {
+  await withClient(async (client, cas) => {
+    await client.beginTransaction();
+    await client.query("INSERT INTO t VALUES (1)");
+    cas.frames.length = 0;
+
+    assert.equal(await client.getServerVersion(), "11.4.0.0000");
+    assert.deepEqual(
+      cas.frames.map((frame) => frame.toString("hex")),
+      [
+        "00000001" + "01000000" + "20",
+        "00000006" + "01000000" + "0f" + "00000001" + "00",
+      ],
+    );
+
+    await client.query("INSERT INTO t VALUES (2)");
+    const inserts = cas.of(CASFunctionCode.PREPARE_AND_EXECUTE);
+    assert.equal(inserts.at(-1)?.session, inserts.at(-2)?.session);
+    assert.equal(cas.of(CASFunctionCode.END_TRAN).length, 0);
+  });
+});
+
 test("a ping inside a transaction fails when CHECK_CAS does", { timeout: 10000 }, async () => {
   await withClient(async (client, cas) => {
     await client.beginTransaction();

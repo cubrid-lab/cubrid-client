@@ -116,6 +116,12 @@ declare class CubridClient implements Queryable {
     rollback(): Promise<void>;
     close(): Promise<void>;
     ping(): Promise<string>;
+    /**
+     * Return the CUBRID server version, for example `11.4.6.1963`. It is the same
+     * single GET_DB_VERSION request as `ping()` and shares its transaction and
+     * reconnect behavior; only the failure message differs.
+     */
+    getServerVersion(): Promise<string>;
     private getSharedConnection;
 }
 

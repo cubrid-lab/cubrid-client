@@ -265,6 +265,22 @@ Inside a manual transaction a ping leaves the transaction open: the work before 
 
 ---
 
+#### `getServerVersion()`
+
+Returns the CUBRID server version. It opens the shared connection if needed.
+
+```ts
+async getServerVersion(): Promise<string>
+```
+
+It sends the same single version request as [`ping()`](#ping), so it has the same effect on a transaction: inside a manual transaction it leaves the transaction open, and outside one it commits the session's empty transaction. It adds no extra network call and performs no caching, so it reports the server the shared connection is currently attached to, after any reconnect. Use it for compatibility checks; use `ping()` for health checks.
+
+**Returns:** The version string as the server reports it, without a trailing NUL, for example `11.4.6.1963`. It is not parsed or normalized.
+
+**Throws:** [`ConnectionError`](#connectionerror) if the request fails or if a custom `connectionFactory` connection has no `ping()` method (see [`ConnectionLike`](#connectionlike)). Inside a transaction, treat a failure as a lost transaction. The `debug` log entry for this call has `operation: "ping"`.
+
+---
+
 #### `close()`
 
 Closes the shared connection after the statements issued before it have finished. After calling `close()`, the client can no longer execute queries. If no connection was opened, this is a no-op.

@@ -376,6 +376,30 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     }
   });
 
+  test("getServerVersion returns the server version and leaves a transaction's row to rollback()", async () => {
+    const client = createClient(TEST_CONFIG);
+
+    try {
+      const version = await client.getServerVersion();
+      assert.match(version, /^\d+\.\d+\.\d+\.\d+$/);
+      assert.equal(version, await client.ping());
+
+      await client.query("DROP TABLE IF EXISTS tx_version_test_native");
+      await client.query("CREATE TABLE tx_version_test_native (val VARCHAR(50))");
+
+      await client.beginTransaction();
+      await client.query("INSERT INTO tx_version_test_native (val) VALUES ('rolled back')");
+      assert.equal(await client.getServerVersion(), version);
+      await client.rollback();
+
+      assert.deepEqual(await client.query("SELECT val FROM tx_version_test_native"), []);
+
+      await client.query("DROP TABLE tx_version_test_native");
+    } finally {
+      await client.close();
+    }
+  });
+
   test("a ping inside a transaction leaves its row to rollback()", async () => {
     const client = createClient(TEST_CONFIG);
 
