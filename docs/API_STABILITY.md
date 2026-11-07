@@ -54,11 +54,11 @@ the SemVer impact explicitly instead of assuming every fix is harmless.
   release** under this 1.x contract, with prior notice and migration steps.
   Node.js reaching end-of-life is a reason to plan a change, not permission
   to change the existing npm contract silently.
-- **Node.js support schedule:** Node.js 18 (end-of-life April 2025) and 20
+- <a id="nodejs-support-schedule"></a>**Node.js support schedule:** Node.js 18 (end-of-life April 2025) and 20
   (end-of-life April 2026) are deprecated but remain supported for all 1.x
   releases; no 1.x release raises `engines.node`. The next 1.x release
-  notes announce this deprecation. The removal of Node 18 and 20 support is a candidate for a future
-  2.0 major release, with its own notice and migration steps; no 2.0 date is
+  notes announce this deprecation. The removal of Node 18 and 20 support is a
+  candidate for a future 2.0 major release, with its own notice and migration steps; no 2.0 date is
   set and the maintainers have not yet decided it. CI tests every currently
   supported Node.js line (22, 24 and 26 LTS) and the retained Node 18 and 20
   lines. `@types/node` stays at the lowest supported major (18) so type
