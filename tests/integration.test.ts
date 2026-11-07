@@ -1586,6 +1586,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       first: NativeCubridAdapter,
       second: NativeCubridAdapter,
       lockTimeoutSeconds?: number,
+      beforeDeadlock: () => Promise<unknown> = async () => {},
     ): Promise<PromiseSettledResult<unknown>[]> {
       await first.beginTransaction();
       await second.beginTransaction();
@@ -1595,6 +1596,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         await second.query(`SET TRANSACTION LOCK TIMEOUT ${lockTimeoutSeconds}`);
       }
 
+      await beforeDeadlock();
       await first.query(`UPDATE ${ROWS} SET n = n + 1 WHERE id = 1`);
       await second.query(`UPDATE ${ROWS} SET n = n + 1 WHERE id = 2`);
 
@@ -1881,6 +1883,127 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         const victim = failed.find((error) => error.code === -968);
         assert.ok(victim instanceof DeadlockError);
         assert.equal(victim.kind, "deadlock");
+      });
+    });
+
+    describe("after the server ended the transaction", () => {
+      const FIRST_ROW = 201;
+      const SECOND_ROW = 301;
+
+      /** Each adapter writes a row, then they deadlock and one fails with `code`. */
+      async function deadlockAfterWrites(
+        first: NativeCubridAdapter,
+        second: NativeCubridAdapter,
+        code: number,
+        lockTimeoutSeconds?: number,
+      ) {
+        const results = await deadlock(first, second, lockTimeoutSeconds, () =>
+          Promise.all([
+            first.query(`INSERT INTO ${ROWS} VALUES (${FIRST_ROW}, 'first', 0)`),
+            second.query(`INSERT INTO ${ROWS} VALUES (${SECOND_ROW}, 'second', 0)`),
+          ]),
+        );
+        const firstFailed = rejections(results.slice(0, 1)).some((error) => error.code === code);
+        const secondFailed = rejections(results.slice(1)).some((error) => error.code === code);
+
+        assert.ok(firstFailed !== secondFailed, `expected one ${code}`);
+        return {
+          victim: firstFailed ? first : second,
+          survivor: firstFailed ? second : first,
+          earlierRow: firstFailed ? FIRST_ROW : SECOND_ROW,
+        };
+      }
+
+      async function committedRows(): Promise<number[]> {
+        const reader = new NativeCubridAdapter(TEST_CONFIG);
+
+        try {
+          const rows = await reader.query<{ id: number }>(
+            `SELECT id FROM ${ROWS} WHERE id > 200 ORDER BY id`,
+          );
+          return rows.map((row) => Number(row.id));
+        } finally {
+          await reader.close();
+        }
+      }
+
+      async function removeRows(): Promise<void> {
+        const cleaner = new NativeCubridAdapter(TEST_CONFIG);
+
+        try {
+          await cleaner.query(`DELETE FROM ${ROWS} WHERE id > 200`);
+        } finally {
+          await cleaner.close();
+        }
+      }
+
+      async function assertFailsWithAbort(
+        run: () => Promise<unknown>,
+        type: new (...args: never[]) => Error,
+      ): Promise<void> {
+        const error = await failure<QueryError>(run);
+
+        assert.ok(error instanceof type);
+        assert.equal(error.code, -72);
+        assert.equal(error.kind, "deadlock");
+      }
+
+      test("no statement commits alone after -72", async () => {
+        await withAdapters(async (first, second) => {
+          const { victim, survivor, earlierRow } = await deadlockAfterWrites(first, second, -72);
+
+          await assertFailsWithAbort(
+            () => victim.query(`INSERT INTO ${ROWS} VALUES (${earlierRow + 1}, 'later', 0)`),
+            DeadlockError,
+          );
+          await assertFailsWithAbort(() => victim.commit(), TransactionError);
+          await survivor.rollback();
+
+          assert.deepEqual(await committedRows(), []);
+        });
+        await removeRows();
+      });
+
+      test("rollback() acknowledges -72 and the same adapter can retry the work", async () => {
+        await withAdapters(async (first, second) => {
+          const { victim, survivor, earlierRow } = await deadlockAfterWrites(first, second, -72);
+          await assertFailsWithAbort(() => victim.query("SELECT 1 FROM db_root"), DeadlockError);
+
+          await victim.rollback();
+          await survivor.rollback();
+          await victim.beginTransaction();
+          await victim.query(`INSERT INTO ${ROWS} VALUES (${earlierRow}, 'retried', 0)`);
+          await victim.commit();
+
+          assert.deepEqual(await committedRows(), [earlierRow]);
+        });
+        await removeRows();
+      });
+
+      test("-968 keeps the transaction, while a commit() rejected after -72 acknowledges it", async () => {
+        // Each round has its own adapters because the lock timeout outlives a transaction.
+        await withAdapters(async (first, second) => {
+          const { victim, survivor, earlierRow } = await deadlockAfterWrites(first, second, -968, 4);
+
+          await victim.query(`INSERT INTO ${ROWS} VALUES (${earlierRow + 1}, 'kept', 0)`);
+          await victim.commit();
+          await survivor.rollback();
+
+          assert.deepEqual(await committedRows(), [earlierRow, earlierRow + 1]);
+        });
+        await removeRows();
+
+        await withAdapters(async (first, second) => {
+          const { victim, survivor, earlierRow } = await deadlockAfterWrites(first, second, -72);
+          await assertFailsWithAbort(() => victim.commit(), TransactionError);
+          await survivor.rollback();
+
+          // Acknowledged, so this statement runs in autocommit and commits by itself.
+          await victim.query(`INSERT INTO ${ROWS} VALUES (${earlierRow}, 'autocommit', 0)`);
+
+          assert.deepEqual(await committedRows(), [earlierRow]);
+        });
+        await removeRows();
       });
     });
 

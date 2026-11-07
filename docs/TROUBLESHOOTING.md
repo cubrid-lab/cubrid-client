@@ -193,7 +193,7 @@ try {
 
 `error.kind` tells these causes apart: `deadlock`, `lock-timeout` or `connection-lost`.
 
-- **`deadlock`**: retry the whole transaction. If your callback catches a `deadlock` error from `tx.query()` it must not continue, because with code `-72` the server already discarded the transaction's earlier statements.
+- **`deadlock`**: retry the whole transaction. With code `-72` the server already rolled it back, so if your callback catches that error and continues, its later `tx.query()` calls reject and nothing is committed. See [what happens after `-72`](API_REFERENCE.md#error-details).
 - **`lock-timeout`**: only the statement failed and the transaction is still open. CUBRID waits indefinitely by default. To limit the wait, run `SET TRANSACTION LOCK TIMEOUT <seconds>` inside the transaction.
 
 ### Transaction auto-rollback

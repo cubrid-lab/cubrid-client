@@ -21,7 +21,11 @@ import {
   type PrepareAndExecuteResult,
 } from "../protocol/protocol.js";
 import { EndTranType, StatementType } from "../protocol/constants.js";
-import { ConnectionLostError } from "../errors/internal-errors.js";
+import {
+  ConnectionLostError,
+  isServerTransactionAbort,
+  type CasReplyError,
+} from "../errors/internal-errors.js";
 import { mapError } from "../internals/map-error.js";
 import { assertValidRetryCount } from "../internals/normalize-config.js";
 import type { DriverAdapter } from "./base.js";
@@ -76,6 +80,14 @@ export class NativeCubridAdapter implements DriverAdapter {
   private transactionGeneration: number | null = null;
 
   /**
+   * The reply that said the server rolled back the open transaction on its own.
+   * The session is still healthy, but its next statement would start a new
+   * server transaction, and a commit would persist that statement alone. So
+   * until the caller acknowledges it, this counts as a lost transaction.
+   */
+  private transactionAbort: CasReplyError | null = null;
+
+  /**
    * Tail of the statement queue; see inTurn(). It never rejects, so one failed
    * statement cannot block the ones behind it.
    */
@@ -116,6 +128,7 @@ export class NativeCubridAdapter implements DriverAdapter {
       // post-response bind, remember that failed generation. A ping/reconnect
       // must never make subsequent statements commit on a replacement CAS.
       this.bindSessionLostByFirstStatement();
+      this.recordTransactionAbort(error);
       throw mapError("query", error, "Failed to execute CUBRID query.");
     }
   }
@@ -129,8 +142,9 @@ export class NativeCubridAdapter implements DriverAdapter {
       const cas = this.getOrCreateCAS();
 
       // Starting over here would hide that acknowledged statements are gone.
-      // rollback() acknowledges the loss and clears this state.
-      if (this.transactionGeneration !== null) {
+      // rollback() acknowledges the loss and clears this state. An abort has no
+      // generation yet when it answered the backslash probe of the first statement.
+      if (this.transactionGeneration !== null || this.transactionAbort !== null) {
         this.assertTransactionSession(cas);
       }
 
@@ -167,6 +181,7 @@ export class NativeCubridAdapter implements DriverAdapter {
       this.assertTransactionSession(cas);
       this.endTransaction();
     } catch (error) {
+      this.recordTransactionAbort(error);
       this.endTransactionIfSessionLost(cas);
       throw mapError("transaction", error, "Failed to commit transaction.");
     }
@@ -190,6 +205,7 @@ export class NativeCubridAdapter implements DriverAdapter {
 
       this.endTransaction();
     } catch (error) {
+      this.recordTransactionAbort(error);
       this.endTransactionIfSessionLost(cas);
       throw mapError("transaction", error, "Failed to roll back transaction.");
     }
@@ -366,13 +382,14 @@ export class NativeCubridAdapter implements DriverAdapter {
     }
   }
 
-  /** True when an open transaction's session no longer exists. */
+  /** True when an open transaction's session is gone, or the server rolled it back. */
   private isTransactionSessionLost(cas: CASConnection): boolean {
     if (this.autoCommit) {
       return false;
     }
 
     return (
+      this.transactionAbort !== null ||
       !cas.isConnected ||
       (this.transactionGeneration !== null &&
         cas.connectionGeneration !== this.transactionGeneration)
@@ -386,6 +403,14 @@ export class NativeCubridAdapter implements DriverAdapter {
   }
 
   private assertTransactionSession(cas: CASConnection): void {
+    // Keeping the reply as the cause reports the same code and kind as the
+    // statement that failed, so a caller can tell this is worth a retry.
+    if (this.transactionAbort !== null) {
+      throw new Error("The server already rolled back this transaction, so nothing was sent", {
+        cause: this.transactionAbort,
+      });
+    }
+
     if (this.isTransactionSessionLost(cas)) {
       throw new ConnectionLostError("Connection lost during transaction");
     }
@@ -419,9 +444,16 @@ export class NativeCubridAdapter implements DriverAdapter {
     }
   }
 
+  private recordTransactionAbort(error: unknown): void {
+    if (!this.autoCommit && isServerTransactionAbort(error)) {
+      this.transactionAbort = error;
+    }
+  }
+
   private endTransaction(): void {
     this.autoCommit = true;
     this.transactionGeneration = null;
+    this.transactionAbort = null;
   }
 
   /** The server discarded the work, so there is nothing left to end. */

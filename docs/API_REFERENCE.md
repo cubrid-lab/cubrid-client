@@ -529,7 +529,7 @@ try {
 | `foreign-key-violation` | `-1284` | `TRUNCATE` of a referenced table (11.2 and later; earlier servers report `-924`) |
 | `syntax` | `-493` | The statement cannot be parsed, or it names an unknown table |
 | `semantic` | `-494` | Unknown column or function, a missing privilege, a type mismatch or a constant division by zero |
-| `deadlock` | `-72` | Deadlock victim. The server rolled back **the whole transaction** |
+| `deadlock` | `-72` | Deadlock victim, or a lock escalation with `rollback_on_lock_escalation=yes`. The server rolled back **the whole transaction**; see below |
 | `deadlock` | `-967`, `-968` | Deadlock victim while a finite lock timeout is set (table lock, row lock). Only the statement failed and the transaction stays open |
 | `lock-timeout` | `-74`, `-75` | A lock wait expired (table lock, row lock). Only the statement failed and the transaction stays open |
 | `interrupted` | `-4` | The server stopped the statement, for example with `cubrid killtran` |
@@ -543,7 +543,16 @@ Failures detected by the client have a `kind` but no `code` or `origin`:
 | `connection-lost` | The socket closed, or the session that held the transaction is gone. The outcome of a request that was in flight is unknown |
 | `read-timeout` | [`ReadTimeoutError`](#readtimeouterror): the client stopped waiting for a response. A server lock wait that expires is `lock-timeout` instead |
 
-After any `deadlock`, roll back and retry the transaction from its start. Do not continue in it: after `-72` the server has already discarded the earlier statements, so anything sent next and committed would persist on its own.
+After any `deadlock`, roll back and retry the transaction from its start.
+
+**After `-72` the server has already rolled the transaction back.** A statement sent next would start a new server transaction and a later commit would persist it alone, so on the same connection every later `query()`, `commit()` and `beginTransaction()` rejects without sending anything, with the same `code` and `kind`, until you acknowledge the loss:
+
+- `rollback()` acknowledges it and resolves. This is what the usual `catch` block does, so the original error still reaches the caller.
+- A rejected `commit()` also acknowledges it. It never reports success.
+
+The connection itself stays usable: it is not closed or reopened, and it is back in **autocommit** afterwards, so call `beginTransaction()` before redoing the work. Inside `transaction()`, a callback that catches the error and carries on gets rejections from `tx.query()`, and `transaction()` itself rejects with a `TransactionError` instead of committing.
+
+Only `-72` is treated this way. The server's reply carries no other signal: its transaction status still says active. On CUBRID 10.2, 11.0, 11.2 and 11.4, `-72` was also what `rollback_on_lock_escalation=yes` reported, and `-74`, `-75`, `-967` and `-968` left the transaction open with its earlier statements intact. A statement rejected with those codes can be followed by more statements and a commit.
 
 All error classes preserve the original driver error via the standard `cause` property:
 

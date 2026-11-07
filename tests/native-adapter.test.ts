@@ -3,10 +3,11 @@ import assert from "node:assert/strict";
 import { createServer, type Server, type Socket as NetSocket } from "node:net";
 
 import { NativeCubridAdapter } from "../src/adapters/native.js";
+import { CubridClient } from "../src/client/client.js";
 import { createClient } from "../src/client/create-client.js";
-import { CASFunctionCode } from "../src/protocol/constants.js";
+import { CASFunctionCode, EndTranType } from "../src/protocol/constants.js";
 import { ConnectionError } from "../src/errors/connection-error.js";
-import { QueryError } from "../src/errors/query-error.js";
+import { DeadlockError, QueryError } from "../src/errors/query-error.js";
 import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { TransactionError } from "../src/errors/transaction-error.js";
 import type { ClientConfig } from "../src/types/client.js";
@@ -2087,4 +2088,245 @@ test("ping after a first-statement timeout cannot give the transaction a new ses
     await client.close();
     await closeStub(server);
   }
+});
+
+// ---------------------------------------------------------------------------
+// A transaction the server rolled back on its own (#184)
+// ---------------------------------------------------------------------------
+
+/** A database server error reply; buildErrorResponse() builds a CAS one. */
+function buildServerErrorResponse(code: number): Buffer {
+  const response = buildErrorResponse(code, "server error");
+  response.writeInt32BE(-2, 0);
+  return response;
+}
+
+/** One insert succeeds, then the server answers the next statement with -72. */
+async function beginAndAbort() {
+  const created = await beginWithOneInsert();
+  created.fakeCAS.queueResponse(buildServerErrorResponse(-72));
+  await assert.rejects(created.adapter.query("INSERT INTO t VALUES ('b')"), DeadlockError);
+  return created;
+}
+
+async function assertLaterStatementIsNotSent(
+  adapter: NativeCubridAdapter,
+  fakeCAS: FakeCASConnection,
+): Promise<void> {
+  fakeCAS.sentPayloads = [];
+
+  await assert.rejects(adapter.query("INSERT INTO t VALUES ('c')"), (error: unknown) => {
+    assert.ok(error instanceof DeadlockError);
+    assert.equal(error.code, -72);
+    assert.equal(error.origin, "server");
+    assert.equal(error.kind, "deadlock");
+    return true;
+  });
+
+  assert.deepEqual(fakeCAS.sentPayloads, []);
+}
+
+function endTranTypes(fakeCAS: FakeCASConnection): number[] {
+  return fakeCAS.sentPayloads
+    .filter((payload) => payload[0] === CASFunctionCode.END_TRAN)
+    .map((payload) => payload.readUInt8(5));
+}
+
+function assertAutocommitResumed(adapter: NativeCubridAdapter): void {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  assert.equal((adapter as any).autoCommit, true);
+}
+
+test("after -72 commit() rejects, because the work that remains is only what follows", async () => {
+  const { adapter, fakeCAS } = await beginAndAbort();
+  await assertLaterStatementIsNotSent(adapter, fakeCAS);
+
+  await assert.rejects(adapter.commit(), (error: unknown) => {
+    assert.ok(error instanceof TransactionError);
+    assert.equal(error.code, -72);
+    assert.equal(error.kind, "deadlock");
+    assert.match(((error.cause as Error).cause as Error).message, /server error/);
+    return true;
+  });
+
+  assert.deepEqual(fakeCAS.sentPayloads, []);
+  assert.equal(fakeCAS.connectCalls, 0);
+  assert.equal(fakeCAS.discardCalls, 0);
+});
+
+test("a statement queued behind -72 is not sent", async () => {
+  const { adapter, fakeCAS } = await beginWithOneInsert();
+  fakeCAS.queueResponse(buildServerErrorResponse(-72));
+  fakeCAS.sentPayloads = [];
+
+  const results = await Promise.allSettled([
+    adapter.query("INSERT INTO t VALUES ('b')"),
+    adapter.query("INSERT INTO t VALUES ('c')"),
+  ]);
+
+  assert.deepEqual(
+    results.map((result) => result.status),
+    ["rejected", "rejected"],
+  );
+  assert.equal(fakeCAS.sentPayloads.length, 1);
+});
+
+test("rollback() after -72 reaches the healthy session and resumes autocommit there", async () => {
+  const { adapter, fakeCAS } = await beginAndAbort();
+  await assertLaterStatementIsNotSent(adapter, fakeCAS);
+
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+  await adapter.rollback();
+
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+  assertAutocommitResumed(adapter);
+  fakeCAS.queueResponse(buildSelectResponse([{ name: "id", type: 2 }], [["1"]]));
+  assert.deepEqual(await adapter.query("SELECT id FROM t"), [{ id: "1" }]);
+  assert.equal(fakeCAS.connectCalls, 0);
+  assert.equal(fakeCAS.discardCalls, 0);
+});
+
+test("a rejected commit() acknowledges -72, and the same session runs in autocommit", async () => {
+  const { adapter, fakeCAS } = await beginAndAbort();
+  await assert.rejects(adapter.commit(), TransactionError);
+
+  assertAutocommitResumed(adapter);
+  fakeCAS.queueResponse(buildSelectResponse([{ name: "id", type: 2 }], [["1"]]));
+  assert.deepEqual(await adapter.query("SELECT id FROM t"), [{ id: "1" }]);
+  assert.equal(fakeCAS.connectCalls, 0);
+});
+
+test("a rejected rollback() acknowledges -72 too", async () => {
+  const { adapter, fakeCAS } = await beginAndAbort();
+  await assertLaterStatementIsNotSent(adapter, fakeCAS);
+
+  fakeCAS.queueResponse(buildErrorResponse(-1, "server refused"));
+  await assert.rejects(adapter.rollback(), TransactionError);
+
+  assertAutocommitResumed(adapter);
+});
+
+test("beginTransaction() cannot hide -72 before it is acknowledged", async () => {
+  const { adapter, fakeCAS } = await beginAndAbort();
+
+  await assert.rejects(adapter.beginTransaction(), (error: unknown) => {
+    assert.ok(error instanceof TransactionError);
+    assert.equal(error.code, -72);
+    return true;
+  });
+  await assertLaterStatementIsNotSent(adapter, fakeCAS);
+
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+  await adapter.rollback();
+  await adapter.beginTransaction();
+  fakeCAS.queueResponse(buildDMLResponse(20, 1));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+  await adapter.query("INSERT INTO t VALUES ('d')");
+});
+
+test("beginTransaction() cannot hide -72 that answered the first statement's backslash probe", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (adapter as any).noBackslashEscapes = null;
+  await adapter.beginTransaction();
+  fakeCAS.queueResponse(buildServerErrorResponse(-72));
+  await assert.rejects(adapter.query("INSERT INTO t VALUES (?)", ["a\\b"]), DeadlockError);
+
+  await assert.rejects(adapter.beginTransaction(), (error: unknown) => {
+    assert.ok(error instanceof TransactionError);
+    assert.equal(error.code, -72);
+    return true;
+  });
+  await assertLaterStatementIsNotSent(adapter, fakeCAS);
+
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+  await adapter.rollback();
+  await adapter.beginTransaction();
+});
+
+test("-72 on a FETCH ends the transaction like -72 on the statement", async () => {
+  const { adapter, fakeCAS } = await beginWithOneInsert();
+  fakeCAS.queueResponse(buildPartialSelectResponse(2));
+  fakeCAS.queueResponse(buildServerErrorResponse(-72));
+  await assert.rejects(adapter.query("SELECT id FROM t"), DeadlockError);
+
+  await assertLaterStatementIsNotSent(adapter, fakeCAS);
+});
+
+for (const method of ["commit", "rollback"] as const) {
+  test(`-72 answering ${method}() ends the transaction instead of leaving it open`, async () => {
+    const { adapter, fakeCAS } = await beginWithOneInsert();
+    fakeCAS.queueResponse(buildServerErrorResponse(-72));
+
+    await assert.rejects(adapter[method](), TransactionError);
+
+    assertAutocommitResumed(adapter);
+  });
+}
+
+test("a closed connection forgets -72, so the next session is not refused", async () => {
+  const { adapter, fakeCAS } = await beginAndAbort();
+  await assertLaterStatementIsNotSent(adapter, fakeCAS);
+
+  await adapter.close();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (adapter as any).cas = fakeCAS;
+  fakeCAS.queueResponse(buildSelectResponse([{ name: "id", type: 2 }], [["1"]]));
+
+  assert.deepEqual(await adapter.query("SELECT id FROM t"), [{ id: "1" }]);
+});
+
+test("transaction() rejects when its callback swallows -72, and sends no COMMIT", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  const client = new CubridClient(DEFAULT_CONFIG, () => adapter);
+  fakeCAS.queueResponse(buildServerErrorResponse(-72));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+
+  await assert.rejects(
+    client.transaction(async (tx) => {
+      await tx.query("INSERT INTO t VALUES ('a')").catch(() => undefined);
+      await tx.query("INSERT INTO t VALUES ('b')").catch(() => undefined);
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof TransactionError);
+      assert.equal(error.code, -72);
+      assert.equal(error.kind, "deadlock");
+      return true;
+    },
+  );
+
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+  assert.equal(
+    fakeCAS.sentPayloads.filter((p) => p[0] === CASFunctionCode.PREPARE_AND_EXECUTE).length,
+    1,
+  );
+});
+
+test("only the server's -72 inside a transaction blocks what follows", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+
+  // -72 in autocommit has no transaction to lose, and the same number from
+  // the CAS process is a different error.
+  fakeCAS.queueResponse(buildServerErrorResponse(-72));
+  await assert.rejects(adapter.query("INSERT INTO t VALUES (1)"), DeadlockError);
+  fakeCAS.queueResponse(buildDMLResponse(20, 1));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+  await adapter.query("INSERT INTO t VALUES (2)");
+
+  await adapter.beginTransaction();
+  fakeCAS.queueResponse(buildErrorResponse(-72, "from the CAS"));
+  await assert.rejects(adapter.query("INSERT INTO t VALUES (3)"), QueryError);
+
+  // Live servers keep the transaction open after these lock failures.
+  for (const code of [-74, -75, -967, -968]) {
+    fakeCAS.queueResponse(buildServerErrorResponse(code));
+    await assert.rejects(adapter.query("INSERT INTO t VALUES (4)"), QueryError);
+    fakeCAS.queueResponse(buildDMLResponse(20, 1));
+    fakeCAS.queueResponse(buildSimpleResponse(0));
+    await adapter.query("INSERT INTO t VALUES (5)");
+  }
+
+  fakeCAS.queueResponse(buildServerErrorResponse(-72));
+  await assert.rejects(adapter.query("INSERT INTO t VALUES (6)"), DeadlockError);
+  await assertLaterStatementIsNotSent(adapter, fakeCAS);
 });
