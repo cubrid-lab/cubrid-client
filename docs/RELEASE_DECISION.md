@@ -1,8 +1,13 @@
 # Reviewed release decision: cubrid-client v1.2.0
 
-Record prepared: 2026-11-07. **Status: candidate only. No authorization
-to publish, no npm or GitHub Release created, and no full
-production-ready certification.** This record distinguishes the already
+Record prepared: 2026-11-07. **Distribution state, as of 2026-11-07:**
+[GitHub Release v1.2.0](https://github.com/cubrid-lab/cubrid-client/releases/tag/v1.2.0)
+exists, but npm still serves `1.1.0`: the
+[v1.2.0 publish run](https://github.com/cubrid-lab/cubrid-client/actions/runs/42315470123)
+failed at its npm publish step. The sections below are the **historical
+pre-release sign-off record**, kept as written; they do not record a
+maintainer approval, a successful npm publication or a full
+production-ready certification. This record distinguishes the already
 observed results from approvals that still must be supplied by a maintainer.
 
 ## Decision scope
@@ -61,7 +66,7 @@ SHA and its corresponding run URL into the sign-off section below.
 
 ## Human approval and publication checklist
 
-These are **currently unchecked**. Complete them before using the manual
+These were unchecked when this record was prepared and have not been updated. Complete them before using the manual
 `PUBLISH` input. Do not prefill a person's name or claim an audit result
 from an earlier commit.
 
@@ -82,8 +87,9 @@ from an earlier commit.
 - [ ] Maintainer explicitly chooses **limited-scope remediation** rather
       than `production-ready` and accepts the limitations in the release
       announcement, with a recorded approval URL.
-- [ ] The npm-publish environment has an authorized reviewer and publishing
-      secret; a manual `PUBLISH` run uses the exact merged main candidate.
+- [ ] The npm-publish environment is authorized for npm trusted (OIDC)
+      publishing as configured in `.github/workflows/publish.yml`; a manual
+      `PUBLISH` run uses the exact merged main candidate.
 - [ ] Only after a successful npm publication is confirmed, decide whether to
       mark `cubrid-client@<=1.1.0` deprecated with an accurate upgrade advisory.
 

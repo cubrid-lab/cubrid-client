@@ -54,8 +54,13 @@ release safeguards. Do not create tool-dependent Oracle/Copilot routes.
 
 ### Role
 
-cubrid-client already benchmarks **faster than MySQL** in TypeScript.
-The narrative is "already fast, now production-ready" — resilience, not speed.
+Do not claim that cubrid-client is faster than another database's driver: the
+only comparison is the external-harness result in `docs/PERFORMANCE.md`, which
+compares different database engines and is not a goal. Release scope is deliberately limited
+(see `docs/API_STABILITY.md`, `docs/RELEASE_DECISION.md` and
+`docs/SUPPORT_MATRIX.md`); do not describe the client as production-ready
+without a recorded verification decision. The focus is resilience and
+verified correctness, not speed.
 
 ### Related Issues
 

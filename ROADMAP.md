@@ -4,14 +4,26 @@ Updated: 2026-11-06. This is the plan for the **TypeScript/Node.js**
 `cubrid-client` package. Issues are a work queue; the version labels below
 are **targets, not a promise that the changes have shipped**.
 
-## Current release candidate: 1.2.0 remediation
+## Release status: 1.2.0 tagged, not on npm
 
-The existing [Release Please PR](https://github.com/cubrid-lab/cubrid-client/pull/123)
-remains **unmerged/unpublished** pending the release checklist
-([#106](https://github.com/cubrid-lab/cubrid-client/issues/106)).
-The branch's generated changelog needs regeneration against the actual main
-history. The final package tarball and curated, emoji-free release note must
-match what the tag contains.
+The release has two independent states, which must not be conflated:
+
+- **GitHub:** [Release Please PR #123](https://github.com/cubrid-lab/cubrid-client/pull/123)
+  was merged and [GitHub Release v1.2.0](https://github.com/cubrid-lab/cubrid-client/releases/tag/v1.2.0)
+  exists (published 2026-11-07).
+- **npm:** as of 2026-11-07 the registry still serves `1.1.0` as `latest`
+  (`npm view cubrid-client version`). The
+  [publish run](https://github.com/cubrid-lab/cubrid-client/actions/runs/42315470123)
+  for v1.2.0 passed its pre-publish validation jobs but its "Publish to npm"
+  step failed. Do not treat 1.2.0 as installable from npm until the registry
+  shows it.
+
+Many fixes have merged to `main` after the v1.2.0 tag and are unreleased.
+The open Release Please PR [#176](https://github.com/cubrid-lab/cubrid-client/pull/176)
+proposes 1.3.0, and [#189](https://github.com/cubrid-lab/cubrid-client/issues/189)
+tracks verifying npm publication before the next release is proposed. The
+[release validation](https://github.com/cubrid-lab/cubrid-client/issues/106)
+record is [docs/RELEASE_DECISION.md](docs/RELEASE_DECISION.md).
 
 A successful offline Node.js matrix is **not** evidence of live CAS protocol
 compatibility. The known type, fetch, transaction and LOB limitations must be
