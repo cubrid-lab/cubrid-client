@@ -103,6 +103,7 @@ interface ClientConfig {
     password: string;
     connectionTimeout?: number | undefined;
     readTimeout?: number | undefined;
+    maxLobBytes?: number | undefined;
     maxConnectionRetryCount?: number | undefined;
     ssl?: boolean | ClientSSLOptions | undefined;
     logger?: unknown;
@@ -115,6 +116,7 @@ interface ClientOptions {
     password?: string;
     connectionTimeout?: number;
     readTimeout?: number;
+    maxLobBytes?: number;
     maxConnectionRetryCount?: number;
     ssl?: boolean | ClientSSLOptions;
     logger?: unknown;

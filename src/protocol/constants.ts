@@ -71,6 +71,7 @@ export const enum CASFunctionCode {
   EXECUTE_BATCH = 20,
   CON_CLOSE = 31,
   CHECK_CAS = 32,
+  LOB_READ = 37,
   GET_LAST_INSERT_ID = 40,
   PREPARE_AND_EXECUTE = 41,
 }
@@ -207,3 +208,12 @@ export const TYPE_NAMES: Record<number, string> = {
  * bytes actually arrive, because frames are never preallocated.
  */
 export const DEFAULT_MAX_FRAME_LENGTH = 1024 * 1024 * 1024;
+
+/** Default of the `maxLobBytes` client option: 64 MiB of content per query. */
+export const DEFAULT_MAX_LOB_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Bytes one LOB_READ asks for. CUBRID 10.2 to 11.4 answer with at most 81908
+ * bytes whatever is requested and report the shorter count, so a read loops.
+ */
+export const LOB_READ_CHUNK_SIZE = 128 * 1024;

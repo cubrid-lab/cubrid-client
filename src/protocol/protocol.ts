@@ -51,6 +51,11 @@ const COLLECTION_KIND_BY_FLAG: Readonly<Record<number, CUBRIDDataType>> = {
 const COLLECTION_HEADER_SIZE = 5;
 /** The response code and the int32 after it: every reply, even an error, has both. */
 const MIN_REPLY_SIZE = SIZE_INT * 2;
+/** A LOB cell starts with int32 db_type, int64 size and int32 locator length. */
+const LOB_HANDLE_HEADER_SIZE = SIZE_INT + SIZE_LONG + SIZE_INT;
+/** The handle's own db_type, a different number from the column's wire type. */
+const LOB_DB_TYPE_BLOB = 33;
+const LOB_DB_TYPE_CLOB = 34;
 
 /**
  * A value this driver has no decoder for, in a reply that is otherwise intact:
@@ -578,6 +583,85 @@ export function parseSimpleResponse(data: Buffer): void {
 }
 
 // ---------------------------------------------------------------------------
+// LOB_READ (FC=37)
+// ---------------------------------------------------------------------------
+
+/**
+ * A BLOB or CLOB cell as the server sends it: not the content but the content's
+ * size and the server's file locator. `NativeCubridAdapter` replaces it with the
+ * content before a row leaves the driver, so `handle` never reaches a caller:
+ * it names a path on the server and is not the column's value.
+ */
+export class LobLocator {
+  constructor(
+    readonly type: CUBRIDDataType.BLOB | CUBRIDDataType.CLOB,
+    readonly size: number,
+    readonly handle: Buffer,
+  ) {}
+}
+
+/** True for a column whose cells can decode to a LobLocator. */
+export function mayHoldLob(column: ColumnMeta): boolean {
+  // A NULL-typed column states each cell's type in the cell itself.
+  return (
+    column.type === CUBRIDDataType.BLOB ||
+    column.type === CUBRIDDataType.CLOB ||
+    column.type === CUBRIDDataType.NULL
+  );
+}
+
+/**
+ * Build a LOB_READ request. `length` must not be 0: CUBRID 10.2 to 11.4 answer
+ * a zero-length read with error -185 and that session then fails every request.
+ */
+export function writeLobRead(
+  handle: Buffer,
+  offset: number,
+  length: number,
+  casInfo: Buffer,
+): { header: Buffer; payload: Buffer } {
+  const w = new PacketWriter(handle.length + 32);
+  w.writeByte(CASFunctionCode.LOB_READ);
+  w.addBytes(handle);
+  w.addLong(BigInt(offset));
+  w.addInt(length);
+
+  const payload = w.toBuffer();
+  const header = PacketWriter.buildHeader(payload.length, casInfo);
+  return { header, payload };
+}
+
+/**
+ * Parse a LOB_READ reply: an int32 count, then exactly that many bytes. A count
+ * of 0 is the end of the file and has no second int32, unlike other replies.
+ */
+export function parseLobRead(data: Buffer, requested: number): Buffer {
+  if (data.length < SIZE_INT) {
+    throw new MalformedReplyError(`Malformed CAS packet: reply of ${data.length} bytes`);
+  }
+
+  const reader = new PacketReader(data);
+  const count = reader.parseInt();
+
+  if (count < 0) {
+    const err = decodeReply(() => reader.readError(data.length - SIZE_INT));
+    throw new CasReplyError(
+      `CUBRID LOB read failed (${err.code}): ${err.message}`,
+      count,
+      err.code,
+    );
+  }
+  if (count > requested || count !== reader.remaining) {
+    throw new MalformedReplyError(
+      `Malformed CAS packet: LOB read of ${requested} bytes reported ${count} ` +
+        `and carried ${reader.remaining}`,
+    );
+  }
+
+  return data.subarray(SIZE_INT);
+}
+
+// ---------------------------------------------------------------------------
 // Bind parameter encoding
 // ---------------------------------------------------------------------------
 
@@ -980,6 +1064,26 @@ function parseColumnMetadata(
 // Row data parser
 // ---------------------------------------------------------------------------
 
+/**
+ * Store a decoded column as an enumerable own property. Plain assignment to the
+ * name `__proto__`, which SQL can give any column as an alias, would set the
+ * row's prototype instead: the value would vanish from the row's keys, and a
+ * NULL would strip the row of its prototype. Only that name takes the slow path.
+ */
+export function setColumn(row: Record<string, unknown>, name: string, value: unknown): void {
+  if (name === "__proto__") {
+    Object.defineProperty(row, name, {
+      value,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+    return;
+  }
+
+  row[name] = value;
+}
+
 function parseRowData(
   reader: PacketReader,
   columns: ColumnMeta[],
@@ -1010,7 +1114,7 @@ function parseRowData(
         );
       }
       if (size === -1) {
-        row[column.name] = null;
+        setColumn(row, column.name, null);
         continue;
       }
 
@@ -1022,7 +1126,7 @@ function parseRowData(
 
       // An empty bit string is not SQL NULL: it is an empty Buffer (#173).
       if (size === 0 && isBitType(colType)) {
-        row[column.name] = Buffer.alloc(0);
+        setColumn(row, column.name, Buffer.alloc(0));
         continue;
       }
 
@@ -1037,7 +1141,7 @@ function parseRowData(
         if (size === 0) {
           throw new Error(`Malformed CAS packet: type ${colType} cannot be empty`);
         }
-        row[column.name] = value;
+        setColumn(row, column.name, value);
       } catch (error) {
         const message =
           `Failed to decode CUBRID column "${column.name}" (wire type ${colType}, ${size} bytes)`;
@@ -1107,9 +1211,11 @@ function readValue(
       return reader.parseTimestamp();
     case CUBRIDDataType.BIT:
     case CUBRIDDataType.VARBIT:
+      return reader.parseBytes(size);
+
     case CUBRIDDataType.BLOB:
     case CUBRIDDataType.CLOB:
-      return reader.parseBytes(size);
+      return readLobLocator(reader, colType, size);
 
     case CUBRIDDataType.SET:
     case CUBRIDDataType.MULTISET:
@@ -1124,6 +1230,42 @@ function readValue(
         `Unsupported CUBRID CAS value type ${colType} (${size} bytes)`,
       );
   }
+}
+
+/**
+ * Decode a LOB cell: `[db_type: int32][size: int64][locator length: int32]` and
+ * the locator with its NUL. An empty LOB has a locator and size 0; SQL NULL is
+ * the usual cell length -1 and never gets here.
+ */
+function readLobLocator(
+  reader: PacketReader,
+  colType: CUBRIDDataType.BLOB | CUBRIDDataType.CLOB,
+  size: number,
+): LobLocator {
+  const handle = reader.parseBytes(size);
+  if (size < LOB_HANDLE_HEADER_SIZE) {
+    throw new Error(`Malformed CAS packet: LOB handle of ${size} bytes has no header`);
+  }
+
+  const cell = new PacketReader(handle);
+  const dbType = cell.parseInt();
+  const lobSize = cell.parseLong();
+  const locatorLength = cell.parseInt();
+  const expectedDbType = colType === CUBRIDDataType.BLOB ? LOB_DB_TYPE_BLOB : LOB_DB_TYPE_CLOB;
+
+  if (dbType !== expectedDbType) {
+    throw new Error(`Malformed CAS packet: LOB db_type ${dbType} in a column of type ${colType}`);
+  }
+  if (lobSize < 0n || lobSize > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error(`Malformed CAS packet: LOB size ${lobSize}`);
+  }
+  assertExactLength(LOB_HANDLE_HEADER_SIZE + locatorLength, size);
+  // CAS counts the locator's NUL in its length, so even an empty LOB has one.
+  if (locatorLength === 0 || handle[size - 1] !== 0) {
+    throw new Error(`Malformed CAS packet: LOB locator of ${locatorLength} bytes has no NUL`);
+  }
+
+  return new LobLocator(colType, Number(lobSize), handle);
 }
 
 function isCollectionType(colType: CUBRIDDataType): boolean {

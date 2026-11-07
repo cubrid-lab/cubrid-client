@@ -13,8 +13,18 @@ export function assertValidRetryCount(count: number | undefined): void {
   }
 }
 
+/**
+ * NaN compares false against every size, which would turn the limit off, so the
+ * adapter, which is public and skips normalizeConfig(), checks this too.
+ */
+export function assertValidMaxLobBytes(limit: number | undefined): void {
+  if (limit !== undefined && !(Number.isSafeInteger(limit) && limit > 0)) {
+    throw new RangeError("maxLobBytes must be a positive integer number of bytes.");
+  }
+}
+
 export function normalizeConfig(options: ClientOptions): ClientConfig {
-  const { readTimeout } = options;
+  const { readTimeout, maxLobBytes } = options;
 
   // A value that quietly disabled the timeout would leave queries able to hang.
   if (
@@ -27,6 +37,7 @@ export function normalizeConfig(options: ClientOptions): ClientConfig {
   }
 
   assertValidRetryCount(options.maxConnectionRetryCount);
+  assertValidMaxLobBytes(maxLobBytes);
 
   return {
     host: options.host,
@@ -36,6 +47,7 @@ export function normalizeConfig(options: ClientOptions): ClientConfig {
     password: options.password ?? "",
     connectionTimeout: options.connectionTimeout,
     ...(readTimeout !== undefined && { readTimeout }),
+    ...(maxLobBytes !== undefined && { maxLobBytes }),
     maxConnectionRetryCount: options.maxConnectionRetryCount,
     ssl: options.ssl,
     logger: options.logger,

@@ -5,6 +5,8 @@
  * Implements the ConnectionLike interface used by CubridClient.
  */
 
+import { TextDecoder } from "node:util";
+
 import { CASConnection, type CASConnectionConfig } from "../protocol/connection.js";
 import {
   writePrepareAndExecute,
@@ -17,26 +19,42 @@ import {
   parseSimpleResponse,
   writeEndTran,
   writeConClose,
+  writeLobRead,
+  parseLobRead,
+  LobLocator,
+  mayHoldLob,
+  setColumn,
+  UnsupportedValueError,
   interpolateParams,
   type ColumnMeta,
   writeGetLastInsertId,
   parseGetLastInsertId,
   type PrepareAndExecuteResult,
 } from "../protocol/protocol.js";
-import { EndTranType, StatementType, TYPE_NAMES } from "../protocol/constants.js";
+import {
+  CUBRIDDataType,
+  DEFAULT_MAX_LOB_BYTES,
+  EndTranType,
+  LOB_READ_CHUNK_SIZE,
+  StatementType,
+  TYPE_NAMES,
+} from "../protocol/constants.js";
 import {
   ConnectionLostError,
   isServerTransactionAbort,
   type CasReplyError,
 } from "../errors/internal-errors.js";
 import { mapError } from "../internals/map-error.js";
-import { assertValidRetryCount } from "../internals/normalize-config.js";
+import { assertValidMaxLobBytes, assertValidRetryCount } from "../internals/normalize-config.js";
 import type { DriverAdapter } from "./base.js";
 import type { ClientConfig, ExecuteResult } from "../types/client.js";
 import type { QueryParams } from "../types/query.js";
 import type { ColumnInfo, QueryResult, QueryResultRow } from "../types/result.js";
 
 const DEFAULT_FETCH_SIZE = 100;
+
+/** Fatal so a CLOB that is not UTF-8 is refused, not silently given U+FFFD. */
+const CLOB_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /** The connection a query was issued on, and its failure count at that moment. */
 interface IssuedOn {
@@ -105,6 +123,7 @@ export class NativeCubridAdapter implements DriverAdapter {
 
   constructor(private readonly config: ClientConfig) {
     assertValidRetryCount(config.maxConnectionRetryCount);
+    assertValidMaxLobBytes(config.maxLobBytes);
   }
 
   async connect(): Promise<void> {
@@ -349,9 +368,14 @@ export class NativeCubridAdapter implements DriverAdapter {
       }
 
       const allRows = [...result.rows];
+      const generation = cas.connectionGeneration;
 
       if (result.totalTupleCount > allRows.length) {
         await this.fetchRemaining(cas, result, allRows);
+      }
+
+      if (result.columns.some(mayHoldLob)) {
+        await this.loadLobs(cas, generation, allRows);
       }
 
       return { rows: allRows as T[], columns: result.columns.map(toColumnInfo) };
@@ -790,6 +814,121 @@ export class NativeCubridAdapter implements DriverAdapter {
   }
 
   /**
+   * Replace every LOB locator in `rows` with its content: a Buffer for a BLOB and
+   * a string for a CLOB. A row never leaves the driver holding a locator.
+   *
+   * This runs inside the query's own turn because a locator cannot be kept: on
+   * CUBRID 10.2 to 11.4 a later commit of a DELETE or UPDATE, or a rollback,
+   * deletes the file it names, and there is no request that holds it or releases
+   * it. The session is pinned for the same reason a query handle's release is:
+   * sendAndRecv() would open a new session after an autocommit reply.
+   *
+   * The sizes are checked before the first read, so a result over the limit
+   * costs no LOB transfer and no memory.
+   */
+  private async loadLobs(
+    cas: CASConnection,
+    generation: number,
+    rows: Record<string, unknown>[],
+  ): Promise<void> {
+    const limit = this.config.maxLobBytes ?? DEFAULT_MAX_LOB_BYTES;
+    const cells: Array<{ row: Record<string, unknown>; name: string; lob: LobLocator }> = [];
+    let total = 0;
+
+    for (const row of rows) {
+      for (const [name, lob] of Object.entries(row)) {
+        if (!(lob instanceof LobLocator)) {
+          continue;
+        }
+        total += lob.size;
+        if (total > limit) {
+          throw new UnsupportedValueError(
+            `CUBRID column "${name}" takes this query's LOB content to ${total} bytes, ` +
+              `over the maxLobBytes limit of ${limit}`,
+          );
+        }
+        cells.push({ row, name, lob });
+      }
+    }
+
+    let replyDamaged = false;
+
+    try {
+      for (const { row, name, lob } of cells) {
+        setColumn(row, name, decodeLob(name, lob, await this.readLob(cas, generation, name, lob)));
+      }
+    } catch (error) {
+      replyDamaged = error instanceof MalformedReplyError;
+      throw error;
+    } finally {
+      // An empty LOB sends no LOB_READ, and nothing may follow a damaged reply.
+      if (total > 0 && !replyDamaged) {
+        await this.endLobReadTransaction(cas, generation);
+      }
+    }
+  }
+
+  private async readLob(
+    cas: CASConnection,
+    generation: number,
+    name: string,
+    lob: LobLocator,
+  ): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    let received = 0;
+
+    while (received < lob.size) {
+      const length = Math.min(lob.size - received, LOB_READ_CHUNK_SIZE);
+      const { header, payload } = writeLobRead(lob.handle, received, length, cas.casInfo);
+      const response = await cas.sendAndRecvOnSession(generation, header, payload);
+
+      if (response === null) {
+        throw new ConnectionLostError("CASConnection is not connected");
+      }
+
+      const chunk = parseLobRead(response, length);
+      if (chunk.length === 0) {
+        throw new UnsupportedValueError(
+          `CUBRID column "${name}" holds ${received} of its declared ${lob.size} LOB bytes`,
+        );
+      }
+
+      chunks.push(chunk);
+      received += chunk.length;
+    }
+
+    return Buffer.concat(chunks, received);
+  }
+
+  /**
+   * LOB_READ opens a transaction on the server, so an autocommit session is left
+   * with one after its statement finished, and CAS_INFO stops reporting it as
+   * releasable: an idle client would keep its CAS. Nothing was changed, so this
+   * only ends that. Inside a caller's transaction there is nothing to do.
+   */
+  private async endLobReadTransaction(cas: CASConnection, generation: number): Promise<void> {
+    if (!this.autoCommit) {
+      return;
+    }
+
+    try {
+      const { header, payload } = writeEndTran(EndTranType.COMMIT, cas.casInfo);
+      const responsePayload = await cas.sendAndRecvOnSession(generation, header, payload);
+
+      if (responsePayload) {
+        parseSimpleResponse(responsePayload);
+      }
+    } catch {
+      // The rows are complete and must still be returned, but this reply cannot
+      // be trusted to have left the stream aligned, so nothing more goes on this
+      // session, not even the query handle's release.
+      if (cas.isConnected) {
+        await cas.discardSession();
+      }
+    }
+  }
+
+  /**
    * Best-effort release on the session that created the handle, so a cleanup
    * failure cannot replace the caller's own error. If that session is gone the
    * server has dropped the handle with it and nothing is sent.
@@ -822,4 +961,18 @@ function toColumnInfo(column: ColumnMeta): ColumnInfo {
     scale: column.scale,
     nullable: column.isNullable,
   };
+}
+
+function decodeLob(name: string, lob: LobLocator, content: Buffer): Buffer | string {
+  if (lob.type === CUBRIDDataType.BLOB) {
+    return content;
+  }
+
+  try {
+    return CLOB_DECODER.decode(content);
+  } catch (error) {
+    throw new UnsupportedValueError(`CUBRID CLOB column "${name}" is not valid UTF-8`, {
+      cause: error,
+    });
+  }
 }

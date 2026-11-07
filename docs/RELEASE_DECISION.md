@@ -41,9 +41,10 @@ SHA and its corresponding run URL into the sign-off section below.
   the query instead of being returned as SQL NULL. Collection/JSON decoders
   remain unimplemented ([#82](https://github.com/cubrid-lab/cubrid-client/issues/82),
   [#111](https://github.com/cubrid-lab/cubrid-client/issues/111)).
-- BLOB/CLOB bytes have not been validated as complete LOB content
-  ([#93](https://github.com/cubrid-lab/cubrid-client/issues/93),
-  [#103](https://github.com/cubrid-lab/cubrid-client/issues/103)).
+- BLOB and CLOB reads load complete content, bounded by `maxLobBytes`, with the
+  [limitations listed in the type guide](TYPES.md#blob-and-clob-columns). LOB
+  writes through a handle are not implemented
+  ([#103](https://github.com/cubrid-lab/cubrid-client/issues/103)).
 - `query()` is not a server-side prepared binding API
   ([#85](https://github.com/cubrid-lab/cubrid-client/issues/85)). DML
   affected-row counts and generated ids are not part of its Promise result;

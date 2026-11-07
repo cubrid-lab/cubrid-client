@@ -52,8 +52,7 @@ criteria are verified and which are still pending real broker tests.
   [#84](https://github.com/cubrid-lab/cubrid-client/issues/84),
   [#88](https://github.com/cubrid-lab/cubrid-client/issues/88),
   [#85](https://github.com/cubrid-lab/cubrid-client/issues/85).
-- Verified LOB read/write:
-  [#93](https://github.com/cubrid-lab/cubrid-client/issues/93),
+- Verified LOB writes:
   [#103](https://github.com/cubrid-lab/cubrid-client/issues/103).
 - Transaction configuration and server version:
   [#91](https://github.com/cubrid-lab/cubrid-client/issues/91),

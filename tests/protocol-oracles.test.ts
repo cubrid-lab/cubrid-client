@@ -10,13 +10,17 @@ import assert from "node:assert/strict";
 import { CASFunctionCode, CUBRIDDataType, StatementType } from "../src/protocol/constants.js";
 import {
   encodeBindParams,
+  LobLocator,
   MalformedReplyError,
   parseFetch,
+  parseLobRead,
   parsePrepareAndExecute,
   UnsupportedValueError,
   writeFetch,
+  writeLobRead,
 } from "../src/protocol/protocol.js";
 import { CAPTURED_FRAMES, type CapturedFrame } from "./fixtures/collection-frames.js";
+import { LOB_FRAMES } from "./fixtures/lob-frames.js";
 
 const i32 = (value: number): Buffer => {
   const b = Buffer.alloc(4);
@@ -33,8 +37,8 @@ const i16 = (value: number): Buffer => {
  * A literal CCI v7 SELECT response with one named column and one row.
  * The numeric header/field values are independent of the driver enum.
  */
-function selectWire(wireType: number, rawValue: Buffer | null): Buffer {
-  const column = Buffer.from("value\0", "utf8");
+function selectWire(wireType: number, rawValue: Buffer | null, name = "value"): Buffer {
+  const column = Buffer.from(`${name}\0`, "utf8");
   return Buffer.concat([
     i32(7),                         // query handle
     i32(0),                         // cache lifetime
@@ -576,3 +580,110 @@ test("a NULL cell keeps an ordinary one-byte metadata type intact", () => {
   assert.equal(parsePrepareAndExecute(selectWire(34, null), 1).columns[0]?.type, 34);
   assert.equal(parsePrepareAndExecute(selectWire(34, null), 1).columns[0]?.elementType, undefined);
 });
+
+// ---------------------------------------------------------------------------
+// BLOB and CLOB
+// ---------------------------------------------------------------------------
+
+/** One LOB cell: db_type, int64 size, locator length, then the locator bytes. */
+function lobCell(dbType: number, size: bigint, locatorLength: number, locator: Buffer): Buffer {
+  const header = Buffer.alloc(16);
+  header.writeInt32BE(dbType, 0);
+  header.writeBigInt64BE(size, 4);
+  header.writeInt32BE(locatorLength, 12);
+  return Buffer.concat([header, locator]);
+}
+
+test("LOB_READ is CAS function 37 and its request matches the captured bytes", () => {
+  const { rows } = parsePrepareAndExecute(Buffer.from(LOB_FRAMES.selectRows.hex, "hex"), 7);
+  const blob = rows[0]!.b as LobLocator;
+  const { header, payload } = writeLobRead(blob.handle, 0, 3, Buffer.from("01fffffb", "hex"));
+
+  assert.equal(CASFunctionCode.LOB_READ, 37);
+  assert.equal(payload.toString("hex"), LOB_FRAMES.readBlobRequest);
+  assert.equal(header.toString("hex"), "0000006301fffffb");
+});
+
+test("captured LOB cells decode to a size and locator on relative and absolute paths", () => {
+  for (const frame of [LOB_FRAMES.selectRows, LOB_FRAMES.selectRowsAbsolutePaths]) {
+    const { rows } = parsePrepareAndExecute(Buffer.from(frame.hex, "hex"), 7);
+    const sizes = rows.map((row) => [row.id, (row.b as LobLocator)?.size, (row.c as LobLocator)?.size]);
+
+    assert.deepEqual(sizes, [[1, 3, 2], [2, 0, 0], [3, undefined, undefined]]);
+    assert.equal(rows[2]!.b, null);
+    assert.equal(rows[2]!.c, null);
+    assert.equal((rows[0]!.b as LobLocator).type, 23);
+    assert.equal((rows[0]!.c as LobLocator).type, 24);
+    assert.equal((rows[0]!.b as LobLocator).handle.subarray(16).toString("latin1").slice(0, 5), "file:");
+  }
+});
+
+test("captured LOB_READ replies decode to their content or to the server's error", () => {
+  const reply = (hex: string): Buffer => Buffer.from(hex, "hex");
+
+  assert.deepEqual([...parseLobRead(reply(LOB_FRAMES.readBlobReply), 3)], [1, 2, 3]);
+  assert.equal(parseLobRead(reply(LOB_FRAMES.readClobReply), 2).toString(), "hi");
+  assert.equal(parseLobRead(reply(LOB_FRAMES.readAtEndReply), 3).length, 0);
+  assert.throws(
+    () => parseLobRead(reply(LOB_FRAMES.fileNotFoundReply), 3),
+    (error: Error) =>
+      !(error instanceof MalformedReplyError) &&
+      /CUBRID LOB read failed \(-1020\): External file ".*" was not found/.test(error.message),
+  );
+});
+
+for (const [name, reply, requested] of [
+  ["no count", "000000", 3],
+  ["more bytes than asked for", "00000004" + "01020304", 3],
+  ["a count larger than its bytes", "00000003" + "0102", 3],
+  ["bytes past its count", "00000002" + "010203", 3],
+  ["an error envelope with no code", "fffffffe", 3],
+] as const) {
+  test(`a LOB_READ reply with ${name} is malformed`, () => {
+    assert.throws(
+      () => parseLobRead(Buffer.from(reply, "hex"), requested),
+      MalformedReplyError,
+    );
+  });
+}
+
+const LOCATOR = Buffer.from("file:ces_1/t.1\0", "latin1");
+
+for (const [name, cell, cause] of [
+  ["shorter than its header", Buffer.alloc(15), /has no header/],
+  ["with the other LOB's db_type", lobCell(34, 3n, LOCATOR.length, LOCATOR), /db_type 34 in a column of type 23/],
+  ["with a negative size", lobCell(33, -1n, LOCATOR.length, LOCATOR), /LOB size -1/],
+  ["with a size past safe integers", lobCell(33, 2n ** 53n, LOCATOR.length, LOCATOR), /LOB size 9007199254740992/],
+  ["whose locator overruns the cell", lobCell(33, 3n, LOCATOR.length + 1, LOCATOR), /value uses 32 of its 31 bytes/],
+  ["whose locator stops short of the cell", lobCell(33, 3n, LOCATOR.length - 1, LOCATOR), /value uses 30 of its 31 bytes/],
+  ["with an empty locator", lobCell(33, 0n, 0, Buffer.alloc(0)), /locator of 0 bytes has no NUL/],
+  ["whose locator has no trailing NUL", lobCell(33, 3n, 4, Buffer.from("file")), /locator of 4 bytes has no NUL/],
+] as const) {
+  test(`a LOB cell ${name} is malformed`, () => {
+    assert.throws(
+      () => parsePrepareAndExecute(selectWire(23, cell), 1),
+      (error: Error) =>
+        error instanceof MalformedReplyError && cause.test((error.cause as Error).message),
+    );
+  });
+}
+
+for (const [name, wireType, cell, expected] of [
+  ["an INT", 8, Buffer.from("00000007", "hex"), 7],
+  ["a string", 2, Buffer.from("6100", "hex"), "a"],
+  ["a NULL", 8, null, null],
+  ["an empty bit string", 6, Buffer.alloc(0), Buffer.alloc(0)],
+] as const) {
+  test(`${name} column aliased __proto__ is an ordinary enumerable column`, () => {
+    const { rows } = parsePrepareAndExecute(selectWire(wireType, cell, "__proto__"), 1);
+    const row = rows[0]!;
+
+    assert.deepEqual(Object.getOwnPropertyDescriptor(row, "__proto__"), {
+      value: expected,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+    assert.equal(Object.getPrototypeOf(row), Object.prototype);
+  });
+}

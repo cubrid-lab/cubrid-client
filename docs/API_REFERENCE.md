@@ -122,6 +122,8 @@ async query<T extends QueryResultRow = QueryResultRow>(
 
 Queries issued at the same time, for example with `Promise.all`, run one at a time in the order issued and each returns exactly its own rows. See [Concurrent Statements on One Connection](CONNECTION.md#concurrent-statements-on-one-connection).
 
+BLOB columns return a complete `Buffer` and CLOB columns a complete `string`, loaded before the promise settles and bounded by [`maxLobBytes`](#clientoptions). See [BLOB and CLOB columns](TYPES.md#blob-and-clob-columns).
+
 ##### Examples
 
 ```ts
@@ -684,6 +686,7 @@ interface ClientOptions {
   password?: string;
   connectionTimeout?: number;
   readTimeout?: number;
+  maxLobBytes?: number;
   maxConnectionRetryCount?: number;
   logger?: unknown;
   connectionFactory?: ConnectionFactory;
@@ -699,6 +702,7 @@ interface ClientOptions {
 | `password` | `string` | `""` | Database password |
 | `connectionTimeout` | `number` | `undefined` | Connection timeout in milliseconds |
 | `readTimeout` | `number` | `undefined` | Milliseconds of server inactivity before a request fails with [`ReadTimeoutError`](#readtimeouterror) and the connection is discarded. `undefined` or `0` means no timeout for requests; the connect handshake then still gives up after 10 seconds of inactivity. Other values must be between 1 and 2147483647, or `createClient()` throws a `RangeError`. See [Read timeout](CONNECTION.md#read-timeout) |
+| `maxLobBytes` | `number` | `67108864` (64 MiB) | Largest total of BLOB and CLOB content, in bytes, one query may load. A query over it rejects with a `QueryError` before any content is read, and the connection stays usable. Must be a positive integer, or `createClient()` throws a `RangeError`. See [BLOB and CLOB columns](TYPES.md#blob-and-clob-columns) |
 | `maxConnectionRetryCount` | `number` | `undefined` | Retries after a failed first attempt to open the TCP connection to the broker (refused, unreachable, timed out). Non-negative integer, default `0`; anything else throws a `RangeError`. See [Connection retries](CONNECTION.md#connection-retries) |
 | `logger` | `unknown` (see `ClientLogger`) | `undefined` | Receives redacted diagnostics for connections, queries and transactions. See [Logging](CONNECTION.md#logging) |
 | `connectionFactory` | [`ConnectionFactory`](#connectionfactory) | Built-in `NativeCubridAdapter` | Custom factory for creating connections |
@@ -716,6 +720,7 @@ interface ClientConfig {
   password: string;
   connectionTimeout?: number | undefined;
   readTimeout?: number | undefined;
+  maxLobBytes?: number | undefined;
   maxConnectionRetryCount?: number | undefined;
   logger?: unknown;
 }

@@ -63,6 +63,8 @@ export interface ClientConfig {
   connectionTimeout?: number | undefined;
   /** See {@link ClientOptions.readTimeout}. */
   readTimeout?: number | undefined;
+  /** See {@link ClientOptions.maxLobBytes}. */
+  maxLobBytes?: number | undefined;
   maxConnectionRetryCount?: number | undefined;
   ssl?: boolean | ClientSSLOptions | undefined;
   logger?: unknown;
@@ -83,6 +85,14 @@ export interface ClientOptions {
    * Undefined or 0 means no timeout.
    */
   readTimeout?: number;
+  /**
+   * Largest total of BLOB and CLOB content, in bytes, that one query may load.
+   * `query()` returns BLOB columns as `Buffer` and CLOB columns as `string`, all
+   * in memory, so this bounds what a row of large objects can cost. A query over
+   * the limit rejects with a `QueryError` before any content is read, and the
+   * connection stays usable. Must be a positive integer. Default: 64 MiB.
+   */
+  maxLobBytes?: number;
   maxConnectionRetryCount?: number;
   ssl?: boolean | ClientSSLOptions;
   /**
