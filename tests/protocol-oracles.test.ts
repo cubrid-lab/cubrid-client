@@ -248,10 +248,11 @@ test("a reply that ends before its declared rows is malformed, not a short resul
 
   // The inline rows of PREPARE_AND_EXECUTE declare two tuples but carry one.
   const wire = selectWire(8, i32(42));
+  assert.deepEqual(parsePrepareAndExecute(wire, 1).rows, [{ value: 42 }]);
   const tupleCountAt = wire.length - (4 + 8 + 4 + 4) - 4;
   wire.writeInt32BE(2, tupleCountAt);
   assert.throws(
-    () => parsePrepareAndExecute(wire, 7),
+    () => parsePrepareAndExecute(wire, 1),
     (error: Error) => error instanceof MalformedReplyError,
   );
 });
