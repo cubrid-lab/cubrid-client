@@ -5,12 +5,14 @@ import type {
   ConnectionFactory,
   ConnectionLike,
   Queryable,
+  ResultQueryable,
+  ResultTransactionClient,
   TransactionCallback,
 } from "../types/client.js";
 import type { QueryParams } from "../types/query.js";
-import type { QueryResultRow } from "../types/result.js";
+import type { QueryResult, QueryResultRow } from "../types/result.js";
 
-export class CubridClient implements Queryable {
+export class CubridClient implements Queryable, ResultQueryable {
   private sharedConnectionPromise: Promise<ConnectionLike> | undefined;
 
   constructor(
@@ -30,7 +32,24 @@ export class CubridClient implements Queryable {
     }
   }
 
-  async transaction<T>(callback: TransactionCallback<T>): Promise<T> {
+  async queryResult<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>> {
+    try {
+      const connection = await this.getSharedConnection();
+      if (!connection.queryResult) {
+        throw new Error("Underlying connection does not support queryResult.");
+      }
+      return await connection.queryResult<T>(sql, params);
+    } catch (error) {
+      throw mapError("query", error, "Query failed.");
+    }
+  }
+
+  async transaction<T>(
+    callback: TransactionCallback<T, ResultTransactionClient>,
+  ): Promise<T> {
     const connection = await this.connectionFactory(this.config);
     const transaction = new CubridTransaction(connection);
 

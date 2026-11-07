@@ -95,6 +95,17 @@ that cannot be decoded. The [roadmap](ROADMAP.md) tracks work that has **not** b
 const version = await db.getServerVersion(); // "11.4.6.1963"
 ```
 
+## Result Columns
+
+`query()` returns only rows. Use `queryResult()` to also get the type, precision, scale and nullability of each column, for example to know the type of a column that is NULL in every row:
+
+```ts
+const { rows, columns } = await db.queryResult("SELECT code, name FROM athlete LIMIT 5");
+// columns[0] -> { name: "code", type: "INT", precision: 10, scale: 0, nullable: false }
+```
+
+`columns` lists every select-list column, so a repeated name such as `SELECT a.id, b.id` appears twice there; each row object still has one key per name, and the last column wins. See [`QueryResult`](docs/API_REFERENCE.md#queryresult).
+
 ## Typed Queries
 
 Use TypeScript generics to get fully typed query results:

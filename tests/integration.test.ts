@@ -401,6 +401,52 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     }
   });
 
+  test("queryResult reports column metadata, duplicate names and a NULL-only column", async () => {
+    const client = createClient(TEST_CONFIG);
+
+    try {
+      await client.query("DROP TABLE IF EXISTS cm_a_native");
+      await client.query("DROP TABLE IF EXISTS cm_b_native");
+      await client.query(
+        "CREATE TABLE cm_a_native (id INT NOT NULL PRIMARY KEY, label VARCHAR(20), amount NUMERIC(10,3), ts DATETIME, tags SET(INT))",
+      );
+      await client.query("CREATE TABLE cm_b_native (id INT)");
+      await client.query("INSERT INTO cm_a_native (id, label) VALUES (7, 'seven')");
+
+      const result = await client.queryResult(
+        "SELECT a.id, b.id, a.label, a.amount, a.ts, a.tags, NULL AS nothing " +
+          "FROM cm_a_native a LEFT JOIN cm_b_native b ON a.id = b.id",
+      );
+
+      assert.deepEqual(result.columns, [
+        { name: "id", type: "INT", precision: 10, scale: 0, nullable: false },
+        { name: "id", type: "INT", precision: 10, scale: 0, nullable: true },
+        { name: "label", type: "VARCHAR", precision: 20, scale: 0, nullable: true },
+        { name: "amount", type: "NUMERIC", precision: 10, scale: 3, nullable: true },
+        { name: "ts", type: "DATETIME", precision: 23, scale: 3, nullable: true },
+        { name: "tags", type: "SET", elementType: "INT", precision: 0, scale: 0, nullable: true },
+        { name: "nothing", type: "NULL", precision: 0, scale: 0, nullable: true },
+      ]);
+      // One key per name, as query() returns: the second `id` (NULL here) wins.
+      assert.deepEqual(result.rows, [
+        { id: null, label: "seven", amount: null, ts: null, tags: null, nothing: null },
+      ]);
+      assert.deepEqual(await client.query("SELECT a.id, b.id FROM cm_a_native a LEFT JOIN cm_b_native b ON a.id = b.id"), [
+        { id: null },
+      ]);
+
+      assert.deepEqual(await client.queryResult("INSERT INTO cm_b_native VALUES (1)"), {
+        rows: [],
+        columns: [],
+      });
+
+      await client.query("DROP TABLE cm_a_native");
+      await client.query("DROP TABLE cm_b_native");
+    } finally {
+      await client.close();
+    }
+  });
+
   test("a ping inside a transaction leaves its row to rollback()", async () => {
     const client = createClient(TEST_CONFIG);
 

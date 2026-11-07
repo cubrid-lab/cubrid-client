@@ -28,9 +28,17 @@ export type {
   ConnectionFactory,
   ConnectionLike,
   Queryable,
+  ResultQueryable,
+  ResultTransactionClient,
   TransactionCallback,
   TransactionClient,
 } from "./types/client.js";
 export type { QueryParam, QueryParams } from "./types/query.js";
-export type { CollectionElement, CollectionValue, QueryResultRow } from "./types/result.js";
+export type {
+  CollectionElement,
+  CollectionValue,
+  ColumnInfo,
+  QueryResult,
+  QueryResultRow,
+} from "./types/result.js";
 export type { ConnectionConfig } from "./utils/connection-string.js";

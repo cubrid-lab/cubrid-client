@@ -886,7 +886,8 @@ function parseColumnMetadata(
     const tableNameLen = reader.parseInt();
     const tableName = reader.parseNullTermString(tableNameLen);
 
-    const isNullable = reader.parseByte() === 1;
+    // The wire byte is is_non_null: zero permits NULL, nonzero means NOT NULL.
+    const isNullable = reader.parseByte() === 0;
 
     const defaultLen = reader.parseInt();
     const defaultValue = reader.parseNullTermString(defaultLen);

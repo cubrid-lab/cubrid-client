@@ -18,9 +18,10 @@ import {
   writeEndTran,
   writeConClose,
   interpolateParams,
+  type ColumnMeta,
   type PrepareAndExecuteResult,
 } from "../protocol/protocol.js";
-import { EndTranType, StatementType } from "../protocol/constants.js";
+import { EndTranType, StatementType, TYPE_NAMES } from "../protocol/constants.js";
 import {
   ConnectionLostError,
   isServerTransactionAbort,
@@ -31,7 +32,7 @@ import { assertValidRetryCount } from "../internals/normalize-config.js";
 import type { DriverAdapter } from "./base.js";
 import type { ClientConfig } from "../types/client.js";
 import type { QueryParams } from "../types/query.js";
-import type { QueryResultRow } from "../types/result.js";
+import type { ColumnInfo, QueryResult, QueryResultRow } from "../types/result.js";
 
 const DEFAULT_FETCH_SIZE = 100;
 
@@ -111,6 +112,13 @@ export class NativeCubridAdapter implements DriverAdapter {
     sql: string,
     params?: QueryParams,
   ): Promise<T[]> {
+    return (await this.queryResult<T>(sql, params)).rows;
+  }
+
+  async queryResult<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>> {
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
     return this.inTurn(() => this.queryNow<T>(sql, params, issued));
@@ -120,7 +128,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     sql: string,
     params: QueryParams | undefined,
     issued: IssuedOn,
-  ): Promise<T[]> {
+  ): Promise<QueryResult<T>> {
     try {
       return await this.executeQuery<T>(sql, params, issued);
     } catch (error) {
@@ -289,7 +297,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     sql: string,
     params: QueryParams | undefined,
     issued: IssuedOn,
-  ): Promise<T[]> {
+  ): Promise<QueryResult<T>> {
     const cas = this.getOrCreateCAS();
 
     // Reconnecting here would drop the earlier statements of this transaction
@@ -338,7 +346,7 @@ export class NativeCubridAdapter implements DriverAdapter {
       );
 
       if (result.statementType !== StatementType.SELECT) {
-        return [] as unknown as T[];
+        return { rows: [], columns: [] };
       }
 
       const allRows = [...result.rows];
@@ -347,7 +355,7 @@ export class NativeCubridAdapter implements DriverAdapter {
         await this.fetchRemaining(cas, result, allRows);
       }
 
-      return allRows as T[];
+      return { rows: allRows as T[], columns: result.columns.map(toColumnInfo) };
     });
   }
 
@@ -623,4 +631,16 @@ export class NativeCubridAdapter implements DriverAdapter {
       // Best-effort cleanup — ignore errors
     }
   }
+}
+
+function toColumnInfo(column: ColumnMeta): ColumnInfo {
+  const typeName = (id: number): string => TYPE_NAMES[id] ?? `UNKNOWN(${id})`;
+  return {
+    name: column.name,
+    type: typeName(column.type),
+    ...(column.elementType === undefined ? {} : { elementType: typeName(column.elementType) }),
+    precision: column.precision,
+    scale: column.scale,
+    nullable: column.isNullable,
+  };
 }

@@ -1,5 +1,5 @@
 import type { QueryParams } from "./query.js";
-import type { QueryResultRow } from "./result.js";
+import type { QueryResult, QueryResultRow } from "./result.js";
 
 /**
  * TLS/SSL options for connecting to an SSL-enabled CUBRID broker (`SSL=ON`).
@@ -25,7 +25,7 @@ export type ClientLogLevel = "debug" | "info" | "error";
  * parameter values, row data, credentials or error messages.
  */
 export interface ClientLogFields {
-  /** `connection`, `connect`, `query`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`. */
+  /** `connection`, `connect`, `query`, `queryResult`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`. */
   operation?: string;
   host?: string;
   port?: number;
@@ -103,12 +103,32 @@ export interface Queryable {
   ): Promise<T[]>;
 }
 
+/** Runs a statement and reports its rows with their column metadata. */
+export interface ResultQueryable {
+  queryResult<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>>;
+}
+
 export interface TransactionClient extends Queryable {
   commit(): Promise<void>;
   rollback(): Promise<void>;
 }
 
-export type TransactionCallback<T> = (tx: TransactionClient) => Promise<T>;
+export type TransactionCallback<
+  T,
+  Tx extends TransactionClient = TransactionClient,
+> = (tx: Tx) => Promise<T>;
+
+/**
+ * The transaction client `CubridClient.transaction()` passes in: a
+ * {@link TransactionClient} that can also return column metadata. Kept apart
+ * from `TransactionClient` so 1.x code that implements that interface, such as
+ * a test double, keeps compiling. A callback written against
+ * `TransactionClient` is still accepted.
+ */
+export interface ResultTransactionClient extends TransactionClient, ResultQueryable {}
 
 export interface ConnectionLike {
   connect(): Promise<void>;
@@ -116,6 +136,14 @@ export interface ConnectionLike {
     sql: string,
     params?: QueryParams,
   ): Promise<T[]>;
+  /**
+   * Optional so 1.x connection factories keep compiling. `queryResult()` on a
+   * client or transaction fails when its connection does not provide it.
+   */
+  queryResult?<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<QueryResult<T>>;
   beginTransaction(): Promise<void>;
   commit(): Promise<void>;
   rollback(): Promise<void>;

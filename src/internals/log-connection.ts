@@ -15,7 +15,7 @@ import type {
   ConnectionLike,
 } from "../types/client.js";
 import type { QueryParams } from "../types/query.js";
-import type { QueryResultRow } from "../types/result.js";
+import type { QueryResult, QueryResultRow } from "../types/result.js";
 
 /**
  * Resolves the `logger` option. Each level is looked up when the event is
@@ -144,6 +144,19 @@ export function withLogging(factory: ConnectionFactory, logger: unknown): Connec
       rollback: () => timed("rollback", {}, () => inner.rollback()),
       close: () => timed("close", {}, () => inner.close()),
     };
+    const queryResult = inner.queryResult?.bind(inner);
+    if (queryResult) {
+      wrapped.queryResult = <T extends QueryResultRow = QueryResultRow>(
+        sql: string,
+        params?: QueryParams,
+      ): Promise<QueryResult<T>> =>
+        timed(
+          "queryResult",
+          { paramCount: params?.length ?? 0 },
+          () => queryResult<T>(sql, params),
+          (result) => result.rows.length,
+        );
+    }
     const ping = inner.ping?.bind(inner);
     if (ping) {
       wrapped.ping = () => timed("ping", {}, ping);
