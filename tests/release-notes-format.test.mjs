@@ -37,3 +37,12 @@ test("rejects an incorrect comparison and wrong section ordering", () => {
   assert.match(validateCuratedNote("1.2.0", sample.replace("v1.1.0...v1.2.0", "v1.0.0...v1.2.0")).join(" "), /Full Changelog/);
   assert.match(validateCuratedNote("1.2.0", sample.replace("### Upgrade notes", "### Features\n\n- Test by @yeongseon\n\n### Upgrade notes")).join(" "), /Upgrade notes/);
 });
+
+test("newly released versions are accepted without hardcoded version changes", () => {
+  const next = sample
+    .replaceAll("v1.2.0", "v1.4.0")
+    .replaceAll("v1.1.0", "v1.3.0")
+    .replaceAll("2026-11-07", "2026-12-01");
+  const versions = ["0.1.0", "0.2.0", "1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0"];
+  assert.deepEqual(validateCuratedNote("1.4.0", next, versions), []);
+});
