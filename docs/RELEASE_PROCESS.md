@@ -97,9 +97,11 @@ descriptions without changing tags or packages.
    that immutable tag instead of creating another release or changing tag
    history. This manual path is for recovery, not the standard release.
 8. Release Please does **not** propose the following version until the
-   current `package.json` version has a matching GitHub Release. This
-   prevents a duplicate or premature version PR while a previous release
-   is still pending. The old v1.3.0 proposal generated before v1.2.0 was
+   current `package.json` version has both a GitHub Release and the **exact
+   corresponding public npm version**. Missing or unavailable registry data
+   fails closed; check the existing immutable tag and use explicit publication
+   recovery instead of skipping a version. The new-release candidate gate also
+   checks that the immediately preceding changelog version exists in npm. The old v1.3.0 proposal generated before v1.2.0 was
    tagged was closed without publishing.
 
 The [v1.2.0 decision record](RELEASE_DECISION.md) and issues

@@ -87,10 +87,28 @@ jobs:
             exit 0
           fi
           if gh release view "$tag" --repo "$GH_REPO" >/dev/null 2>&1; then
-            echo "::notice::$tag already has a GitHub Release; no duplicate publication."
-            echo "should_publish=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            if node scripts/verify-npm-version.mjs "$version"; then
+              echo "::notice::$tag already exists in GitHub and npm; no duplicate publication."
+              echo "should_publish=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error::$tag exists on GitHub but npm publication is not verified. Use explicit recovery_tag for this immutable version; never advance by creating another tag."
+            exit 1
           fi
+          # A candidate must not bypass a previous version that exists only
+          # as a GitHub Release. Read the immediately preceding changelog version,
+          # never 'npm latest', which may point to an unrelated dist-tag.
+          previous=$(node - <<'NODE'
+          const fs = require("node:fs");
+          const current = require("./package.json").version;
+          const entries = [...fs.readFileSync("CHANGELOG.md", "utf8").matchAll(/^## \[([0-9]+\.[0-9]+\.[0-9]+)\]/gm)].map(match => match[1]);
+          if (entries[0] !== current || !entries[1]) {
+            throw new Error("Cannot verify the preceding changelog version for " + current);
+          }
+          process.stdout.write(entries[1]);
+          NODE
+          )
+          node scripts/verify-npm-version.mjs "$previous"
           # An orphan tag must never be overwritten in an automatic retry.
           if gh api "repos/$GH_REPO/git/ref/tags/$tag" >/dev/null 2>&1; then
             echo "::error::$tag already exists without a GitHub Release; investigate manually."
