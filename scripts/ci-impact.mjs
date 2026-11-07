@@ -27,7 +27,7 @@ export function classify(event, paths) {
   for (const change of paths) {
     // A status is required: accepting bare paths silently treats a deleted
     // Markdown file or a renamed doc as documentation-only validation.
-    const match = /^(A|M|D)\\t(.+)$/.exec(change);
+    const match = /^(A|M|D)\t(.+)$/.exec(change);
     if (!match) {
       return { runtime: true, docs: true, reason: "unrecognized change status: fail closed" };
     }
