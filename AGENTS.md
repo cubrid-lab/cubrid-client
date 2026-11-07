@@ -164,3 +164,7 @@ issues because their own events may not trigger this workflow.
 
 This process never guesses issue urgency or creates another PR gate. Existing
 quality, security and release expectations still apply.
+
+## Repository ownership for issues and pull requests
+
+This repository owns the Node.js/TypeScript CAS driver and its npm-published API, transaction/error and compatibility contracts. Issue and PR titles, descriptions, ADR rationale and release claims must describe this package's own observable behavior and tests; do not present another project's design, incident history, roadmap or language-specific policy as governing authority. A linked external implementation can provide independent comparison evidence only. An actual npm consumer/adapter dependency may be cited by its tested public contract, not as an implementation or release prerequisite. Review issue/PR body, ADR, contributor guides, and release notes for misplaced project names before merge; do not block legitimate verified JDBC comparisons.
