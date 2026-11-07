@@ -16,7 +16,7 @@ convert a runtime value.
 | BIGINT | `bigint` | Lossless signed 64-bit value; corrected by [#126](https://github.com/cubrid-lab/cubrid-client/pull/126); `JSON.stringify` needs explicit bigint conversion |
 | FLOAT, DOUBLE, MONETARY | `number` | IEEE-754 conversion may round decimal values |
 | NUMERIC | `string` | Decimal text retained without floating-point rounding; consumer chooses decimal library |
-| DATE, TIME, TIMESTAMP, DATETIME | `Date` | Parsed using the **local Node.js process timezone**; SQL DATETIME itself has no timezone, so this is not stable across zones ([#113](https://github.com/cubrid-lab/cubrid-client/issues/113)) |
+| DATE, TIME, TIMESTAMP, DATETIME | `Date` | Parsed using the **local Node.js process timezone**; SQL DATETIME itself has no timezone, so this is not stable across zones ([#113](https://github.com/cubrid-lab/cubrid-client/issues/113)). The zero date `0000-00-00` of DATE, DATETIME and TIMESTAMP has no `Date`, so the query rejects; see [zero dates](#zero-dates) |
 | BIT, VARBIT | `Buffer` | Binary bytes; verify bit-length/bit-order semantics per server version. An empty `X''` currently returns `null`, the same as SQL NULL ([#173](https://github.com/cubrid-lab/cubrid-client/issues/173)) |
 | BLOB, CLOB | `Buffer` from the wire field | **Not established as full LOB content**; the field may be a locator rather than the object body ([#93](https://github.com/cubrid-lab/cubrid-client/issues/93), [#103](https://github.com/cubrid-lab/cubrid-client/issues/103)) |
 | SET, MULTISET, SEQUENCE | Array (`CollectionValue`) | See [collection columns](#collection-columns) |
@@ -35,7 +35,7 @@ the connection depends on whether the server's reply can still be trusted:
 
 | Failure | Example | Connection afterwards |
 | --- | --- | --- |
-| **Unsupported value** (`UnsupportedValueError`) in a reply that is otherwise intact | A TIMESTAMPTZ column | Stays open. The query handle is released, and an open transaction stays open for you to commit or roll back |
+| **Unsupported value** (`UnsupportedValueError`) in a reply that is otherwise intact | A TIMESTAMPTZ column, or a zero date | Stays open. The query handle is released, and an open transaction stays open for you to commit or roll back |
 | **Malformed reply** (`MalformedReplyError`) that contradicts its own structure | A length past the end of the reply, or a value that does not fill its cell | Dropped, because the next reply could not be trusted to line up. Nothing more is sent on it |
 
 The driver reads the rest of a reply, including every remaining and nested
@@ -62,6 +62,23 @@ A zero-byte value is never treated as SQL NULL, except for the
 VARBIT: the server counts the NUL of text and writes fixed-width types in full,
 so it has no other zero-byte encoding. A zero-byte value of another decodable
 type is a malformed reply.
+
+### Zero dates
+
+`DATE'0000-00-00'` and its DATETIME and TIMESTAMP forms, whether a literal or a
+stored value, reach the client as all-zero year, month and day fields. They
+used to decode to a real-looking `Date` in 1899 (`new Date(0, -1, 0)`), which
+is silently wrong data. They now reject the query as an
+[unsupported value](#values-that-cannot-be-decoded): the `QueryError` cause
+names the column and wire type (`Failed to decode CUBRID column "d" (wire type
+13, 6 bytes)`, with the cause `Zero date 0000-00-00 ...`), and the connection
+and any open transaction stay usable. This matches pycubrid, which also raises
+an error instead of returning a date.
+
+The query rejects as a whole, so no other column of that row is returned. To
+read a table that holds zero dates, filter them out or convert them in SQL, for
+example `SELECT CASE WHEN d = DATE'0000-00-00' THEN NULL ELSE d END`, or select
+`TO_CHAR(d)`. Valid dates decode exactly as before.
 
 The driver can only reject what it receives. In some cases the server itself
 sends SQL NULL for a non-NULL value, such as a

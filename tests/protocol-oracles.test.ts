@@ -149,6 +149,27 @@ test("a captured TIMESTAMPTZ value rejects as unsupported, naming its column and
   );
 });
 
+test("captured zero dates reject as unsupported, naming the column and type, never an 1899 Date", () => {
+  // Literal wire types and sizes from the replies: DATE 13 is 6 bytes, DATETIME 22 is
+  // 14 bytes and TIMESTAMP 15 is 12 bytes, all zero.
+  const expected = [
+    [CAPTURED_FRAMES.zeroDate, /column "d" \(wire type 13, 6 bytes\)/],
+    [CAPTURED_FRAMES.zeroDatetime, /column "d" \(wire type 22, 14 bytes\)/],
+    [CAPTURED_FRAMES.zeroTimestamp, /column "d" \(wire type 15, 12 bytes\)/],
+  ] as const;
+  for (const [frame, message] of expected) {
+    assert.throws(
+      () => parsePrepareAndExecute(Buffer.from(frame.hex, "hex"), 7),
+      (error: Error) => {
+        assert.ok(error instanceof UnsupportedValueError, frame.sql);
+        assert.match(error.message, message);
+        assert.match((error.cause as Error).message, /Zero date 0000-00-00/);
+        return true;
+      },
+    );
+  }
+});
+
 test("a zero-byte value is null only for BIT and VARBIT, and never for another type", () => {
   // The captured SELECT X'' has a size-0 cell. It stays null until #173 and keeps column t.
   assert.deepEqual(
@@ -299,6 +320,55 @@ test("unsupported collection elements reject and name the column", () => {
       frame.sql,
     );
   }
+});
+
+test("a zero date element rejects as unsupported, and structural damage still wins", () => {
+  // Captured SEQUENCE OF DATE {0000-00-00, 2020-01-02}: the first element is the zero date.
+  assert.throws(
+    () => decodeFrame(CAPTURED_FRAMES.zeroDateElement),
+    (error: Error) => {
+      assert.ok(error instanceof UnsupportedValueError);
+      assert.match(error.message, /column "c" \(wire type 18, 25 bytes\)/);
+      assert.match((error.cause as Error).message, /Zero date 0000-00-00/);
+      return true;
+    },
+  );
+
+  // The second element now claims 7 bytes, one more than the cell holds: the whole
+  // reply is malformed even though an unsupported element came first.
+  const { hex } = CAPTURED_FRAMES.zeroDateElement;
+  const second = "0000000607e400010002";
+  assert.ok(hex.includes(second));
+  assert.throws(
+    () => parsePrepareAndExecute(Buffer.from(hex.replace(second, "0000000707e400010002"), "hex"), 7),
+    (error: Error) => error instanceof MalformedReplyError,
+  );
+});
+
+test("an all-zero value of the wrong width is malformed, not a zero date", () => {
+  // Only DATE 6, DATETIME 14 and TIMESTAMP 12 bytes can be the zero date. Any other
+  // width contradicts its cell, so the reply is malformed and the session is dropped.
+  for (const [wireType, size] of [[22, 6], [15, 6], [13, 7], [13, 14], [15, 14]] as const) {
+    assert.throws(
+      () => parsePrepareAndExecute(selectWire(wireType, Buffer.alloc(size)), 1),
+      (error: Error) => error instanceof MalformedReplyError,
+      `wire type ${wireType}, ${size} zero bytes`,
+    );
+  }
+});
+
+test("a zero-filled element of the wrong width in a collection is malformed", () => {
+  // The captured SEQUENCE OF DATE reduced to its one six-byte zero element (cell
+  // size 15, count 1) and retyped as DATETIME (22): six zero bytes are not a 14-byte
+  // DATETIME. A second, valid element would hide this, so the cell holds only the zero.
+  const { hex } = CAPTURED_FRAMES.zeroDateElement;
+  const cell = "190d00000002" + "00000006000000000000" + "0000000607e400010002";
+  const retyped = "0f1600000001" + "00000006000000000000";
+  assert.equal(hex.split(cell).length, 2);
+  assert.throws(
+    () => parsePrepareAndExecute(Buffer.from(hex.replace(cell, retyped), "hex"), 7),
+    (error: Error) => error instanceof MalformedReplyError,
+  );
 });
 
 test("parseFetch decodes collections with the metadata of the executed query", () => {

@@ -586,6 +586,116 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
   });
 
   // -------------------------------------------------------------------------
+  // Zero dates (#178)
+  // -------------------------------------------------------------------------
+
+  describe("zero dates", () => {
+    const TABLE = "integration_zero_dates";
+    const ZERO_VALUES = [
+      { type: "DATE", literal: "DATE'0000-00-00'", wireType: 13, size: 6 },
+      { type: "DATETIME", literal: "DATETIME'0000-00-00 00:00:00'", wireType: 22, size: 14 },
+      { type: "TIMESTAMP", literal: "TIMESTAMP'0000-00-00 00:00:00'", wireType: 15, size: 12 },
+    ];
+
+    for (const { type, literal, wireType, size } of ZERO_VALUES) {
+      test(`a zero ${type} rejects with its column and type, and the session stays usable`, async () => {
+        const adapter = new NativeCubridAdapter(TEST_CONFIG);
+        await adapter.connect();
+        const cas = (adapter as unknown as { cas: CASConnection }).cas;
+        const generation = cas.connectionGeneration;
+
+        try {
+          await assert.rejects(adapter.query(`SELECT ${literal} AS zero_value, 'after' AS t`), (err: Error) => {
+            assert.ok(err instanceof QueryError);
+            assert.match(
+              (err.cause as Error).message,
+              new RegExp(`column "zero_value" \\(wire type ${wireType}, ${size} bytes\\)`),
+            );
+            return true;
+          });
+
+          // Same physical session, and it answers the next statement.
+          assert.equal(cas.connectionGeneration, generation);
+          assert.deepEqual(await adapter.query("SELECT 1 AS one"), [{ one: 1 }]);
+        } finally {
+          await adapter.close();
+        }
+      });
+    }
+
+    test("a zero date inside a collection rejects, and the session stays usable", async () => {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+      await adapter.connect();
+      const cas = (adapter as unknown as { cas: CASConnection }).cas;
+      const generation = cas.connectionGeneration;
+
+      try {
+        await assert.rejects(
+          adapter.query(
+            "SELECT CAST({DATE'0000-00-00', DATE'2020-01-02'} AS SEQUENCE OF DATE) AS c, 'after' AS t",
+          ),
+          (err: Error) => {
+            assert.ok(err instanceof QueryError);
+            assert.match((err.cause as Error).message, /column "c" \(wire type 18, 25 bytes\)/);
+            return true;
+          },
+        );
+        assert.equal(cas.connectionGeneration, generation);
+        assert.deepEqual(await adapter.query("SELECT 1 AS one"), [{ one: 1 }]);
+      } finally {
+        await adapter.close();
+      }
+    });
+
+    test("a stored zero date rejects, a valid row beside it still decodes, and a transaction survives", async () => {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+      await adapter.connect();
+
+      try {
+        await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        await adapter.query(
+          `CREATE TABLE ${TABLE} (id INT PRIMARY KEY, d DATE, dt DATETIME, ts TIMESTAMP)`,
+        );
+        await adapter.beginTransaction();
+        await adapter.query(
+          `INSERT INTO ${TABLE} VALUES (1, DATE'0000-00-00', DATETIME'0000-00-00 00:00:00', ` +
+            `TIMESTAMP'0000-00-00 00:00:00')`,
+        );
+        await adapter.query(
+          `INSERT INTO ${TABLE} VALUES (2, DATE'2020-01-02', DATETIME'2020-01-02 03:04:05', ` +
+            `TIMESTAMP'2020-01-02 03:04:05')`,
+        );
+
+        for (const column of ["d", "dt", "ts"]) {
+          await assert.rejects(
+            adapter.query(`SELECT id, ${column} FROM ${TABLE} WHERE id = 1`),
+            (err: Error) => {
+              assert.ok(err instanceof QueryError);
+              assert.match((err.cause as Error).message, new RegExp(`column "${column}"`));
+              return true;
+            },
+          );
+        }
+
+        const rows = await adapter.query(`SELECT id, d FROM ${TABLE} WHERE id = 2`);
+        assert.equal(rows.length, 1);
+        assert.ok(rows[0]!.d instanceof Date);
+
+        // The open transaction is still ours: its rows are visible, and commit works.
+        assert.equal((await adapter.query(`SELECT id FROM ${TABLE}`)).length, 2);
+        await adapter.commit();
+        assert.equal((await adapter.query(`SELECT id FROM ${TABLE}`)).length, 2);
+      } finally {
+        try {
+          await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`);
+        } finally {
+          await adapter.close();
+        }
+      }
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // Collections (#82)
   // -------------------------------------------------------------------------
 

@@ -113,7 +113,11 @@ The driver does not export these two classes, so test `name` and not
   for. Its message names the column and CAS wire type: `29` to `32` are the
   timezone-aware types, and `19` is an OBJECT reference. The connection and any
   open transaction stay usable, so cast the column in SQL, for example
-  `CAST(created_at AS DATETIME)`, or select `TO_CHAR(created_at)`.
+  `CAST(created_at AS DATETIME)`, or select `TO_CHAR(created_at)`. A message
+  `Zero date 0000-00-00` on wire type `13`, `15` or `22` means a DATE, TIMESTAMP
+  or DATETIME holds the zero date, which has no JavaScript `Date`; use
+  `TO_CHAR(created_at)` or `CASE WHEN created_at = DATETIME'0000-00-00 00:00:00'
+  THEN NULL ELSE created_at END`.
 - **`MalformedReplyError`**: the reply was damaged, so the connection was dropped
   and the server rolled back any open transaction. Its message names the column
   only when one cell failed. See

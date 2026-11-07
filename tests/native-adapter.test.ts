@@ -1541,6 +1541,24 @@ test("a zero-byte value without a decoder rejects, and the session stays open", 
   assert.deepEqual(fakeCAS.closedHandles, [1]);
 });
 
+test("a captured zero date rejects, and the session stays open for the next query", async () => {
+  for (const frame of [
+    CAPTURED_FRAMES.zeroDate,
+    CAPTURED_FRAMES.zeroDatetime,
+    CAPTURED_FRAMES.zeroTimestamp,
+    CAPTURED_FRAMES.zeroDateElement,
+  ]) {
+    const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+    fakeCAS.queueResponse(Buffer.from(frame.hex, "hex"));
+
+    await assertQueryFails(adapter, /Zero date 0000-00-00/);
+
+    assert.equal(fakeCAS.discardCalls, 0, frame.sql);
+    assert.equal(fakeCAS.isConnected, true, frame.sql);
+    assert.deepEqual(fakeCAS.closedHandles, [1], frame.sql);
+  }
+});
+
 test("damage after an unsupported value still drops the session", async () => {
   const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
   const { hex } = CAPTURED_FRAMES.timestamptzValue;

@@ -1035,15 +1035,18 @@ function readValue(
       return reader.parseNullTermString(size);
 
     case CUBRIDDataType.DATE:
+      rejectZeroDate(reader, size, SIZE_SHORT * 3);
       return reader.parseDate();
 
     case CUBRIDDataType.TIME:
       return reader.parseTime();
 
     case CUBRIDDataType.DATETIME:
+      rejectZeroDate(reader, size, SIZE_DATETIME);
       return reader.parseDatetime();
 
     case CUBRIDDataType.TIMESTAMP:
+      rejectZeroDate(reader, size, SIZE_SHORT * 6);
       return reader.parseTimestamp();
     case CUBRIDDataType.BIT:
     case CUBRIDDataType.VARBIT:
@@ -1072,6 +1075,22 @@ function isCollectionType(colType: CUBRIDDataType): boolean {
     colType === CUBRIDDataType.MULTISET ||
     colType === CUBRIDDataType.SEQUENCE
   );
+}
+
+/**
+ * The broker sends the zero date `0000-00-00` (DATE, DATETIME and TIMESTAMP) as
+ * all-zero fields. `new Date(0, -1, 0)` would turn it into a real-looking 1899
+ * instant, and no JavaScript Date can hold it, so report it instead. The value
+ * is intact and has its full size, so the session stays usable. Only the exact
+ * width of the type counts (DATE 6, DATETIME 14, TIMESTAMP 12): any other width is
+ * malformed and falls through to the exact-length check, which drops the session.
+ */
+function rejectZeroDate(reader: PacketReader, size: number, width: number): void {
+  if (size === width && reader.peekZeroDate()) {
+    throw new UnsupportedValueError(
+      "Zero date 0000-00-00 cannot be represented as a JavaScript Date",
+    );
+  }
 }
 
 function isBitType(colType: CUBRIDDataType): boolean {
