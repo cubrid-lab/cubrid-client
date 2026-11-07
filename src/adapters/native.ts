@@ -78,6 +78,9 @@ const DEFAULT_FETCH_SIZE = 100;
 
 const QUERY_FAILED = "Failed to execute CUBRID query.";
 
+/** A stream's maximum idle-consumer wait, unless configured otherwise. */
+const DEFAULT_CONSUMER_TIMEOUT_MS = 5000;
+
 /** Internal control-flow signal: an orderly iterator close is not a query error. */
 const STREAM_STOPPED = Symbol("stream stopped");
 
@@ -748,6 +751,13 @@ export class NativeCubridAdapter implements DriverAdapter {
       if (this.autoCommit && !replyDamaged && (lobsRead || fetched < result.totalTupleCount)) {
         await this.endReadTransaction(cas, generation);
       }
+    }
+  }
+
+  /** An INSERT executed by a query path can invalidate the insert-ID baseline. */
+  private forgetInsertIdAfterQuery(result: PrepareAndExecuteResult): void {
+    if (result.resultInfos.some((info) => info.statementType !== StatementType.SELECT)) {
+      this.forgetInsertId();
     }
   }
 
