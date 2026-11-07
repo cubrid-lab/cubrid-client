@@ -221,6 +221,17 @@ for (const readTimeout of [-1, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31]) {
   });
 }
 
+test("normalizeConfig keeps a valid maxConnectionRetryCount", () => {
+  assert.equal(normalizeConfig({ ...baseOptions(), maxConnectionRetryCount: 3 }).maxConnectionRetryCount, 3);
+  assert.equal(normalizeConfig({ ...baseOptions(), maxConnectionRetryCount: 0 }).maxConnectionRetryCount, 0);
+});
+
+for (const maxConnectionRetryCount of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+  test(`createClient rejects maxConnectionRetryCount ${maxConnectionRetryCount}`, () => {
+    assert.throws(() => createClient({ ...baseOptions(), maxConnectionRetryCount }), RangeError);
+  });
+}
+
 test("ReadTimeoutError is a ConnectionError and survives every mapError kind", () => {
   const timeout = new ReadTimeoutError(250);
 

@@ -16,6 +16,17 @@ import { CAPTURED_FRAMES } from "./fixtures/collection-frames.js";
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** A port nothing listens on: bind an ephemeral port, then release it. */
+function closedPort(): Promise<number> {
+  return new Promise((resolve) => {
+    const server = createServer();
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address() as { port: number };
+      server.close(() => resolve(port));
+    });
+  });
+}
+
 const DEFAULT_CONFIG: ClientConfig = {
   host: "127.0.0.1",
   port: 33000,
@@ -493,6 +504,51 @@ test("NativeCubridAdapter connect creates CAS lazily if not set", async () => {
     },
   );
 });
+
+test("NativeCubridAdapter connect passes maxConnectionRetryCount to the CAS and keeps the cause", async () => {
+  // The redirect target is closed, so each attempt reaches the broker once and fails.
+  const redirect = await closedPort();
+  let connections = 0;
+  const broker = createServer((socket) => {
+    connections += 1;
+    socket.on("error", () => undefined);
+    socket.once("data", () => {
+      const reply = Buffer.alloc(4);
+      reply.writeInt32BE(redirect, 0);
+      socket.write(reply);
+    });
+  });
+  await new Promise<void>((resolve) => broker.listen(0, "127.0.0.1", resolve));
+  const { port } = broker.address() as { port: number };
+  const adapter = new NativeCubridAdapter({
+    ...DEFAULT_CONFIG,
+    port,
+    maxConnectionRetryCount: 2,
+  });
+
+  try {
+    await assert.rejects(
+      () => adapter.connect(),
+      (err: Error) => {
+        assert.ok(err instanceof ConnectionError);
+        assert.match((err.cause as Error).message, /Failed to connect/);
+        return true;
+      },
+    );
+    assert.equal(connections, 3);
+  } finally {
+    await new Promise((resolve) => broker.close(resolve));
+  }
+});
+
+for (const maxConnectionRetryCount of [Number.NaN, Number.POSITIVE_INFINITY, -1, 1.5]) {
+  test(`NativeCubridAdapter rejects maxConnectionRetryCount ${maxConnectionRetryCount}`, () => {
+    assert.throws(
+      () => new NativeCubridAdapter({ ...DEFAULT_CONFIG, maxConnectionRetryCount }),
+      RangeError,
+    );
+  });
+}
 
 test("NativeCubridAdapter connect wraps error as ConnectionError", async () => {
   const { adapter } = createAdapterWithFakeCAS(DEFAULT_CONFIG, {

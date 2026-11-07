@@ -44,7 +44,7 @@ await db.close();
 | `password` | `string` | No | `""` | Database password (empty string for no password) |
 | `connectionTimeout` | `number` | No | — | Connection timeout in milliseconds |
 | `readTimeout` | `number` | No | — | Milliseconds of server inactivity before a request fails. See [Read timeout](#read-timeout) |
-| `maxConnectionRetryCount` | `number` | No | — | Maximum number of retry attempts on connection failure |
+| `maxConnectionRetryCount` | `number` | No | — | Retries after a failed TCP connect (default `0`). See [Connection retries](#connection-retries) |
 | `logger` | `unknown` | No | — | Receives redacted diagnostics (connection created, operation timing and failures). See [Logging](#logging) |
 | `connectionFactory` | `ConnectionFactory` | No | — | Custom factory for creating connections (advanced) |
 
@@ -91,6 +91,29 @@ with a custom `connectionFactory`. No protocol-level events are emitted. The
 option is declared `unknown`, so existing 1.x code keeps compiling; the
 `ClientLogger`, `ClientLogFields` and `ClientLogLevel` types describe the
 contract.
+
+## Connection retries
+
+`maxConnectionRetryCount` is the number of retries after a failed first attempt to open the TCP connection to the broker or CAS: connection refused, host unreachable, or `connectionTimeout` expired. It defaults to `0` (no retry) and must be a non-negative integer, or `createClient()` throws a `RangeError`. Delays between attempts double from 100 ms up to 2 s, so the cumulative backoff is at most `maxConnectionRetryCount` times 2 s. That is not a bound on the total time to connect: `connectionTimeout` stops applying once the TCP connection is open, so a broker that accepts the connection and then never answers the handshake, the OpenDatabase reply or the TLS handshake waits indefinitely unless `readTimeout` is set. Set `readTimeout` to bound that.
+
+```ts
+const client = createClient({
+  host: "localhost",
+  database: "demodb",
+  user: "dba",
+  connectionTimeout: 2000,
+  maxConnectionRetryCount: 3,
+});
+```
+
+Only that step is retried. A retry never runs SQL again and never replays a request whose outcome is unknown:
+
+- Rejected credentials or a database error in the handshake fail at once.
+- A failure after the socket opened (a broker closing the connection, a TLS failure, a malformed reply, `readTimeout`) fails at once.
+- A request or transaction that fails after it was sent is not retried.
+- There is no fallback to another host.
+
+When every attempt fails, the last failure is kept as the innermost `cause`. The outer error depends on the operation that triggered the connection: `client.query()` rejects with a `QueryError`, `client.transaction()` and the transaction methods with a `TransactionError`, and `client.ping()` with a `ConnectionError`. Read `error.cause` (and its `cause`) for the `Failed to connect to host:port` error.
 
 ## Read timeout
 

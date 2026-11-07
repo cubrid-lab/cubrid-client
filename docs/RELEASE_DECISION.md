@@ -43,9 +43,9 @@ SHA and its corresponding run URL into the sign-off section below.
   metadata is not exposed by the present Promise result
   ([#85](https://github.com/cubrid-lab/cubrid-client/issues/85),
   [#84](https://github.com/cubrid-lab/cubrid-client/issues/84)).
-- The accepted `maxConnectionRetryCount` option does not yet implement its
-  advertised configurable behavior
-  ([#83](https://github.com/cubrid-lab/cubrid-client/issues/83)). The `logger`
+- `maxConnectionRetryCount` retries only a failed TCP connect; it does not
+  retry rejected credentials, requests or transactions, and there is no host
+  fallback ([#83](https://github.com/cubrid-lab/cubrid-client/issues/83)). The `logger`
   option now emits redacted diagnostics
   ([#100](https://github.com/cubrid-lab/cubrid-client/issues/100)).
 - CUBRID DATE/DATETIME have no embedded timezone; current decoding is
