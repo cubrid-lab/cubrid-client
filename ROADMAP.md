@@ -55,7 +55,9 @@ criteria are verified and which are still pending real broker tests.
 
 ## Compatibility and release policy
 
-The current npm runtime contract is `node >=18` and the public API is already
+The current npm runtime contract is `node >=18` (CI tests Node 18, 20, 22, 24
+and 26; Node 18 and 20 are deprecated and a removal candidate for 2.0, see
+[Node.js support schedule](docs/API_STABILITY.md#nodejs-support-schedule)) and the public API is already
 1.x. [API stability](docs/API_STABILITY.md) requires a MAJOR for incompatible
 changes, including increasing the Node.js minimum. A build-tool upgrade
 (e.g. `tsup`) does not by itself justify changing the consumer Node.js floor.

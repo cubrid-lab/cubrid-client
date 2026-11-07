@@ -51,7 +51,9 @@ npm install cubrid-client
 
 No peer dependencies required.
 
-**Declared runtime requirement:** Node.js 18+. The
+**Declared runtime requirement:** Node.js 18+ (CI tests Node 18, 20, 22, 24 and 26;
+Node 18 and 20 are end-of-life upstream and deprecated, see the
+[support schedule](docs/API_STABILITY.md#nodejs-support-schedule)). The
 [real-broker CI matrix](https://github.com/cubrid-lab/cubrid-client/actions/runs/42216017228)
 passed 23 integration tests (0 skipped) on CUBRID 10.2, 11.0, 11.2 and
 11.4. A separate real SSL=ON CUBRID 11.4 run also passed 3/3 certificate

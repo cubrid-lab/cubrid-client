@@ -47,13 +47,24 @@ the SemVer impact explicitly instead of assuming every fix is harmless.
 ## Node.js, TypeScript and distribution
 
 - **Current runtime declaration:** `engines.node >=18` in
-  `package.json`, with Node 18/20/22 CI. A successful CI build is not a
+  `package.json`, with Node 18/20/22/24/26 CI. A successful CI build is not a
   substitute for a packaged ESM/CJS consumer smoke test.
 - **Changing the Node.js runtime floor:** raising it above 18 excludes
   previously supported installations and therefore requires a **major
   release** under this 1.x contract, with prior notice and migration steps.
   Node.js reaching end-of-life is a reason to plan a change, not permission
   to change the existing npm contract silently.
+- **Node.js support schedule:** Node.js 18 (end-of-life April 2025) and 20
+  (end-of-life April 2026) are deprecated but remain supported for all 1.x
+  releases; no 1.x release raises `engines.node`. The next 1.x release
+  notes announce this deprecation. The removal of Node 18 and 20 support is a candidate for a future
+  2.0 major release, with its own notice and migration steps; no 2.0 date is
+  set and the maintainers have not yet decided it. CI tests every currently
+  supported Node.js line (22, 24 and 26 LTS) and the retained Node 18 and 20
+  lines. `@types/node` stays at the lowest supported major (18) so type
+  declarations do not use newer Node APIs; do not merge an `@types/node`
+  major bump until the Node 18 floor is raised. See the
+  [Node.js release schedule](https://nodejs.org/en/about/previous-releases).
 - **Build tool vs consumer support:** tsup, TypeScript and other
   devDependencies may need a newer Node version to *build*; this does not
   automatically raise the minimum runtime for the published JavaScript.
