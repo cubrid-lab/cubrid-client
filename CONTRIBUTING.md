@@ -16,6 +16,8 @@ and instructions for contributing to the project.
 
 ---
 
+**Supported consumer runtime (1.x):** Node 18 and Node 20 remain supported for the entire `cubrid-client@1.x` line. Developers may use Node 22 (`.nvmrc`) for tools, but must not raise `engines.node` or ship Node >18-only output in a 1.x release. Confirm packed ESM/CJS under Node 18; future runtime-floor changes require a 2.0 MAJOR review. See [ADR 0006](docs/adr/0006-node-18-support-through-1x.md).
+
 ## Development Setup
 
 ### Prerequisites
