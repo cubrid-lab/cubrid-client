@@ -50,7 +50,6 @@ release safeguards. Do not create tool-dependent Oracle/Copilot routes.
 ## Project Context — Performance Loop System
 
 > This repo is a **supporting track** (nice-to-have) for the Performance Loop.
-> Board: [CUBRID Ecosystem Roadmap](https://github.com/orgs/cubrid-lab/projects/2)
 
 ### Role
 
