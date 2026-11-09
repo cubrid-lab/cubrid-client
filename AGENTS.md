@@ -1,8 +1,8 @@
 # AGENTS.md
 
-## Shared issue and pull request policy
+## Issue and pull request guidance (cubrid-client)
 
-See [cubrid-lab issue, PR, and commit standard](https://github.com/cubrid-lab/.github/blob/main/docs/ISSUE_PR_COMMIT_STANDARD.md). Issues use a simple type-only title (`feat: ...`, `bug: ...`, `docs: ...`) without required module names. Describe the problem or goal, relevant evidence, and a verifiable outcome; keep implementation details provisional. Triage owns validity, duplicates, scope, priority and size. Pull requests and commits use the existing Conventional Commits/CI requirements and document actual changes and checks. Do not include internal agent instructions or personal comments in public issue prose.
+Follow [CONTRIBUTING.md](CONTRIBUTING.md) and the local issue forms. Issues use a simple type-only title (`feat: ...`, `bug: ...`, `docs: ...`) without required module names. Describe the problem or goal, relevant evidence, and a verifiable outcome; keep implementation details provisional. Triage owns validity, duplicates, scope, priority and size. Pull requests and commits use the existing Conventional Commits/CI requirements and document actual changes and checks. Do not include internal agent instructions or personal comments in public issue prose.
 
 
 ## Purpose
@@ -121,15 +121,13 @@ documentation, presentations, and other maintainer-facing writing.
   separate lookup table. Edit an existing editable comment to correct unclear
   wording rather than adding redundant follow-up comments.
 
-This is a shared writing convention, not a new CI check, reviewer approval,
-or merge gate. Keep existing repository-specific technical and safety rules.
+These are local writing expectations, not a new CI check, reviewer approval,
+or merge gate. This repository's TypeScript API, CAS protocol, test and release requirements remain authoritative.
 
 ### Self-explanatory code comments, tests and review text
 
 Source comments, test names and test comments, examples, PR descriptions
-and review replies follow the organization rule in
-[Explanations in code, tests, reviews and agent-written text](https://github.com/cubrid-lab/.github/blob/main/docs/ISSUE_PR_COMMIT_STANDARD.md#6-explanations-in-code-tests-reviews-and-agent-written-text)
-(section 6 of the shared standard; it is linked here, not copied). In short:
+and review replies follow the local explanation rule below:
 say what happens, why it matters and which constraint applies, then add an
 issue number or scenario code only for traceability. The TLS upgrade comment
 on `upgradeToTls` in `src/protocol/connection.ts` is a good local model: it
