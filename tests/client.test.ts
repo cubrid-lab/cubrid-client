@@ -1,8 +1,7 @@
-import test from "node:test";
 import assert from "node:assert/strict";
-
-import { createClient } from "../src/client/create-client.js";
+import test from "node:test";
 import { CubridClient } from "../src/client/client.js";
+import { createClient } from "../src/client/create-client.js";
 import { CubridTransaction } from "../src/client/transaction.js";
 import { ConnectionError } from "../src/errors/connection-error.js";
 import { CasReplyError, ConnectionLostError } from "../src/errors/internal-errors.js";
@@ -16,15 +15,15 @@ import {
 import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { TransactionError } from "../src/errors/transaction-error.js";
 import { mapError } from "../src/internals/map-error.js";
-import { MalformedReplyError, UnsupportedValueError } from "../src/protocol/protocol.js";
 import { normalizeConfig } from "../src/internals/normalize-config.js";
+import { MalformedReplyError, UnsupportedValueError } from "../src/protocol/protocol.js";
 import type {
   ClientOptions,
   ConnectionLike,
   ExecuteResult,
-  TransactionOptions,
   PreparedTransactionClient,
   TransactionClient,
+  TransactionOptions,
 } from "../src/types/client.js";
 import type { QueryParams } from "../src/types/query.js";
 import type { QueryResult, QueryResultRow } from "../src/types/result.js";
@@ -157,8 +156,14 @@ for (const readTimeout of [-1, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31]) {
 }
 
 test("normalizeConfig keeps a valid maxConnectionRetryCount", () => {
-  assert.equal(normalizeConfig({ ...baseOptions(), maxConnectionRetryCount: 3 }).maxConnectionRetryCount, 3);
-  assert.equal(normalizeConfig({ ...baseOptions(), maxConnectionRetryCount: 0 }).maxConnectionRetryCount, 0);
+  assert.equal(
+    normalizeConfig({ ...baseOptions(), maxConnectionRetryCount: 3 }).maxConnectionRetryCount,
+    3,
+  );
+  assert.equal(
+    normalizeConfig({ ...baseOptions(), maxConnectionRetryCount: 0 }).maxConnectionRetryCount,
+    0,
+  );
 });
 
 for (const maxConnectionRetryCount of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
@@ -198,9 +203,7 @@ test("client query returns typed rows from the shared connection", async () => {
     }),
   );
 
-  const rows = await client.query<{ id: number; name: string }>(
-    "SELECT id, name FROM users",
-  );
+  const rows = await client.query<{ id: number; name: string }>("SELECT id, name FROM users");
 
   assert.deepEqual(rows, [{ id: 1, name: "Alice" }]);
   assert.equal(connection.queries.length, 1);
@@ -237,10 +240,7 @@ test("client retries connection after initial factory failure", async () => {
     }),
   );
 
-  await assert.rejects(
-    client.query("SELECT 1"),
-    (error: unknown) => error instanceof QueryError,
-  );
+  await assert.rejects(client.query("SELECT 1"), (error: unknown) => error instanceof QueryError);
 
   connection.nextRows = [{ id: 1 }];
   const rows = await client.query("SELECT 1");
@@ -285,9 +285,13 @@ test("scoped transaction keeps an unrelated concurrent query off its physical se
   // transaction. The scoped callback must receive a different connection.
   await client.query("SELECT shared before");
   let signalEntered!: () => void;
-  const entered = new Promise<void>((resolve) => { signalEntered = resolve; });
+  const entered = new Promise<void>((resolve) => {
+    signalEntered = resolve;
+  });
   let releaseTransaction!: () => void;
-  const hold = new Promise<void>((resolve) => { releaseTransaction = resolve; });
+  const hold = new Promise<void>((resolve) => {
+    releaseTransaction = resolve;
+  });
 
   const work = client.transaction(async (tx) => {
     await tx.query("INSERT INTO ledger VALUES (1)");
@@ -305,7 +309,10 @@ test("scoped transaction keeps an unrelated concurrent query off its physical se
       shared.queries.map(({ sql }) => sql),
       ["SELECT shared before", "SELECT unrelated while transaction is open"],
     );
-    assert.deepEqual(scoped.queries.map(({ sql }) => sql), ["INSERT INTO ledger VALUES (1)"]);
+    assert.deepEqual(
+      scoped.queries.map(({ sql }) => sql),
+      ["INSERT INTO ledger VALUES (1)"],
+    );
     assert.equal(shared.beginCalls, 0);
     assert.equal(shared.commitCalls, 0);
     assert.equal(scoped.beginCalls, 1);
@@ -456,7 +463,13 @@ test("transaction hands the callback a CubridTransaction and commits before clos
     await tx.query("INSERT");
   });
 
-  assert.deepEqual(connection.calls, ["begin", "query:INSERT", "queried:INSERT", "commit", "close"]);
+  assert.deepEqual(connection.calls, [
+    "begin",
+    "query:INSERT",
+    "queried:INSERT",
+    "commit",
+    "close",
+  ]);
 });
 
 test("transaction connection factory failure propagates before anything can be closed", async () => {
@@ -467,7 +480,10 @@ test("transaction connection factory failure propagates before anything can be c
     }),
   );
 
-  await assert.rejects(client.transaction(async () => "unused"), (error: unknown) => error === failure);
+  await assert.rejects(
+    client.transaction(async () => "unused"),
+    (error: unknown) => error === failure,
+  );
 });
 
 test("transaction begin failure skips the callback and any completion", async () => {
@@ -1231,11 +1247,14 @@ test("query that failed and settled before the callback returned cannot stop the
 
 for (const [label, value] of [
   ["a null-prototype object", Object.create(null)],
-  ["an object whose toString throws", {
-    toString() {
-      throw new Error("no string form");
+  [
+    "an object whose toString throws",
+    {
+      toString() {
+        throw new Error("no string form");
+      },
     },
-  }],
+  ],
 ] as const) {
   test(`transaction closes its connection when the callback throws ${label}`, async () => {
     const connection = new RecordingConnection();
@@ -1588,8 +1607,7 @@ test("client ping wraps error as ConnectionError", async () => {
   await assert.rejects(
     client.ping(),
     (error: unknown) =>
-      error instanceof ConnectionError &&
-      error.message === "Health check failed.",
+      error instanceof ConnectionError && error.message === "Health check failed.",
   );
 });
 
@@ -1616,8 +1634,7 @@ test("client getServerVersion wraps a failure as ConnectionError", async () => {
   await assert.rejects(
     client.getServerVersion(),
     (error: unknown) =>
-      error instanceof ConnectionError &&
-      error.message === "Failed to get the server version.",
+      error instanceof ConnectionError && error.message === "Failed to get the server version.",
   );
 });
 
@@ -1627,8 +1644,7 @@ test("client getServerVersion rejects when the connection cannot report a versio
   await assert.rejects(
     client.getServerVersion(),
     (error: unknown) =>
-      error instanceof ConnectionError &&
-      error.message === "Failed to get the server version.",
+      error instanceof ConnectionError && error.message === "Failed to get the server version.",
   );
 });
 
@@ -1656,7 +1672,9 @@ test("client queryResult fails with a QueryError when the connection lacks it", 
 
 test("transaction queryResult delegates and reports a missing capability as TransactionError", async () => {
   const withResult = Object.assign(new FakeConnection(), {
-    queryResult: (async () => ({ rows: [], columns: [] })) as NonNullable<ConnectionLike["queryResult"]>,
+    queryResult: (async () => ({ rows: [], columns: [] })) as NonNullable<
+      ConnectionLike["queryResult"]
+    >,
   });
   const ok = createClient(baseOptions({ connectionFactory: () => withResult }));
   assert.deepEqual(await ok.transaction((tx) => tx.queryResult("SELECT 1")), {
@@ -1682,8 +1700,7 @@ test("client ping throws when connection has no ping method", async () => {
   await assert.rejects(
     client.ping(),
     (error: unknown) =>
-      error instanceof ConnectionError &&
-      error.message === "Health check failed.",
+      error instanceof ConnectionError && error.message === "Health check failed.",
   );
 });
 
@@ -1881,10 +1898,7 @@ test("application code can construct errors with details", () => {
   assert.equal(error.sqlState, "23000");
   assert.equal(new TransactionError("x", { sqlState: "40001" }).sqlState, "40001");
   assert.equal(new ConnectionError("x", { sqlState: "08006" }).sqlState, "08006");
-  assert.equal(
-    (mapError("query", error, "Query failed.") as QueryError).sqlState,
-    "23000",
-  );
+  assert.equal((mapError("query", error, "Query failed.") as QueryError).sqlState, "23000");
 });
 
 test("a connection factory error reaches callers of client.query with its details", async () => {
@@ -2016,7 +2030,9 @@ test("execute reports a connection that lacks it, and query keeps working", asyn
 
   await assert.rejects(
     () => client.execute("DELETE FROM users"),
-    (error: Error) => error instanceof QueryError && error.cause instanceof Error &&
+    (error: Error) =>
+      error instanceof QueryError &&
+      error.cause instanceof Error &&
       /does not support execute/.test(error.cause.message),
   );
   assert.deepEqual(await client.query("SELECT 1"), []);
@@ -2176,7 +2192,10 @@ for (const [name, run] of TRANSACTION_STATEMENTS) {
     await transactionClient(kept).transaction(async (tx) => {
       keptTx = tx;
     });
-    await assert.rejects(run(keptTx as StatementTransaction, "LATE"), rejectsWith(ALREADY_COMMITTED));
+    await assert.rejects(
+      run(keptTx as StatementTransaction, "LATE"),
+      rejectsWith(ALREADY_COMMITTED),
+    );
     assert.deepEqual(kept.calls, ["begin", "commit", "close"]);
   });
 
@@ -2388,7 +2407,10 @@ test("transaction called in the same tick as close opens no connection", async (
   );
 
   const closed = client.close();
-  await assert.rejects(client.transaction(async () => undefined), TransactionError);
+  await assert.rejects(
+    client.transaction(async () => undefined),
+    TransactionError,
+  );
   await closed;
 
   assert.equal(opened, 0);
@@ -2425,7 +2447,9 @@ test("the prepared methods never fall back to SQL literals on a connection witho
   ] as const) {
     await assert.rejects(
       run,
-      (error: Error) => error instanceof QueryError && error.cause instanceof Error &&
+      (error: Error) =>
+        error instanceof QueryError &&
+        error.cause instanceof Error &&
         error.cause.message === `Underlying connection does not support ${name}.`,
     );
   }
@@ -2513,10 +2537,7 @@ for (const isolationLevel of ["READ COMMITTED", "read uncommitted", "snapshot", 
     const options = { ...baseOptions(), isolationLevel } as unknown as ClientOptions;
 
     assert.throws(() => createClient(options), RangeError);
-    assert.throws(
-      () => new CubridClient(options as never, () => new FakeConnection()),
-      RangeError,
-    );
+    assert.throws(() => new CubridClient(options as never, () => new FakeConnection()), RangeError);
   });
 }
 
@@ -2554,7 +2575,10 @@ test("transaction() rejects invalid options before opening a connection", async 
     }),
     RangeError,
   );
-  await assert.rejects(client.transaction(async () => undefined, { lockTimeout: -2 }), RangeError);
+  await assert.rejects(
+    client.transaction(async () => undefined, { lockTimeout: -2 }),
+    RangeError,
+  );
 
   assert.equal(opened, 0);
 });
@@ -2774,23 +2798,29 @@ test("stream wraps a failed read and a failed release in QueryError", async () =
   connection.failure = new Error("read failed");
   const client = createClient(baseOptions({ connectionFactory: () => connection }));
 
-  await assert.rejects(async () => {
-    for await (const row of client.stream("SELECT 1")) {
-      assert.ok(row);
-    }
-  }, (error: Error) => error instanceof QueryError && error.cause === connection.failure);
+  await assert.rejects(
+    async () => {
+      for await (const row of client.stream("SELECT 1")) {
+        assert.ok(row);
+      }
+    },
+    (error: Error) => error instanceof QueryError && error.cause === connection.failure,
+  );
   assert.equal(connection.returned, false);
 
   const releasing = new StreamingConnection();
   releasing.failureOnReturn = new Error("release failed");
   const other = createClient(baseOptions({ connectionFactory: () => releasing }));
 
-  await assert.rejects(async () => {
-    for await (const row of other.stream("SELECT 1")) {
-      assert.ok(row);
-      break;
-    }
-  }, (error: Error) => error instanceof QueryError && error.cause === releasing.failureOnReturn);
+  await assert.rejects(
+    async () => {
+      for await (const row of other.stream("SELECT 1")) {
+        assert.ok(row);
+        break;
+      }
+    },
+    (error: Error) => error instanceof QueryError && error.cause === releasing.failureOnReturn,
+  );
 });
 
 test("stream reports an abort with the signal's own reason", async () => {
@@ -2801,11 +2831,14 @@ test("stream reports an abort with the signal's own reason", async () => {
   controller.abort(reason);
   const client = createClient(baseOptions({ connectionFactory: () => connection }));
 
-  await assert.rejects(async () => {
-    for await (const row of client.stream("SELECT 1", undefined, { signal: controller.signal })) {
-      assert.ok(row);
-    }
-  }, (error) => error === reason);
+  await assert.rejects(
+    async () => {
+      for await (const row of client.stream("SELECT 1", undefined, { signal: controller.signal })) {
+        assert.ok(row);
+      }
+    },
+    (error) => error === reason,
+  );
 });
 
 test("stream closes the connection's iterator on break and on a loop body failure", async () => {
@@ -2820,12 +2853,15 @@ test("stream closes the connection's iterator on break and on a loop body failur
 
   connection.returned = false;
   const failure = new Error("the loop failed");
-  await assert.rejects(async () => {
-    for await (const row of client.stream("SELECT 1")) {
-      assert.ok(row);
-      throw failure;
-    }
-  }, (error) => error === failure);
+  await assert.rejects(
+    async () => {
+      for await (const row of client.stream("SELECT 1")) {
+        assert.ok(row);
+        throw failure;
+      }
+    },
+    (error) => error === failure,
+  );
   assert.equal(connection.returned, true);
 });
 

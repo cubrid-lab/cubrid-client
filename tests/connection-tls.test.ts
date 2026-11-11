@@ -1,18 +1,18 @@
-import test from "node:test";
 import assert from "node:assert/strict";
-import { createServer, type Server, type Socket as NetSocket } from "node:net";
+import { createServer, type Socket as NetSocket, type Server } from "node:net";
+import test from "node:test";
 import { TLSSocket } from "node:tls";
 
 import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { CASConnection, type CASConnectionConfig } from "../src/protocol/connection.js";
-import { writeClientInfoExchange } from "../src/protocol/protocol.js";
 import {
   CAS_MAGIC,
   CAS_MAGIC_SSL,
+  SIZE_BROKER_INFO,
   SIZE_CAS_INFO,
   SIZE_DATA_LENGTH,
-  SIZE_BROKER_INFO,
 } from "../src/protocol/constants.js";
+import { writeClientInfoExchange } from "../src/protocol/protocol.js";
 
 // ---------------------------------------------------------------------------
 // Self-signed cert/key for CN=localhost (SAN: localhost, 127.0.0.1).
@@ -339,7 +339,9 @@ test("readTimeout retires a TLS connection that stalls mid-frame", { timeout: 50
   }
 });
 
-test("readTimeout over TLS spares a slow frame that keeps arriving", { timeout: 5000 }, async () => {
+test("readTimeout over TLS spares a slow frame that keeps arriving", {
+  timeout: 5000,
+}, async () => {
   const framed = frameResponse(Buffer.concat([Buffer.from([1, 2, 3, 4]), Buffer.alloc(2, 0xab)]));
   const { server, port } = await createMockSslBroker({
     onRequest: async (tls) => {

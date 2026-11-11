@@ -10,15 +10,13 @@
  */
 
 import { CasReplyError } from "../errors/internal-errors.js";
-import { PacketReader } from "./packet-reader.js";
-import { PacketWriter } from "./packet-writer.js";
 import { ZonedDateTime } from "../types/zoned-date-time.js";
 import {
-  CASFunctionCode,
   CAS_MAGIC,
   CAS_MAGIC_SSL,
   CAS_PROTOCOL_VERSION,
   CAS_VERSION,
+  CASFunctionCode,
   CLIENT_JDBC,
   CUBRIDDataType,
   EXECUTE_QUERY_ALL,
@@ -36,6 +34,8 @@ import {
   SIZE_SHORT,
   StatementType,
 } from "./constants.js";
+import { PacketReader } from "./packet-reader.js";
+import { PacketWriter } from "./packet-writer.js";
 
 // ---------------------------------------------------------------------------
 // Column metadata (shared between prepare and execute results)
@@ -44,9 +44,9 @@ import {
 /** Bits of the first metadata type byte that name a collection kind. */
 const COLLECTION_KIND_MASK = 0x60;
 const COLLECTION_KIND_BY_FLAG: Readonly<Record<number, CUBRIDDataType>> = {
-  0x20: CUBRIDDataType.SET,
-  0x40: CUBRIDDataType.MULTISET,
-  0x60: CUBRIDDataType.SEQUENCE,
+  32: CUBRIDDataType.SET,
+  64: CUBRIDDataType.MULTISET,
+  96: CUBRIDDataType.SEQUENCE,
 };
 /** One element-type byte and an int32 element count. */
 const COLLECTION_HEADER_SIZE = 5;
@@ -156,14 +156,8 @@ export function parseClientInfoExchange(data: Buffer): number {
 /**
  * Build OpenDatabase request (628 bytes, unframed).
  */
-export function writeOpenDatabase(
-  database: string,
-  user: string,
-  password: string,
-): Buffer {
-  const w = new PacketWriter(
-    OPEN_DB_FIELD_SIZE * 3 + OPEN_DB_FILLER_SIZE + OPEN_DB_RESERVED_SIZE,
-  );
+export function writeOpenDatabase(database: string, user: string, password: string): Buffer {
+  const w = new PacketWriter(OPEN_DB_FIELD_SIZE * 3 + OPEN_DB_FILLER_SIZE + OPEN_DB_RESERVED_SIZE);
   w.writeFixedString(database, OPEN_DB_FIELD_SIZE);
   w.writeFixedString(user, OPEN_DB_FIELD_SIZE);
   w.writeFixedString(password, OPEN_DB_FIELD_SIZE);
@@ -516,11 +510,7 @@ export interface FetchResult {
 /**
  * Parse FETCH response.
  */
-export function parseFetch(
-  data: Buffer,
-  columns: ColumnMeta[],
-  utcDates = false,
-): FetchResult {
+export function parseFetch(data: Buffer, columns: ColumnMeta[], utcDates = false): FetchResult {
   assertReplySize(data);
   const reader = new PacketReader(data, 0, utcDates);
   const responseCode = reader.parseInt();
@@ -571,10 +561,7 @@ export function writeCloseReqHandle(
 // EndTran (FC=1) — commit/rollback
 // ---------------------------------------------------------------------------
 
-export function writeEndTran(
-  txType: number,
-  casInfo: Buffer,
-): { header: Buffer; payload: Buffer } {
+export function writeEndTran(txType: number, casInfo: Buffer): { header: Buffer; payload: Buffer } {
   const w = new PacketWriter(16);
   w.writeByte(CASFunctionCode.END_TRAN);
   w.addByte(txType);
@@ -642,9 +629,7 @@ export function parseGetDbVersion(data: Buffer): string {
 // ConClose (FC=31)
 // ---------------------------------------------------------------------------
 
-export function writeConClose(
-  casInfo: Buffer,
-): { header: Buffer; payload: Buffer } {
+export function writeConClose(casInfo: Buffer): { header: Buffer; payload: Buffer } {
   const w = new PacketWriter(8);
   w.writeByte(CASFunctionCode.CON_CLOSE);
 
@@ -1274,10 +1259,14 @@ function escapeString(value: string, noBackslashEscapes: boolean): string {
 /** Text the literal path refuses, which the prepared path refuses too. */
 function assertStorableText(value: string): void {
   if (value.includes("\0")) {
-    throw new Error("string parameter contains a null byte (0x00), which CUBRID cannot store in a string literal");
+    throw new Error(
+      "string parameter contains a null byte (0x00), which CUBRID cannot store in a string literal",
+    );
   }
   if (value.includes("\x1a")) {
-    throw new Error("string parameter contains a Ctrl-Z byte (0x1A), which has no safe CUBRID string-literal escape");
+    throw new Error(
+      "string parameter contains a Ctrl-Z byte (0x1A), which has no safe CUBRID string-literal escape",
+    );
   }
 }
 
@@ -1317,10 +1306,7 @@ function parseColumnType(reader: PacketReader): {
   return kind === undefined ? { type: wireType } : { type: kind, elementType: wireType };
 }
 
-function parseColumnMetadata(
-  reader: PacketReader,
-  count: number,
-): ColumnMeta[] {
+function parseColumnMetadata(reader: PacketReader, count: number): ColumnMeta[] {
   const columns: ColumnMeta[] = [];
 
   for (let i = 0; i < count; i++) {
@@ -1462,8 +1448,7 @@ function parseRowData(
         }
         setColumn(row, column.name, value);
       } catch (error) {
-        const message =
-          `Failed to decode CUBRID column "${column.name}" (wire type ${colType}, ${size} bytes)`;
+        const message = `Failed to decode CUBRID column "${column.name}" (wire type ${colType}, ${size} bytes)`;
         if (!(error instanceof UnsupportedValueError)) {
           throw new MalformedReplyError(message, { cause: error });
         }
@@ -1482,11 +1467,7 @@ function parseRowData(
   }
 }
 
-function readValue(
-  reader: PacketReader,
-  colType: CUBRIDDataType,
-  size: number,
-): unknown {
+function readValue(reader: PacketReader, colType: CUBRIDDataType, size: number): unknown {
   switch (colType) {
     case CUBRIDDataType.CHAR:
     case CUBRIDDataType.STRING:
@@ -1664,8 +1645,17 @@ function readZonedDateTime(
   }
   const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
   const daysInMonth = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-  if (year < 1 || year > 9999 || month < 1 || month > 12 || day < 1 || day > daysInMonth[month - 1]!) {
-    throw new Error(`Malformed CAS packet: zoned value date ${year}-${month}-${day} does not exist`);
+  if (
+    year < 1 ||
+    year > 9999 ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > daysInMonth[month - 1]!
+  ) {
+    throw new Error(
+      `Malformed CAS packet: zoned value date ${year}-${month}-${day} does not exist`,
+    );
   }
 
   return new ZonedDateTime({

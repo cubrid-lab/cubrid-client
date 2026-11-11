@@ -1,9 +1,9 @@
-import { mapError, toError } from "../internals/map-error.js";
 import { TransactionError } from "../errors/transaction-error.js";
+import { mapError, toError } from "../internals/map-error.js";
 import type {
   ConnectionLike,
-  ExecuteResult,
   ExecutableTransactionClient,
+  ExecuteResult,
   PreparedTransactionClient,
   ResultTransactionClient,
 } from "../types/client.js";

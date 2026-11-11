@@ -1,5 +1,5 @@
-import test from "node:test";
 import assert from "node:assert/strict";
+import test from "node:test";
 
 import { parseConnectionString } from "../src/utils/connection-string.js";
 
@@ -42,22 +42,13 @@ test("parseConnectionString decodes encoded credentials", () => {
 });
 
 test("parseConnectionString rejects invalid protocol", () => {
-  assert.throws(
-    () => parseConnectionString("mysql://dba:secret@localhost/demodb"),
-    /cubrid:\/\//,
-  );
+  assert.throws(() => parseConnectionString("mysql://dba:secret@localhost/demodb"), /cubrid:\/\//);
 });
 
 test("parseConnectionString rejects URL without database", () => {
-  assert.throws(
-    () => parseConnectionString("cubrid://dba:secret@localhost"),
-    /database name/,
-  );
+  assert.throws(() => parseConnectionString("cubrid://dba:secret@localhost"), /database name/);
 });
 
 test("parseConnectionString rejects invalid URL text", () => {
-  assert.throws(
-    () => parseConnectionString("not-a-url"),
-    /Invalid CUBRID connection URL/,
-  );
+  assert.throws(() => parseConnectionString("not-a-url"), /Invalid CUBRID connection URL/);
 });

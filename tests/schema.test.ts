@@ -1,5 +1,5 @@
-import test from "node:test";
 import assert from "node:assert/strict";
+import test from "node:test";
 
 import { createClient } from "../src/client/create-client.js";
 import { QueryError } from "../src/errors/query-error.js";
@@ -61,19 +61,54 @@ test("getColumns binds the table name and numbers columns from 1", async () => {
   const connection = new CatalogConnection();
   connection.views.db_class = [{ class_name: "t", owner_name: "DBA" }];
   connection.views.db_attribute = [
-    { attr_name: "id", def_order: 0, data_type: "INTEGER", prec: 10, scale: 0, is_nullable: "NO", default_value: null },
-    { attr_name: "v", def_order: 1, data_type: "STRING", prec: 5, scale: 0, is_nullable: "YES", default_value: "zz" },
+    {
+      attr_name: "id",
+      def_order: 0,
+      data_type: "INTEGER",
+      prec: 10,
+      scale: 0,
+      is_nullable: "NO",
+      default_value: null,
+    },
+    {
+      attr_name: "v",
+      def_order: 1,
+      data_type: "STRING",
+      prec: 5,
+      scale: 0,
+      is_nullable: "YES",
+      default_value: "zz",
+    },
   ];
   const client = clientWith(connection);
   const hostile = "t' OR '1'='1";
 
   assert.deepEqual(await client.getColumns(hostile), [
-    { name: "id", position: 1, dataType: "INTEGER", precision: 10, scale: 0, nullable: false, defaultValue: null },
-    { name: "v", position: 2, dataType: "STRING", precision: 5, scale: 0, nullable: true, defaultValue: "zz" },
+    {
+      name: "id",
+      position: 1,
+      dataType: "INTEGER",
+      precision: 10,
+      scale: 0,
+      nullable: false,
+      defaultValue: null,
+    },
+    {
+      name: "v",
+      position: 2,
+      dataType: "STRING",
+      precision: 5,
+      scale: 0,
+      nullable: true,
+      defaultValue: "zz",
+    },
   ]);
   // The name reaches the server only as a bound parameter, never inside the SQL text.
   assert.deepEqual(connection.statements[0]?.params, [hostile]);
-  assert.equal(connection.statements.some((s) => s.sql.includes(hostile)), false);
+  assert.equal(
+    connection.statements.some((s) => s.sql.includes(hostile)),
+    false,
+  );
   assert.deepEqual(connection.statements[1]?.params, ["t"]);
   assert.doesNotMatch(connection.statements[1]?.sql ?? "", /owner_name = \?/);
 });
@@ -81,12 +116,21 @@ test("getColumns binds the table name and numbers columns from 1", async () => {
 test("an unknown or inaccessible table rejects with a QueryError", async () => {
   const client = clientWith(new CatalogConnection());
 
-  await assert.rejects(() => client.getColumns("missing"), (error: unknown) => {
-    assert.ok(error instanceof QueryError);
-    assert.match(error.message, /Table missing was not found, or the connected user may not SELECT/);
-    return true;
-  });
-  await assert.rejects(() => client.getIndexes("missing", { schema: "u" }), /Table u\.missing was not found/);
+  await assert.rejects(
+    () => client.getColumns("missing"),
+    (error: unknown) => {
+      assert.ok(error instanceof QueryError);
+      assert.match(
+        error.message,
+        /Table missing was not found, or the connected user may not SELECT/,
+      );
+      return true;
+    },
+  );
+  await assert.rejects(
+    () => client.getIndexes("missing", { schema: "u" }),
+    /Table u\.missing was not found/,
+  );
   await assert.rejects(() => client.getPrimaryKey("missing"), QueryError);
 });
 
@@ -97,11 +141,22 @@ test("several owners need a schema, and the owner then scopes the follow-up quer
     { class_name: "dup", owner_name: "UB" },
   ];
   connection.views.db_attribute = [
-    { attr_name: "x", def_order: 0, data_type: "INTEGER", prec: 10, scale: 0, is_nullable: "YES", default_value: null },
+    {
+      attr_name: "x",
+      def_order: 0,
+      data_type: "INTEGER",
+      prec: 10,
+      scale: 0,
+      is_nullable: "YES",
+      default_value: null,
+    },
   ];
   const client = clientWith(connection);
 
-  await assert.rejects(() => client.getColumns("dup"), /owned by several users \(UA, UB\); pass schema/);
+  await assert.rejects(
+    () => client.getColumns("dup"),
+    /owned by several users \(UA, UB\); pass schema/,
+  );
   assert.equal(connection.statements.length, 1);
 
   assert.equal((await client.getColumns("dup", { schema: "ub" })).length, 1);
@@ -114,13 +169,48 @@ test("getPrimaryKey returns the key columns in key order, or null", async () => 
   const connection = new CatalogConnection();
   connection.views.db_class = [{ class_name: "t", owner_name: "DBA" }];
   connection.views.db_index = [
-    { index_name: "i_x", is_unique: "NO", is_reverse: "NO", is_primary_key: "NO", is_foreign_key: "NO", filter_expression: null },
-    { index_name: "pk_t", is_unique: "YES", is_reverse: "NO", is_primary_key: "YES", is_foreign_key: "NO", filter_expression: null },
+    {
+      index_name: "i_x",
+      is_unique: "NO",
+      is_reverse: "NO",
+      is_primary_key: "NO",
+      is_foreign_key: "NO",
+      filter_expression: null,
+    },
+    {
+      index_name: "pk_t",
+      is_unique: "YES",
+      is_reverse: "NO",
+      is_primary_key: "YES",
+      is_foreign_key: "NO",
+      filter_expression: null,
+    },
   ];
   connection.views.db_index_key = [
-    { index_name: "i_x", key_attr_name: "x", key_order: 0, asc_desc: "ASC", key_prefix_length: -1, func: null },
-    { index_name: "pk_t", key_attr_name: "b", key_order: 0, asc_desc: "ASC", key_prefix_length: -1, func: null },
-    { index_name: "pk_t", key_attr_name: "a", key_order: 1, asc_desc: "ASC", key_prefix_length: -1, func: null },
+    {
+      index_name: "i_x",
+      key_attr_name: "x",
+      key_order: 0,
+      asc_desc: "ASC",
+      key_prefix_length: -1,
+      func: null,
+    },
+    {
+      index_name: "pk_t",
+      key_attr_name: "b",
+      key_order: 0,
+      asc_desc: "ASC",
+      key_prefix_length: -1,
+      func: null,
+    },
+    {
+      index_name: "pk_t",
+      key_attr_name: "a",
+      key_order: 1,
+      asc_desc: "ASC",
+      key_prefix_length: -1,
+      func: null,
+    },
   ];
   const client = clientWith(connection);
 
@@ -134,11 +224,32 @@ test("getIndexes maps flags, descending keys, prefixes, expressions and filters"
   const connection = new CatalogConnection();
   connection.views.db_class = [{ class_name: "t", owner_name: "DBA" }];
   connection.views.db_index = [
-    { index_name: "i_all", is_unique: "YES", is_reverse: "YES", is_primary_key: "NO", is_foreign_key: "YES", filter_expression: " [t].d is not null " },
+    {
+      index_name: "i_all",
+      is_unique: "YES",
+      is_reverse: "YES",
+      is_primary_key: "NO",
+      is_foreign_key: "YES",
+      filter_expression: " [t].d is not null ",
+    },
   ];
   connection.views.db_index_key = [
-    { index_name: "i_all", key_attr_name: "c", key_order: 0, asc_desc: "DESC", key_prefix_length: 5, func: null },
-    { index_name: "i_all", key_attr_name: null, key_order: 1, asc_desc: "ASC", key_prefix_length: -1, func: " lower([t].[c])" },
+    {
+      index_name: "i_all",
+      key_attr_name: "c",
+      key_order: 0,
+      asc_desc: "DESC",
+      key_prefix_length: 5,
+      func: null,
+    },
+    {
+      index_name: "i_all",
+      key_attr_name: null,
+      key_order: 1,
+      asc_desc: "ASC",
+      key_prefix_length: -1,
+      func: " lower([t].[c])",
+    },
   ];
 
   assert.deepEqual(await clientWith(connection).getIndexes("t"), [
@@ -191,12 +302,19 @@ for (const method of ["getColumns", "getIndexes", "getPrimaryKey"] as const) {
     connection.views.db_class = [{ class_name: "t", owner_name: "DBA" }];
     let firstQueryStarted!: () => void;
     let releaseFirstQuery!: () => void;
-    const started = new Promise<void>((resolve) => { firstQueryStarted = resolve; });
-    const gate = new Promise<void>((resolve) => { releaseFirstQuery = resolve; });
+    const started = new Promise<void>((resolve) => {
+      firstQueryStarted = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      releaseFirstQuery = resolve;
+    });
     const query = connection.query.bind(connection);
     const requests: string[] = [];
     let closedCount = 0;
-    connection.query = async <T extends Row = Row>(sql: string, params?: QueryParams): Promise<T[]> => {
+    connection.query = async <T extends Row = Row>(
+      sql: string,
+      params?: QueryParams,
+    ): Promise<T[]> => {
       requests.push(sql);
       const rows = await query<T>(sql, params);
       if (sql.includes("FROM db_class")) {
@@ -205,12 +323,16 @@ for (const method of ["getColumns", "getIndexes", "getPrimaryKey"] as const) {
       }
       return rows;
     };
-    connection.close = async () => { closedCount += 1; };
+    connection.close = async () => {
+      closedCount += 1;
+    };
     const client = clientWith(connection);
     const ongoing = client[method]("t");
     await started;
     let closeCompleted = false;
-    const closing = client.close().then(() => { closeCompleted = true; });
+    const closing = client.close().then(() => {
+      closeCompleted = true;
+    });
     await Promise.resolve();
     assert.equal(closedCount, 0);
     assert.equal(closeCompleted, false);

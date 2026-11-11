@@ -6,42 +6,28 @@
  */
 
 import { TextDecoder } from "node:util";
-
+import {
+  type CasReplyError,
+  ConnectionLostError,
+  isServerTransactionAbort,
+  StreamBusyError,
+} from "../errors/internal-errors.js";
+import { TransactionError } from "../errors/transaction-error.js";
+import { type ErrorKind, mapError } from "../internals/map-error.js";
+import {
+  assertValidFetchSize,
+  assertValidMaxLobBytes,
+  assertValidRetryCount,
+  assertValidStreamOptions,
+  assertValidTimezone,
+  assertValidTransactionOptions,
+  pickTransactionOptions,
+} from "../internals/normalize-config.js";
 import {
   CASConnection,
   type CASConnectionConfig,
   type SessionParameter,
 } from "../protocol/connection.js";
-import {
-  writePrepareAndExecute,
-  parsePrepareAndExecute,
-  writePrepare,
-  parsePrepare,
-  writeExecute,
-  parseExecute,
-  encodePreparedParams,
-  assertPreparableSql,
-  readQueryHandle,
-  MalformedReplyError,
-  writeFetch,
-  parseFetch,
-  writeCloseReqHandle,
-  parseSimpleResponse,
-  writeEndTran,
-  writeConClose,
-  writeLobRead,
-  parseLobRead,
-  LobLocator,
-  mayHoldLob,
-  setColumn,
-  UnsupportedValueError,
-  interpolateParams,
-  type ColumnMeta,
-  writeGetLastInsertId,
-  parseGetLastInsertId,
-  type PrepareAndExecuteResult,
-  type PreparedBinds,
-} from "../protocol/protocol.js";
 import {
   CUBRIDDataType,
   DbParameter,
@@ -53,27 +39,45 @@ import {
   TYPE_NAMES,
 } from "../protocol/constants.js";
 import {
-  ConnectionLostError,
-  isServerTransactionAbort,
-  StreamBusyError,
-  type CasReplyError,
-} from "../errors/internal-errors.js";
-import { mapError, type ErrorKind } from "../internals/map-error.js";
-import { TransactionError } from "../errors/transaction-error.js";
-import {
-  assertValidFetchSize,
-  assertValidMaxLobBytes,
-  assertValidRetryCount,
-  assertValidStreamOptions,
-  assertValidTimezone,
-  assertValidTransactionOptions,
-  pickTransactionOptions,
-} from "../internals/normalize-config.js";
-import { StreamCursor } from "./stream-cursor.js";
-import type { DriverAdapter } from "./base.js";
-import type { ClientConfig, ExecuteResult, StreamOptions, TransactionOptions } from "../types/client.js";
+  assertPreparableSql,
+  type ColumnMeta,
+  encodePreparedParams,
+  interpolateParams,
+  LobLocator,
+  MalformedReplyError,
+  mayHoldLob,
+  type PrepareAndExecuteResult,
+  type PreparedBinds,
+  parseExecute,
+  parseFetch,
+  parseGetLastInsertId,
+  parseLobRead,
+  parsePrepare,
+  parsePrepareAndExecute,
+  parseSimpleResponse,
+  readQueryHandle,
+  setColumn,
+  UnsupportedValueError,
+  writeCloseReqHandle,
+  writeConClose,
+  writeEndTran,
+  writeExecute,
+  writeFetch,
+  writeGetLastInsertId,
+  writeLobRead,
+  writePrepare,
+  writePrepareAndExecute,
+} from "../protocol/protocol.js";
+import type {
+  ClientConfig,
+  ExecuteResult,
+  StreamOptions,
+  TransactionOptions,
+} from "../types/client.js";
 import type { QueryParams } from "../types/query.js";
 import type { ColumnInfo, QueryResult, QueryResultRow } from "../types/result.js";
+import type { DriverAdapter } from "./base.js";
+import { StreamCursor } from "./stream-cursor.js";
 
 const DEFAULT_FETCH_SIZE = 100;
 
@@ -92,8 +96,6 @@ function assertStreamWanted(cursor?: StreamCursor): void {
   if (cursor.isStopped) throw STREAM_STOPPED;
 }
 
-
-
 /** Fatal so a CLOB that is not UTF-8 is refused, not silently given U+FFFD. */
 const CLOB_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
@@ -108,7 +110,6 @@ interface WaitingStatement {
   since: number;
   refuse: (reason: Error) => void;
 }
-
 
 /** Whether any parameter renders differently under the two backslash modes. */
 function needsBackslashMode(params: QueryParams): boolean {
@@ -128,7 +129,10 @@ function needsBackslashMode(params: QueryParams): boolean {
   });
 }
 
-function toSessionParameters({ isolationLevel, lockTimeout }: TransactionOptions): SessionParameter[] {
+function toSessionParameters({
+  isolationLevel,
+  lockTimeout,
+}: TransactionOptions): SessionParameter[] {
   return [
     ...(isolationLevel === undefined
       ? []
@@ -241,7 +245,9 @@ export class NativeCubridAdapter implements DriverAdapter {
   ): Promise<QueryResult<T>> {
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
-    return this.inTurn("query", QUERY_FAILED, () => this.queryNow<T>(sql, params, issued, undefined));
+    return this.inTurn("query", QUERY_FAILED, () =>
+      this.queryNow<T>(sql, params, issued, undefined),
+    );
   }
 
   /**
@@ -305,7 +311,9 @@ export class NativeCubridAdapter implements DriverAdapter {
   async execute(sql: string, params?: QueryParams): Promise<ExecuteResult> {
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
-    return this.inTurn("query", "Failed to execute CUBRID statement.", () => this.executeNow(sql, params, issued, undefined));
+    return this.inTurn("query", "Failed to execute CUBRID statement.", () =>
+      this.executeNow(sql, params, issued, undefined),
+    );
   }
 
   async queryPrepared<T extends QueryResultRow = QueryResultRow>(
@@ -329,7 +337,9 @@ export class NativeCubridAdapter implements DriverAdapter {
     const binds = bindOrRefuse(sql, params, "Failed to execute CUBRID statement.");
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
-    return this.inTurn("query", "Failed to execute CUBRID statement.", () => this.executeNow(sql, params, issued, binds));
+    return this.inTurn("query", "Failed to execute CUBRID statement.", () =>
+      this.executeNow(sql, params, issued, binds),
+    );
   }
 
   private async executeNow(
@@ -416,7 +426,9 @@ export class NativeCubridAdapter implements DriverAdapter {
    */
   async setTransactionOptions(options: TransactionOptions): Promise<void> {
     assertValidTransactionOptions(options);
-    return this.inTurn("transaction", "Failed to apply transaction options.", () => this.setTransactionOptionsNow(options));
+    return this.inTurn("transaction", "Failed to apply transaction options.", () =>
+      this.setTransactionOptionsNow(options),
+    );
   }
 
   private async setTransactionOptionsNow(options: TransactionOptions): Promise<void> {
@@ -435,7 +447,9 @@ export class NativeCubridAdapter implements DriverAdapter {
   }
 
   async beginTransaction(): Promise<void> {
-    return this.inTurn("transaction", "Failed to start transaction.", () => this.beginTransactionNow());
+    return this.inTurn("transaction", "Failed to start transaction.", () =>
+      this.beginTransactionNow(),
+    );
   }
 
   private async beginTransactionNow(): Promise<void> {
@@ -648,26 +662,29 @@ export class NativeCubridAdapter implements DriverAdapter {
       soonest = Math.min(soonest, deadline(statement));
     }
 
-    this.refusalTimer = setTimeout(() => {
-      this.refusalTimer = null;
-      const now = Date.now();
+    this.refusalTimer = setTimeout(
+      () => {
+        this.refusalTimer = null;
+        const now = Date.now();
 
-      for (const statement of this.waitingStatements) {
-        if (this.heldBy === cursor && now >= deadline(statement)) {
-          this.waitingStatements.delete(statement);
-          statement.refuse(
-            new StreamBusyError(
-              `This statement waited ${cursor.consumerTimeout}ms behind a stream whose ` +
-                "consumer asked for no row. A statement awaited while iterating stream() " +
-                "on the same connection can never run: finish or close the stream first, " +
-                "or use transaction() or another client. Nothing was sent.",
-            ),
-          );
+        for (const statement of this.waitingStatements) {
+          if (this.heldBy === cursor && now >= deadline(statement)) {
+            this.waitingStatements.delete(statement);
+            statement.refuse(
+              new StreamBusyError(
+                `This statement waited ${cursor.consumerTimeout}ms behind a stream whose ` +
+                  "consumer asked for no row. A statement awaited while iterating stream() " +
+                  "on the same connection can never run: finish or close the stream first, " +
+                  "or use transaction() or another client. Nothing was sent.",
+              ),
+            );
+          }
         }
-      }
 
-      this.watchHeldTurn();
-    }, Math.max(0, soonest - Date.now()));
+        this.watchHeldTurn();
+      },
+      Math.max(0, soonest - Date.now()),
+    );
   }
 
   /** Hands rows over and, while more can follow, waits for the consumer to ask for them. */
@@ -1116,7 +1133,9 @@ export class NativeCubridAdapter implements DriverAdapter {
   /** Nothing was lost if this adapter never held a transaction on a session. */
   private notConnectedError(cas: CASConnection): Error {
     const message = "Not connected";
-    return this.isTransactionSessionLost(cas) ? new ConnectionLostError(message) : new Error(message);
+    return this.isTransactionSessionLost(cas)
+      ? new ConnectionLostError(message)
+      : new Error(message);
   }
 
   private assertTransactionSession(cas: CASConnection): void {
@@ -1256,13 +1275,15 @@ export class NativeCubridAdapter implements DriverAdapter {
     };
   }
 
-
   /**
    * Return the negotiated backslash-escaping mode for the current connection,
    * probing again whenever the session has changed since it was measured.
    */
   private async ensureBackslashMode(cas: CASConnection): Promise<boolean> {
-    if (this.noBackslashEscapes === null || this.backslashModeGeneration !== cas.connectionGeneration) {
+    if (
+      this.noBackslashEscapes === null ||
+      this.backslashModeGeneration !== cas.connectionGeneration
+    ) {
       const generation = cas.connectionGeneration;
       this.noBackslashEscapes = await this.negotiateBackslashEscapes(cas);
       this.backslashModeGeneration = generation;
@@ -1427,7 +1448,11 @@ export class NativeCubridAdapter implements DriverAdapter {
 
     for (const { name, lob } of cells) {
       assertStreamWanted(cursor);
-      setColumn(row, name, decodeLob(name, lob, await this.readLob(cas, generation, name, lob, cursor)));
+      setColumn(
+        row,
+        name,
+        decodeLob(name, lob, await this.readLob(cas, generation, name, lob, cursor)),
+      );
     }
 
     return total > 0;
@@ -1558,7 +1583,11 @@ export class NativeCubridAdapter implements DriverAdapter {
  * insert id, open a session or be probed. The binds are a snapshot, so changing
  * the array afterwards does not change what is sent.
  */
-function bindOrRefuse(sql: string, params: QueryParams | undefined, message: string): PreparedBinds {
+function bindOrRefuse(
+  sql: string,
+  params: QueryParams | undefined,
+  message: string,
+): PreparedBinds {
   try {
     assertPreparableSql(sql);
     return encodePreparedParams(params ?? []);

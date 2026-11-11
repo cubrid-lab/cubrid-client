@@ -6,10 +6,11 @@
  * node-cubrid pinned in .github/workflows/live-cubrid.yml. This test must
  * fail rather than skip if the reference package is not checked out.
  */
-import test from "node:test";
+
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { resolve } from "node:path";
+import test from "node:test";
 import { createClient } from "../src/client/create-client.js";
 
 const oldEntry = process.env.NODE_CUBRID_ENTRY;
@@ -51,12 +52,15 @@ function normal(rows: Array<Record<string, unknown>>) {
 test("original node-cubrid and native client agree on integer/text/NULL and DML effects", async () => {
   const native = createClient(base);
   const legacy = legacyDriver.createConnection({
-    ...base, maxConnectionRetryCount: 1,
+    ...base,
+    maxConnectionRetryCount: 1,
   });
   await legacy.connect();
   try {
     await native.query(`DROP TABLE IF EXISTS ${TABLE}`);
-    await native.query(`CREATE TABLE ${TABLE} (id INTEGER PRIMARY KEY, name VARCHAR(60), optional_value VARCHAR(30))`);
+    await native.query(
+      `CREATE TABLE ${TABLE} (id INTEGER PRIMARY KEY, name VARCHAR(60), optional_value VARCHAR(30))`,
+    );
     await native.query(`INSERT INTO ${TABLE} VALUES (1, 'from native', NULL)`);
 
     // Test the legacy WRITE path, but don't compare return API shapes.

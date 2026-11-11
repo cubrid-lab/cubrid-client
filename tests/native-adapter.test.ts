@@ -1,16 +1,17 @@
-import test from "node:test";
 import assert from "node:assert/strict";
-import { createServer, type Server, type Socket as NetSocket } from "node:net";
+import { createServer, type Socket as NetSocket, type Server } from "node:net";
+import test from "node:test";
 import { inspect } from "node:util";
 
 import { NativeCubridAdapter } from "../src/adapters/native.js";
 import { CubridClient } from "../src/client/client.js";
 import { createClient } from "../src/client/create-client.js";
-import { CASFunctionCode, EndTranType } from "../src/protocol/constants.js";
 import { ConnectionError } from "../src/errors/connection-error.js";
 import { DeadlockError, QueryError } from "../src/errors/query-error.js";
 import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { TransactionError } from "../src/errors/transaction-error.js";
+import { CASFunctionCode, EndTranType } from "../src/protocol/constants.js";
+import { writePrepareAndExecute } from "../src/protocol/protocol.js";
 import type {
   ClientConfig,
   ExecutableTransactionClient,
@@ -18,10 +19,9 @@ import type {
 } from "../src/types/client.js";
 import type { QueryParam } from "../src/types/query.js";
 import { CAPTURED_FRAMES } from "./fixtures/collection-frames.js";
-import { ZONED_FRAMES } from "./fixtures/zoned-frames.js";
-import { LOB_FRAMES, LOB_READ_REPLY_LIMIT } from "./fixtures/lob-frames.js";
 import { DML_FRAMES, LAST_INSERT_ID_FRAMES, PREPARED_FRAMES } from "./fixtures/dml-frames.js";
-import { writePrepareAndExecute } from "../src/protocol/protocol.js";
+import { LOB_FRAMES, LOB_READ_REPLY_LIMIT } from "./fixtures/lob-frames.js";
+import { ZONED_FRAMES } from "./fixtures/zoned-frames.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -244,10 +244,7 @@ function buildSimpleResponse(code: number): Buffer {
  *   [resultCount:int32BE]
  *   ...resultInfos (per resultCount entries)
  */
-function buildDMLResponse(
-  statementType: number,
-  totalTupleCount: number,
-): Buffer {
+function buildDMLResponse(statementType: number, totalTupleCount: number): Buffer {
   const parts: Buffer[] = [];
 
   // queryHandle (responseCode) = 1
@@ -527,7 +524,11 @@ test("NativeCubridAdapter connect delegates to CAS.connect", async () => {
 
 test("NativeCubridAdapter connect creates CAS lazily if not set", async () => {
   // Use a port that nothing listens on so connect reliably fails
-  const adapter = new NativeCubridAdapter({ ...DEFAULT_CONFIG, port: 19999, connectionTimeout: 2000 });
+  const adapter = new NativeCubridAdapter({
+    ...DEFAULT_CONFIG,
+    port: 19999,
+    connectionTimeout: 2000,
+  });
   await assert.rejects(
     () => adapter.connect(),
     (err: Error) => {
@@ -700,10 +701,7 @@ test("NativeCubridAdapter query SELECT returns rows", async () => {
 test("NativeCubridAdapter query SELECT with NULL values", async () => {
   const { adapter, fakeCAS } = createAdapterWithFakeCAS();
 
-  const selectResp = buildSelectResponse(
-    [{ name: "val", type: 2 }],
-    [[null]],
-  );
+  const selectResp = buildSelectResponse([{ name: "val", type: 2 }], [[null]]);
   fakeCAS.queueResponse(selectResp);
   fakeCAS.queueResponse(buildSimpleResponse(0)); // CloseReqHandle
 
@@ -717,9 +715,7 @@ test("NativeCubridAdapter query SELECT with NULL values", async () => {
 // ---------------------------------------------------------------------------
 
 function queueProbeResponse(fakeCAS: FakeCASConnection, charLength: string): void {
-  fakeCAS.queueResponse(
-    buildSelectResponse([{ name: "char_length", type: 2 }], [[charLength]]),
-  );
+  fakeCAS.queueResponse(buildSelectResponse([{ name: "char_length", type: 2 }], [[charLength]]));
   fakeCAS.queueResponse(buildSimpleResponse(0)); // CloseReqHandle after probe
 }
 
@@ -1082,7 +1078,7 @@ test("NativeCubridAdapter close wraps error as ConnectionError", async () => {
 test("NativeCubridAdapter forwards connectionTimeout to CAS config", async () => {
   const config: ClientConfig = {
     ...DEFAULT_CONFIG,
-    port: 19999,  // Use non-connectable port to avoid real connection
+    port: 19999, // Use non-connectable port to avoid real connection
     connectionTimeout: 5000,
   };
   const adapter = new NativeCubridAdapter(config);
@@ -1105,7 +1101,7 @@ test("NativeCubridAdapter forwards connectionTimeout to CAS config", async () =>
 test("NativeCubridAdapter omits connectionTimeout when undefined", async () => {
   const config: ClientConfig = {
     ...DEFAULT_CONFIG,
-    port: 19999,  // Use non-connectable port to avoid real connection
+    port: 19999, // Use non-connectable port to avoid real connection
     // connectionTimeout NOT set
   };
   const adapter = new NativeCubridAdapter(config);
@@ -1249,10 +1245,7 @@ test("NativeCubridAdapter rejects zero-tuple FETCH before the advertised total",
   const { adapter, fakeCAS } = createAdapterWithFakeCAS();
 
   // Build a SELECT response where totalTupleCount > inline rows
-  const selectResp = buildSelectResponse(
-    [{ name: "id", type: 2 }],
-    [["1"]],
-  );
+  const selectResp = buildSelectResponse([{ name: "id", type: 2 }], [["1"]]);
   const colMetaSize = 1 + 2 + 4 + 4 + 3 + 4 + 3 + 4 + 1 + 1 + 4 + 1 + 7;
   const ttcOffset = 4 + 4 + 1 + 4 + 1 + 4 + colMetaSize;
   selectResp.writeInt32BE(3, ttcOffset); // totalTupleCount = 3 (but fetch returns 0)
@@ -1712,7 +1705,11 @@ test("a captured zero date rejects, and the session stays open for the next quer
 
     assert.equal(fakeCAS.discardCalls, 0, frame.sql);
     assert.equal(fakeCAS.isConnected, true, frame.sql);
-    assert.deepEqual(fakeCAS.closedHandles, [Number.parseInt(frame.hex.slice(0, 8), 16)], frame.sql);
+    assert.deepEqual(
+      fakeCAS.closedHandles,
+      [Number.parseInt(frame.hex.slice(0, 8), 16)],
+      frame.sql,
+    );
   }
 });
 
@@ -1724,7 +1721,10 @@ test("a zoned value reaches the caller with its zone, and its column has the typ
 
   assert.equal(String(rows[0]?.tz), "2020-07-02 03:04:05.999 America/New_York EDT");
   assert.equal(rows[0]?.t, "after");
-  assert.deepEqual(columns.map((column) => column.type), ["DATETIMETZ", "CHAR"]);
+  assert.deepEqual(
+    columns.map((column) => column.type),
+    ["DATETIMETZ", "CHAR"],
+  );
 });
 
 test("a zoned value whose zone text has no NUL drops the session", async () => {
@@ -1979,7 +1979,6 @@ test("NativeCubridAdapter ping wraps error as ConnectionError", async () => {
   );
 });
 
-
 // ---------------------------------------------------------------------------
 // Read timeout through the public client, over a real socket (#90)
 // ---------------------------------------------------------------------------
@@ -2040,14 +2039,22 @@ async function createScriptedCas(
 }
 
 function clientFor(port: number) {
-  return createClient({ host: "127.0.0.1", port, database: "testdb", user: "dba", readTimeout: 200 });
+  return createClient({
+    host: "127.0.0.1",
+    port,
+    database: "testdb",
+    user: "dba",
+    readTimeout: 200,
+  });
 }
 
 function closeStub(server: Server): Promise<void> {
   return new Promise((resolve) => server.close(() => resolve()));
 }
 
-test("client.query rejects with ReadTimeoutError, and the next query reconnects", { timeout: 5000 }, async () => {
+test("client.query rejects with ReadTimeoutError, and the next query reconnects", {
+  timeout: 5000,
+}, async () => {
   const { server, port, requests } = await createScriptedCas([[STALL], [INSERT_OK, CLOSE_OK]]);
   const client = clientFor(port);
 
@@ -2062,7 +2069,9 @@ test("client.query rejects with ReadTimeoutError, and the next query reconnects"
   }
 });
 
-test("a query queued behind a timeout fails fast, and later queries work", { timeout: 5000 }, async () => {
+test("a query queued behind a timeout fails fast, and later queries work", {
+  timeout: 5000,
+}, async () => {
   const { server, port, requests } = await createScriptedCas([
     [INSERT_OK, CLOSE_OK, STALL],
     [INSERT_OK, CLOSE_OK],
@@ -2102,7 +2111,9 @@ test("client.ping rejects with ReadTimeoutError", { timeout: 5000 }, async () =>
   }
 });
 
-test("a timeout inside a transaction loses the session: query and commit fail loudly", { timeout: 5000 }, async () => {
+test("a timeout inside a transaction loses the session: query and commit fail loudly", {
+  timeout: 5000,
+}, async () => {
   const { server, port, requests } = await createScriptedCas([
     [INSERT_OK, CLOSE_OK, STALL],
     [INSERT_OK, CLOSE_OK],
@@ -2116,7 +2127,10 @@ test("a timeout inside a transaction loses the session: query and commit fail lo
 
     await assert.rejects(client.query("INSERT INTO t VALUES (3)"), (error: unknown) => {
       assert.ok(error instanceof QueryError);
-      assert.match(((error.cause as Error).cause as Error).message, /Connection lost during transaction/);
+      assert.match(
+        ((error.cause as Error).cause as Error).message,
+        /Connection lost during transaction/,
+      );
       return true;
     });
     await assert.rejects(client.commit(), TransactionError);
@@ -2133,7 +2147,9 @@ test("a timeout inside a transaction loses the session: query and commit fail lo
   }
 });
 
-test("a timeout on the first transaction statement cannot start a new session", { timeout: 5000 }, async () => {
+test("a timeout on the first transaction statement cannot start a new session", {
+  timeout: 5000,
+}, async () => {
   const { server, port, requests } = await createScriptedCas([[STALL]]);
   const client = clientFor(port);
 
@@ -2151,7 +2167,9 @@ test("a timeout on the first transaction statement cannot start a new session", 
   }
 });
 
-test("a statement whose handle cleanup times out still fails the commit", { timeout: 5000 }, async () => {
+test("a statement whose handle cleanup times out still fails the commit", {
+  timeout: 5000,
+}, async () => {
   const { server, port } = await createScriptedCas([[INSERT_OK, STALL]]);
   const client = clientFor(port);
 
@@ -2166,7 +2184,9 @@ test("a statement whose handle cleanup times out still fails the commit", { time
   }
 });
 
-test("a timed-out COMMIT reports ReadTimeoutError and is not retried", { timeout: 5000 }, async () => {
+test("a timed-out COMMIT reports ReadTimeoutError and is not retried", {
+  timeout: 5000,
+}, async () => {
   const { server, port, requests } = await createScriptedCas([[INSERT_OK, CLOSE_OK, STALL]]);
   const client = clientFor(port);
 
@@ -2195,7 +2215,9 @@ test("client.transaction surfaces a timeout and still closes", { timeout: 5000 }
   await closeStub(server);
 });
 
-test("ping after a first-statement timeout cannot give the transaction a new session", { timeout: 5000 }, async () => {
+test("ping after a first-statement timeout cannot give the transaction a new session", {
+  timeout: 5000,
+}, async () => {
   const version = Buffer.concat([buildSimpleResponse(0), Buffer.from("11.4.0\0")]);
   const checkCasOk = Buffer.alloc(0);
   const { server, port, requests } = await createScriptedCas([[STALL], [checkCasOk, version]]);
@@ -2208,7 +2230,10 @@ test("ping after a first-statement timeout cannot give the transaction a new ses
 
     await assert.rejects(client.query("INSERT INTO t VALUES (2)"), (error: unknown) => {
       assert.ok(error instanceof QueryError);
-      assert.match(((error.cause as Error).cause as Error).message, /Connection lost during transaction/);
+      assert.match(
+        ((error.cause as Error).cause as Error).message,
+        /Connection lost during transaction/,
+      );
       return true;
     });
     await assert.rejects(client.commit(), TransactionError);
@@ -2564,7 +2589,12 @@ test("execute reports the rows and generated id of an autocommit INSERT", async 
   // The value stays with the session, and a commit lets the CAS go, so the
   // statement is sent without the autocommit flag, asked for the value, and
   // committed afterwards.
-  assert.deepEqual(sentCodes(fakeCAS), [PREPARE_AND_EXECUTE, GET_LAST_INSERT_ID, END_TRAN, CLOSE_REQ_HANDLE]);
+  assert.deepEqual(sentCodes(fakeCAS), [
+    PREPARE_AND_EXECUTE,
+    GET_LAST_INSERT_ID,
+    END_TRAN,
+    CLOSE_REQ_HANDLE,
+  ]);
   assert.deepEqual(fakeCAS.sentPayloads[0], sentStatement(DML_FRAMES.insertOneRow.sql, false));
   assert.equal(fakeCAS.sentPayloads[2]?.[fakeCAS.sentPayloads[2].length - 1], COMMIT);
 });
@@ -2723,7 +2753,8 @@ test("execute fails instead of reporting success when the session is lost before
 
   await assert.rejects(
     () => adapter.execute(DML_FRAMES.insertOneRow.sql),
-    (error: Error) => error instanceof QueryError && /before the statement was committed/.test(String(error.cause)),
+    (error: Error) =>
+      error instanceof QueryError && /before the statement was committed/.test(String(error.cause)),
   );
 });
 
@@ -2881,8 +2912,13 @@ test("an autocommit execute does not commit after a structurally invalid id repl
 
   await assert.rejects(() => adapter.execute(DML_FRAMES.insertOneRow.sql), QueryError);
 
-  assert.equal(sentCodes(fakeCAS).includes(END_TRAN) && fakeCAS.sentPayloads.some(
-    (payload) => payload[0] === END_TRAN && payload[payload.length - 1] === COMMIT), false);
+  assert.equal(
+    sentCodes(fakeCAS).includes(END_TRAN) &&
+      fakeCAS.sentPayloads.some(
+        (payload) => payload[0] === END_TRAN && payload[payload.length - 1] === COMMIT,
+      ),
+    false,
+  );
   assert.equal(fakeCAS.discardCalls, 1);
 });
 
@@ -3209,7 +3245,11 @@ test("LOB: a column aliased __proto__ counts against maxLobBytes", async () => {
   const { adapter, fakeCAS } = lobAdapter({ maxLobBytes: 2 });
   fakeCAS.queueResponse(lobSelectReplyWithBlobAlias("__proto__"));
 
-  await assertQueryFails(adapter, /column "__proto__" takes this query's LOB content to 3 bytes/, SELECT_LOBS);
+  await assertQueryFails(
+    adapter,
+    /column "__proto__" takes this query's LOB content to 3 bytes/,
+    SELECT_LOBS,
+  );
 
   assert.deepEqual(lobReads(fakeCAS), []);
 });
@@ -3268,7 +3308,10 @@ test("LOB: queryResult() returns content too, never the locator", async () => {
   const { rows, columns } = await adapter.queryResult(SELECT_LOBS);
 
   assert.deepEqual(rows[0], { id: 1, b: Buffer.from([1, 2, 3]), c: "hi" });
-  assert.deepEqual(columns.map((column) => column.type), ["INT", "BLOB", "CLOB"]);
+  assert.deepEqual(
+    columns.map((column) => column.type),
+    ["INT", "BLOB", "CLOB"],
+  );
   assert.ok(!inspect(rows, { depth: null }).includes("file:"));
 });
 
@@ -3399,7 +3442,10 @@ test("transaction() keeps -72 from the COMMIT reply and still ends with one roll
   fakeCAS.queueResponse(buildServerErrorResponse(-72));
   fakeCAS.queueResponse(buildSimpleResponse(0));
 
-  await assert.rejects(client.transaction(async () => "lost"), rejectsWithAbort);
+  await assert.rejects(
+    client.transaction(async () => "lost"),
+    rejectsWithAbort,
+  );
 
   assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.COMMIT, EndTranType.ROLLBACK]);
 });
@@ -3776,7 +3822,10 @@ test("the values bound are the ones passed when the method was called", async ()
 
   const execute = fakeCAS.sentPayloads.find((payload) => payload[0] === CASFunctionCode.EXECUTE);
   assert.ok(execute);
-  assert.equal(execute.subarray(execute.length - 13).toString("hex"), "0000000108" + "00000004" + "00000007");
+  assert.equal(
+    execute.subarray(execute.length - 13).toString("hex"),
+    "0000000108" + "00000004" + "00000007",
+  );
 });
 
 test("a truncated EXECUTE reply in autocommit drops the session and never commits", async () => {
@@ -4028,7 +4077,8 @@ test("beginTransaction resolves only once a new session's settings hold", async 
 function lobReplyWithSizes(row1: [bigint, bigint], row2: [bigint, bigint]): Buffer {
   const reply = lobSelectReply(row1[0], row1[1]);
   const second = (typeCode: string): number =>
-    reply.indexOf(Buffer.from(typeCode, "hex"), reply.indexOf(Buffer.from(typeCode, "hex")) + 8) + 4;
+    reply.indexOf(Buffer.from(typeCode, "hex"), reply.indexOf(Buffer.from(typeCode, "hex")) + 8) +
+    4;
   reply.writeBigInt64BE(row2[0], second("00000021"));
   reply.writeBigInt64BE(row2[1], second("00000022"));
   return reply;

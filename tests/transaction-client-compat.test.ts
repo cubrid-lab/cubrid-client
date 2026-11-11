@@ -1,5 +1,5 @@
-import test from "node:test";
 import assert from "node:assert/strict";
+import test from "node:test";
 
 import { createClient } from "../src/client/create-client.js";
 import type { TransactionClient } from "../src/index.js";
@@ -34,7 +34,8 @@ test("a transaction callback written against TransactionClient is still accepted
       async close() {},
     }),
   });
-  const callback = async (tx: TransactionClient): Promise<number> => (await tx.query("SELECT 1")).length;
+  const callback = async (tx: TransactionClient): Promise<number> =>
+    (await tx.query("SELECT 1")).length;
 
   assert.equal(await db.transaction(callback), 0);
 });

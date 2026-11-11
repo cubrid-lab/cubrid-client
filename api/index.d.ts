@@ -406,297 +406,6 @@ interface ConnectionLike {
 }
 type ConnectionFactory = (config: ClientConfig) => ConnectionLike | Promise<ConnectionLike>;
 
-/** Selects the owner (CUBRID calls it the schema) of the table to inspect. */
-interface SchemaOptions {
-    /**
-     * Owner of the table, for example `DBA`, matched without regard to case. It
-     * is needed only when several visible users own a table with the same name,
-     * which CUBRID 11.2 and later allow. When omitted and the name is ambiguous,
-     * the call rejects with a `QueryError` that lists the owners.
-     */
-    schema?: string;
-}
-/** A table or view returned by `getTables()`. */
-interface SchemaTable {
-    /** The table name as the catalog stores it: CUBRID folds identifiers to lower case. */
-    name: string;
-    /** The owner of the table, as the catalog stores it, for example `DBA`. */
-    schema: string;
-    type: "table" | "view";
-}
-/** A column returned by `getColumns()`. */
-interface SchemaColumn {
-    name: string;
-    /** 1-based position in the table. */
-    position: number;
-    /** The catalog's type name, for example `INTEGER`, `STRING` (VARCHAR) or `NUMERIC`. */
-    dataType: string;
-    /** The catalog's precision: the length of a string or the digits of a `NUMERIC`. */
-    precision: number;
-    scale: number;
-    nullable: boolean;
-    /** The default as the catalog's text, for example `zz` or `SYS_DATETIME`; `null` when none. */
-    defaultValue: string | null;
-}
-/** A primary key returned by `getPrimaryKey()`. */
-interface SchemaPrimaryKey {
-    name: string;
-    /** Column names in key order. */
-    columns: string[];
-}
-/** One key column of an index. */
-interface SchemaIndexColumn {
-    /** `null` for an expression of a function-based index; see `expression`. */
-    name: string | null;
-    /** The expression text of a function-based index key. */
-    expression?: string;
-    order: "asc" | "desc";
-    /** The prefix length of a prefix index such as `c(5)`. */
-    prefixLength?: number;
-}
-/** An index returned by `getIndexes()`. Primary and foreign keys are indexes too. */
-interface SchemaIndex {
-    name: string;
-    unique: boolean;
-    reverse: boolean;
-    primaryKey: boolean;
-    foreignKey: boolean;
-    /** The condition of a filtered index; `null` when the index covers every row. */
-    filter: string | null;
-    columns: SchemaIndexColumn[];
-}
-
-declare class CubridClient implements Queryable, ResultQueryable, Executable, PreparedQueryable, Streamable {
-    private readonly config;
-    private readonly connectionFactory;
-    private sharedConnectionPromise;
-    private closed;
-    private readonly schemaOperations;
-    private readonly openScopes;
-    /** beginTransactionScope() calls still opening a connection, so close() can wait for them. */
-    private readonly beginningScopes;
-    constructor(config: ClientConfig, connectionFactory: ConnectionFactory);
-    query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
-    queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
-    execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
-    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
-    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
-    executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>;
-    /**
-     * Run a statement and read its rows one at a time with `for await`, holding at
-     * most one server reply of rows in memory. Nothing is sent before the first read.
-     *
-     * The open cursor holds this connection's turn until the rows run out or the
-     * stream closes. A `break`, a throw or a failed read closes it and releases the
-     * query handle; code that drives the iterator by hand must call `return()`.
-     * Statements issued on this client meanwhile wait, so one awaited inside the loop
-     * can never run: it rejects with `kind: "stream-busy"` after
-     * {@link StreamOptions.consumerTimeout}. Use `transaction()`, which has its own
-     * connection, or another client. See `docs/API_REFERENCE.md`.
-     *
-     * @throws RangeError at once when an option is invalid.
-     */
-    stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncGenerator<T, void, undefined>;
-    private streamRows;
-    transaction<T>(callback: TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient>, options?: TransactionOptions): Promise<T>;
-    /**
-     * Start a manual transaction on its own connection and return the handle that
-     * owns it. Statements belong to the transaction only when sent through the
-     * handle; `client.query()` and the rest keep using the shared connection in
-     * autocommit, so concurrent callers can never join it (#112).
-     *
-     * End it with exactly one `commit()` or `rollback()`, which also closes its
-     * connection; later calls on the handle reject without reaching the server.
-     * `close()` rolls back a handle that was never ended.
-     *
-     * @throws RangeError at once when an option is invalid.
-     */
-    beginTransactionScope(options?: TransactionOptions): Promise<TransactionScope>;
-    private openScope;
-    /**
-     * Start a manual transaction on the shared connection.
-     *
-     * @deprecated This 1.x method has no ownership token: any other call on this
-     * client while the transaction is open, including an unrelated caller's,
-     * joins the same server transaction. Use {@link beginTransactionScope}, or
-     * `transaction(async (tx) => ...)`, which own a dedicated connection. Kept,
-     * with its behavior unchanged, for all of 1.x. See issue #112.
-     */
-    beginTransaction(): Promise<void>;
-    /**
-     * Commit the manual transaction started by {@link beginTransaction}.
-     *
-     * @deprecated Use the `commit()` of a {@link beginTransactionScope} handle. See issue #112.
-     */
-    commit(): Promise<void>;
-    /**
-     * Roll back the manual transaction started by {@link beginTransaction}.
-     *
-     * @deprecated Use the `rollback()` of a {@link beginTransactionScope} handle. See issue #112.
-     */
-    rollback(): Promise<void>;
-    close(): Promise<void>;
-    private closeSharedConnection;
-    ping(): Promise<string>;
-    /**
-     * Return the CUBRID server version, for example `11.4.6.1963`. It sends the
-     * same requests as `ping()` and shares its transaction and reconnect behavior;
-     * only the failure message differs.
-     */
-    getServerVersion(): Promise<string>;
-    /**
-     * List the user tables and views the connected user may SELECT from, ordered
-     * by owner and name. See {@link SchemaOptions} to list one owner only.
-     */
-    getTables(options?: SchemaOptions): Promise<SchemaTable[]>;
-    /** List the columns of a table or view in table order. */
-    getColumns(table: string, options?: SchemaOptions): Promise<SchemaColumn[]>;
-    /** Return the primary key of a table, or `null` when it has none. */
-    getPrimaryKey(table: string, options?: SchemaOptions): Promise<SchemaPrimaryKey | null>;
-    /** List the indexes of a table, including its primary and foreign keys. */
-    getIndexes(table: string, options?: SchemaOptions): Promise<SchemaIndex[]>;
-    /** Run catalog inspections on a captured shared connection until completion. */
-    private runSchemaOperation;
-    private getSharedConnection;
-    private prepareSharedConnection;
-    /**
-     * Hands `options` to a new connection before anything runs on it. A connection
-     * that cannot take them fails here: the statements would otherwise run, with no
-     * sign of it, under the server's defaults.
-     */
-    private applyTransactionOptions;
-}
-
-declare function createClient(options: ClientOptions): CubridClient;
-
-declare class CubridTransaction implements ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient {
-    private readonly connection;
-    constructor(connection: ConnectionLike);
-    query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
-    queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
-    execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
-    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
-    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
-    executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>;
-    commit(): Promise<void>;
-    rollback(): Promise<void>;
-}
-
-/**
- * What a failure was, without parsing its message. Each server-reported value
- * was observed from a live broker; a code that was not observed has no kind.
- *
- * - `unique-violation`, `not-null-violation`, `foreign-key-violation`: a
- *   constraint rejected the statement.
- * - `syntax`: the server could not parse the statement. CUBRID also reports an
- *   unknown table this way.
- * - `semantic`: the statement parsed but cannot run, such as an unknown column,
- *   a missing privilege or a constant division by zero.
- * - `deadlock`: the server picked this transaction as the deadlock victim.
- * - `lock-timeout`: a server-side lock wait expired. This is not `read-timeout`.
- * - `interrupted`: the server stopped the statement, for example `cubrid killtran`.
- * - `authentication`: the broker refused the user or password.
- * - `connection-lost`: the connection went away, or the server process died and
- *   took the transaction with it. The outcome of a request in flight is unknown.
- * - `read-timeout`: the client gave up waiting, see `ReadTimeoutError`.
- * - `stream-busy`: the client refused a statement that waited behind a `stream()`
- *   whose consumer stopped asking for rows. Nothing was sent.
- */
-type CubridErrorKind = "unique-violation" | "not-null-violation" | "foreign-key-violation" | "syntax" | "semantic" | "deadlock" | "lock-timeout" | "interrupted" | "authentication" | "connection-lost" | "read-timeout" | "stream-busy";
-interface CubridErrorDetails {
-    /** Numeric error code of the CAS error reply. Absent for client-side failures. */
-    code?: number;
-    /**
-     * Who assigned `code`: `server` for a database error code, `cas` for one from
-     * the CAS process. The two number ranges overlap, so compare a code only
-     * together with its origin: `-1012` is a different error in each.
-     */
-    origin?: "server" | "cas";
-    /**
-     * Five-character SQLSTATE. CAS error replies do not carry one and CUBRID
-     * documents no mapping from its codes, so this driver never sets it. It is
-     * kept for a custom connection that has a real value to report.
-     */
-    sqlState?: string;
-    /** Classification of a known failure. Absent when the failure is not classified. */
-    kind?: CubridErrorKind;
-}
-interface CubridErrorOptions extends ErrorOptions, CubridErrorDetails {
-}
-
-interface ConnectionError extends Readonly<CubridErrorDetails> {
-}
-declare class ConnectionError extends Error {
-    name: string;
-    constructor(message: string, options?: CubridErrorOptions);
-}
-
-interface QueryError extends Readonly<CubridErrorDetails> {
-}
-declare class QueryError extends Error {
-    name: string;
-    constructor(message: string, options?: CubridErrorOptions);
-}
-/** A unique, NOT NULL or foreign key constraint rejected the statement; see `kind`. */
-declare class ConstraintError extends QueryError {
-    name: string;
-}
-/** The server could not parse the statement, or it names an unknown table. */
-declare class SqlSyntaxError extends QueryError {
-    name: string;
-}
-/**
- * The server chose this transaction as a deadlock victim. With code `-72` it
- * already rolled the whole transaction back, so later statements and `commit()`
- * on this connection reject until `rollback()` or a rejected `commit()`
- * acknowledges that. With `-967` or `-968`, reported under a finite lock timeout,
- * only the statement failed and the transaction stays open. Either way, roll back
- * and retry the transaction from its start.
- */
-declare class DeadlockError extends QueryError {
-    name: string;
-}
-/**
- * A server-side lock wait expired. Only the statement failed, and the
- * transaction stays open. This is not the client-side `ReadTimeoutError`.
- */
-declare class LockTimeoutError extends QueryError {
-    name: string;
-}
-
-/**
- * The server sent nothing for `timeoutMs` milliseconds while a response was
- * awaited. The connection has been discarded, so a late response can never be
- * mistaken for the next operation's. The request's outcome on the server is
- * unknown: it may still have run, and a COMMIT may have succeeded.
- * Applications must verify the outcome; a timed-out COMMIT is never retried
- * automatically by the driver.
- */
-declare class ReadTimeoutError extends ConnectionError {
-    readonly timeoutMs: number;
-    name: string;
-    constructor(timeoutMs: number, options?: ErrorOptions);
-}
-
-interface TransactionError extends Readonly<CubridErrorDetails> {
-}
-declare class TransactionError extends Error {
-    name: string;
-    /**
-     * Set by `CubridClient.transaction()`, and by the `commit()` of a
-     * `beginTransactionScope()` handle, when rolling back also failed. `cause`
-     * still holds the failure that started it. The connection is closed
-     * afterwards, so the server discards the uncommitted work either way.
-     */
-    rollbackError?: Error;
-    /**
-     * Set by `CubridClient.transaction()`, and when a `beginTransactionScope()`
-     * handle failed to end, when closing its connection also failed.
-     */
-    closeError?: Error;
-    constructor(message: string, options?: CubridErrorOptions);
-}
-
 interface DriverAdapter extends ConnectionLike {
 }
 
@@ -990,6 +699,297 @@ declare class NativeCubridAdapter implements DriverAdapter {
      * server has dropped the handle with it and nothing is sent.
      */
     private closeQueryHandle;
+}
+
+/** Selects the owner (CUBRID calls it the schema) of the table to inspect. */
+interface SchemaOptions {
+    /**
+     * Owner of the table, for example `DBA`, matched without regard to case. It
+     * is needed only when several visible users own a table with the same name,
+     * which CUBRID 11.2 and later allow. When omitted and the name is ambiguous,
+     * the call rejects with a `QueryError` that lists the owners.
+     */
+    schema?: string;
+}
+/** A table or view returned by `getTables()`. */
+interface SchemaTable {
+    /** The table name as the catalog stores it: CUBRID folds identifiers to lower case. */
+    name: string;
+    /** The owner of the table, as the catalog stores it, for example `DBA`. */
+    schema: string;
+    type: "table" | "view";
+}
+/** A column returned by `getColumns()`. */
+interface SchemaColumn {
+    name: string;
+    /** 1-based position in the table. */
+    position: number;
+    /** The catalog's type name, for example `INTEGER`, `STRING` (VARCHAR) or `NUMERIC`. */
+    dataType: string;
+    /** The catalog's precision: the length of a string or the digits of a `NUMERIC`. */
+    precision: number;
+    scale: number;
+    nullable: boolean;
+    /** The default as the catalog's text, for example `zz` or `SYS_DATETIME`; `null` when none. */
+    defaultValue: string | null;
+}
+/** A primary key returned by `getPrimaryKey()`. */
+interface SchemaPrimaryKey {
+    name: string;
+    /** Column names in key order. */
+    columns: string[];
+}
+/** One key column of an index. */
+interface SchemaIndexColumn {
+    /** `null` for an expression of a function-based index; see `expression`. */
+    name: string | null;
+    /** The expression text of a function-based index key. */
+    expression?: string;
+    order: "asc" | "desc";
+    /** The prefix length of a prefix index such as `c(5)`. */
+    prefixLength?: number;
+}
+/** An index returned by `getIndexes()`. Primary and foreign keys are indexes too. */
+interface SchemaIndex {
+    name: string;
+    unique: boolean;
+    reverse: boolean;
+    primaryKey: boolean;
+    foreignKey: boolean;
+    /** The condition of a filtered index; `null` when the index covers every row. */
+    filter: string | null;
+    columns: SchemaIndexColumn[];
+}
+
+declare class CubridClient implements Queryable, ResultQueryable, Executable, PreparedQueryable, Streamable {
+    private readonly config;
+    private readonly connectionFactory;
+    private sharedConnectionPromise;
+    private closed;
+    private readonly schemaOperations;
+    private readonly openScopes;
+    /** beginTransactionScope() calls still opening a connection, so close() can wait for them. */
+    private readonly beginningScopes;
+    constructor(config: ClientConfig, connectionFactory: ConnectionFactory);
+    query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
+    queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
+    execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
+    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
+    executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+    /**
+     * Run a statement and read its rows one at a time with `for await`, holding at
+     * most one server reply of rows in memory. Nothing is sent before the first read.
+     *
+     * The open cursor holds this connection's turn until the rows run out or the
+     * stream closes. A `break`, a throw or a failed read closes it and releases the
+     * query handle; code that drives the iterator by hand must call `return()`.
+     * Statements issued on this client meanwhile wait, so one awaited inside the loop
+     * can never run: it rejects with `kind: "stream-busy"` after
+     * {@link StreamOptions.consumerTimeout}. Use `transaction()`, which has its own
+     * connection, or another client. See `docs/API_REFERENCE.md`.
+     *
+     * @throws RangeError at once when an option is invalid.
+     */
+    stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncGenerator<T, void, undefined>;
+    private streamRows;
+    transaction<T>(callback: TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient>, options?: TransactionOptions): Promise<T>;
+    /**
+     * Start a manual transaction on its own connection and return the handle that
+     * owns it. Statements belong to the transaction only when sent through the
+     * handle; `client.query()` and the rest keep using the shared connection in
+     * autocommit, so concurrent callers can never join it (#112).
+     *
+     * End it with exactly one `commit()` or `rollback()`, which also closes its
+     * connection; later calls on the handle reject without reaching the server.
+     * `close()` rolls back a handle that was never ended.
+     *
+     * @throws RangeError at once when an option is invalid.
+     */
+    beginTransactionScope(options?: TransactionOptions): Promise<TransactionScope>;
+    private openScope;
+    /**
+     * Start a manual transaction on the shared connection.
+     *
+     * @deprecated This 1.x method has no ownership token: any other call on this
+     * client while the transaction is open, including an unrelated caller's,
+     * joins the same server transaction. Use {@link beginTransactionScope}, or
+     * `transaction(async (tx) => ...)`, which own a dedicated connection. Kept,
+     * with its behavior unchanged, for all of 1.x. See issue #112.
+     */
+    beginTransaction(): Promise<void>;
+    /**
+     * Commit the manual transaction started by {@link beginTransaction}.
+     *
+     * @deprecated Use the `commit()` of a {@link beginTransactionScope} handle. See issue #112.
+     */
+    commit(): Promise<void>;
+    /**
+     * Roll back the manual transaction started by {@link beginTransaction}.
+     *
+     * @deprecated Use the `rollback()` of a {@link beginTransactionScope} handle. See issue #112.
+     */
+    rollback(): Promise<void>;
+    close(): Promise<void>;
+    private closeSharedConnection;
+    ping(): Promise<string>;
+    /**
+     * Return the CUBRID server version, for example `11.4.6.1963`. It sends the
+     * same requests as `ping()` and shares its transaction and reconnect behavior;
+     * only the failure message differs.
+     */
+    getServerVersion(): Promise<string>;
+    /**
+     * List the user tables and views the connected user may SELECT from, ordered
+     * by owner and name. See {@link SchemaOptions} to list one owner only.
+     */
+    getTables(options?: SchemaOptions): Promise<SchemaTable[]>;
+    /** List the columns of a table or view in table order. */
+    getColumns(table: string, options?: SchemaOptions): Promise<SchemaColumn[]>;
+    /** Return the primary key of a table, or `null` when it has none. */
+    getPrimaryKey(table: string, options?: SchemaOptions): Promise<SchemaPrimaryKey | null>;
+    /** List the indexes of a table, including its primary and foreign keys. */
+    getIndexes(table: string, options?: SchemaOptions): Promise<SchemaIndex[]>;
+    /** Run catalog inspections on a captured shared connection until completion. */
+    private runSchemaOperation;
+    private getSharedConnection;
+    private prepareSharedConnection;
+    /**
+     * Hands `options` to a new connection before anything runs on it. A connection
+     * that cannot take them fails here: the statements would otherwise run, with no
+     * sign of it, under the server's defaults.
+     */
+    private applyTransactionOptions;
+}
+
+declare function createClient(options: ClientOptions): CubridClient;
+
+declare class CubridTransaction implements ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient {
+    private readonly connection;
+    constructor(connection: ConnectionLike);
+    query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
+    queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
+    execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
+    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
+    executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+    commit(): Promise<void>;
+    rollback(): Promise<void>;
+}
+
+/**
+ * What a failure was, without parsing its message. Each server-reported value
+ * was observed from a live broker; a code that was not observed has no kind.
+ *
+ * - `unique-violation`, `not-null-violation`, `foreign-key-violation`: a
+ *   constraint rejected the statement.
+ * - `syntax`: the server could not parse the statement. CUBRID also reports an
+ *   unknown table this way.
+ * - `semantic`: the statement parsed but cannot run, such as an unknown column,
+ *   a missing privilege or a constant division by zero.
+ * - `deadlock`: the server picked this transaction as the deadlock victim.
+ * - `lock-timeout`: a server-side lock wait expired. This is not `read-timeout`.
+ * - `interrupted`: the server stopped the statement, for example `cubrid killtran`.
+ * - `authentication`: the broker refused the user or password.
+ * - `connection-lost`: the connection went away, or the server process died and
+ *   took the transaction with it. The outcome of a request in flight is unknown.
+ * - `read-timeout`: the client gave up waiting, see `ReadTimeoutError`.
+ * - `stream-busy`: the client refused a statement that waited behind a `stream()`
+ *   whose consumer stopped asking for rows. Nothing was sent.
+ */
+type CubridErrorKind = "unique-violation" | "not-null-violation" | "foreign-key-violation" | "syntax" | "semantic" | "deadlock" | "lock-timeout" | "interrupted" | "authentication" | "connection-lost" | "read-timeout" | "stream-busy";
+interface CubridErrorDetails {
+    /** Numeric error code of the CAS error reply. Absent for client-side failures. */
+    code?: number;
+    /**
+     * Who assigned `code`: `server` for a database error code, `cas` for one from
+     * the CAS process. The two number ranges overlap, so compare a code only
+     * together with its origin: `-1012` is a different error in each.
+     */
+    origin?: "server" | "cas";
+    /**
+     * Five-character SQLSTATE. CAS error replies do not carry one and CUBRID
+     * documents no mapping from its codes, so this driver never sets it. It is
+     * kept for a custom connection that has a real value to report.
+     */
+    sqlState?: string;
+    /** Classification of a known failure. Absent when the failure is not classified. */
+    kind?: CubridErrorKind;
+}
+interface CubridErrorOptions extends ErrorOptions, CubridErrorDetails {
+}
+
+interface ConnectionError extends Readonly<CubridErrorDetails> {
+}
+declare class ConnectionError extends Error {
+    name: string;
+    constructor(message: string, options?: CubridErrorOptions);
+}
+
+interface QueryError extends Readonly<CubridErrorDetails> {
+}
+declare class QueryError extends Error {
+    name: string;
+    constructor(message: string, options?: CubridErrorOptions);
+}
+/** A unique, NOT NULL or foreign key constraint rejected the statement; see `kind`. */
+declare class ConstraintError extends QueryError {
+    name: string;
+}
+/** The server could not parse the statement, or it names an unknown table. */
+declare class SqlSyntaxError extends QueryError {
+    name: string;
+}
+/**
+ * The server chose this transaction as a deadlock victim. With code `-72` it
+ * already rolled the whole transaction back, so later statements and `commit()`
+ * on this connection reject until `rollback()` or a rejected `commit()`
+ * acknowledges that. With `-967` or `-968`, reported under a finite lock timeout,
+ * only the statement failed and the transaction stays open. Either way, roll back
+ * and retry the transaction from its start.
+ */
+declare class DeadlockError extends QueryError {
+    name: string;
+}
+/**
+ * A server-side lock wait expired. Only the statement failed, and the
+ * transaction stays open. This is not the client-side `ReadTimeoutError`.
+ */
+declare class LockTimeoutError extends QueryError {
+    name: string;
+}
+
+/**
+ * The server sent nothing for `timeoutMs` milliseconds while a response was
+ * awaited. The connection has been discarded, so a late response can never be
+ * mistaken for the next operation's. The request's outcome on the server is
+ * unknown: it may still have run, and a COMMIT may have succeeded.
+ * Applications must verify the outcome; a timed-out COMMIT is never retried
+ * automatically by the driver.
+ */
+declare class ReadTimeoutError extends ConnectionError {
+    readonly timeoutMs: number;
+    name: string;
+    constructor(timeoutMs: number, options?: ErrorOptions);
+}
+
+interface TransactionError extends Readonly<CubridErrorDetails> {
+}
+declare class TransactionError extends Error {
+    name: string;
+    /**
+     * Set by `CubridClient.transaction()`, and by the `commit()` of a
+     * `beginTransactionScope()` handle, when rolling back also failed. `cause`
+     * still holds the failure that started it. The connection is closed
+     * afterwards, so the server discards the uncommitted work either way.
+     */
+    rollbackError?: Error;
+    /**
+     * Set by `CubridClient.transaction()`, and when a `beginTransactionScope()`
+     * handle failed to end, when closing its connection also failed.
+     */
+    closeError?: Error;
+    constructor(message: string, options?: CubridErrorOptions);
 }
 
 interface ConnectionConfig {

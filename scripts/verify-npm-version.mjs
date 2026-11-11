@@ -27,7 +27,10 @@ export function checkNpmVersion(version, run = spawnSync) {
     if (/\b(?:E404|ETARGET)\b/.test(message)) {
       return { status: "missing", detail: "Exact version absent from public npm registry." };
     }
-    return { status: "unavailable", detail: "npm registry verification failed: " + message.slice(0, 350) };
+    return {
+      status: "unavailable",
+      detail: "npm registry verification failed: " + message.slice(0, 350),
+    };
   }
 
   let observed;

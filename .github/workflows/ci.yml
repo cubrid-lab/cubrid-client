@@ -92,6 +92,14 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Lint and format check (Biome, read-only)
+        if: matrix.node-version == 22
+        run: npm run lint:ci
+
+      - name: Prove the Biome policy rejects violations
+        if: matrix.node-version == 22
+        run: node --test tests/lint-policy.test.mjs
+
       - name: Test with coverage
         # c8's yargs dependency does not load on Node 26, so that lane runs the
         # same tests without coverage.

@@ -1,5 +1,5 @@
-import { definedErrorDetails } from "./error-details.js";
 import type { CubridErrorDetails, CubridErrorKind } from "./error-details.js";
+import { definedErrorDetails } from "./error-details.js";
 
 /** The leading int of a CAS error reply: CAS_ERROR_INDICATOR and DBMS_ERROR_INDICATOR. */
 const ORIGINS: ReadonlyMap<number, "server" | "cas"> = new Map([
@@ -41,13 +41,17 @@ const SERVER_ERROR_KINDS: ReadonlyMap<number, CubridErrorKind> = new Map([
  */
 export interface CasReplyError extends Readonly<CubridErrorDetails> {}
 
+// biome-ignore lint/suspicious/noUnsafeDeclarationMerging: the interface only declares the readonly error details the constructor assigns
 export class CasReplyError extends Error {
   constructor(message: string, indicator: number, code: number) {
     super(message);
 
     const origin = ORIGINS.get(indicator);
     const kind = origin === "server" ? SERVER_ERROR_KINDS.get(code) : undefined;
-    Object.assign(this, definedErrorDetails({ code, ...(origin && { origin }), ...(kind && { kind }) }));
+    Object.assign(
+      this,
+      definedErrorDetails({ code, ...(origin && { origin }), ...(kind && { kind }) }),
+    );
   }
 }
 

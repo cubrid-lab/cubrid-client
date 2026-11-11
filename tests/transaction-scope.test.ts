@@ -2,8 +2,9 @@
  * #112: `beginTransactionScope()` returns a handle that owns a dedicated
  * connection, so unrelated statements on the client can never join it.
  */
-import test from "node:test";
+
 import assert from "node:assert/strict";
+import test from "node:test";
 
 import { createClient } from "../src/client/create-client.js";
 import { TransactionError } from "../src/errors/transaction-error.js";
@@ -112,7 +113,11 @@ test("scope: statements run on a dedicated connection; client queries stay on th
   const own = connections[1]!;
 
   // An unrelated caller runs while the scope is open, interleaved with it.
-  await Promise.all([tx.query("INSERT a"), client.query("SELECT unrelated"), tx.execute("UPDATE b")]);
+  await Promise.all([
+    tx.query("INSERT a"),
+    client.query("SELECT unrelated"),
+    tx.execute("UPDATE b"),
+  ]);
   await tx.commit();
 
   assert.deepEqual(shared!.calls, ["query:SELECT shared", "query:SELECT unrelated"]);
@@ -237,7 +242,9 @@ test("scope: options apply to its own connection before BEGIN, client settings f
 
   await client.beginTransactionScope({ isolationLevel: "serializable" });
 
-  assert.deepEqual(connections[0]!.options, [{ lockTimeout: 2000, isolationLevel: "serializable" }]);
+  assert.deepEqual(connections[0]!.options, [
+    { lockTimeout: 2000, isolationLevel: "serializable" },
+  ]);
   assert.deepEqual(connections[0]!.calls, ["options", "begin"]);
 });
 
@@ -265,7 +272,10 @@ test("scope: close() discards a scope nobody ended by closing its connection; la
   // the uncommitted work when the connection closes.
   assert.deepEqual(connections[0]!.calls, ["begin", "query:INSERT a", "close"]);
   assert.deepEqual(connections[1]!.calls, ["begin", "commit", "close"]);
-  await assert.rejects(tx.query("SELECT late"), rejectsWith("Transaction was discarded because the client was closed."));
+  await assert.rejects(
+    tx.query("SELECT late"),
+    rejectsWith("Transaction was discarded because the client was closed."),
+  );
   await assert.rejects(tx.commit(), TransactionError);
   await assert.rejects(tx.rollback(), TransactionError);
 });

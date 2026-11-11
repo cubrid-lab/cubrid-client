@@ -1,5 +1,3 @@
-import * as schema from "./schema.js";
-import { CallbackTransaction, ScopedTransaction } from "./transaction.js";
 import { TransactionError } from "../errors/transaction-error.js";
 import { mapError, toError } from "../internals/map-error.js";
 import {
@@ -35,8 +33,12 @@ import type {
   SchemaPrimaryKey,
   SchemaTable,
 } from "../types/schema.js";
+import * as schema from "./schema.js";
+import { CallbackTransaction, ScopedTransaction } from "./transaction.js";
 
-export class CubridClient implements Queryable, ResultQueryable, Executable, PreparedQueryable, Streamable {
+export class CubridClient
+  implements Queryable, ResultQueryable, Executable, PreparedQueryable, Streamable
+{
   private sharedConnectionPromise: Promise<ConnectionLike> | undefined;
   private closed = false;
   private readonly schemaOperations = new Set<Promise<unknown>>();
@@ -200,6 +202,7 @@ export class CubridClient implements Queryable, ResultQueryable, Executable, Pre
         try {
           await rows.return?.();
         } catch (error) {
+          // biome-ignore lint/correctness/noUnsafeFinally: a failed cleanup of an unfinished stream is the error the caller must see
           throw failure(error);
         }
       }
@@ -254,6 +257,7 @@ export class CubridClient implements Queryable, ResultQueryable, Executable, Pre
         await connection.close();
       } catch (closeError) {
         if (!failed) {
+          // biome-ignore lint/correctness/noUnsafeFinally: after a commit, a failed close is the 1.x result of transaction()
           throw closeError;
         }
 
@@ -478,8 +482,12 @@ export class CubridClient implements Queryable, ResultQueryable, Executable, Pre
     })();
     this.schemaOperations.add(running);
     void running.then(
-      () => { this.schemaOperations.delete(running); },
-      () => { this.schemaOperations.delete(running); },
+      () => {
+        this.schemaOperations.delete(running);
+      },
+      () => {
+        this.schemaOperations.delete(running);
+      },
     );
     return running;
   }

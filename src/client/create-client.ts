@@ -1,8 +1,8 @@
 import { NativeCubridAdapter } from "../adapters/native.js";
-import { CubridClient } from "./client.js";
 import { withLogging } from "../internals/log-connection.js";
 import { normalizeConfig } from "../internals/normalize-config.js";
 import type { ClientOptions } from "../types/client.js";
+import { CubridClient } from "./client.js";
 
 export function createClient(options: ClientOptions): CubridClient {
   const config = normalizeConfig(options);

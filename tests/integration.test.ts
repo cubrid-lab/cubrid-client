@@ -8,15 +8,14 @@
  *
  * Run:  npm run test:integration
  */
-import test, { describe, after, before } from "node:test";
+
 import assert from "node:assert/strict";
 import { createServer, connect as netConnect, type Server, type Socket } from "node:net";
+import test, { after, before, describe } from "node:test";
 import { setFlagsFromString } from "node:v8";
 import { runInNewContext } from "node:vm";
-
-import { createClient } from "../src/client/create-client.js";
 import { NativeCubridAdapter } from "../src/adapters/native.js";
-import { ZonedDateTime } from "../src/types/zoned-date-time.js";
+import { createClient } from "../src/client/create-client.js";
 import { ConnectionError } from "../src/errors/connection-error.js";
 import {
   ConstraintError,
@@ -27,18 +26,19 @@ import {
 } from "../src/errors/query-error.js";
 import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { TransactionError } from "../src/errors/transaction-error.js";
-import { CASFunctionCode } from "../src/protocol/constants.js";
 import { CASConnection } from "../src/protocol/connection.js";
-import type { TransactionClient } from "../src/types/client.js";
-import type { QueryParam, QueryParams } from "../src/types/query.js";
+import { CASFunctionCode } from "../src/protocol/constants.js";
 import {
+  type FetchResult,
+  type PrepareAndExecuteResult,
   parseFetch,
   parsePrepareAndExecute,
   writeFetch,
   writePrepareAndExecute,
-  type FetchResult,
-  type PrepareAndExecuteResult,
 } from "../src/protocol/protocol.js";
+import type { TransactionClient } from "../src/types/client.js";
+import type { QueryParam, QueryParams } from "../src/types/query.js";
+import { ZonedDateTime } from "../src/types/zoned-date-time.js";
 
 const TEST_CONFIG = {
   host: "127.0.0.1",
@@ -59,7 +59,9 @@ async function isCubridAvailable(): Promise<boolean> {
     await adapter.close();
     return true;
   } catch (err) {
-    console.log(`CUBRID not available; offline integration tests are skipped: ${(err as Error).message}`);
+    console.log(
+      `CUBRID not available; offline integration tests are skipped: ${(err as Error).message}`,
+    );
     return false;
   }
 }
@@ -368,9 +370,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       await client.query("INSERT INTO null_test_native (val) VALUES (NULL)");
       await client.query("INSERT INTO null_test_native (val) VALUES ('not null')");
 
-      const rows = await client.query(
-        "SELECT val FROM null_test_native ORDER BY id",
-      );
+      const rows = await client.query("SELECT val FROM null_test_native ORDER BY id");
       assert.equal(rows.length, 2);
       assert.equal(rows[0]!.val, null);
       assert.equal(rows[1]!.val, "not null");
@@ -467,9 +467,12 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       assert.deepEqual(result.rows, [
         { id: null, label: "seven", amount: null, ts: null, tags: null, nothing: null },
       ]);
-      assert.deepEqual(await client.query("SELECT a.id, b.id FROM cm_a_native a LEFT JOIN cm_b_native b ON a.id = b.id"), [
-        { id: null },
-      ]);
+      assert.deepEqual(
+        await client.query(
+          "SELECT a.id, b.id FROM cm_a_native a LEFT JOIN cm_b_native b ON a.id = b.id",
+        ),
+        [{ id: null }],
+      );
 
       assert.deepEqual(await client.queryResult("INSERT INTO cm_b_native VALUES (1)"), {
         rows: [],
@@ -555,9 +558,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
 
       const result = await client.transaction(async (tx) => {
         await tx.query("INSERT INTO tx_cb_test_native (val) VALUES ('via callback')");
-        const rows = await tx.query<{ val: string }>(
-          "SELECT val FROM tx_cb_test_native",
-        );
+        const rows = await tx.query<{ val: string }>("SELECT val FROM tx_cb_test_native");
         return rows[0]!.val;
       });
 
@@ -593,13 +594,13 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       await assert.rejects(
         () =>
           client.transaction(async (tx) => {
-            await tx.query(
-              "INSERT INTO tx_err_test_native (val) VALUES ('should be rolled back')",
-            );
+            await tx.query("INSERT INTO tx_err_test_native (val) VALUES ('should be rolled back')");
             throw new Error("intentional error");
           }),
         (err: Error) => {
-          assert.ok(err.message.includes("Transaction failed") || err.message.includes("intentional error"));
+          assert.ok(
+            err.message.includes("Transaction failed") || err.message.includes("intentional error"),
+          );
           assert.ok(err.cause instanceof Error);
           assert.equal((err.cause as Error).message, "intentional error");
           return true;
@@ -1089,15 +1090,12 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
 
       // Insert 150 rows to trigger multi-fetch (DEFAULT_FETCH_SIZE is 100)
       for (let i = 0; i < 150; i++) {
-        await client.query(
-          "INSERT INTO fetch_test_native (val) VALUES (?)",
-          [`row_${String(i).padStart(3, "0")}`],
-        );
+        await client.query("INSERT INTO fetch_test_native (val) VALUES (?)", [
+          `row_${String(i).padStart(3, "0")}`,
+        ]);
       }
 
-      const rows = await client.query(
-        "SELECT id, val FROM fetch_test_native ORDER BY id",
-      );
+      const rows = await client.query("SELECT id, val FROM fetch_test_native ORDER BY id");
       assert.equal(rows.length, 150);
       assert.equal(rows[0]!.val, "row_000");
       assert.equal(rows[149]!.val, "row_149");
@@ -1128,14 +1126,17 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         const generation = cas.connectionGeneration;
 
         try {
-          await assert.rejects(adapter.query(`SELECT ${literal} AS zero_value, 'after' AS t`), (err: Error) => {
-            assert.ok(err instanceof QueryError);
-            assert.match(
-              (err.cause as Error).message,
-              new RegExp(`column "zero_value" \\(wire type ${wireType}, ${size} bytes\\)`),
-            );
-            return true;
-          });
+          await assert.rejects(
+            adapter.query(`SELECT ${literal} AS zero_value, 'after' AS t`),
+            (err: Error) => {
+              assert.ok(err instanceof QueryError);
+              assert.match(
+                (err.cause as Error).message,
+                new RegExp(`column "zero_value" \\(wire type ${wireType}, ${size} bytes\\)`),
+              );
+              return true;
+            },
+          );
 
           // Same physical session, and it answers the next statement.
           assert.equal(cas.connectionGeneration, generation);
@@ -1344,7 +1345,11 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
           selectValue(`SELECT ${literal} AS v`),
           (error: Error) => {
             assert.ok(error instanceof QueryError, literal);
-            assert.match(String((error.cause as Error | undefined)?.message), /Invalid utime/, literal);
+            assert.match(
+              String((error.cause as Error | undefined)?.message),
+              /Invalid utime/,
+              literal,
+            );
             return true;
           },
           literal,
@@ -1400,7 +1405,15 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
 
         assert.deepEqual(
           columns.map((column) => column.type),
-          ["INT", "TIMESTAMPTZ", "TIMESTAMPLTZ", "DATETIMETZ", "DATETIMELTZ", "SEQUENCE", "VARCHAR"],
+          [
+            "INT",
+            "TIMESTAMPTZ",
+            "TIMESTAMPLTZ",
+            "DATETIMETZ",
+            "DATETIMELTZ",
+            "SEQUENCE",
+            "VARCHAR",
+          ],
         );
         const [first, second] = rows;
         assert.equal(String(first?.tstz), "2020-01-02 03:04:05 +09:00");
@@ -1408,10 +1421,10 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         for (const column of ["tsltz", "dtltz"] as const) {
           assert.ok(first?.[column] instanceof ZonedDateTime);
         }
-        assert.deepEqual(
-          (first?.seq as ZonedDateTime[]).map(String),
-          ["2020-01-02 03:04:05 +09:00", "2020-07-02 03:04:05 -05:30"],
-        );
+        assert.deepEqual((first!.seq as ZonedDateTime[]).map(String), [
+          "2020-01-02 03:04:05 +09:00",
+          "2020-07-02 03:04:05 -05:30",
+        ]);
         for (const column of [...COLUMNS, "seq", "j"]) {
           assert.equal(second?.[column], null, column);
         }
@@ -1427,8 +1440,18 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     });
 
     for (const { type, literal, wireType, size } of [
-      { type: "TIMESTAMPTZ", literal: "TIMESTAMPTZ'0000-00-00 00:00:00 +00:00'", wireType: 29, size: 19 },
-      { type: "DATETIMETZ", literal: "DATETIMETZ'0000-00-00 00:00:00.000 +00:00'", wireType: 31, size: 21 },
+      {
+        type: "TIMESTAMPTZ",
+        literal: "TIMESTAMPTZ'0000-00-00 00:00:00 +00:00'",
+        wireType: 29,
+        size: 19,
+      },
+      {
+        type: "DATETIMETZ",
+        literal: "DATETIMETZ'0000-00-00 00:00:00.000 +00:00'",
+        wireType: 31,
+        size: 21,
+      },
     ]) {
       test(`a zero ${type} rejects with its column and type, and the session stays usable`, async () => {
         const adapter = new NativeCubridAdapter(TEST_CONFIG);
@@ -1437,14 +1460,17 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         const generation = cas.connectionGeneration;
 
         try {
-          await assert.rejects(adapter.query(`SELECT ${literal} AS zero_value, 'after' AS t`), (err: Error) => {
-            assert.ok(err instanceof QueryError);
-            assert.match(
-              (err.cause as Error).message,
-              new RegExp(`column "zero_value" \\(wire type ${wireType}, ${size} bytes\\)`),
-            );
-            return true;
-          });
+          await assert.rejects(
+            adapter.query(`SELECT ${literal} AS zero_value, 'after' AS t`),
+            (err: Error) => {
+              assert.ok(err instanceof QueryError);
+              assert.match(
+                (err.cause as Error).message,
+                new RegExp(`column "zero_value" \\(wire type ${wireType}, ${size} bytes\\)`),
+              );
+              return true;
+            },
+          );
 
           assert.equal(cas.connectionGeneration, generation);
           assert.deepEqual(await adapter.query("SELECT 1 AS one"), [{ one: 1 }]);
@@ -1465,7 +1491,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       await assert.rejects(
         client.query("SELECT DATETIME'0000-00-00 00:00:00' AS zeroed"),
         (error: Error) => {
-          const failure = ((error.cause as Error).cause as Error);
+          const failure = (error.cause as Error).cause as Error;
           assert.equal(error.name, "QueryError");
           assert.equal(failure.name, "UnsupportedValueError");
           assert.match(failure.message, /column "zeroed" \(wire type 22, /);
@@ -1596,9 +1622,10 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         assert.deepEqual(await client.query("SELECT {{1,2},{'a'}} AS c, 'after' AS t"), [
           { c: [[1, 2], ["a"]], t: "after" },
         ]);
-        assert.deepEqual(await client.query("SELECT {{},{1}} AS c, {NULL,{1}} AS d, 'after' AS t"), [
-          { c: [[], [1]], d: [null, [1]], t: "after" },
-        ]);
+        assert.deepEqual(
+          await client.query("SELECT {{},{1}} AS c, {NULL,{1}} AS d, 'after' AS t"),
+          [{ c: [[], [1]], d: [null, [1]], t: "after" }],
+        );
         assert.deepEqual(await client.query("SELECT {{{1}}} AS c, 'after' AS t"), [
           { c: [[[1]]], t: "after" },
         ]);
@@ -1633,9 +1660,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     test("an unsupported element rejects and leaves the session usable", async () => {
       const client = collectionClient();
       try {
-        for (const expression of [
-          "CAST({X'0f'} AS SEQUENCE OF BLOB)",
-        ]) {
+        for (const expression of ["CAST({X'0f'} AS SEQUENCE OF BLOB)"]) {
           await assert.rejects(
             () => client.query(`SELECT ${expression} AS c, 'after' AS t`),
             (error: Error) => {
@@ -1713,7 +1738,9 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     }
 
     /** Observe every request and let `tamper` replace the response decoded by the adapter. */
-    async function open(tamper: (functionCode: number, response: Buffer) => Buffer): Promise<Trace> {
+    async function open(
+      tamper: (functionCode: number, response: Buffer) => Buffer,
+    ): Promise<Trace> {
       const adapter = new NativeCubridAdapter(TEST_CONFIG);
       await adapter.connect();
       const cas = (adapter as unknown as { cas: CASConnection }).cas;
@@ -2014,8 +2041,10 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       try {
         for (let round = 0; round < ROUNDS; round += 1) {
           const groups = Array.from({ length: GROUPS }, (_unused, group) => group);
-          const results = await Promise.all(groups.map((group) => client.query(selectGroup(group))));
-          groups.forEach((group) => assertOwnRows(results[group]!, group));
+          const results = await Promise.all(
+            groups.map((group) => client.query(selectGroup(group))),
+          );
+          for (const group of groups) assertOwnRows(results[group]!, group);
         }
         assert.ok(fetches() > 0, "the test proves nothing unless these rows needed FETCH");
       } finally {
@@ -2033,7 +2062,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
             client.query(`SELECT id, grp, pad FROM ${TABLE} WHERE grp = ? ORDER BY id`, [group]),
           ),
         );
-        groups.forEach((group) => assertOwnRows(results[group]!, group));
+        for (const group of groups) assertOwnRows(results[group]!, group);
         assert.ok(fetches() > 0);
       } finally {
         await client.close();
@@ -2197,7 +2226,10 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
           const handles = new Set(results.map((result) => result.queryHandle));
           assert.equal(handles.size, groups.length);
           const rows = results.map((result) => [...result.rows]);
-          assert.ok(rows.every((own) => own.length < ROWS_PER_GROUP), "FETCH must be needed");
+          assert.ok(
+            rows.every((own) => own.length < ROWS_PER_GROUP),
+            "FETCH must be needed",
+          );
 
           while (rows.some((own) => own.length < ROWS_PER_GROUP)) {
             for (const group of groups) {
@@ -2208,7 +2240,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
             }
           }
 
-          groups.forEach((group) => assertOwnRows(rows[group]!, group));
+          for (const group of groups) assertOwnRows(rows[group]!, group);
         } finally {
           await cas.close();
         }
@@ -2350,7 +2382,9 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
 
       try {
         await adapter.query("SELECT 1 FROM db_root");
-        const rows = await adapter.query("SELECT a.class_name FROM db_class a, db_class b LIMIT 500");
+        const rows = await adapter.query(
+          "SELECT a.class_name FROM db_class a, db_class b LIMIT 500",
+        );
         assert.equal(rows.length, 500);
         await adapter.query("SELECT 1 FROM db_root");
         await adapter.query("SELECT 1 FROM db_root");
@@ -2407,34 +2441,51 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       try {
         await adapter.query(`DROP TABLE IF EXISTS ${keyed}`);
         await adapter.query(`DROP TABLE IF EXISTS ${plain}`);
-        await adapter.query(`CREATE TABLE ${keyed} (id INT AUTO_INCREMENT(100, 1) PRIMARY KEY, n INT)`);
+        await adapter.query(
+          `CREATE TABLE ${keyed} (id INT AUTO_INCREMENT(100, 1) PRIMARY KEY, n INT)`,
+        );
         await adapter.query(`CREATE TABLE ${plain} (n INT)`);
         const generation = cas.connectionGeneration;
 
-        assert.deepEqual(await adapter.execute(insertKeyed), { affectedRows: 1, lastInsertId: 100 });
+        assert.deepEqual(await adapter.execute(insertKeyed), {
+          affectedRows: 1,
+          lastInsertId: 100,
+        });
         assert.deepEqual(await adapter.execute(insertPlain), { affectedRows: 1 });
 
         await adapter.query(insertKeyed);
         assert.deepEqual(await adapter.execute(insertPlain), { affectedRows: 1 });
 
         await adapter.beginTransaction();
-        assert.deepEqual(await adapter.execute(insertKeyed), { affectedRows: 1, lastInsertId: 102 });
+        assert.deepEqual(await adapter.execute(insertKeyed), {
+          affectedRows: 1,
+          lastInsertId: 102,
+        });
         await adapter.rollback();
         assert.deepEqual(await adapter.execute(insertPlain), { affectedRows: 1 });
 
         await adapter.beginTransaction();
-        assert.deepEqual(await adapter.execute(insertKeyed), { affectedRows: 1, lastInsertId: 103 });
+        assert.deepEqual(await adapter.execute(insertKeyed), {
+          affectedRows: 1,
+          lastInsertId: 103,
+        });
         await adapter.commit();
         await adapter.beginTransaction();
         assert.deepEqual(await adapter.execute(insertPlain), { affectedRows: 1 });
         await adapter.commit();
 
-        await assert.rejects(adapter.execute(`INSERT INTO ${keyed} (id, n) VALUES (103, 1)`), ConstraintError);
+        await assert.rejects(
+          adapter.execute(`INSERT INTO ${keyed} (id, n) VALUES (103, 1)`),
+          ConstraintError,
+        );
         assert.deepEqual(await adapter.execute(insertPlain), { affectedRows: 1 });
 
         await adapter.query(`REPLACE INTO ${keyed} (n) VALUES (1)`);
         assert.deepEqual(await adapter.execute(insertPlain), { affectedRows: 1 });
-        assert.deepEqual(await adapter.execute(insertKeyed), { affectedRows: 1, lastInsertId: 105 });
+        assert.deepEqual(await adapter.execute(insertKeyed), {
+          affectedRows: 1,
+          lastInsertId: 105,
+        });
 
         assert.equal(cas.connectionGeneration, generation);
       } finally {
@@ -2575,10 +2626,15 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
 
         try {
           assert.equal((await serverSettings(client)).level, code);
-          assert.equal(await client.transaction(async (tx) => (await serverSettings(tx)).level), code);
+          assert.equal(
+            await client.transaction(async (tx) => (await serverSettings(tx)).level),
+            code,
+          );
           assert.equal((await serverSettings(mixed)).level, otherCode);
           assert.equal(
-            await mixed.transaction(async (tx) => (await serverSettings(tx)).level, { isolationLevel }),
+            await mixed.transaction(async (tx) => (await serverSettings(tx)).level, {
+              isolationLevel,
+            }),
             code,
           );
         } finally {
@@ -2596,10 +2652,14 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
             await client.transaction(
               async (tx) => {
                 assert.equal((await serverSettings(tx)).level, code);
-                const first = await tx.query(`SELECT v, (SELECT COUNT(*) FROM ${TABLE}) AS n FROM ${TABLE} WHERE id = 1`);
+                const first = await tx.query(
+                  `SELECT v, (SELECT COUNT(*) FROM ${TABLE}) AS n FROM ${TABLE} WHERE id = 1`,
+                );
                 await observer.query(`UPDATE ${TABLE} SET v = 1 WHERE id = 1`);
                 await observer.query(`INSERT INTO ${TABLE} VALUES (2, 0)`);
-                const second = await tx.query(`SELECT v, (SELECT COUNT(*) FROM ${TABLE}) AS n FROM ${TABLE} WHERE id = 1`);
+                const second = await tx.query(
+                  `SELECT v, (SELECT COUNT(*) FROM ${TABLE}) AS n FROM ${TABLE} WHERE id = 1`,
+                );
 
                 assert.equal(first[0]!.v, 0);
                 assert.equal(second[0]!.v, seesConcurrentCommit ? 1 : 0);
@@ -2626,12 +2686,15 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
                 await tx.query(`SELECT v FROM ${TABLE}`);
                 await observer.query(`UPDATE ${TABLE} SET v = 5 WHERE id = 1`);
 
-                await assert.rejects(tx.query(`UPDATE ${TABLE} SET v = 6 WHERE id = 1`), (error: TransactionError) => {
-                  assert.ok(error instanceof TransactionError);
-                  assert.equal(error.code, -1158);
-                  assert.equal(error.kind, undefined);
-                  return true;
-                });
+                await assert.rejects(
+                  tx.query(`UPDATE ${TABLE} SET v = 6 WHERE id = 1`),
+                  (error: TransactionError) => {
+                    assert.ok(error instanceof TransactionError);
+                    assert.equal(error.code, -1158);
+                    assert.equal(error.kind, undefined);
+                    return true;
+                  },
+                );
 
                 // Only that statement failed, so the transaction can go on and commit.
                 await tx.query(`UPDATE ${TABLE} SET v = 7 WHERE id = 2`);
@@ -2700,7 +2763,9 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     });
 
     // A limit that never reached the server would wait for the lock forever.
-    test("lockTimeout limits a blocked statement in milliseconds, and 0 does not wait", { timeout: 30_000 }, async () => {
+    test("lockTimeout limits a blocked statement in milliseconds, and 0 does not wait", {
+      timeout: 30_000,
+    }, async () => {
       const client = createClient(TEST_CONFIG);
 
       try {
@@ -3330,7 +3395,12 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       test("-968 keeps the transaction, while a commit() rejected after -72 acknowledges it", async () => {
         // Each round has its own adapters because the lock timeout outlives a transaction.
         await withAdapters(async (first, second) => {
-          const { victim, survivor, earlierRow } = await deadlockAfterWrites(first, second, -968, 4);
+          const { victim, survivor, earlierRow } = await deadlockAfterWrites(
+            first,
+            second,
+            -968,
+            4,
+          );
 
           await victim.query(`INSERT INTO ${ROWS} VALUES (${earlierRow + 1}, 'kept', 0)`);
           await victim.commit();
@@ -3380,7 +3450,11 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     const USER_A = "cc_sch_ua";
     const USER_B = "cc_sch_ub";
 
-    async function serverAtLeast(client: ReturnType<typeof createClient>, major: number, minor: number) {
+    async function serverAtLeast(
+      client: ReturnType<typeof createClient>,
+      major: number,
+      minor: number,
+    ) {
       const [maj, min] = (await client.getServerVersion()).split(".").map(Number);
       return maj! > major || (maj === major && min! >= minor);
     }
@@ -3400,7 +3474,9 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         await client.query(sql);
       }
       for (const user of [USER_A, USER_B]) {
-        const exists = await client.query("SELECT name FROM db_user WHERE name = ?", [user.toUpperCase()]);
+        const exists = await client.query("SELECT name FROM db_user WHERE name = ?", [
+          user.toUpperCase(),
+        ]);
         if (exists.length > 0) {
           await client.query(`DROP USER ${user}`);
         }
@@ -3449,7 +3525,9 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         assert.equal(byName.has("db_class"), false);
         assert.equal(byName.has("_db_class"), false);
         assert.deepEqual(await client.getTables({ schema: "nobody_owns_this" }), []);
-        assert.ok((await client.getTables({ schema: "dba" })).some((table) => table.name === PARENT));
+        assert.ok(
+          (await client.getTables({ schema: "dba" })).some((table) => table.name === PARENT),
+        );
       } finally {
         await client.close();
       }
@@ -3485,7 +3563,10 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         assert.equal(columns[3]?.scale, 3);
         assert.equal(columns[0]?.defaultValue, null);
         assert.equal(columns[4]?.defaultValue, "SYS_DATETIME");
-        assert.deepEqual((await client.getColumns(VIEW)).map((column) => column.name), ["a"]);
+        assert.deepEqual(
+          (await client.getColumns(VIEW)).map((column) => column.name),
+          ["a"],
+        );
       } finally {
         await client.close();
       }
@@ -3498,7 +3579,10 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         assert.equal((await client.getColumns(PARENT.toUpperCase())).length, 7);
         assert.equal((await client.getColumns(PARENT, { schema: "Dba" })).length, 7);
         // CREATE TABLE "cc_sch Odd Table" stores the name and its column in lower case.
-        assert.deepEqual((await client.getColumns(ODD)).map((column) => column.name), ["odd col"]);
+        assert.deepEqual(
+          (await client.getColumns(ODD)).map((column) => column.name),
+          ["odd col"],
+        );
         assert.deepEqual(await client.getPrimaryKey(ODD), {
           name: (await client.getPrimaryKey(ODD))?.name,
           columns: ["odd col"],
@@ -3563,7 +3647,10 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         assert.match(indexes.get("i_cc_sch_filter")?.filter ?? "", /is not null/i);
 
         const fk = (await client.getIndexes(CHILD)).find((index) => index.foreignKey);
-        assert.deepEqual(fk?.columns.map((column) => column.name), ["pb", "pa"]);
+        assert.deepEqual(
+          fk?.columns.map((column) => column.name),
+          ["pb", "pa"],
+        );
         assert.equal(fk?.primaryKey, false);
       } finally {
         await client.close();
@@ -3574,12 +3661,20 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       const client = createClient(TEST_CONFIG);
 
       try {
-        for (const hostile of [`${PARENT}' OR '1'='1`, `x'; DROP TABLE ${PARENT}; --`, "%", "cc_sch_missing"]) {
+        for (const hostile of [
+          `${PARENT}' OR '1'='1`,
+          `x'; DROP TABLE ${PARENT}; --`,
+          "%",
+          "cc_sch_missing",
+        ]) {
           await assert.rejects(() => client.getColumns(hostile), QueryError);
           await assert.rejects(() => client.getIndexes(hostile), QueryError);
           await assert.rejects(() => client.getPrimaryKey(hostile), QueryError);
         }
-        await assert.rejects(() => client.getColumns(PARENT, { schema: "nobody_owns_this" }), QueryError);
+        await assert.rejects(
+          () => client.getColumns(PARENT, { schema: "nobody_owns_this" }),
+          QueryError,
+        );
         assert.equal((await client.getColumns(PARENT)).length, 7);
       } finally {
         await client.close();
@@ -3596,7 +3691,10 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
           (await granted.getTables()).map((table) => table.name),
           [PARENT],
         );
-        await assert.rejects(() => granted.getColumns(CHILD), /was not found, or the connected user may not SELECT/);
+        await assert.rejects(
+          () => granted.getColumns(CHILD),
+          /was not found, or the connected user may not SELECT/,
+        );
         assert.deepEqual(await denied.getTables(), []);
         await assert.rejects(() => denied.getIndexes(PARENT), QueryError);
       } finally {
@@ -3615,17 +3713,28 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
           // Older servers keep one table per name and own it by the creator, DBA.
           const found = (await client.getTables()).filter((table) => table.name === DUP);
           assert.deepEqual(found, [{ name: DUP, schema: "DBA", type: "table" }]);
-          assert.deepEqual((await client.getColumns(DUP, { schema: "dba" })).map((c) => c.name), ["a_only"]);
+          assert.deepEqual(
+            (await client.getColumns(DUP, { schema: "dba" })).map((c) => c.name),
+            ["a_only"],
+          );
           return;
         }
 
         await client.query(`CREATE TABLE ${USER_B}.${DUP} (b_only INT, b_two INT)`);
         assert.deepEqual(
-          (await client.getTables()).filter((table) => table.name === DUP).map((table) => table.schema),
+          (await client.getTables())
+            .filter((table) => table.name === DUP)
+            .map((table) => table.schema),
           [USER_A.toUpperCase(), USER_B.toUpperCase()],
         );
-        await assert.rejects(() => client.getColumns(DUP), /owned by several users \(CC_SCH_UA, CC_SCH_UB\)/);
-        assert.deepEqual((await client.getColumns(DUP, { schema: USER_A })).map((c) => c.name), ["a_only"]);
+        await assert.rejects(
+          () => client.getColumns(DUP),
+          /owned by several users \(CC_SCH_UA, CC_SCH_UB\)/,
+        );
+        assert.deepEqual(
+          (await client.getColumns(DUP, { schema: USER_A })).map((c) => c.name),
+          ["a_only"],
+        );
         assert.deepEqual(
           (await client.getColumns(DUP, { schema: USER_B })).map((c) => c.name),
           ["b_only", "b_two"],
@@ -3686,10 +3795,10 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
           lastInsertId: 1,
         });
         // A multi-row INSERT reports the first id it generated (here 2, 3 and 4).
-        assert.deepEqual(
-          await client.execute(`INSERT INTO ${AUTO} (v) VALUES (11), (12), (13)`),
-          { affectedRows: 3, lastInsertId: 2 },
-        );
+        assert.deepEqual(await client.execute(`INSERT INTO ${AUTO} (v) VALUES (11), (12), (13)`), {
+          affectedRows: 3,
+          lastInsertId: 2,
+        });
         assert.deepEqual(await client.execute(`UPDATE ${AUTO} SET v = v + 100 WHERE v > 10`), {
           affectedRows: 3,
         });
@@ -3834,10 +3943,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
             throw new Error("abort");
           }),
         );
-        assert.deepEqual(
-          await client.query(`SELECT COUNT(*) AS n FROM ${AUTO}`),
-          before,
-        );
+        assert.deepEqual(await client.query(`SELECT COUNT(*) AS n FROM ${AUTO}`), before);
       } finally {
         await client.close();
       }
@@ -3981,9 +4087,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       await withLobTable(async (client) => {
         await client.query(`INSERT INTO ${TABLE} VALUES (?, ?, ?)`, [1, LARGE_BLOB, LARGE_CLOB]);
 
-        const [row] = await client.query<{ b: Buffer; c: string }>(
-          `SELECT b, c FROM ${TABLE}`,
-        );
+        const [row] = await client.query<{ b: Buffer; c: string }>(`SELECT b, c FROM ${TABLE}`);
 
         assert.ok(LARGE_BLOB.equals(row!.b));
         assert.equal(row!.c, LARGE_CLOB);
@@ -3996,9 +4100,9 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         await client.query(`INSERT INTO ${TABLE} VALUES ${rows.join(",")}`);
 
         const results = await Promise.all(
-          [0, 1, 2, 3].map(() => client.query<{ id: number; c: string }>(
-            `SELECT id, b, c FROM ${TABLE} ORDER BY id`,
-          )),
+          [0, 1, 2, 3].map(() =>
+            client.query<{ id: number; c: string }>(`SELECT id, b, c FROM ${TABLE} ORDER BY id`),
+          ),
         );
 
         for (const result of results) {
@@ -4009,40 +4113,46 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     });
 
     test("over the limit, the query rejects by name and the connection stays usable", async () => {
-      await withLobTable(async (client) => {
-        await client.query(`INSERT INTO ${TABLE} VALUES (1, ?, 'short')`, [LARGE_BLOB]);
+      await withLobTable(
+        async (client) => {
+          await client.query(`INSERT INTO ${TABLE} VALUES (1, ?, 'short')`, [LARGE_BLOB]);
 
-        await assert.rejects(
-          () => client.query(`SELECT b FROM ${TABLE}`),
-          (error: Error) => {
-            assert.ok(error instanceof QueryError);
-            assert.match(
-              causes(error),
-              /UnsupportedValueError: CUBRID column "b" .* 250000 bytes, over the maxLobBytes limit of 100000/,
-            );
-            return true;
-          },
-        );
+          await assert.rejects(
+            () => client.query(`SELECT b FROM ${TABLE}`),
+            (error: Error) => {
+              assert.ok(error instanceof QueryError);
+              assert.match(
+                causes(error),
+                /UnsupportedValueError: CUBRID column "b" .* 250000 bytes, over the maxLobBytes limit of 100000/,
+              );
+              return true;
+            },
+          );
 
-        // Under the limit on the same connection, in the same table.
-        assert.deepEqual(await client.query(`SELECT c FROM ${TABLE}`), [{ c: "short" }]);
-      }, { maxLobBytes: 100_000 });
+          // Under the limit on the same connection, in the same table.
+          assert.deepEqual(await client.query(`SELECT c FROM ${TABLE}`), [{ c: "short" }]);
+        },
+        { maxLobBytes: 100_000 },
+      );
     });
 
     test("over the limit in a transaction, the transaction stays open", async () => {
-      await withLobTable(async (client) => {
-        await client.transaction(async (tx) => {
-          await tx.query(`INSERT INTO ${TABLE} VALUES (1, X'0102', 'kept')`);
-          await assert.rejects(() => tx.query(`SELECT b FROM ${TABLE}`), TransactionError);
-          await tx.query(`INSERT INTO ${TABLE} VALUES (2, NULL, 'too')`);
-        });
+      await withLobTable(
+        async (client) => {
+          await client.transaction(async (tx) => {
+            await tx.query(`INSERT INTO ${TABLE} VALUES (1, X'0102', 'kept')`);
+            await assert.rejects(() => tx.query(`SELECT b FROM ${TABLE}`), TransactionError);
+            await tx.query(`INSERT INTO ${TABLE} VALUES (2, NULL, 'too')`);
+          });
 
-        // Both rows committed; `c` is left out because it is over this client's limit.
-        assert.deepEqual(await client.query(`SELECT id FROM ${TABLE} ORDER BY id`), [
-          { id: 1 },
-          { id: 2 },
-        ]);
-      }, { maxLobBytes: 1 });
+          // Both rows committed; `c` is left out because it is over this client's limit.
+          assert.deepEqual(await client.query(`SELECT id FROM ${TABLE} ORDER BY id`), [
+            { id: 1 },
+            { id: 2 },
+          ]);
+        },
+        { maxLobBytes: 1 },
+      );
     });
 
     test("a transaction reads its own uncommitted row, and a rollback removes it", async () => {
@@ -4051,11 +4161,12 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         // would itself roll back and look like the planned failure.
         let seen: unknown;
         await assert.rejects(
-          () => client.transaction(async (tx) => {
-            await tx.query(`INSERT INTO ${TABLE} VALUES (1, X'0a0b', 'uncommitted')`);
-            seen = await tx.query(`SELECT b, c FROM ${TABLE}`);
-            throw new Error("roll it back");
-          }),
+          () =>
+            client.transaction(async (tx) => {
+              await tx.query(`INSERT INTO ${TABLE} VALUES (1, X'0a0b', 'uncommitted')`);
+              seen = await tx.query(`SELECT b, c FROM ${TABLE}`);
+              throw new Error("roll it back");
+            }),
           TransactionError,
         );
 
@@ -4091,7 +4202,10 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         await assert.rejects(
           () => client.query(`SELECT c FROM ${TABLE}`),
           (error: Error) => {
-            assert.match(causes(error), /UnsupportedValueError: CUBRID CLOB column "c" is not valid UTF-8/);
+            assert.match(
+              causes(error),
+              /UnsupportedValueError: CUBRID CLOB column "c" is not valid UTF-8/,
+            );
             return true;
           },
         );
@@ -4111,7 +4225,10 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         const [scalar] = await client.query(`SELECT 7 AS "__proto__", 'after' AS t`);
         const [nullValue] = await client.query(`SELECT NULL AS "__proto__", 'after' AS t`);
 
-        assert.deepEqual(Object.getOwnPropertyDescriptor(lob, "__proto__")?.value, Buffer.from([10, 11]));
+        assert.deepEqual(
+          Object.getOwnPropertyDescriptor(lob, "__proto__")?.value,
+          Buffer.from([10, 11]),
+        );
         assert.equal(Object.getOwnPropertyDescriptor(scalar, "__proto__")?.value, 7);
         assert.equal(Object.getOwnPropertyDescriptor(nullValue, "__proto__")?.value, null);
         assert.deepEqual(Object.keys(nullValue!), ["__proto__", "t"]);
@@ -4151,8 +4268,23 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     const CAS_ER_SRV_HANDLE = -1006;
     const WHEN = new Date(Date.UTC(2024, 1, 29, 13, 45, 56, 789));
     const COLUMNS = [
-      "c_short", "c_int", "c_big", "c_float", "c_double", "c_money", "c_num", "c_char", "c_var",
-      "c_nchar", "c_date", "c_time", "c_dt", "c_ts", "c_bit", "c_vbit", "c_enum",
+      "c_short",
+      "c_int",
+      "c_big",
+      "c_float",
+      "c_double",
+      "c_money",
+      "c_num",
+      "c_char",
+      "c_var",
+      "c_nchar",
+      "c_date",
+      "c_time",
+      "c_dt",
+      "c_ts",
+      "c_bit",
+      "c_vbit",
+      "c_enum",
     ];
     const INSERT_TYPES = `INSERT INTO ${TYPES} (k, ${COLUMNS.join(", ")}) VALUES (?, ${COLUMNS.map(() => "?").join(", ")})`;
 
@@ -4247,8 +4379,44 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       const client = createClient(TEST_CONFIG);
       const buffer = Buffer.from([0xab, 0xcd]);
       const cases: QueryParams[] = [
-        [12, 1234, 9007199254740993n, 1.5, 0.1, 19.99, 12345.6789, "abc", "text", null, WHEN, WHEN, WHEN, WHEN, buffer, buffer, "a"],
-        [-12, -1234, -5000000000, -2.25, -1e300, -1, -0.5, "", "", null, WHEN, WHEN, WHEN, WHEN, buffer, buffer, "b"],
+        [
+          12,
+          1234,
+          9007199254740993n,
+          1.5,
+          0.1,
+          19.99,
+          12345.6789,
+          "abc",
+          "text",
+          null,
+          WHEN,
+          WHEN,
+          WHEN,
+          WHEN,
+          buffer,
+          buffer,
+          "a",
+        ],
+        [
+          -12,
+          -1234,
+          -5000000000,
+          -2.25,
+          -1e300,
+          -1,
+          -0.5,
+          "",
+          "",
+          null,
+          WHEN,
+          WHEN,
+          WHEN,
+          WHEN,
+          buffer,
+          buffer,
+          "b",
+        ],
         [true, false, 42, 42, 42, 42, 42, 42, 42, null, WHEN, WHEN, WHEN, WHEN, buffer, buffer, 1],
         COLUMNS.map(() => null),
       ];
@@ -4327,8 +4495,19 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     test("text binds arrive unchanged, whatever SQL they look like", async () => {
       const client = createClient(TEST_CONFIG);
       const values = [
-        "it's", "double\"quote", "back\\slash", "\\'", "line\nbreak\r", "한글", "", "ab  ",
-        "100%_", "?", "-- comment", "/* comment */", "'; DROP TABLE cc_prep_rows; --",
+        "it's",
+        'double"quote',
+        "back\\slash",
+        "\\'",
+        "line\nbreak\r",
+        "한글",
+        "",
+        "ab  ",
+        "100%_",
+        "?",
+        "-- comment",
+        "/* comment */",
+        "'; DROP TABLE cc_prep_rows; --",
       ];
       try {
         for (const value of values) {
@@ -4342,7 +4521,9 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
           assert.deepEqual(rows, [{ c_var: value }]);
         }
         // COUNT(*) is INT before 11.4 and BIGINT from 11.4 on.
-        const [count] = await client.query<{ n: number | bigint }>(`SELECT COUNT(*) AS n FROM ${ROWS}`);
+        const [count] = await client.query<{ n: number | bigint }>(
+          `SELECT COUNT(*) AS n FROM ${ROWS}`,
+        );
         assert.equal(Number(count?.n), 0);
       } finally {
         await client.close();
@@ -4416,10 +4597,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
           { id: 2, n: 20 },
         ]);
         const multiSelect = "SELECT 1 AS a FROM db_root; SELECT 2 AS b FROM db_root";
-        assert.deepEqual(
-          await client.queryPrepared(multiSelect),
-          await client.query(multiSelect),
-        );
+        assert.deepEqual(await client.queryPrepared(multiSelect), await client.query(multiSelect));
       } finally {
         await client.close();
       }
@@ -4534,7 +4712,10 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
           // Too many values.
           () => adapter.queryPrepared("SELECT 1 FROM db_root", [1]),
           // A value that cannot be decoded: the zero date has no Date.
-          () => adapter.queryPrepared("SELECT CAST(? AS DATETIME) AS z FROM db_root", ["0000-00-00 00:00:00"]),
+          () =>
+            adapter.queryPrepared("SELECT CAST(? AS DATETIME) AS z FROM db_root", [
+              "0000-00-00 00:00:00",
+            ]),
         ]) {
           await assertReleasedAfter(trace, run);
         }
@@ -4584,7 +4765,10 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
           new Date(Number.NaN),
           new Date("0000-06-01T00:00:00Z"),
         ]) {
-          await assert.rejects(trace.adapter.queryPrepared("SELECT ? FROM db_root", [value]), QueryError);
+          await assert.rejects(
+            trace.adapter.queryPrepared("SELECT ? FROM db_root", [value]),
+            QueryError,
+          );
         }
         assert.deepEqual(trace.sent, []);
       } finally {
@@ -4601,10 +4785,9 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         await new Promise((resolve) => setImmediate(resolve));
         const sent = trace.sent.length;
 
-        assert.deepEqual(
-          await trace.adapter.queryPrepared("SELECT ? AS v FROM db_root", [2]),
-          [{ v: 2 }],
-        );
+        assert.deepEqual(await trace.adapter.queryPrepared("SELECT ? AS v FROM db_root", [2]), [
+          { v: 2 },
+        ]);
         assert.equal(trace.sent[sent], CASFunctionCode.PREPARE);
       } finally {
         await trace.adapter.close();
@@ -4623,7 +4806,10 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       };
 
       try {
-        await assert.rejects(trace.adapter.queryPrepared("SELECT ? AS v FROM db_root", [1]), QueryError);
+        await assert.rejects(
+          trace.adapter.queryPrepared("SELECT ? AS v FROM db_root", [1]),
+          QueryError,
+        );
         assert.equal(trace.sent.includes(CASFunctionCode.CLOSE_REQ_HANDLE), false);
 
         trace.cas.sendAndRecvOnSession = sendOnSession;
@@ -4746,7 +4932,10 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
               : client.query<{ v: number }>("SELECT ? AS v FROM db_root", [i]),
           ),
         );
-        assert.deepEqual(results.map((rows) => rows[0]?.v), results.map((_, i) => i));
+        assert.deepEqual(
+          results.map((rows) => rows[0]?.v),
+          results.map((_, i) => i),
+        );
       } finally {
         await client.close();
       }
@@ -4989,12 +5178,15 @@ describe("stream()", { skip: !available }, () => {
     await withStreamTable(async (client) => {
       const failure = new Error("the consumer failed");
 
-      await assert.rejects(async () => {
-        for await (const row of client.stream(`SELECT id FROM ${TABLE} ORDER BY id`)) {
-          assert.ok(row);
-          throw failure;
-        }
-      }, (error) => error === failure);
+      await assert.rejects(
+        async () => {
+          for await (const row of client.stream(`SELECT id FROM ${TABLE} ORDER BY id`)) {
+            assert.ok(row);
+            throw failure;
+          }
+        },
+        (error) => error === failure,
+      );
 
       await assertTableUnlocked();
     });
@@ -5036,13 +5228,16 @@ describe("stream()", { skip: !available }, () => {
 
   test("a query awaited inside the loop rejects, and the connection keeps working", async () => {
     await withStreamTable(async (client) => {
-      await assert.rejects(async () => {
-        for await (const row of client.stream(`SELECT id FROM ${TABLE}`, undefined, {
-          consumerTimeout: 50,
-        })) {
-          await client.query(`SELECT ${String(row.id)} AS id FROM db_root`);
-        }
-      }, (error: QueryError) => error instanceof QueryError && error.kind === "stream-busy");
+      await assert.rejects(
+        async () => {
+          for await (const row of client.stream(`SELECT id FROM ${TABLE}`, undefined, {
+            consumerTimeout: 50,
+          })) {
+            await client.query(`SELECT ${String(row.id)} AS id FROM db_root`);
+          }
+        },
+        (error: QueryError) => error instanceof QueryError && error.kind === "stream-busy",
+      );
 
       await assertTableUnlocked();
       assert.deepEqual(await client.query("SELECT 1 AS one FROM db_root"), [{ one: 1 }]);
@@ -5085,7 +5280,9 @@ describe("stream()", { skip: !available }, () => {
       await client.query(`UPDATE ${TABLE} SET b = BIT_TO_BLOB(X'0102') WHERE id <= 500`);
       let read = 0;
 
-      for await (const row of client.stream(`SELECT id, b FROM ${TABLE} WHERE id <= 500 ORDER BY id`)) {
+      for await (const row of client.stream(
+        `SELECT id, b FROM ${TABLE} WHERE id <= 500 ORDER BY id`,
+      )) {
         read += 1;
         assert.equal(row.id, read);
         assert.deepEqual(row.b, Buffer.from([1, 2]));
@@ -5097,24 +5294,30 @@ describe("stream()", { skip: !available }, () => {
   });
 
   test("maxLobBytes limits one row, and a row over it fails with the connection usable", async () => {
-    await withStreamTable(async (client) => {
-      await client.query(`UPDATE ${TABLE} SET b = BIT_TO_BLOB(X'0102') WHERE id <= 500`);
-      await client.query(`UPDATE ${TABLE} SET b = BIT_TO_BLOB(X'010203') WHERE id = 5`);
-      const sql = `SELECT id, b FROM ${TABLE} WHERE id <= 5 ORDER BY id`;
-      await assert.rejects(() => client.query(sql), QueryError);
-      let read = 0;
+    await withStreamTable(
+      async (client) => {
+        await client.query(`UPDATE ${TABLE} SET b = BIT_TO_BLOB(X'0102') WHERE id <= 500`);
+        await client.query(`UPDATE ${TABLE} SET b = BIT_TO_BLOB(X'010203') WHERE id = 5`);
+        const sql = `SELECT id, b FROM ${TABLE} WHERE id <= 5 ORDER BY id`;
+        await assert.rejects(() => client.query(sql), QueryError);
+        let read = 0;
 
-      await assert.rejects(async () => {
-        for await (const row of client.stream(sql)) {
-          assert.ok(row);
-          read += 1;
-        }
-      }, (error: QueryError) => (error.cause as Error).cause instanceof Error);
+        await assert.rejects(
+          async () => {
+            for await (const row of client.stream(sql)) {
+              assert.ok(row);
+              read += 1;
+            }
+          },
+          (error: QueryError) => (error.cause as Error).cause instanceof Error,
+        );
 
-      assert.equal(read, 4);
-      await assertTableUnlocked();
-      assert.deepEqual(await client.query("SELECT 1 AS one FROM db_root"), [{ one: 1 }]);
-    }, { maxLobBytes: 2 });
+        assert.equal(read, 4);
+        await assertTableUnlocked();
+        assert.deepEqual(await client.query("SELECT 1 AS one FROM db_root"), [{ one: 1 }]);
+      },
+      { maxLobBytes: 2 },
+    );
   });
 
   test("a break after LOB reads releases the table lock", async () => {
