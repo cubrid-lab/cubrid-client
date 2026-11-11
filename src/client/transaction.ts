@@ -99,13 +99,20 @@ export class CubridTransaction
   }
 }
 
-type CallbackTransactionState = "open" | "completing" | "committed" | "rolledBack" | "failed";
+type CallbackTransactionState =
+  | "open"
+  | "completing"
+  | "committed"
+  | "rolledBack"
+  | "failed"
+  | "discarded";
 
 const COMPLETED_MESSAGES: Record<Exclude<CallbackTransactionState, "open">, string> = {
   completing: "Transaction is already completing.",
   committed: "Transaction has already been committed.",
   rolledBack: "Transaction has already been rolled back.",
   failed: "Transaction has already failed.",
+  discarded: "Transaction was discarded because the client was closed.",
 };
 
 /**
@@ -119,7 +126,7 @@ const COMPLETED_MESSAGES: Record<Exclude<CallbackTransactionState, "open">, stri
  * public 1.x API and a caller may reuse one across several transactions.
  */
 export class CallbackTransaction extends CubridTransaction {
-  private state: CallbackTransactionState = "open";
+  protected state: CallbackTransactionState = "open";
   private completion: Promise<void> | undefined;
   private readonly runningQueries = new Set<Promise<unknown>>();
   private readonly justRejectedQueries = new Set<Promise<unknown>>();
@@ -236,7 +243,7 @@ export class CallbackTransaction extends CubridTransaction {
    * one turn after the callback returns, so by then this entry is gone. A query still
    * here when the callback settles rejected too late for the callback to have seen it.
    */
-  private rememberRejection(query: Promise<unknown>): void {
+  protected rememberRejection(query: Promise<unknown>): void {
     this.rejectedQueries.add(query);
     this.justRejectedQueries.add(query);
     queueMicrotask(() => {
@@ -311,6 +318,107 @@ export class CallbackTransaction extends CubridTransaction {
       this.state = "failed";
       this.rollbackFailure = toError(error);
       throw error;
+    }
+  }
+}
+
+/**
+ * The handle `CubridClient.beginTransactionScope()` returns (#112). It owns a
+ * dedicated connection, so statements sent on the client meanwhile cannot join
+ * its transaction. It keeps the guarantees of the `transaction()` callback's
+ * `tx`: one terminal outcome, a commit refused while one of its statements is
+ * still failing, and a rollback after a failed commit. Whichever way it ends, its
+ * connection is closed and the client stops tracking it.
+ */
+export class ScopedTransaction extends CallbackTransaction {
+  private ending: Promise<void> | undefined;
+
+  constructor(
+    private readonly ownConnection: ConnectionLike,
+    private readonly onEnded: () => void,
+  ) {
+    super(ownConnection);
+  }
+
+  override commit(): Promise<void> {
+    return this.end(() => super.commit(), "Failed to commit.", true);
+  }
+
+  override rollback(): Promise<void> {
+    return this.end(() => super.rollback(), "Failed to rollback.", false);
+  }
+
+  /**
+   * For `CubridClient.close()`: ends a transaction nobody ended by closing its
+   * connection, and the server discards the uncommitted work with it. It does not
+   * wait for statements still running first, unlike rollback(): one may be waiting
+   * for a lock that only another connection being closed would release. A
+   * statement already sent then fails with a connection error. Never rejects.
+   */
+  async discard(): Promise<void> {
+    if (!this.ending) {
+      this.state = "discarded";
+      this.ending = this.closeOwnConnection();
+    }
+
+    await this.ending.catch(() => {
+      // Nothing to report: close() is not about this transaction's outcome.
+    });
+  }
+
+  /**
+   * A handle may live long and run many statements whose failures its caller
+   * handled; only finish() and abort() of the transaction() callback read these.
+   */
+  protected override rememberRejection(): void {}
+
+  private end(run: () => Promise<void>, message: string, committing: boolean): Promise<void> {
+    if (this.ending) {
+      // Rejects with "already completing" or the settled outcome's message.
+      return run();
+    }
+
+    this.ending = this.runToEnd(run, message, committing);
+    return this.ending;
+  }
+
+  private async runToEnd(
+    run: () => Promise<void>,
+    message: string,
+    committing: boolean,
+  ): Promise<void> {
+    let failure: Error | undefined;
+
+    try {
+      await run();
+    } catch (error) {
+      failure = mapError("transaction", error, message);
+      // A failed explicit rollback is already the cause.
+      if (committing && failure instanceof TransactionError && this.rollbackFailure) {
+        failure.rollbackError = this.rollbackFailure;
+      }
+    }
+
+    try {
+      await this.closeOwnConnection();
+    } catch (closeError) {
+      // The outcome is decided by now: a committed transaction stays committed,
+      // and an uncommitted one is discarded by the server with the connection.
+      if (failure instanceof TransactionError) {
+        failure.closeError = toError(closeError);
+      }
+    }
+
+    if (failure) {
+      throw failure;
+    }
+  }
+
+  private async closeOwnConnection(): Promise<void> {
+    try {
+      await this.ownConnection.close();
+    } finally {
+      this.onEnded();
     }
   }
 }

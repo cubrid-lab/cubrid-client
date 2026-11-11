@@ -280,6 +280,20 @@ export interface ResultTransactionClient extends TransactionClient, ResultQuerya
  */
 export interface PreparedTransactionClient extends TransactionClient, PreparedQueryable {}
 
+/**
+ * A manual transaction returned by `CubridClient.beginTransactionScope()`. It owns
+ * a dedicated connection, so statements issued on the client meanwhile never join
+ * it. Exactly one `commit()` or `rollback()` ends it and closes that connection;
+ * every later call rejects without reaching the server.
+ *
+ * This describes a value the client returns. Members may be added to it in a
+ * minor release, so do not implement it in your own classes.
+ */
+export interface TransactionScope
+  extends ResultTransactionClient,
+    ExecutableTransactionClient,
+    PreparedTransactionClient {}
+
 export interface ConnectionLike {
   connect(): Promise<void>;
   query<T extends QueryResultRow = QueryResultRow>(

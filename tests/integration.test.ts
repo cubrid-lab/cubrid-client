@@ -587,6 +587,90 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
   });
 
   // -------------------------------------------------------------------------
+  // #112: beginTransactionScope() owns its connection on a real server
+  // -------------------------------------------------------------------------
+
+  describe("beginTransactionScope() ownership", () => {
+    const table = "tx_scope_test_native";
+
+    async function withScopeTable(
+      run: (client: ReturnType<typeof createClient>) => Promise<void>,
+    ): Promise<void> {
+      const client = createClient(TEST_CONFIG);
+      try {
+        await client.query(`DROP TABLE IF EXISTS ${table}`);
+        await client.query(`CREATE TABLE ${table} (val VARCHAR(40))`);
+        await run(client);
+      } finally {
+        await client.query(`DROP TABLE IF EXISTS ${table}`).catch(() => undefined);
+        await client.close();
+      }
+    }
+
+    const values = async (client: ReturnType<typeof createClient>): Promise<string[]> =>
+      (await client.query<{ val: string }>(`SELECT val FROM ${table} ORDER BY val`)).map(
+        (row) => row.val,
+      );
+
+    test("an unrelated client write during the scope is not rolled back with it", async () => {
+      await withScopeTable(async (client) => {
+        const tx = await client.beginTransactionScope();
+
+        await Promise.all([
+          tx.query(`INSERT INTO ${table} VALUES ('scoped')`),
+          client.query(`INSERT INTO ${table} VALUES ('unrelated')`),
+        ]);
+        await tx.rollback();
+
+        assert.deepEqual(await values(client), ["unrelated"]);
+      });
+    });
+
+    test("scoped work is invisible to the client until commit, then persists", async () => {
+      await withScopeTable(async (client) => {
+        const tx = await client.beginTransactionScope({ lockTimeout: 0 });
+        await tx.query(`INSERT INTO ${table} VALUES ('scoped')`);
+
+        // The shared connection is another session: it cannot read the
+        // uncommitted row without waiting for its lock, so it sees nothing yet.
+        const other = createClient(TEST_CONFIG);
+        try {
+          const seen = await other
+            .transaction(async (otx) => {
+              await otx.query("SET TRANSACTION LOCK TIMEOUT 0");
+              return otx.query(`SELECT val FROM ${table}`);
+            })
+            .catch(() => "blocked" as const);
+          assert.ok(seen === "blocked" || seen.length === 0, `saw ${JSON.stringify(seen)}`);
+        } finally {
+          await other.close();
+        }
+
+        await tx.commit();
+        assert.deepEqual(await values(client), ["scoped"]);
+        await assert.rejects(tx.query("SELECT 1 FROM db_root"), TransactionError);
+      });
+    });
+
+    test("close() rolls back a scope nobody ended", async () => {
+      const client = createClient(TEST_CONFIG);
+      await client.query(`DROP TABLE IF EXISTS ${table}`);
+      await client.query(`CREATE TABLE ${table} (val VARCHAR(40))`);
+      const tx = await client.beginTransactionScope();
+      await tx.query(`INSERT INTO ${table} VALUES ('abandoned')`);
+      await client.close();
+
+      const check = createClient(TEST_CONFIG);
+      try {
+        assert.deepEqual(await values(check), []);
+      } finally {
+        await check.query(`DROP TABLE IF EXISTS ${table}`);
+        await check.close();
+      }
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // Transaction callback lifecycle: one terminal outcome, nothing after it
   // -------------------------------------------------------------------------
 

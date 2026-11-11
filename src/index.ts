@@ -42,6 +42,7 @@ export type {
   TransactionCallback,
   TransactionClient,
   TransactionOptions,
+  TransactionScope,
 } from "./types/client.js";
 export type { QueryParam, QueryParams } from "./types/query.js";
 export type {
