@@ -61,9 +61,12 @@ export function validateCuratedNote(version, note, knownVersions = Object.keys(p
   if (note.includes("cubrid-labs/cubrid-client")) errors.push("Outdated organization URL");
   if (/(?:^|\n)## (?:New Contributors|Highlights|Known limitations)/.test(note))
     errors.push("Outdated or duplicated release section");
-  const ids = [...note.matchAll(/github\.com\/cubrid-lab\/cubrid-client\/pull\/(\d+)/g)].map(
-    (x) => x[1],
-  );
+  // Plain text, not a URL check: the numbers after each pull-request link.
+  const ids = note
+    .split("github.com/cubrid-lab/cubrid-client/pull/")
+    .slice(1)
+    .map((part) => /^\d+/.exec(part)?.[0])
+    .filter((id) => id !== undefined);
   if (ids.length !== new Set(ids).size) errors.push("Repeated pull-request reference");
 
   const index = versions.indexOf(version);
