@@ -1,3 +1,4 @@
+import type { PreparedQueryParam } from "./lob.js";
 import type { QueryParams } from "./query.js";
 import type { QueryResult, QueryResultRow } from "./result.js";
 
@@ -286,17 +287,17 @@ export interface Executable {
 export interface PreparedQueryable {
   queryPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
-    params?: QueryParams,
+    params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
   ): Promise<T[]>;
   queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
-    params?: QueryParams,
+    params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
   ): Promise<QueryResult<T>>;
   executePrepared(
     sql: string,
-    params?: QueryParams,
+    params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
   ): Promise<ExecuteResult>;
 }
@@ -410,17 +411,17 @@ export interface ConnectionLike {
    */
   queryPrepared?<T extends QueryResultRow = QueryResultRow>(
     sql: string,
-    params?: QueryParams,
+    params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
   ): Promise<T[]>;
   queryResultPrepared?<T extends QueryResultRow = QueryResultRow>(
     sql: string,
-    params?: QueryParams,
+    params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
   ): Promise<QueryResult<T>>;
   executePrepared?(
     sql: string,
-    params?: QueryParams,
+    params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
   ): Promise<ExecuteResult>;
   /**

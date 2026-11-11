@@ -52,8 +52,9 @@ criteria are verified and which are still pending real broker tests.
   [#84](https://github.com/cubrid-lab/cubrid-client/issues/84),
   [#88](https://github.com/cubrid-lab/cubrid-client/issues/88),
   [#85](https://github.com/cubrid-lab/cubrid-client/issues/85).
-- Verified LOB writes:
-  [#103](https://github.com/cubrid-lab/cubrid-client/issues/103).
+- Verified LOB writes through `blob()` and `clob()` on the prepared methods:
+  [#103](https://github.com/cubrid-lab/cubrid-client/issues/103). Batches with
+  LOBs, a separate `createLob()` and a write-side size limit are not included.
 - Transaction configuration and server version:
   [#91](https://github.com/cubrid-lab/cubrid-client/issues/91),
   [#102](https://github.com/cubrid-lab/cubrid-client/issues/102).

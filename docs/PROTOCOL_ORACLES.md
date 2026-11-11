@@ -141,6 +141,28 @@ captured bytes.
   rollback, the read fails with -1020, and a LOB built by a statement is already
   gone when an autocommit reply arrives.
 
+## LOB_NEW and LOB_WRITE wire format
+
+`blob()` and `clob()` use functions 35 and 36 (`fn_lob_new`, `fn_lob_write` in
+`cas_function.c`; `ux_lob_new`, `ux_lob_write` in `cas_execute.c`; JDBC
+`UConnection.lobNew`, `lobWrite` and `UOutputBuffer.addLob`). These facts were
+measured with a raw socket client on the cubrid/cubrid 10.2 and 11.4 images with
+protocol version 7; `LOB_WRITE_FRAMES` in `tests/fixtures/lob-frames.ts` holds the
+captured bytes. The driver's live suite then ran the same requests on 11.0 and 11.2.
+
+- **LOB_NEW** sends one int argument, the bind type: `23 00000004 00000017` for a
+  BLOB, `...18` for a CLOB. The reply is the handle's length, then the handle in the
+  cell layout above with size 0. There is no separate result code.
+- **An unknown type** is answered with -10004 alone, four bytes with no error block.
+- **LOB_WRITE** sends the handle with an int32 length, the int64 offset and the
+  bytes with an int32 length. The reply is only the int32 count written. A write
+  past the end of the file fails with -2, error -1016 and a message.
+- **The handle's size is not updated by the server.** The client counts the bytes
+  written and patches the int64 size before binding the handle in EXECUTE as
+  `int32 1, byte 23 or 24, int32 length, handle`, as JDBC does with `setLobSize`.
+- **The file is a temporary one** (`ces_temp...`) until EXECUTE stores it, and it
+  belongs to the session's transaction: a rollback discards it.
+
 ## EXECUTE_ARRAY wire format
 
 `executeMany()` uses function 21, `CAS_FC_EXECUTE_ARRAY` in CUBRID's

@@ -18,6 +18,7 @@ import type {
   QueryOptions,
   StreamOptions,
 } from "../types/client.js";
+import type { PreparedQueryParam } from "../types/lob.js";
 import type { QueryParams } from "../types/query.js";
 import type { QueryResult, QueryResultRow } from "../types/result.js";
 
@@ -190,7 +191,7 @@ export function withLogging(factory: ConnectionFactory, logger: unknown): Connec
     if (queryPrepared) {
       wrapped.queryPrepared = <T extends QueryResultRow = QueryResultRow>(
         sql: string,
-        params?: QueryParams,
+        params?: readonly PreparedQueryParam[],
         options?: QueryOptions,
       ): Promise<T[]> =>
         timed(
@@ -204,7 +205,7 @@ export function withLogging(factory: ConnectionFactory, logger: unknown): Connec
     if (queryResultPrepared) {
       wrapped.queryResultPrepared = <T extends QueryResultRow = QueryResultRow>(
         sql: string,
-        params?: QueryParams,
+        params?: readonly PreparedQueryParam[],
         options?: QueryOptions,
       ): Promise<QueryResult<T>> =>
         timed(
@@ -218,7 +219,7 @@ export function withLogging(factory: ConnectionFactory, logger: unknown): Connec
     if (executePrepared) {
       wrapped.executePrepared = (
         sql: string,
-        params?: QueryParams,
+        params?: readonly PreparedQueryParam[],
         options?: QueryOptions,
       ): Promise<ExecuteResult> =>
         timed("executePrepared", { paramCount: params?.length ?? 0 }, () =>

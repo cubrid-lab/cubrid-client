@@ -11,6 +11,7 @@ import type {
   QueryOptions,
   ResultTransactionClient,
 } from "../types/client.js";
+import { LobParamError, type PreparedQueryParam, refuseLobParams } from "../types/lob.js";
 import type { QueryParams } from "../types/query.js";
 import type { QueryResult, QueryResultRow } from "../types/result.js";
 
@@ -28,9 +29,10 @@ export class CubridTransaction
     params?: QueryParams,
     options?: QueryOptions,
   ): Promise<T[]> {
-    return runStatement(options, "Transaction query failed.", () =>
-      this.connection.query<T>(sql, params, options),
-    );
+    return runStatement(options, "Transaction query failed.", () => {
+      refuseLobParams(params);
+      return this.connection.query<T>(sql, params, options);
+    });
   }
 
   queryResult<T extends QueryResultRow = QueryResultRow>(
@@ -39,6 +41,7 @@ export class CubridTransaction
     options?: QueryOptions,
   ): Promise<QueryResult<T>> {
     return runStatement(options, "Transaction query failed.", () => {
+      refuseLobParams(params);
       if (!this.connection.queryResult) {
         throw new Error("Underlying connection does not support queryResult.");
       }
@@ -48,6 +51,7 @@ export class CubridTransaction
 
   execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult> {
     return runStatement(options, "Transaction statement failed.", () => {
+      refuseLobParams(params);
       if (!this.connection.execute) {
         throw new Error("Underlying connection does not support execute.");
       }
@@ -57,7 +61,7 @@ export class CubridTransaction
 
   queryPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
-    params?: QueryParams,
+    params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
   ): Promise<T[]> {
     return runStatement(options, "Transaction query failed.", () => {
@@ -70,7 +74,7 @@ export class CubridTransaction
 
   queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
-    params?: QueryParams,
+    params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
   ): Promise<QueryResult<T>> {
     return runStatement(options, "Transaction query failed.", () => {
@@ -83,7 +87,7 @@ export class CubridTransaction
 
   executePrepared(
     sql: string,
-    params?: QueryParams,
+    params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
   ): Promise<ExecuteResult> {
     return runStatement(options, "Transaction statement failed.", () => {
@@ -138,7 +142,8 @@ async function runStatement<R>(
   try {
     return await run();
   } catch (error) {
-    if (isAbortReason(error, options?.signal)) {
+    // A misused blob() or clob() is the caller's TypeError, as on the client.
+    if (isAbortReason(error, options?.signal) || error instanceof LobParamError) {
       throw error;
     }
     throw mapError("transaction", error, failureMessage);
@@ -207,7 +212,7 @@ export class CallbackTransaction extends CubridTransaction {
 
   override queryPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
-    params?: QueryParams,
+    params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
   ): Promise<T[]> {
     return this.track(() => super.queryPrepared<T>(sql, params, options));
@@ -215,7 +220,7 @@ export class CallbackTransaction extends CubridTransaction {
 
   override queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
-    params?: QueryParams,
+    params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
   ): Promise<QueryResult<T>> {
     return this.track(() => super.queryResultPrepared<T>(sql, params, options));
@@ -223,7 +228,7 @@ export class CallbackTransaction extends CubridTransaction {
 
   override executePrepared(
     sql: string,
-    params?: QueryParams,
+    params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
   ): Promise<ExecuteResult> {
     return this.track(() => super.executePrepared(sql, params, options));

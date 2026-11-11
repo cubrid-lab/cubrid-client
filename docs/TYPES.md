@@ -241,9 +241,97 @@ the query again.
   returns such a value through the ordinary text path, which substitutes U+FFFD for
   invalid bytes.
 - **BLOB and CLOB collection elements** still reject the query.
-- **Writing** through a LOB handle is tracked in
-  [#103](https://github.com/cubrid-lab/cubrid-client/issues/103). A `Buffer` or
-  `string` parameter already stores content as a SQL literal.
+- **Writing** large content goes through [`blob()` and `clob()`](#writing-blob-and-clob).
+  A `Buffer` or `string` parameter also stores content, as a SQL literal or a
+  VARBIT or CHAR bind that the whole statement carries.
+
+## Writing BLOB and CLOB
+
+`blob(source)` and `clob(source)` wrap content for the prepared methods. The
+driver creates the LOB on the server with LOB_NEW, writes it with LOB_WRITE in
+pieces of 128 KiB, and binds the resulting handle in EXECUTE, as the JDBC driver's
+`Blob` and `Clob` do. Writes were checked on CUBRID 10.2, 11.0, 11.2 and 11.4.
+
+```ts
+import { createReadStream } from "node:fs";
+import { blob, clob } from "cubrid-client";
+
+await db.executePrepared("INSERT INTO docs (id, body, notes) VALUES (?, ?, ?)", [
+  1,
+  blob(createReadStream("report.pdf")),
+  clob("Résumé 😀"),
+]);
+```
+
+| Source | `blob()` | `clob()` |
+| --- | --- | --- |
+| `Buffer` | The bytes | UTF-8 bytes, checked |
+| `Uint8Array` | The bytes | Refused |
+| `string` | Refused | Encoded as UTF-8 |
+| `AsyncIterable` or `Readable` | Chunks of `Buffer` or `Uint8Array` | Chunks of `string`, `Buffer` or `Uint8Array`, mixed as you like |
+| Empty | An empty BLOB, not NULL | An empty CLOB, not NULL |
+
+**Encoding.** A CLOB is UTF-8: the driver has no charset option, and the server
+stores the bytes without converting them, which is also what
+[reading a CLOB](#blob-and-clob-columns) expects. Strings are encoded about 128 KiB
+at a time. A high surrogate at the end of one stream chunk is joined with the low
+surrogate that starts the next, so splitting text anywhere is safe. A lone
+surrogate, `Buffer` bytes that are not UTF-8, or a stream that ends inside a
+character reject the statement with a `TypeError`. That can only be found while
+reading a stream, so part of the CLOB may already have been written; it is
+discarded with the statement as described below.
+
+**Memory.** A stream source is read with `for await`, and the next chunk is asked
+for only after the server has answered the previous LOB_WRITE, so a slow server
+slows the source down instead of filling memory. Chunks are merged or sliced into
+LOB_WRITEs of exactly 128 KiB, except the last. Apart from the source's own
+buffers, the driver holds about one chunk at a time. A `Buffer` or `string`
+source is already in memory; the driver does not copy it whole.
+
+**Cost.** A LOB takes one LOB_NEW and one LOB_WRITE per 128 KiB, each a round trip
+before the statement's EXECUTE, so an 8 MiB BLOB adds 65 requests. A statement with
+several LOBs uploads them one after the other, in parameter order.
+
+**Transactions and failure.** The upload starts after PREPARE, so SQL the server
+refuses fails before anything is uploaded. The LOB belongs to the statement's
+transaction:
+
+- In autocommit mode the statement and its LOBs are committed together after
+  EXECUTE, or rolled back together when anything fails: a LOB_WRITE error, a short
+  write, a source that throws, or EXECUTE itself, such as a unique violation.
+- Inside `transaction()` or a transaction scope a failed upload fails only that
+  statement and the transaction stays yours: commit or roll back as after any
+  failed statement. `scope.rollback()` discards the LOBs with the rows.
+- An abort or a `readTimeout` while a LOB_WRITE is in flight discards the
+  connection, as for any statement. `signal` also stops a wait on a stream source
+  that yields nothing, and since the LOB_NEW was already sent, the connection is
+  discarded then too.
+
+Each statement creates its own LOBs; a handle is never reused, and none reaches
+your code.
+
+**Stream sources are read once.** An `AsyncIterable` or `Readable` is marked as
+consumed when its upload starts. Passing it again after that, or twice in one
+statement, rejects with a `TypeError` before anything is sent. Two statements
+given the same stream before either has started are both accepted; the second
+rejects with a `TypeError` once it is prepared, and is rolled back in autocommit
+mode. A statement that fails before the upload starts, such as on a syntax error,
+leaves the stream unread. A failed upload destroys the `Readable` whose upload
+failed; the sources of later LOB parameters stay unread.
+
+**A source must not wait on the same connection.** The upload holds the
+connection's turn, so a source that awaits a statement of the same client or
+transaction waits forever, and so does that statement. `readTimeout` does not
+limit the source, only each reply; pass a `signal` to bound a source that may stall.
+
+**Not supported:**
+
+- `query()`, `queryResult()`, `execute()` and `stream()` render SQL literals and
+  reject a `blob()` or `clob()` value with a `TypeError` before anything is sent.
+- `executeMany()` rejects one too: a batch with LOBs is not implemented.
+- There is no LOB object to create or append to separately (`createLob()`), and no
+  write-side size limit: `maxLobBytes` only limits reads, so a CLOB larger than it
+  can be written but not read back without raising the limit.
 
 ## Collection columns
 
@@ -309,7 +397,7 @@ Other parameters render the same in both modes and are sent without that probe.
 | `bigint` | Decimal integer text, preserving JavaScript bigint precision |
 | `boolean` | `1` or `0` |
 | `Date` | `DATETIME'YYYY-MM-DD HH:MM:SS.mmm'` using **UTC components**; it has no timezone offset embedded |
-| `Buffer` | Hexadecimal binary literal `X'...'`; not a promise of native BLOB/CLOB write support |
+| `Buffer` | Hexadecimal binary literal `X'...'`. For BLOB or CLOB content use [`blob()` or `clob()`](#writing-blob-and-clob) with a prepared method |
 | `null` | SQL `NULL` |
 
 The module also defines an older internal binary encoder, `encodeBindParams()`.
@@ -336,6 +424,7 @@ rendering SQL literals.
 | `string` | CHAR | UTF-8; NUL and Ctrl-Z are refused, as on the literal path |
 | `Date` | DATETIME | **UTC components**, as on the literal path. Years outside 0001 to 9999 and an invalid `Date` are refused |
 | `Buffer` | VARBIT | An empty `Buffer` is refused: the broker reads it as SQL NULL |
+| `blob()`, `clob()` | BLOB, CLOB handle | Uploaded first. See [writing BLOB and CLOB](#writing-blob-and-clob) |
 | Anything else | Refused | The literal path would stringify it |
 
 A refused value rejects with a `QueryError` before anything is sent, and the

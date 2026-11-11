@@ -205,6 +205,45 @@ export class CASConnection {
     }
   }
 
+  /**
+   * Wait for `pending`, work of the running scope that is not a request, such as
+   * reading the next chunk of a LOB source. The scope's signal stops the wait as
+   * it stops a request: once a request of the scope has been written, its
+   * outcome on the server is unknown, so the session is discarded.
+   */
+  async awaitScoped<T>(pending: Promise<T>): Promise<T> {
+    const scope = this.scope;
+    const signal = scope?.signal;
+    if (!scope || !signal) {
+      return pending;
+    }
+    // Abandoned on abort, so a later failure of it must not go unhandled.
+    pending.catch(() => undefined);
+
+    if (!signal.aborted) {
+      let onAbort = (): void => {};
+      const aborted = new Promise<never>((_resolve, reject) => {
+        onAbort = () => reject(signal.reason);
+        signal.addEventListener("abort", onAbort, { once: true });
+      });
+      try {
+        return await Promise.race([pending, aborted]);
+      } catch (error) {
+        if (!signal.aborted) {
+          throw error;
+        }
+      } finally {
+        signal.removeEventListener("abort", onAbort);
+      }
+    }
+
+    if (scope.sent) {
+      await this.discardSession();
+    }
+    scope.aborted = true;
+    throw signal.reason;
+  }
+
   /** Unlocked connect body. MUST only be called from within the queue. */
   private async connectUnlocked(): Promise<void> {
     const retries = this.config.maxConnectionRetryCount ?? 0;

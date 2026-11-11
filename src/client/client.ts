@@ -29,6 +29,7 @@ import type {
   TransactionOptions,
   TransactionScope,
 } from "../types/client.js";
+import { type PreparedQueryParam, refuseLobParams } from "../types/lob.js";
 import type { QueryParams } from "../types/query.js";
 import type { QueryResult, QueryResultRow } from "../types/result.js";
 import type {
@@ -74,7 +75,7 @@ export class CubridClient
     return runStatement(
       options,
       "Query failed.",
-      () => this.getSharedConnection(),
+      () => this.literalConnection(params),
       (connection) => connection.query<T>(sql, params, options),
     );
   }
@@ -87,7 +88,7 @@ export class CubridClient
     return runStatement(
       options,
       "Query failed.",
-      () => this.getSharedConnection(),
+      () => this.literalConnection(params),
       (connection) => {
         if (!connection.queryResult) {
           throw new Error("Underlying connection does not support queryResult.");
@@ -101,7 +102,7 @@ export class CubridClient
     return runStatement(
       options,
       "Statement failed.",
-      () => this.getSharedConnection(),
+      () => this.literalConnection(params),
       (connection) => {
         if (!connection.execute) {
           throw new Error("Underlying connection does not support execute.");
@@ -113,7 +114,7 @@ export class CubridClient
 
   queryPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
-    params?: QueryParams,
+    params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
   ): Promise<T[]> {
     return runStatement(
@@ -131,7 +132,7 @@ export class CubridClient
 
   queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
-    params?: QueryParams,
+    params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
   ): Promise<QueryResult<T>> {
     return runStatement(
@@ -149,7 +150,7 @@ export class CubridClient
 
   executePrepared(
     sql: string,
-    params?: QueryParams,
+    params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
   ): Promise<ExecuteResult> {
     return runStatement(
@@ -217,6 +218,7 @@ export class CubridClient
     options?: StreamOptions,
   ): AsyncGenerator<T, void, undefined> {
     assertValidStreamOptions(options);
+    refuseLobParams(params);
     return this.streamRows<T>(sql, params, options);
   }
 
@@ -555,6 +557,16 @@ export class CubridClient
       },
     );
     return running;
+  }
+
+  /**
+   * getSharedConnection() for a method that renders SQL literals, refusing blob()
+   * and clob() first. Not async: an extra await would let a statement issued later
+   * take the connection's turn first.
+   */
+  private literalConnection(params: QueryParams | undefined): Promise<ConnectionLike> {
+    refuseLobParams(params);
+    return this.getSharedConnection();
   }
 
   private getSharedConnection(): Promise<ConnectionLike> {

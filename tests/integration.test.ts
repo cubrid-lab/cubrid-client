@@ -11,6 +11,7 @@
 
 import assert from "node:assert/strict";
 import { createServer, connect as netConnect, type Server, type Socket } from "node:net";
+import { Readable } from "node:stream";
 import test, { after, before, describe } from "node:test";
 import { setFlagsFromString } from "node:v8";
 import { runInNewContext } from "node:vm";
@@ -37,6 +38,7 @@ import {
   writePrepareAndExecute,
 } from "../src/protocol/protocol.js";
 import type { TransactionClient } from "../src/types/client.js";
+import { blob, clob } from "../src/types/lob.js";
 import type { QueryParam, QueryParams } from "../src/types/query.js";
 import { ZonedDateTime } from "../src/types/zoned-date-time.js";
 
@@ -5742,6 +5744,252 @@ describe("Integration: executeMany (#86)", { skip: !available }, () => {
         affectedRows: 1,
         results: [1],
       });
+    });
+  });
+});
+
+describe("Integration: writing BLOB and CLOB with LOB_NEW and LOB_WRITE (#103)", {
+  skip: !available,
+}, () => {
+  const TABLE = "cc103_lob_write";
+  const INSERT = `INSERT INTO ${TABLE} (id, b, c) VALUES (?, ?, ?)`;
+  const MIB8 = 8 * 1024 * 1024;
+  const CHUNK = 128 * 1024;
+
+  /** Bytes that differ at every offset of a 251-byte cycle, so a misplaced chunk shows. */
+  function pattern(length: number): Buffer {
+    const bytes = Buffer.alloc(length);
+    for (let i = 0; i < length; i++) {
+      bytes[i] = i % 251;
+    }
+    return bytes;
+  }
+
+  /** `content` in pieces of `size` bytes, as a file stream would yield them. */
+  function piecesOf(content: Buffer, size: number): Readable {
+    const pieces: Buffer[] = [];
+    for (let at = 0; at < content.length; at += size) {
+      pieces.push(content.subarray(at, at + size));
+    }
+    return Readable.from(pieces);
+  }
+
+  async function withLobTable<T>(
+    run: (client: ReturnType<typeof createClient>) => Promise<T>,
+  ): Promise<T> {
+    const client = createClient(TEST_CONFIG);
+    try {
+      await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+      await client.query(`CREATE TABLE ${TABLE} (id INT PRIMARY KEY, b BLOB, c CLOB)`);
+      return await run(client);
+    } finally {
+      await client.query(`DROP TABLE IF EXISTS ${TABLE}`).catch(() => undefined);
+      await client.close();
+    }
+  }
+
+  /** Whether any error in the cause chain of `error` has `message`. */
+  function causedBy(error: unknown, message: string): boolean {
+    for (let e = error; e instanceof Error; e = e.cause) {
+      if (e.message === message) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Counted on a separate client, so only committed rows are seen. */
+  async function committedIds(): Promise<number[]> {
+    const other = createClient(TEST_CONFIG);
+    try {
+      return (await other.query<{ id: number }>(`SELECT id FROM ${TABLE} ORDER BY id`)).map(
+        (row) => row.id,
+      );
+    } finally {
+      await other.close();
+    }
+  }
+
+  test("an 8 MiB BLOB from a Buffer and from a Readable reads back byte for byte", async () => {
+    await withLobTable(async (client) => {
+      const content = pattern(MIB8);
+      await client.executePrepared(INSERT, [1, blob(content), null]);
+      await client.executePrepared(INSERT, [2, blob(piecesOf(content, 65_536 + 7)), null]);
+
+      const rows = await client.query<{ id: number; b: Buffer }>(
+        `SELECT id, b FROM ${TABLE} ORDER BY id`,
+      );
+      assert.equal(rows.length, 2);
+      for (const row of rows) {
+        assert.equal(row.b.length, MIB8);
+        assert.ok(row.b.equals(content), `row ${row.id} differs`);
+      }
+      // The server measures the stored size itself.
+      const [sizes] = await client.query<{ n: number }>(
+        `SELECT MIN(BIT_LENGTH(b)) AS n FROM ${TABLE}`,
+      );
+      assert.equal(Number(sizes?.n), MIB8 * 8);
+    });
+  });
+
+  test("a CLOB with 3- and 4-byte characters across the 128 KiB boundary reads back unchanged", async () => {
+    await withLobTable(async (client) => {
+      // Each variant puts a different byte of a multibyte character on the boundary.
+      const texts = [1, 2, 3].map(
+        (lead) => `${"a".repeat(CHUNK - lead)}\uD55C\u{1F600}\uAE00\u{20000}${"z".repeat(5)}`,
+      );
+      for (const [index, text] of texts.entries()) {
+        const source =
+          index === 2 ? clob(Readable.from(text.match(/[\s\S]{1,999}/gu) ?? [])) : clob(text);
+        await client.executePrepared(INSERT, [index + 1, null, source]);
+      }
+      await client.executePrepared(INSERT, [4, null, clob(Buffer.from(texts[0]!, "utf-8"))]);
+
+      const rows = await client.query<{ c: string }>(`SELECT c FROM ${TABLE} ORDER BY id`);
+      assert.deepEqual(
+        rows.map((row) => row.c),
+        [...texts, texts[0]],
+      );
+      // The server stored the UTF-8 bytes, not a converted or truncated text.
+      const [length] = await client.query<{ n: number }>(
+        `SELECT OCTET_LENGTH(CLOB_TO_CHAR(c)) AS n FROM ${TABLE} WHERE id = 1`,
+      );
+      assert.equal(Number(length?.n), Buffer.byteLength(texts[0]!, "utf-8"));
+    });
+  });
+
+  test("blob() of an empty Buffer is an empty BLOB, and null is NULL", async () => {
+    await withLobTable(async (client) => {
+      await client.executePrepared(INSERT, [1, blob(Buffer.alloc(0)), clob("")]);
+      await client.executePrepared(INSERT, [2, null, null]);
+
+      assert.deepEqual(await client.query(`SELECT id, b, c FROM ${TABLE} ORDER BY id`), [
+        { id: 1, b: Buffer.alloc(0), c: "" },
+        { id: 2, b: null, c: null },
+      ]);
+      assert.deepEqual(await client.query(`SELECT id FROM ${TABLE} WHERE b IS NULL ORDER BY id`), [
+        { id: 2 },
+      ]);
+    });
+  });
+
+  test("an autocommit statement that fails after a LOB_WRITE rolls back and the session is reused", async () => {
+    await withLobTable(async (client) => {
+      await client.executePrepared(INSERT, [1, blob(pattern(10)), null]);
+
+      // The upload completes, then EXECUTE fails on the duplicate key.
+      await assert.rejects(
+        client.executePrepared(INSERT, [1, blob(pattern(3 * CHUNK)), null]),
+        (error: unknown) => error instanceof ConstraintError,
+      );
+      // The source fails after its first chunk was written.
+      async function* failing(): AsyncGenerator<Buffer> {
+        yield pattern(CHUNK);
+        throw new Error("source failed");
+      }
+      await assert.rejects(
+        client.executePrepared(INSERT, [2, blob(failing()), null]),
+        (error: unknown) => error instanceof QueryError && causedBy(error, "source failed"),
+      );
+
+      assert.deepEqual(await committedIds(), [1]);
+      await client.executePrepared(INSERT, [3, blob(pattern(5)), clob("after")]);
+      assert.deepEqual(await client.query(`SELECT id, b, c FROM ${TABLE} WHERE id = 3`), [
+        { id: 3, b: pattern(5), c: "after" },
+      ]);
+      assert.deepEqual(await committedIds(), [1, 3]);
+    });
+  });
+
+  test("scope.rollback() leaves no row and no LOB behind", async () => {
+    await withLobTable(async (client) => {
+      const scope = await client.beginTransactionScope();
+      await scope.executePrepared(INSERT, [1, blob(pattern(2 * CHUNK)), clob("rolled back")]);
+      assert.equal((await scope.query(`SELECT id FROM ${TABLE}`)).length, 1);
+      await scope.rollback();
+
+      assert.deepEqual(await committedIds(), []);
+    });
+  });
+
+  test("an abort partway through the upload rejects with its reason and stores nothing", async () => {
+    await withLobTable(async (client) => {
+      const controller = new AbortController();
+      const reason = new Error("upload stopped by the test");
+      async function* slow(): AsyncGenerator<Buffer> {
+        yield pattern(CHUNK);
+        yield pattern(CHUNK);
+        controller.abort(reason);
+        // A source that never yields again: only the signal can end the wait.
+        await new Promise(() => undefined);
+      }
+
+      const started = Date.now();
+      await assert.rejects(
+        client.executePrepared(INSERT, [1, blob(slow()), null], { signal: controller.signal }),
+        (error: unknown) => error === reason,
+      );
+      assert.ok(Date.now() - started < 5000, `took ${Date.now() - started}ms`);
+
+      assert.deepEqual(await committedIds(), []);
+      await client.executePrepared(INSERT, [2, blob(pattern(4)), null]);
+      assert.deepEqual(await committedIds(), [2]);
+    });
+  });
+
+  test("an abort while a LOB_WRITE is in flight retires the socket and the client recovers", async () => {
+    await withLobTable(async (client) => {
+      const controller = new AbortController();
+      const reason = new Error("aborted mid-write");
+      const content = pattern(MIB8);
+      // Abort as soon as the upload has been running for a moment.
+      setTimeout(() => controller.abort(reason), 20);
+
+      await assert.rejects(
+        client.executePrepared(INSERT, [1, blob(content), null], { signal: controller.signal }),
+        (error: unknown) => error === reason,
+      );
+
+      assert.deepEqual(await committedIds(), []);
+      await client.executePrepared(INSERT, [2, blob(pattern(4)), null]);
+      assert.deepEqual(await committedIds(), [2]);
+    });
+  });
+
+  test("a failed upload inside a transaction leaves the transaction to the caller, who commits", async () => {
+    await withLobTable(async (client) => {
+      async function* failing(): AsyncGenerator<Buffer> {
+        yield pattern(CHUNK);
+        throw new Error("source failed");
+      }
+
+      await client.transaction(async (tx) => {
+        await tx.executePrepared(INSERT, [1, blob(pattern(CHUNK + 1)), clob("kept")]);
+        await assert.rejects(tx.executePrepared(INSERT, [2, blob(failing()), null]), (error) =>
+          causedBy(error, "source failed"),
+        );
+        await tx.executePrepared(INSERT, [3, null, clob("also kept")]);
+      });
+
+      assert.deepEqual(await committedIds(), [1, 3]);
+      const rows = await client.query<{ id: number; b: Buffer | null; c: string }>(
+        `SELECT id, b, c FROM ${TABLE} ORDER BY id`,
+      );
+      assert.ok(rows[0]!.b?.equals(pattern(CHUNK + 1)));
+      assert.deepEqual(
+        rows.map((row) => row.c),
+        ["kept", "also kept"],
+      );
+    });
+  });
+
+  test("blob() on a literal method is refused with a TypeError and nothing is stored", async () => {
+    await withLobTable(async (client) => {
+      await assert.rejects(
+        client.query(INSERT, [1, blob(pattern(3)) as never, null]),
+        (error: unknown) => error instanceof TypeError,
+      );
+      assert.deepEqual(await committedIds(), []);
     });
   });
 });

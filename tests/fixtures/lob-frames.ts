@@ -72,3 +72,41 @@ export const LOB_FRAMES = {
 
 /** The count CUBRID 10.2 to 11.4 all answered with when asked for more than a reply holds. */
 export const LOB_READ_REPLY_LIMIT = 81908;
+
+/**
+ * LOB_NEW and LOB_WRITE frames captured byte for byte from the cubrid/cubrid:11.4
+ * and 10.2 images with protocol version 7, by a raw socket client that framed
+ * each request itself. 10.2 sent the same layout with an absolute locator, as
+ * for `selectRowsAbsolutePaths`. Provenance: docs/PROTOCOL_ORACLES.md.
+ */
+export const LOB_WRITE_FRAMES = {
+  /** Payload of LOB_NEW for a BLOB: function 35, int32 4, int32 23. */
+  newBlobRequest: "230000000400000017",
+  /** 11.4: int32 64, then the handle: db_type 33, size 0, locator length 48 and the locator. */
+  newBlobReply:
+    "000000400000002100000000000000000000003066696c653a6365735f3437352f6365735f74656d70" +
+    "2e30303030313739343433373035333635363835385f3234363700",
+  /** 11.4: the same for a CLOB, db_type 34. */
+  newClobReply:
+    "000000400000002200000000000000000000003066696c653a6365735f3434332f6365735f74656d70" +
+    "2e30303030313739343433373035333635373339375f3735393200",
+  /** 10.2: a handle of 91 bytes, whose locator is an absolute path. */
+  newBlobReplyAbsolutePath:
+    "0000005b0000002100000000000000000000004b66696c653a2f7661722f6c69622f6375627269642f" +
+    "7465737464622f6c6f622f6365735f3136302f6365735f74656d702e3030303031373934343337303533" +
+    "3735353832325f3332353800",
+  /** An unknown LOB type: the CAS answers -10004 alone, with no error block. */
+  newBadTypeReply: "ffffd8ec",
+  /** Payload of LOB_WRITE of 01 02 03 at offset 0 to the handle of `newBlobReply`. */
+  writeRequest:
+    "24000000400000002100000000000000000000003066696c653a6365735f3437352f6365735f74656d" +
+    "702e30303030313739343433373035333635363835385f323436370000000008000000000000000000" +
+    "000003010203",
+  /** The reply is only the count written. */
+  writeReply: "00000003",
+  /** A write past the end of the file: -2, then error -1016 and its message. */
+  writeGapReply:
+    "fffffffefffffc08504f5349582065787465726e616c2073746f72616765206572726f723a206f6666" +
+    "736574206572726f72206365735f3437352f6365735f74656d702e3030303031373934343337303533" +
+    "3635363835385f3234363700",
+} as const;

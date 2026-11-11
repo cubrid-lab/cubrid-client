@@ -72,6 +72,8 @@ export enum CASFunctionCode {
   EXECUTE_ARRAY = 21,
   CON_CLOSE = 31,
   CHECK_CAS = 32,
+  LOB_NEW = 35,
+  LOB_WRITE = 36,
   LOB_READ = 37,
   GET_LAST_INSERT_ID = 40,
   PREPARE_AND_EXECUTE = 41,
@@ -244,3 +246,9 @@ export const DEFAULT_MAX_LOB_BYTES = 64 * 1024 * 1024;
  * bytes whatever is requested and report the shorter count, so a read loops.
  */
 export const LOB_READ_CHUNK_SIZE = 128 * 1024;
+
+/**
+ * Bytes one LOB_WRITE carries at most, as the official JDBC driver sends
+ * (CUBRIDBlob.BLOB_MAX_IO_LENGTH). Every request but a LOB's last is this size.
+ */
+export const LOB_WRITE_CHUNK_SIZE = 128 * 1024;

@@ -16,12 +16,19 @@ import {
 } from "../errors/query-error.js";
 import { ReadTimeoutError } from "../errors/read-timeout-error.js";
 import { TransactionError } from "../errors/transaction-error.js";
+import { LobParamError } from "../types/lob.js";
 
 export type ErrorKind = "connection" | "query" | "transaction";
 
 export function mapError(kind: ErrorKind, error: unknown, message: string): Error {
   // Kept as-is at every layer so callers can test for it without unwrapping.
   if (isInstance(error, ReadTimeoutError)) {
+    return error;
+  }
+  // A misused blob() or clob() is a TypeError in the caller's code, like a bad
+  // option, so a statement rejects with it as it is. A transaction that fails
+  // because of it still reports a TransactionError, with it as the cause.
+  if (kind === "query" && isInstance(error, LobParamError)) {
     return error;
   }
 

@@ -11,27 +11,36 @@ import test from "node:test";
 import { CasReplyError } from "../src/errors/internal-errors.js";
 import { CASFunctionCode, CUBRIDDataType, StatementType } from "../src/protocol/constants.js";
 import {
+  bindLobHandles,
   encodeBindParams,
   encodePreparedParams,
+  formatValue,
+  interpolateParams,
   type LobLocator,
   MalformedReplyError,
   parseExecute,
   parseExecuteArray,
   parseFetch,
+  parseLobNew,
   parseLobRead,
+  parseLobWrite,
   parsePrepare,
   parsePrepareAndExecute,
+  setLobHandleSize,
   UnsupportedValueError,
   writeExecute,
   writeExecuteArray,
   writeFetch,
+  writeLobNew,
   writeLobRead,
+  writeLobWrite,
   writePrepare,
 } from "../src/protocol/protocol.js";
+import { blob, clob } from "../src/types/lob.js";
 import { ZonedDateTime } from "../src/types/zoned-date-time.js";
 import { CAPTURED_FRAMES, type CapturedFrame } from "./fixtures/collection-frames.js";
 import { EXECUTE_ARRAY_FRAMES, PREPARED_FRAMES } from "./fixtures/dml-frames.js";
-import { LOB_FRAMES } from "./fixtures/lob-frames.js";
+import { LOB_FRAMES, LOB_WRITE_FRAMES } from "./fixtures/lob-frames.js";
 import { ZONED_FRAMES } from "./fixtures/zoned-frames.js";
 
 const i32 = (value: number): Buffer => {
@@ -1530,4 +1539,237 @@ test("a negative EXECUTE_ARRAY result code is the server's error for the whole r
     () => parseExecuteArray(frame(PREPARED_FRAMES.executeCoercionError), 1, 7),
     (error: unknown) => error instanceof CasReplyError && error.code === -494,
   );
+});
+
+// ---------------------------------------------------------------------------
+// LOB_NEW (35) and LOB_WRITE (36), against frames captured from 10.2 and 11.4
+// ---------------------------------------------------------------------------
+
+const lobReply = (hex: string): Buffer => Buffer.from(hex, "hex");
+/** The handle of the captured 11.4 BLOB: the LOB_NEW reply after its int32 length. */
+const NEW_BLOB_HANDLE = lobReply(LOB_WRITE_FRAMES.newBlobReply).subarray(4);
+
+test("LOB_NEW is CAS function 35 and its requests are the captured bytes", () => {
+  const casInfo = Buffer.from("01fffffb", "hex");
+  const blobRequest = writeLobNew(CUBRIDDataType.BLOB, casInfo);
+  const clobRequest = writeLobNew(CUBRIDDataType.CLOB, casInfo);
+
+  assert.equal(CASFunctionCode.LOB_NEW, 35);
+  assert.equal(blobRequest.payload.toString("hex"), LOB_WRITE_FRAMES.newBlobRequest);
+  assert.equal(blobRequest.header.toString("hex"), "0000000901fffffb");
+  assert.equal(clobRequest.payload.toString("hex"), "230000000400000018");
+});
+
+test("captured LOB_NEW replies decode to the handle, on relative and absolute paths", () => {
+  const blobHandle = parseLobNew(lobReply(LOB_WRITE_FRAMES.newBlobReply), CUBRIDDataType.BLOB);
+  assert.equal(blobHandle.length, 64);
+  assert.equal(blobHandle.readInt32BE(0), 33);
+  assert.equal(blobHandle.readBigInt64BE(4), 0n);
+  assert.equal(blobHandle.readInt32BE(12), 48);
+  assert.equal(
+    blobHandle.subarray(16).toString("latin1"),
+    "file:ces_475/ces_temp.00001794437053656858_2467\0",
+  );
+
+  const clobHandle = parseLobNew(lobReply(LOB_WRITE_FRAMES.newClobReply), CUBRIDDataType.CLOB);
+  assert.equal(clobHandle.readInt32BE(0), 34);
+
+  const absolute = parseLobNew(
+    lobReply(LOB_WRITE_FRAMES.newBlobReplyAbsolutePath),
+    CUBRIDDataType.BLOB,
+  );
+  assert.equal(absolute.length, 91);
+  assert.match(absolute.subarray(16).toString("latin1"), /^file:\/var\/lib\/cubrid\/testdb\/lob\//);
+});
+
+test("a LOB_NEW handle is a copy, not a view of the reply", () => {
+  const reply = lobReply(LOB_WRITE_FRAMES.newBlobReply);
+  const handle = parseLobNew(reply, CUBRIDDataType.BLOB);
+  reply.fill(0);
+  assert.equal(handle.readInt32BE(0), 33);
+});
+
+test("a LOB_NEW refusal with a bare CAS code is an error, not a malformed reply", () => {
+  assert.throws(
+    () => parseLobNew(lobReply(LOB_WRITE_FRAMES.newBadTypeReply), CUBRIDDataType.BLOB),
+    (error: unknown) =>
+      error instanceof CasReplyError &&
+      error.code === -10004 &&
+      error.origin === "cas" &&
+      /CUBRID LOB create failed \(-10004\)/.test(error.message),
+  );
+});
+
+test("a LOB_NEW server error carries its code and message", () => {
+  // The error layout every CAS reply shares: -2, the code, then the message.
+  const reply = lobReply(`fffffffefffffc08${Buffer.from("disk full\0").toString("hex")}`);
+  assert.throws(
+    () => parseLobNew(reply, CUBRIDDataType.CLOB),
+    (error: unknown) =>
+      error instanceof CasReplyError &&
+      error.code === -1016 &&
+      error.origin === "server" &&
+      /LOB create failed \(-1016\): disk full/.test(error.message),
+  );
+});
+
+const newBlobHex = LOB_WRITE_FRAMES.newBlobReply;
+for (const [name, reply, type] of [
+  ["no length", "000000", CUBRIDDataType.BLOB],
+  ["a length of 0", "00000000", CUBRIDDataType.BLOB],
+  ["a length longer than its bytes", `00000041${newBlobHex.slice(8)}`, CUBRIDDataType.BLOB],
+  ["bytes past its length", `${newBlobHex}00`, CUBRIDDataType.BLOB],
+  ["a header and no locator", `00000010${newBlobHex.slice(8, 40)}`, CUBRIDDataType.BLOB],
+  ["the other LOB's db_type", newBlobHex, CUBRIDDataType.CLOB],
+  [
+    "a size other than 0",
+    `${newBlobHex.slice(0, 16)}0000000000000001${newBlobHex.slice(32)}`,
+    CUBRIDDataType.BLOB,
+  ],
+  [
+    "a locator length that disagrees",
+    `${newBlobHex.slice(0, 32)}0000002f${newBlobHex.slice(40)}`,
+    CUBRIDDataType.BLOB,
+  ],
+  ["a locator without its NUL", `${newBlobHex.slice(0, -2)}41`, CUBRIDDataType.BLOB],
+  ["an error envelope with no code", "fffffffe00", CUBRIDDataType.BLOB],
+] as const) {
+  test(`a LOB_NEW reply with ${name} is malformed`, () => {
+    assert.throws(() => parseLobNew(lobReply(reply), type), MalformedReplyError);
+  });
+}
+
+test("LOB_WRITE is CAS function 36 and its request is the captured bytes", () => {
+  const { header, payload } = writeLobWrite(
+    NEW_BLOB_HANDLE,
+    0,
+    Buffer.from([1, 2, 3]),
+    Buffer.from("01fffffb", "hex"),
+  );
+
+  assert.equal(CASFunctionCode.LOB_WRITE, 36);
+  assert.equal(payload.toString("hex"), LOB_WRITE_FRAMES.writeRequest);
+  assert.equal(header.readInt32BE(0), payload.length);
+});
+
+test("a LOB_WRITE request states its offset as an int64", () => {
+  const offset = 2 ** 33 + 5;
+  const { payload } = writeLobWrite(NEW_BLOB_HANDLE, offset, Buffer.from([9]), Buffer.alloc(4));
+  const at = 1 + 4 + NEW_BLOB_HANDLE.length;
+  assert.equal(payload.readInt32BE(at), 8);
+  assert.equal(payload.readBigInt64BE(at + 4), BigInt(offset));
+  assert.equal(payload.subarray(at + 12).toString("hex"), "0000000109");
+});
+
+test("a captured LOB_WRITE reply is the count written, and an error carries its code", () => {
+  assert.equal(parseLobWrite(lobReply(LOB_WRITE_FRAMES.writeReply), 3), 3);
+  assert.throws(
+    () => parseLobWrite(lobReply(LOB_WRITE_FRAMES.writeGapReply), 1),
+    (error: unknown) =>
+      error instanceof CasReplyError &&
+      error.code === -1016 &&
+      /CUBRID LOB write failed \(-1016\): POSIX external storage error: offset error/.test(
+        error.message,
+      ),
+  );
+});
+
+test("a LOB_WRITE that stored fewer bytes than sent fails without condemning the session", () => {
+  assert.throws(
+    () => parseLobWrite(lobReply("00000002"), 3),
+    (error: Error) =>
+      !(error instanceof MalformedReplyError) &&
+      !(error instanceof CasReplyError) &&
+      error.message === "CUBRID LOB write stored 2 of 3 bytes",
+  );
+});
+
+for (const [name, reply] of [
+  ["no count", "000000"],
+  ["a count larger than sent", "00000004"],
+  ["bytes after its count", "0000000300"],
+  ["an error envelope with no code", "fffffffe"],
+] as const) {
+  test(`a LOB_WRITE reply with ${name} is malformed`, () => {
+    assert.throws(() => parseLobWrite(lobReply(reply), 3), MalformedReplyError);
+  });
+}
+
+test("the size patch writes the int64 after db_type into a copy of the handle", () => {
+  const sized = setLobHandleSize(NEW_BLOB_HANDLE, 8 * 1024 * 1024);
+
+  assert.equal(sized.readBigInt64BE(4), 8_388_608n);
+  assert.equal(sized.subarray(0, 4).toString("hex"), "00000021");
+  assert.ok(sized.subarray(12).equals(NEW_BLOB_HANDLE.subarray(12)));
+  assert.equal(NEW_BLOB_HANDLE.readBigInt64BE(4), 0n);
+});
+
+test("a LOB parameter binds as int32 1, the BLOB or CLOB type, then the length-prefixed handle", () => {
+  const binds = encodePreparedParams([7, blob(Buffer.from("ab")), "x", clob("c")]);
+  assert.deepEqual(
+    binds.lobs?.map(({ offset, param }) => [offset, param.kind]),
+    [
+      [13, "blob"],
+      [24, "clob"],
+    ],
+  );
+
+  const blobHandle = setLobHandleSize(NEW_BLOB_HANDLE, 2);
+  const clobHandle = setLobHandleSize(
+    parseLobNew(lobReply(LOB_WRITE_FRAMES.newClobReply), CUBRIDDataType.CLOB),
+    1,
+  );
+  const bound = bindLobHandles(binds, [blobHandle, clobHandle]);
+
+  assert.equal(bound.count, 4);
+  assert.equal(bound.lobs, undefined);
+  assert.equal(
+    bound.bytes.toString("hex"),
+    "0000000108" +
+      "0000000400000007" +
+      `0000000117${"00000040"}${blobHandle.toString("hex")}` +
+      "0000000101" +
+      "000000027800" +
+      `0000000118${"00000040"}${clobHandle.toString("hex")}`,
+  );
+});
+
+test("an EXECUTE with a LOB carries the bound handle as its last value", () => {
+  const statement = parsePrepare(Buffer.from(EXECUTE_ARRAY_FRAMES.prepareInsert, "hex"));
+  const handle = setLobHandleSize(NEW_BLOB_HANDLE, 3);
+  const bound = bindLobHandles(encodePreparedParams([1, blob(Buffer.from([1, 2, 3]))]), [handle]);
+  const { payload } = writeExecute(statement, bound, Buffer.alloc(4));
+
+  assert.equal(
+    payload.subarray(payload.length - bound.bytes.length).toString("hex"),
+    `00000001080000000400000001000000011700000040${handle.toString("hex")}`,
+  );
+});
+
+test("an empty blob() still uploads: it is an empty BLOB, not NULL", () => {
+  const binds = encodePreparedParams([blob(Buffer.alloc(0))]);
+  assert.equal(binds.bytes.length, 0);
+  assert.equal(binds.lobs?.length, 1);
+});
+
+test("blob() and clob() are refused by every SQL literal path with a TypeError", () => {
+  for (const value of [blob(Buffer.from("a")), clob("a")]) {
+    assert.throws(() => formatValue(value, true), TypeError);
+    assert.throws(() => interpolateParams("SELECT ?", [value], true), TypeError);
+    assert.throws(() => encodeBindParams([value]), TypeError);
+  }
+});
+
+test("a stream source given twice to one statement is refused before anything is encoded", async () => {
+  async function* source(): AsyncGenerator<Buffer> {
+    yield Buffer.from("a");
+  }
+  const stream = source();
+  assert.throws(
+    () => encodePreparedParams([blob(stream), blob(stream)]),
+    (error: Error) => error instanceof TypeError && /used twice/.test(error.message),
+  );
+  // A Buffer is not read once, so it may appear twice.
+  const bytes = Buffer.from("a");
+  assert.equal(encodePreparedParams([blob(bytes), blob(bytes)]).lobs?.length, 2);
 });

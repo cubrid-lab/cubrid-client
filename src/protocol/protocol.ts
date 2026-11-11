@@ -10,6 +10,14 @@
  */
 
 import { CasReplyError } from "../errors/internal-errors.js";
+import {
+  isLobParam,
+  isSourceConsumed,
+  isStreamSource,
+  type LobParam,
+  LobParamError,
+  STREAM_REUSED,
+} from "../types/lob.js";
 import { ZonedDateTime } from "../types/zoned-date-time.js";
 import {
   CAS_MAGIC,
@@ -974,6 +982,167 @@ export function parseLobRead(data: Buffer, requested: number): Buffer {
 }
 
 // ---------------------------------------------------------------------------
+// LOB_NEW (FC=35) and LOB_WRITE (FC=36)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a LOB_NEW request: one int argument, the bind type of the new LOB
+ * (CAS `fn_lob_new`, JDBC `UConnection.lobNew`).
+ */
+export function writeLobNew(
+  type: CUBRIDDataType.BLOB | CUBRIDDataType.CLOB,
+  casInfo: Buffer,
+): { header: Buffer; payload: Buffer } {
+  const w = new PacketWriter(16);
+  w.writeByte(CASFunctionCode.LOB_NEW);
+  w.addInt(type);
+
+  const payload = w.toBuffer();
+  const header = PacketWriter.buildHeader(payload.length, casInfo);
+  return { header, payload };
+}
+
+/**
+ * Parse a LOB_NEW reply: the handle's length, then the handle, int32 db_type,
+ * int64 size, int32 locator length and the locator with its NUL (CAS
+ * `ux_lob_new`, `net_buf_cp_lob_handle`). A new LOB is empty, so its size is 0.
+ * Returns a copy of the handle, which LOB_WRITE and EXECUTE send back as it is.
+ */
+export function parseLobNew(data: Buffer, type: CUBRIDDataType.BLOB | CUBRIDDataType.CLOB): Buffer {
+  if (data.length < SIZE_INT) {
+    throw new MalformedReplyError(`Malformed CAS packet: reply of ${data.length} bytes`);
+  }
+  const reader = new PacketReader(data);
+  const length = reader.parseInt();
+
+  // A refused argument is the CAS's own code alone, with no error block (-10004
+  // on 10.2 and 11.4 for an unknown type), unlike a failure to create the file.
+  if (length < 0 && reader.remaining === 0) {
+    throw new CasReplyError(`CUBRID LOB create failed (${length})`, -1, length);
+  }
+  if (length < 0) {
+    const err = decodeReply(() => reader.readError(data.length - SIZE_INT));
+    throw new CasReplyError(
+      `CUBRID LOB create failed (${err.code}): ${err.message}`,
+      length,
+      err.code,
+    );
+  }
+
+  return decodeReply(() => {
+    if (length !== reader.remaining || length <= LOB_HANDLE_HEADER_SIZE) {
+      throw new MalformedReplyError(
+        `Malformed CAS packet: LOB handle of ${length} bytes in a reply carrying ${reader.remaining}`,
+      );
+    }
+    const handle = Buffer.from(data.subarray(SIZE_INT));
+    const dbType = handle.readInt32BE(0);
+    const size = handle.readBigInt64BE(SIZE_INT);
+    const locatorLength = handle.readInt32BE(SIZE_INT + SIZE_LONG);
+    const expectedDbType = type === CUBRIDDataType.BLOB ? LOB_DB_TYPE_BLOB : LOB_DB_TYPE_CLOB;
+    if (dbType !== expectedDbType || size !== 0n) {
+      throw new MalformedReplyError(
+        `Malformed CAS packet: new LOB of db_type ${dbType} and size ${size} for type ${type}`,
+      );
+    }
+    if (locatorLength !== length - LOB_HANDLE_HEADER_SIZE || handle[handle.length - 1] !== 0) {
+      throw new MalformedReplyError(
+        `Malformed CAS packet: LOB locator of ${locatorLength} bytes in a handle of ${length}`,
+      );
+    }
+    return handle;
+  });
+}
+
+/**
+ * Build a LOB_WRITE request: the handle, the int64 offset and the bytes, each
+ * length-prefixed (CAS `fn_lob_write`, JDBC `UConnection.lobWrite`).
+ */
+export function writeLobWrite(
+  handle: Buffer,
+  offset: number,
+  data: Buffer,
+  casInfo: Buffer,
+): { header: Buffer; payload: Buffer } {
+  const w = new PacketWriter(handle.length + data.length + 32);
+  w.writeByte(CASFunctionCode.LOB_WRITE);
+  w.addBytes(handle);
+  w.addLong(BigInt(offset));
+  w.addBytes(data);
+
+  const payload = w.toBuffer();
+  const header = PacketWriter.buildHeader(payload.length, casInfo);
+  return { header, payload };
+}
+
+/**
+ * Parse a LOB_WRITE reply: only the int32 count of bytes written (CAS
+ * `ux_lob_write`). A negative count is an error block. A count other than the
+ * `sent` bytes fails the write: the reply itself is intact, so the session is not.
+ */
+export function parseLobWrite(data: Buffer, sent: number): number {
+  if (data.length < SIZE_INT) {
+    throw new MalformedReplyError(`Malformed CAS packet: reply of ${data.length} bytes`);
+  }
+
+  const reader = new PacketReader(data);
+  const written = reader.parseInt();
+
+  if (written < 0) {
+    const err = decodeReply(() => reader.readError(data.length - SIZE_INT));
+    throw new CasReplyError(
+      `CUBRID LOB write failed (${err.code}): ${err.message}`,
+      written,
+      err.code,
+    );
+  }
+  if (written > sent || reader.remaining !== 0) {
+    throw new MalformedReplyError(
+      `Malformed CAS packet: LOB write of ${sent} bytes reported ${written} ` +
+        `and carried ${reader.remaining} more bytes`,
+    );
+  }
+  if (written !== sent) {
+    throw new Error(`CUBRID LOB write stored ${written} of ${sent} bytes`);
+  }
+  return written;
+}
+
+/**
+ * A copy of `handle` whose int64 size says `size`. LOB_NEW returns size 0 and
+ * LOB_WRITE never updates it, but EXECUTE stores the size the handle states, as
+ * the JDBC driver's `CUBRIDLobHandle.setLobSize` does.
+ */
+export function setLobHandleSize(handle: Buffer, size: number): Buffer {
+  const sized = Buffer.from(handle);
+  sized.writeBigInt64BE(BigInt(size), SIZE_INT);
+  return sized;
+}
+
+/**
+ * The binds of `binds` with each LOB's handle in its place, in order: byte
+ * BLOB or CLOB, then the length-prefixed handle (JDBC `UOutputBuffer.addLob`).
+ */
+export function bindLobHandles(binds: PreparedBinds, handles: readonly Buffer[]): PreparedBinds {
+  const lobs = binds.lobs ?? [];
+  if (handles.length !== lobs.length) {
+    throw new Error(`${lobs.length} LOB parameters but ${handles.length} handles`);
+  }
+
+  const w = new PacketWriter(binds.bytes.length + 64 * handles.length);
+  let at = 0;
+  handles.forEach((handle, index) => {
+    const { offset, param } = lobs[index] as (typeof lobs)[number];
+    w.writeBytes(binds.bytes.subarray(at, offset));
+    w.addByte(param.kind === "blob" ? CUBRIDDataType.BLOB : CUBRIDDataType.CLOB);
+    w.addBytes(handle);
+    at = offset;
+  });
+  w.writeBytes(binds.bytes.subarray(at));
+  return { count: binds.count, bytes: Buffer.from(w.toBuffer()) };
+}
+
+// ---------------------------------------------------------------------------
 // Bind parameter encoding
 // ---------------------------------------------------------------------------
 
@@ -993,6 +1162,10 @@ export function encodeBindParams(params: readonly unknown[]): Buffer {
 }
 
 function encodeOneParam(w: PacketWriter, value: unknown): void {
+  if (isLobParam(value)) {
+    throw new LobParamError(LOB_LITERAL_REFUSED);
+  }
+
   if (value === null || value === undefined) {
     w.writeInt(0); // NULL
     return;
@@ -1076,9 +1249,21 @@ function encodeOneParam(w: PacketWriter, value: unknown): void {
 
 export interface PreparedBinds {
   count: number;
-  /** One length-prefixed type byte and one length-prefixed value per parameter. */
+  /**
+   * One length-prefixed type byte and one length-prefixed value per parameter,
+   * except a LOB, whose bind needs its handle: see `lobs`.
+   */
   bytes: Buffer;
+  /**
+   * The blob() and clob() parameters, in order, each with the offset in `bytes`
+   * where its bind goes once uploaded. See bindLobHandles().
+   */
+  lobs?: ReadonlyArray<{ offset: number; param: LobParam }>;
 }
+
+const LOB_LITERAL_REFUSED =
+  "a blob() or clob() value can only be sent by queryPrepared(), queryResultPrepared() " +
+  "or executePrepared()";
 
 const INT32_MIN = -2147483648;
 const INT32_MAX = 2147483647;
@@ -1096,10 +1281,30 @@ const MAX_DATETIME_YEAR = 9999;
  */
 export function encodePreparedParams(params: readonly unknown[]): PreparedBinds {
   const w = new PacketWriter(256);
+  const lobs: Array<{ offset: number; param: LobParam }> = [];
+  const streams = new Set<unknown>();
   for (const param of params) {
+    if (isLobParam(param)) {
+      if (isSourceConsumed(param.source)) {
+        throw new LobParamError(STREAM_REUSED);
+      }
+      if (isStreamSource(param.source)) {
+        if (streams.has(param.source)) {
+          throw new LobParamError(
+            "the same blob() or clob() stream source is used twice; a stream can be read only once",
+          );
+        }
+        streams.add(param.source);
+      }
+      lobs.push({ offset: w.length, param });
+      continue;
+    }
     writePreparedParam(w, param);
   }
-  return { count: params.length, bytes: Buffer.from(w.toBuffer()) };
+  const bytes = Buffer.from(w.toBuffer());
+  return lobs.length === 0
+    ? { count: params.length, bytes }
+    : { count: params.length, bytes, lobs };
 }
 
 function writePreparedParam(w: PacketWriter, value: unknown): void {
@@ -1350,6 +1555,11 @@ export function interpolateParams(
  * Format a JavaScript value as a SQL literal.
  */
 export function formatValue(value: unknown, noBackslashEscapes: boolean): string {
+  // String() would render the wrapper as '[object Object]' without complaint.
+  if (isLobParam(value)) {
+    throw new LobParamError(LOB_LITERAL_REFUSED);
+  }
+
   if (value === null || value === undefined) {
     return "NULL";
   }
