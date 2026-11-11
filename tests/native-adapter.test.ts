@@ -850,6 +850,65 @@ test("a new session is probed again, so a changed backslash mode escapes its SQL
   assert.equal(sentSql().length, 5);
 });
 
+test("a negative parameter after a minus sign is sent parenthesized, never as a comment", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  const sentSql = (): string[] =>
+    fakeCAS.sentPayloads
+      .filter((payload) => payload[0] === CASFunctionCode.PREPARE_AND_EXECUTE)
+      .map((payload) => payload.toString("latin1"));
+
+  for (const value of [-1, -1n]) {
+    fakeCAS.queueResponse(buildDMLResponse(20, 1));
+    fakeCAS.queueResponse(buildSimpleResponse(0));
+    await adapter.query("UPDATE t SET b = b-? WHERE id = 1", [value]);
+  }
+  for (const sql of sentSql()) {
+    assert.ok(sql.includes("UPDATE t SET b = b-(-1) WHERE id = 1"), sql);
+    assert.ok(!sql.includes("--"), sql);
+  }
+  assert.equal(sentSql().length, 2);
+});
+
+test("a value the literal path cannot render is refused before connecting or sending", async () => {
+  const refused: unknown[] = [
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.NEGATIVE_INFINITY,
+    new Date(Number.NaN),
+    [1, 2],
+    { toString: () => "1 OR 1=1" },
+    () => 1,
+    Symbol("s"),
+  ];
+  for (const value of refused) {
+    const params = [1, value] as unknown as QueryParam[];
+    const calls: Array<[string, (adapter: NativeCubridAdapter) => Promise<unknown>]> = [
+      ["query", (adapter) => adapter.query("SELECT ?, ?", params)],
+      ["queryResult", (adapter) => adapter.queryResult("SELECT ?, ?", params)],
+      ["execute", (adapter) => adapter.execute("UPDATE t SET a = ? WHERE id = ?", params)],
+      [
+        "stream",
+        async (adapter) => {
+          for await (const _row of adapter.stream("SELECT ?, ?", params)) {
+            // unreachable
+          }
+        },
+      ],
+    ];
+    for (const [name, call] of calls) {
+      const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+      fakeCAS._isConnected = false;
+      await assert.rejects(call(adapter), (error: unknown) => {
+        assert.ok(error instanceof QueryError, name);
+        assert.ok(error.cause instanceof Error);
+        return true;
+      });
+      assert.equal(fakeCAS.sendAndRecvCalls, 0, name);
+      assert.equal(fakeCAS.connectCalls, 0, name);
+    }
+  }
+});
+
 // ---------------------------------------------------------------------------
 // query() — error handling
 // ---------------------------------------------------------------------------

@@ -44,6 +44,7 @@ import {
   TYPE_NAMES,
 } from "../protocol/constants.js";
 import {
+  assertLiteralParams,
   assertPreparableSql,
   assertSingleStatement,
   bindLobHandles,
@@ -284,6 +285,7 @@ export class NativeCubridAdapter implements DriverAdapter {
   ): Promise<QueryResult<T>> {
     assertValidQueryOptions(options);
     refuseLobParams(params);
+    literalOrRefuse(params, QUERY_FAILED);
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
     return this.inTurn(
@@ -316,6 +318,7 @@ export class NativeCubridAdapter implements DriverAdapter {
   ): AsyncGenerator<T, void, undefined> {
     const signal = options?.signal;
     signal?.throwIfAborted();
+    literalOrRefuse(params, QUERY_FAILED);
 
     const cursor = new StreamCursor(options?.consumerTimeout ?? DEFAULT_CONSUMER_TIMEOUT_MS);
     const fetchSize = options?.fetchSize ?? this.config.fetchSize ?? DEFAULT_FETCH_SIZE;
@@ -356,6 +359,7 @@ export class NativeCubridAdapter implements DriverAdapter {
   async execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult> {
     assertValidQueryOptions(options);
     refuseLobParams(params);
+    literalOrRefuse(params, "Failed to execute CUBRID statement.");
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
     return this.inTurn(
@@ -1935,6 +1939,21 @@ export class NativeCubridAdapter implements DriverAdapter {
     } catch {
       // Best-effort cleanup — ignore errors
     }
+  }
+}
+
+/**
+ * Checks the values of a statement sent as SQL text when it is called, before it
+ * waits for its turn or sends anything, as bindOrRefuse() does for a prepared one.
+ */
+function literalOrRefuse(params: QueryParams | undefined, message: string): void {
+  if (params === undefined) {
+    return;
+  }
+  try {
+    assertLiteralParams(params);
+  } catch (error) {
+    throw mapError("query", error, message);
   }
 }
 

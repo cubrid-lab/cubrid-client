@@ -393,16 +393,24 @@ Other parameters render the same in both modes and are sent without that probe.
 | JavaScript parameter | Current SQL literal behavior |
 | --- | --- |
 | `string` | Quoted, server-mode-aware escaped string; embedded NUL/Ctrl-Z rejected |
-| `number` | Decimal text representation; floating-point/large integer precision is subject to JavaScript `number` |
-| `bigint` | Decimal integer text, preserving JavaScript bigint precision |
+| `number` | Decimal text representation; floating-point/large integer precision is subject to JavaScript `number`. A negative value is parenthesized, `(-1)`. `NaN` and the infinities are refused |
+| `bigint` | Decimal integer text, preserving JavaScript bigint precision. A negative value is parenthesized, `(-1)` |
 | `boolean` | `1` or `0` |
-| `Date` | `DATETIME'YYYY-MM-DD HH:MM:SS.mmm'` using **UTC components**; it has no timezone offset embedded |
+| `Date` | `DATETIME'YYYY-MM-DD HH:MM:SS.mmm'` using **UTC components**; it has no timezone offset embedded. An invalid `Date` is refused |
 | `Buffer` | Hexadecimal binary literal `X'...'`. For BLOB or CLOB content use [`blob()` or `clob()`](#writing-blob-and-clob) with a prepared method |
-| `null` | SQL `NULL` |
+| `null`, `undefined` | SQL `NULL` |
+| `blob()`, `clob()` | Refused with a `TypeError`: use a prepared method |
+| Anything else | Refused: an object, array, function or symbol is never converted with `String()` |
+
+A negative number is parenthesized because the SQL text can put a minus sign
+before the marker: `b-?` with `-1` would otherwise read `b--1`, and `--` starts a
+comment that hides the rest of the line, a `WHERE` clause included. A refused
+value rejects with a `QueryError` before anything is sent, and the error names
+only the value's type.
 
 The module also defines an older internal binary encoder, `encodeBindParams()`.
 Nothing uses it, and its layout is not the one EXECUTE reads: prepared binding
-has its own encoder. Check [the API reference](API_REFERENCE.md) for current
+has its own encoder. It refuses values outside `QueryParam` too. Check [the API reference](API_REFERENCE.md) for current
 method contracts.
 
 ### Prepared binding
@@ -425,7 +433,7 @@ rendering SQL literals.
 | `Date` | DATETIME | **UTC components**, as on the literal path. Years outside 0001 to 9999 and an invalid `Date` are refused |
 | `Buffer` | VARBIT | An empty `Buffer` is refused: the broker reads it as SQL NULL |
 | `blob()`, `clob()` | BLOB, CLOB handle | Uploaded first. See [writing BLOB and CLOB](#writing-blob-and-clob) |
-| Anything else | Refused | The literal path would stringify it |
+| Anything else | Refused | As on the literal path |
 
 A refused value rejects with a `QueryError` before anything is sent, and the
 error never contains the value.

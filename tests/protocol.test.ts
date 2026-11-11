@@ -21,6 +21,7 @@ import {
 import { PacketReader } from "../src/protocol/packet-reader.js";
 import { PacketWriter } from "../src/protocol/packet-writer.js";
 import {
+  assertLiteralParams,
   assertSingleStatement,
   type ColumnMeta,
   encodeBindParams,
@@ -926,9 +927,10 @@ test("encodeBindParams encodes Buffer as VARBIT", () => {
   assert.deepEqual([...buf.subarray(5, 8)], [0xaa, 0xbb, 0xcc]);
 });
 
-test("encodeBindParams fallback stringifies unknown types", () => {
-  const buf = encodeBindParams([{ toString: () => "custom" }]);
-  assert.equal(buf[4], CUBRIDDataType.STRING);
+test("encodeBindParams refuses values that are not a QueryParam instead of stringifying them", () => {
+  for (const value of [{ toString: () => "custom" }, [1], () => 1, Symbol("s")]) {
+    assert.throws(() => encodeBindParams([value]), /unsupported parameter type/);
+  }
 });
 
 test("encodeBindParams encodes multiple params sequentially", () => {
@@ -1144,8 +1146,79 @@ test("formatValue formats Buffer", () => {
   assert.equal(formatValue(Buffer.from([0xde, 0xad]), true), "X'dead'");
 });
 
-test("formatValue stringifies unknown types", () => {
-  assert.equal(formatValue({ toString: () => "custom" }, true), "'custom'");
+test("formatValue parenthesizes negative numbers and bigints, and only those", () => {
+  for (const mode of [true, false]) {
+    assert.equal(formatValue(-1, mode), "(-1)");
+    assert.equal(formatValue(-1.5e-7, mode), "(-1.5e-7)");
+    assert.equal(formatValue(-1n, mode), "(-1)");
+    assert.equal(formatValue(-(2n ** 63n), mode), "(-9223372036854775808)");
+    assert.equal(formatValue(-Number.MAX_VALUE, mode), `(${String(-Number.MAX_VALUE)})`);
+    assert.equal(formatValue(0, mode), "0");
+    assert.equal(formatValue(-0, mode), "0");
+    assert.equal(formatValue(0n, mode), "0");
+    assert.equal(formatValue(1, mode), "1");
+    assert.equal(formatValue(1e21, mode), "1e+21");
+    assert.equal(formatValue(2n ** 70n, mode), String(2n ** 70n));
+  }
+});
+
+test("formatValue refuses NaN and Infinity", () => {
+  for (const mode of [true, false]) {
+    for (const value of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      assert.throws(() => formatValue(value, mode), /NaN and Infinity are not supported/);
+    }
+  }
+});
+
+test("formatValue refuses an invalid Date", () => {
+  assert.throws(() => formatValue(new Date(Number.NaN), true), /invalid Date/);
+});
+
+test("formatValue refuses values that are not a QueryParam instead of stringifying them", () => {
+  const cases: Array<[unknown, string]> = [
+    [{ toString: () => "1) OR (1=1" }, "object"],
+    [[1, 2], "array"],
+    [[], "array"],
+    [() => "x", "function"],
+    [Symbol("s"), "symbol"],
+    [new Map(), "object"],
+    [Object.create(null), "object"],
+    [new Uint8Array([1]), "object"],
+  ];
+  for (const [value, type] of cases) {
+    for (const mode of [true, false]) {
+      assert.throws(
+        () => formatValue(value, mode),
+        (error: Error) => {
+          // The message names the type, never the value.
+          assert.equal(error.message, `unsupported parameter type: ${type}`);
+          return true;
+        },
+      );
+    }
+  }
+});
+
+test("assertLiteralParams accepts every QueryParam and refuses what formatValue refuses", () => {
+  assertLiteralParams([null, undefined, true, 1, -1, 1n, "it's", new Date(0), Buffer.from([1])]);
+  for (const value of [Number.NaN, new Date(Number.NaN), {}, [1], "a\0b"]) {
+    assert.throws(() => assertLiteralParams(["ok", value]));
+  }
+});
+
+test("a negative value after a minus sign never forms a -- comment, in either mode", () => {
+  for (const mode of [true, false]) {
+    for (const value of [-1, -1n, -0.5, -(2n ** 63n)]) {
+      const sql = interpolateParams("UPDATE t SET b = b-? WHERE id = 1", [value], mode);
+      assert.ok(!sql.includes("--"), sql);
+      assert.equal(sql, `UPDATE t SET b = b-(${String(value)}) WHERE id = 1`);
+    }
+    assert.equal(interpolateParams("SELECT 5-?", [-1], mode), "SELECT 5-(-1)");
+    assert.equal(interpolateParams("SELECT 5-?", [-1n], mode), "SELECT 5-(-1)");
+    assert.equal(interpolateParams("SELECT -?", [-2], mode), "SELECT -(-2)");
+    assert.equal(interpolateParams("SELECT ?-?", [-1, -2], mode), "SELECT (-1)-(-2)");
+    assert.equal(interpolateParams("SELECT 5-?", [1], mode), "SELECT 5-1");
+  }
 });
 
 // ---------------------------------------------------------------------------

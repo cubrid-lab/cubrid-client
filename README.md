@@ -279,6 +279,12 @@ the connection:
   backslashes are doubled and `\r` / `\n` are backslash-escaped in addition to
   doubling the single quote.
 
+A negative `number` or `bigint` is rendered in parentheses, `(-1)`, so SQL such
+as `balance-?` can never become `balance--1`, where `--` would start a comment.
+`NaN`, `Infinity`, an invalid `Date` and any value that is not a `QueryParam`
+(an object, array, function or symbol) are rejected with a `QueryError` before
+anything is sent; they are never converted with `String()`.
+
 > **Rejected bytes:** string parameters containing a NUL (`0x00`) or Ctrl-Z
 > (`0x1A`) byte are rejected with a `QueryError`, because CUBRID cannot store a
 > NUL in a string literal and defines no safe literal escape for `0x1A`. Encode

@@ -5993,3 +5993,117 @@ describe("Integration: writing BLOB and CLOB with LOB_NEW and LOB_WRITE (#103)",
     });
   });
 });
+
+describe("Integration: negative literal parameters (#242)", { skip: !available }, () => {
+  const TABLE = "cc_literal_242";
+
+  async function withRows<T>(run: (client: ReturnType<typeof createClient>) => Promise<T>) {
+    const client = createClient(TEST_CONFIG);
+    try {
+      await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+      await client.query(`CREATE TABLE ${TABLE} (id INT PRIMARY KEY, b INT)`);
+      await client.query(`INSERT INTO ${TABLE} VALUES (1, 10), (2, 10), (3, 10)`);
+      return await run(client);
+    } finally {
+      await client.query(`DROP TABLE IF EXISTS ${TABLE}`).catch(() => undefined);
+      await client.close();
+    }
+  }
+
+  async function rows(client: ReturnType<typeof createClient>): Promise<Array<[number, number]>> {
+    const result = await client.query<{ id: number; b: number }>(
+      `SELECT id, b FROM ${TABLE} ORDER BY id`,
+    );
+    return result.map((row) => [row.id, row.b]);
+  }
+
+  test("an UPDATE with b-? and a trailing WHERE changes only the matching row", async () => {
+    for (const value of [-1, -1n]) {
+      await withRows(async (client) => {
+        // With `b--1` the rest of the line, WHERE included, would be a comment.
+        const result = await client.execute(`UPDATE ${TABLE} SET b = b-? WHERE id = ?`, [value, 2]);
+        assert.equal(result.affectedRows, 1);
+        assert.deepEqual(await rows(client), [
+          [1, 10],
+          [2, 11],
+          [3, 10],
+        ]);
+
+        await client.query(`UPDATE ${TABLE} SET b = b-? WHERE id = ?`, [value, 3]);
+        assert.deepEqual(await rows(client), [
+          [1, 10],
+          [2, 11],
+          [3, 11],
+        ]);
+      });
+    }
+  });
+
+  test("a DELETE with id > 0-? and a trailing condition deletes only the matching row", async () => {
+    for (const value of [-1, -1n]) {
+      await withRows(async (client) => {
+        // `id > 0--1 AND id = ?` would read `id > 0` and delete every row.
+        const result = await client.execute(`DELETE FROM ${TABLE} WHERE id > 0-? AND id = ?`, [
+          value,
+          2,
+        ]);
+        assert.equal(result.affectedRows, 1);
+        assert.deepEqual(await rows(client), [
+          [1, 10],
+          [3, 10],
+        ]);
+      });
+    }
+  });
+
+  test("unary and binary minus next to a negative value compute what was written", async () => {
+    const client = createClient(TEST_CONFIG);
+    try {
+      for (const [value, expected] of [
+        [-1, { a: 6, b: 1, c: 0, d: 5, e: -5 }],
+        [-1n, { a: 6, b: 1, c: 0, d: 5, e: -5 }],
+        [-2.5, { a: 7.5, b: 2.5, c: 0, d: 12.5, e: -2 }],
+      ] as const) {
+        const [row] = await client.query(
+          "SELECT 5-? AS a, -? AS b, ?-? AS c, 5*-? AS d, 5/? AS e FROM db_root",
+          [value, value, value, value, value, value],
+        );
+        assert.deepEqual(
+          Object.fromEntries(Object.entries(row!).map(([key, v]) => [key, Number(v)])),
+          expected,
+        );
+      }
+      const [min] = await client.query("SELECT ? AS v FROM db_root", [-(2n ** 63n)]);
+      assert.equal(BigInt(String(min!.v)), -(2n ** 63n));
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("NaN, Infinity, an invalid Date, arrays and objects are refused and change nothing", async () => {
+    await withRows(async (client) => {
+      for (const value of [
+        Number.NaN,
+        Number.POSITIVE_INFINITY,
+        Number.NEGATIVE_INFINITY,
+        new Date(Number.NaN),
+        [1, 2],
+        { toString: () => "0 OR 1=1" },
+      ]) {
+        await assert.rejects(
+          client.execute(`DELETE FROM ${TABLE} WHERE id = ?`, [value as unknown as QueryParam]),
+          QueryError,
+        );
+        await assert.rejects(
+          client.query(`UPDATE ${TABLE} SET b = ? WHERE id = 1`, [value as unknown as QueryParam]),
+          QueryError,
+        );
+      }
+      assert.deepEqual(await rows(client), [
+        [1, 10],
+        [2, 10],
+        [3, 10],
+      ]);
+    });
+  });
+});

@@ -1234,13 +1234,7 @@ function encodeOneParam(w: PacketWriter, value: unknown): void {
     return;
   }
 
-  // Fallback: stringify
-  const str = String(value);
-  const encoded = Buffer.from(str, "utf-8");
-  w.writeInt(1 + encoded.length + 1);
-  w.writeByte(CUBRIDDataType.STRING);
-  w.writeBytes(encoded);
-  w.writeByte(0);
+  throw unsupportedParam(value);
 }
 
 // ---------------------------------------------------------------------------
@@ -1569,11 +1563,14 @@ export function formatValue(value: unknown, noBackslashEscapes: boolean): string
   }
 
   if (typeof value === "number") {
-    return String(value);
+    if (!Number.isFinite(value)) {
+      throw new Error("NaN and Infinity are not supported as a parameter");
+    }
+    return formatNumeric(value, value < 0);
   }
 
   if (typeof value === "bigint") {
-    return String(value);
+    return formatNumeric(value, value < 0n);
   }
 
   if (typeof value === "string") {
@@ -1581,6 +1578,9 @@ export function formatValue(value: unknown, noBackslashEscapes: boolean): string
   }
 
   if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) {
+      throw new Error("an invalid Date cannot be sent as a parameter");
+    }
     return formatDatetime(value);
   }
 
@@ -1588,7 +1588,36 @@ export function formatValue(value: unknown, noBackslashEscapes: boolean): string
     return `X'${value.toString("hex")}'`;
   }
 
-  return escapeString(String(value), noBackslashEscapes);
+  throw unsupportedParam(value);
+}
+
+/**
+ * A negative number is parenthesized: after a `-` in the SQL text, `5-?` with -1
+ * would otherwise read `5--1`, and `--` starts a comment that hides the rest of
+ * the line, a WHERE clause included.
+ */
+function formatNumeric(value: number | bigint, negative: boolean): string {
+  return negative ? `(${String(value)})` : String(value);
+}
+
+/**
+ * Checks every value of a literal statement without rendering it, so a refused
+ * value fails before anything is sent. Both backslash modes refuse the same values.
+ */
+export function assertLiteralParams(params: readonly unknown[]): void {
+  for (const value of params) {
+    if (typeof value === "string") {
+      assertStorableText(value);
+    } else {
+      formatValue(value, true);
+    }
+  }
+}
+
+/** Objects, arrays, functions and symbols are not a QueryParam; their text is not a value. */
+function unsupportedParam(value: unknown): Error {
+  const type = Array.isArray(value) ? "array" : typeof value;
+  return new Error(`unsupported parameter type: ${type}`);
 }
 
 /**
