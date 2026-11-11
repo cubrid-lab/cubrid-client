@@ -12,6 +12,7 @@ and instructions for contributing to the project.
 - [Public API compatibility](#public-api-compatibility)
 - [Code Style](#code-style)
 - [Pull Request Guidelines](#pull-request-guidelines)
+- [Temporary code and tooling](#temporary-code-and-tooling)
 - [Reporting Issues](#reporting-issues)
 
 ---
@@ -250,6 +251,45 @@ and a verified GitHub assignee before taking reserved work; coordinate with
 existing PR owners. Keep `database/sql`-equivalent transaction intent,
 parameter binding and wire parsing safe, use focused regression tests, and
 report offline versus real-database evidence separately.
+
+## Temporary code and tooling
+
+Some additions are meant to be short-lived: a diagnostic workflow for a release
+failure, a one-time migration or synchronization job, a debug helper, a
+workaround waiting on an upstream fix. They are fine when they solve a real
+problem, but they must not quietly become permanent.
+
+**Prefer not to commit them.** Run a one-off operation by hand, or as a
+`workflow_dispatch` run from a branch, and record the command and its result in
+the issue. Commit temporary tooling only when it must run from `main` or by
+someone else, and do not add tests or required CI checks only for it.
+
+**When you do commit one, the PR description states:**
+
+- **Purpose:** the problem it solves, and the local issue that tracks it.
+- **Owner:** who decides whether it stays.
+- **Removal condition:** the event that ends its use, such as "npm shows
+  1.2.0 published by OIDC" or "historical Release pages synced", or a review
+  date if there is no such event.
+- **What stays:** the evidence or test that must outlive it, for example a run
+  link in the issue or a regression test.
+
+Mark the file itself with a first-line comment naming the issue, for example
+`# Temporary: remove when #166 is resolved.`
+
+**When the condition is met**, the owner removes it, or records why it stays, in
+the tracking issue. Before removing it, check callers, CI, release workflows,
+docs, published artifacts and the compatibility contract. Keep the evidence and
+tests listed above. Stable release tooling, compatibility paths, reproducible
+benchmarks such as `scripts/bench-prepared.ts`, and regression tests are not
+temporary and stay.
+
+Example ([#226](https://github.com/cubrid-lab/cubrid-client/issues/226)):
+`verify-npm-publisher.yml` diagnosed the rejected `NPM_TOKEN` behind the
+failed v1.2.0 publication (#166). Its removal condition, publication through
+Trusted Publishing, was met when 1.2.0 and 1.3.0 were published by OIDC with
+provenance. It was removed, and the run links stay in #166 and
+`docs/RELEASE_PROCESS.md`.
 
 ## Release management
 

@@ -46,9 +46,15 @@ issue/PR links on the **same source line**. Let GitHub wrap text to the
 reader's screen width instead of adding hard line breaks in the middle
 of a sentence or putting the citation on a continuation line.
 Check the **published GitHub Release page**, not only the Markdown file,
-after updating an existing release. The
-[`sync-historical-release-notes.yml`](../.github/workflows/sync-historical-release-notes.yml)
-workflow synchronizes every existing published GitHub Release from its reviewed `docs/releases/vX.Y.Z.md` source, without changing tags or npm packages. The v0.2.0 tag exists but has no historical GitHub Release page: its curated source note is retained and synchronization skips creation of a new Release.
+after updating an existing release. `publish.yml` publishes the curated
+`docs/releases/vX.Y.Z.md` as the Release description of each new version. To
+correct an already published description after a reviewed merge of its source
+note, run `gh release edit vX.Y.Z --title "cubrid-client vX.Y.Z" --notes-file docs/releases/vX.Y.Z.md`;
+this changes no tag or npm package. (The one-time historical synchronization
+workflow finished its job on 2026-11-07 and was removed in
+[#226](https://github.com/cubrid-lab/cubrid-client/issues/226).) The v0.2.0 tag
+exists but has no historical GitHub Release page: its curated source note is
+retained and no Release is created for it.
 
 ## Automated publication and recovery
 
@@ -134,10 +140,10 @@ GitHub Releases and npm are separate registries. The existence of a
 published that version**; the final `npm view cubrid-client@X.Y.Z version`
 check is mandatory.
 
-For v1.2.0, the initial GitHub Release exists, but the npm publish step
+For v1.2.0, the initial GitHub Release existed, but the npm publish step
 failed with `E404` on `PUT https://registry.npmjs.org/cubrid-client`.
-A read-only follow-up diagnostic also demonstrated that the previous
-`NPM_TOKEN` failed `npm whoami`:
+A read-only follow-up diagnostic (a temporary workflow, since removed) also
+demonstrated that the previous `NPM_TOKEN` failed `npm whoami`:
 [release run](https://github.com/cubrid-lab/cubrid-client/actions/runs/42315470123),
 [auth diagnostic](https://github.com/cubrid-lab/cubrid-client/actions/runs/42320289488).
 Never create a different version to work around a registry credential failure.
@@ -155,8 +161,11 @@ manual recovery with `confirmation=PUBLISH` and
 `recovery_tag=v1.2.0`. This checks and republishes **the original
 immutable tag** without creating or modifying another GitHub Release.
 Confirm the actual npm registry version after the workflow succeeds.
-See [#166](https://github.com/cubrid-lab/cubrid-client/issues/166)
-for the tracked release discrepancy.
+This recovery was completed: v1.2.0 and v1.3.0 were published by
+`publish.yml` through Trusted Publishing (npm publisher
+`npm-oidc-no-reply@github.com`, SLSA provenance, `gitHead` equal to the tag
+commit); see [#166](https://github.com/cubrid-lab/cubrid-client/issues/166).
+No workflow reads `NPM_TOKEN` any more, so a maintainer may delete that secret.
 
 ## Release-note ownership and style
 
@@ -171,8 +180,8 @@ PR against actual commits, rather than an anticipated issue milestone.
 Use one Markdown source line per change and do not insert hard wraps. Decorative emoji are disallowed in curated release notes and generated CHANGELOG content, except for the exact inline first-contribution celebration. The validation script enforces section order, attribution and duplicate PR references for all versioned source notes, including historical releases. GitHub Release descriptions are synced from reviewed source notes without rewriting immutable tags or republishing npm artifacts.
 
 The historical v0.1.0, v0.2.0, v1.0.0, v1.1.0 and v1.2.0 notes are curated against immutable tag contents and the actual contributor/PR history. v0.1.0 credits the author of PR #1 as `@Copilot` without declaring a bot to be a first-time human contributor. The tagged v0.2.0 has no corresponding GitHub Release page; retaining a source note is not authorization to create one. Updating these files does not modify tag commits or npm artifacts.
-The separate historical-release synchronization workflow updates the existing
-GitHub Release descriptions and titles after a reviewed merge to `main`.
+Correct an existing GitHub Release description with the `gh release edit`
+command under [GitHub Release note formatting](#github-release-note-formatting).
 Verify the resulting GitHub Release pages; do not infer success from a
 successfully merged source PR.
 
