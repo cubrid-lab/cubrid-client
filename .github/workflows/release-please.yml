@@ -39,7 +39,7 @@ jobs:
           fi
       - name: Propose version, lockfile and changelog in a Release PR
         if: steps.current-version.outputs.released == 'true'
-        uses: googleapis/release-please-action@v4
+        uses: googleapis/release-please-action@v5
         with:
           # Supply a restricted PAT for automatic PR CI (or mint an App token per run).
           # With GITHUB_TOKEN, manually rerun CI on generated Release PRs.
