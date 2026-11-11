@@ -10,7 +10,7 @@ convert a runtime value.
 
 | CUBRID wire type(s) | Current JavaScript value | Status / limitation |
 | --- | --- | --- |
-| CHAR, VARCHAR/STRING, NCHAR, VARNCHAR, ENUM | `string` | Decoded as null-terminated text; validate encoding against a live broker |
+| CHAR, VARCHAR/STRING, NCHAR, VARNCHAR, ENUM | `string` | Decoded as UTF-8 null-terminated text whatever the column charset. In a non-UTF-8 database (`iso88591` in the Docker images) this differs from JDBC; see [the recorded difference](LEGACY_PARITY.md#recorded-defect-text-in-a-non-utf-8-database) |
 | JSON | `string` | Raw JSON text, not parsed. This driver declares CAS protocol 7, and below protocol 8 the server sends JSON columns as VARCHAR (wire type 2), so wire type 34 does not arrive. Checked on 10.2, 11.0, 11.2 and 11.4; see [JSON columns](#json-columns) |
 | SHORT, INTEGER | `number` | Parsed signed 16-bit / 32-bit integers |
 | BIGINT | `bigint` | Lossless signed 64-bit value; corrected by [#126](https://github.com/cubrid-lab/cubrid-client/pull/126); `JSON.stringify` needs explicit bigint conversion |
