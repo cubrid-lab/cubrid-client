@@ -9,6 +9,7 @@ on:
       - ".github/workflows/release-validation.yml"
       - ".github/workflows/live-cubrid.yml"
       - ".github/workflows/live-cubrid-tls.yml"
+      - ".github/workflows/jdbc-parity.yml"
       - ".github/workflows/publish.yml"
       # Release Please candidates change these, normal source PRs do not.
       - ".release-please-manifest.json"
@@ -41,6 +42,14 @@ jobs:
     uses: ./.github/workflows/live-cubrid-tls.yml
     with:
       checkout_ref: ${{ inputs.checkout_ref || github.sha }}
+
+  # Same SQL corpus through the official JDBC driver and cubrid-client on all
+  # four servers; any undeclared difference or a near-empty run fails (#118).
+  jdbc-parity:
+    uses: ./.github/workflows/jdbc-parity.yml
+    with:
+      checkout_ref: ${{ inputs.checkout_ref || github.sha }}
+      full_matrix: true
 
   npm-consumer-smoke:
     name: npm artifact / Node ${{ matrix.node-version }} smoke
@@ -94,7 +103,7 @@ jobs:
   release-gate:
     name: All reviewed release checks passed
     if: always()
-    needs: [live-cubrid-matrix, live-cubrid-tls, npm-consumer-smoke]
+    needs: [live-cubrid-matrix, live-cubrid-tls, jdbc-parity, npm-consumer-smoke]
     runs-on: ubuntu-latest
     steps:
       - name: Reject missing, skipped, failed, or cancelled checks
@@ -102,12 +111,13 @@ jobs:
           LIVE_MATRIX: ${{ needs.live-cubrid-matrix.result }}
           LIVE_TLS: ${{ needs.live-cubrid-tls.result }}
           NPM_SMOKE: ${{ needs.npm-consumer-smoke.result }}
+          JDBC_PARITY: ${{ needs.jdbc-parity.result }}
         shell: bash
         run: |
           set -euo pipefail
-          printf 'Live database matrix: %s\nLive TLS: %s\nPacked npm consumers: %s\n' \
-            "$LIVE_MATRIX" "$LIVE_TLS" "$NPM_SMOKE"
-          if [[ "$LIVE_MATRIX" != success || "$LIVE_TLS" != success || "$NPM_SMOKE" != success ]]; then
+          printf 'Live database matrix: %s\nLive TLS: %s\nJDBC parity: %s\nPacked npm consumers: %s\n' \
+            "$LIVE_MATRIX" "$LIVE_TLS" "$JDBC_PARITY" "$NPM_SMOKE"
+          if [[ "$LIVE_MATRIX" != success || "$LIVE_TLS" != success || "$JDBC_PARITY" != success || "$NPM_SMOKE" != success ]]; then
             echo "::error::Required release validation was absent, skipped, failed or cancelled."
             exit 1
           fi

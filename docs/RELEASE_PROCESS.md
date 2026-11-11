@@ -3,6 +3,9 @@
 This TypeScript/npm library uses Release Please's **node** release type, not a
 Python release strategy. The GitHub Release and npm publish steps are separate.
 
+What a release must prove, and which check proves it, is defined in
+[RELEASE_CRITERIA.md](RELEASE_CRITERIA.md).
+
 ## Baseline and Release PRs
 
 - Bootstrap from the already published v1.1.0 tag. The manifest starts at
@@ -63,7 +66,7 @@ retained and no Release is created for it.
    A version is **not published** merely because the PR exists.
 2. Review the candidate notes and supported/unsupported behavior. The release
    PR automatically runs the **full four-version CUBRID matrix**, real
-   CUBRID 11.4 SSL=ON certificate checks, Node 18/20/22/24/26 packed ESM/CJS
+   CUBRID 11.4 SSL=ON certificate checks, the four-version JDBC parity comparison, Node 18/20/22/24/26 packed ESM/CJS
    smoke, API declaration verification, offline tests and security scans.
    Never merge while a required check has failed, been skipped or is absent.
 3. **Merging the reviewed Release Please PR into `main` automatically
