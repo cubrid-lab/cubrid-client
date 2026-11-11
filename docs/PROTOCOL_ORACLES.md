@@ -75,7 +75,8 @@ settings without the client opening a new one.
 An autocommit SELECT closed before its last row therefore stays in a transaction:
 it keeps its table lock and its CAS, and a second session's `ALTER TABLE` waits,
 until the next statement or an END_TRAN. So `stream()` sends END_TRAN when it stops
-early in autocommit mode. An END_TRAN between two FETCHes closes the cursor, and the
+early in autocommit mode, and `query()` sends it when a FETCH fails before the last
+row; after a malformed reply the session is dropped instead. An END_TRAN between two FETCHes closes the cursor, and the
 next FETCH fails with `-1012`, which is why a stream that read LOB content sends it
 once, after the cursor is finished, and never between rows. LOB_READ itself leaves
 the cursor and the status alone.

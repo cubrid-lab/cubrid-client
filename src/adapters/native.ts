@@ -785,7 +785,19 @@ export class NativeCubridAdapter implements DriverAdapter {
       const generation = cas.connectionGeneration;
 
       if (result.totalTupleCount > allRows.length) {
-        await this.fetchRemaining(cas, result, allRows);
+        try {
+          await this.fetchRemaining(cas, result, allRows);
+        } catch (error) {
+          // An autocommit SELECT stays IN_TRAN until its last row is fetched, so
+          // a FETCH that fails partway leaves the session holding the table lock,
+          // and its CAS, until the next statement (#214). Ending it here keeps the
+          // caller's error. A prepared statement is rolled back by runStatement(),
+          // and nothing may follow a damaged reply: its session is dropped.
+          if (binds === undefined && !(error instanceof MalformedReplyError)) {
+            await this.endReadTransaction(cas, generation);
+          }
+          throw error;
+        }
       }
 
       if (result.columns.some(mayHoldLob)) {

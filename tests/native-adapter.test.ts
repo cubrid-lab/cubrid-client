@@ -1834,12 +1834,68 @@ test("query handle: a failed close does not mask the fetch failure", async () =>
   const { adapter, fakeCAS } = createAdapterWithFakeCAS();
   fakeCAS.queueResponse(buildPartialSelectResponse(2));
   fakeCAS.queueResponse(buildErrorResponse(-495, "fetch rejected"));
+  fakeCAS.queueResponse(buildSimpleResponse(0)); // END_TRAN of the read transaction
   fakeCAS.queueExchangeFailure(new Error("close failed"));
 
   await assertQueryFails(adapter, /CUBRID fetch failed/);
 
   assert.deepEqual(fakeCAS.closedHandles, [QUERY_HANDLE]);
   assert.equal(fakeCAS.isConnected, false);
+});
+
+// #214: an autocommit SELECT stays IN_TRAN until its last row, so a FETCH that
+// fails partway must end that transaction rather than keep the table lock.
+test("autocommit query: a FETCH that fails partway ends the read transaction", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(buildPartialSelectResponse(3));
+  fakeCAS.queueResponse(buildErrorResponse(-495, "fetch rejected"));
+  fakeCAS.queueResponse(buildSimpleResponse(0)); // END_TRAN
+
+  await assertQueryFails(adapter, /CUBRID fetch failed/);
+
+  assert.deepEqual(sentCodes(fakeCAS), [
+    PREPARE_AND_EXECUTE,
+    CASFunctionCode.FETCH,
+    END_TRAN,
+    CLOSE_REQ_HANDLE,
+  ]);
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.COMMIT]);
+  assert.equal(fakeCAS.isConnected, true);
+});
+
+test("autocommit query: a failed END_TRAN after a failed FETCH keeps the FETCH error and drops the session", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(buildPartialSelectResponse(3));
+  fakeCAS.queueResponse(buildErrorResponse(-495, "fetch rejected"));
+  fakeCAS.queueResponse(buildErrorResponse(-1, "end tran rejected"));
+
+  await assertQueryFails(adapter, /CUBRID fetch failed/);
+
+  assert.equal(fakeCAS.discardCalls, 1);
+  assert.equal(fakeCAS.isConnected, false);
+  assert.deepEqual(fakeCAS.closedHandles, []);
+});
+
+test("autocommit query: a malformed FETCH sends no END_TRAN", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(buildPartialSelectResponse(2));
+  fakeCAS.queueResponse(buildTruncatedFetchResponse());
+
+  await assertQueryFails(adapter, /Malformed CAS packet|out of range/i);
+
+  assert.deepEqual(endTranTypes(fakeCAS), []);
+  assertSessionDiscarded(fakeCAS);
+});
+
+test("transaction query: a failed FETCH leaves the caller's transaction to the caller", async () => {
+  const { adapter, fakeCAS } = await beginWithOneInsert();
+  fakeCAS.sentPayloads = [];
+  fakeCAS.queueResponse(buildPartialSelectResponse(3));
+  fakeCAS.queueResponse(buildErrorResponse(-495, "fetch rejected"));
+
+  await assertQueryFails(adapter, /CUBRID fetch failed/);
+
+  assert.deepEqual(endTranTypes(fakeCAS), []);
 });
 
 test("query handle: a close rejected by the server does not mask the failure", async () => {
@@ -3584,6 +3640,23 @@ test("a FETCH of a prepared handle never reaches a replaced session", async () =
   await assert.rejects(adapter.queryPrepared("SELECT ? AS v", [7]), QueryError);
 
   assert.ok(!sentCodes(fakeCAS).includes(CASFunctionCode.FETCH));
+});
+
+// #214: the prepared path already rolls back its own transaction, so a failed
+// FETCH must not also send the read-transaction COMMIT.
+test("queryPrepared: a FETCH that fails partway is rolled back once, never committed", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  const twoRows = PREPARED_FRAMES.executeUntypedInt.replace(/^00000001/, "00000002");
+  fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.prepareUntypedMarker));
+  fakeCAS.queueResponse(preparedReply(twoRows));
+  fakeCAS.queueResponse(buildErrorResponse(-495, "fetch rejected"));
+  fakeCAS.queueResponse(buildSimpleResponse(0)); // CLOSE_REQ_HANDLE
+  fakeCAS.queueResponse(buildSimpleResponse(0)); // END_TRAN ROLLBACK
+
+  await assert.rejects(adapter.queryPrepared("SELECT ? AS v", [7]), QueryError);
+
+  assert.ok(sentCodes(fakeCAS).includes(CASFunctionCode.FETCH));
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
 });
 
 test("executePrepared reports affected rows from the EXECUTE reply", async () => {
