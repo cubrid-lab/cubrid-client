@@ -408,13 +408,44 @@ try {
 
 ---
 
+#### `beginTransactionScope(options?)`
+
+Begins a manual transaction on a **dedicated connection** and returns a [`TransactionScope`](#transactionscope) handle that owns it. Use it when the transaction's work cannot be written as one `transaction()` callback, for example when commit is decided elsewhere.
+
+```ts
+async beginTransactionScope(options?: TransactionOptions): Promise<TransactionScope>
+```
+
+```ts
+const tx = await db.beginTransactionScope({ isolationLevel: "serializable" });
+try {
+  await tx.query("UPDATE accounts SET balance = balance - ? WHERE id = ?", [100, 1]);
+  await tx.query("UPDATE accounts SET balance = balance + ? WHERE id = ?", [100, 2]);
+  await tx.commit();
+} catch (error) {
+  await tx.rollback().catch(() => {});
+  throw error;
+}
+```
+
+- Only statements sent through `tx` belong to the transaction. `db.query()` and the other client methods keep using the shared connection in autocommit, so an unrelated caller can never join it, and two scopes never share a connection.
+- `options` works as for [`transaction()`](#transactiontcallback-options): client settings apply first, then these, on the new connection before the transaction begins. Invalid options throw a `RangeError` before any connection opens.
+- Exactly one `commit()` or `rollback()` ends it, and either one closes its connection. Every later call on `tx`, including a second `commit()`, rejects with a [`TransactionError`](#transactionerror) without reaching the server.
+- `commit()` first waits for statements of `tx` still running. If one of them failed, or the COMMIT itself is refused, it rolls back instead and rejects with a `TransactionError`; `rollbackError` and `closeError` are set when those also failed (a `ReadTimeoutError` is passed on unchanged, without them). A statement whose failure already settled before `commit()` was called is the caller's to handle and does not stop the commit. A connection that fails to close after a successful commit does not turn the commit into a failure, unlike `transaction()`, which rejects with the close error.
+- [`close()`](#close) discards every scope that was not ended: it closes the scope's connection, without waiting for its statements still running, and the server rolls back the uncommitted work. Such a statement fails with a connection error, and later calls on `tx` reject with `Transaction was discarded because the client was closed.`
+- A failed BEGIN closes the new connection and rejects with `Failed to begin transaction.`; no handle is returned.
+
+**Throws:** `RangeError` for invalid options, [`TransactionError`](#transactionerror) on failure.
+
+---
+
 #### `beginTransaction()`
 
-Manually begins a transaction on the **shared connection**. Prefer `transaction()` for automatic commit/rollback **and connection ownership**.
+> **Deprecated.** Use [`beginTransactionScope()`](#begintransactionscopeoptions) or [`transaction()`](#transactiontcallback-options). It is kept, with its behavior unchanged, for all of 1.x.
 
-**Concurrency limitation in the existing 1.x API:** `beginTransaction()`, ordinary `db.query()`/`db.execute()`, `commit()` and `rollback()` have no caller or ownership token. Packet-level serialization alone cannot distinguish the task that began a manual transaction from an unrelated asynchronous caller. **Any call using the same client during that transaction may become part of it**, including another request's read or write. Sharing one manually transacting client between concurrent requests is therefore unsafe; no concurrent ownership guarantee is made for the current manual API.
+Manually begins a transaction on the **shared connection**.
 
-For concurrent workloads, use the scoped `await db.transaction(async (tx) => { ... })` callback and issue the transaction's statements through **`tx`**, not `db`. It owns a dedicated connection, while unrelated `db.query()` calls use the separate shared connection. Alternatively give each manual transaction its own unshared `CubridClient` instance. This is a usage boundary, not a claim that `beginTransaction()` itself now rejects or isolates unrelated callers. See [issue #112](https://github.com/cubrid-lab/cubrid-client/issues/112) for the unresolved ownership contract.
+**Concurrency limitation:** `beginTransaction()`, ordinary `db.query()`/`db.execute()`, `commit()` and `rollback()` have no caller or ownership token. Packet-level serialization alone cannot distinguish the task that began a manual transaction from an unrelated asynchronous caller. **Any call using the same client during that transaction may become part of it**, including another request's read or write. Sharing one manually transacting client between concurrent requests is therefore unsafe. [`beginTransactionScope()`](#begintransactionscopeoptions) is the replacement with an ownership guarantee ([#112](https://github.com/cubrid-lab/cubrid-client/issues/112)).
 
 ```ts
 async beginTransaction(): Promise<void>
@@ -425,6 +456,8 @@ async beginTransaction(): Promise<void>
 ---
 
 #### `commit()`
+
+> **Deprecated** with [`beginTransaction()`](#begintransaction). Use the `commit()` of a [`TransactionScope`](#transactionscope).
 
 Manually commits the current transaction on the shared connection.
 
@@ -437,6 +470,8 @@ async commit(): Promise<void>
 ---
 
 #### `rollback()`
+
+> **Deprecated** with [`beginTransaction()`](#begintransaction). Use the `rollback()` of a [`TransactionScope`](#transactionscope).
 
 Manually rolls back the current transaction on the shared connection.
 
@@ -512,7 +547,7 @@ const indexes = await db.getIndexes("athlete", { schema: "dba" });
 
 #### `close()`
 
-Closes the shared connection after statements and multi-query schema inspections started before it have finished. After calling `close()`, the client can no longer execute queries: a `query()`, `queryResult()`, `execute()`, `ping()`, `getServerVersion()`, `getTables()`, `getColumns()`, `getPrimaryKey()`, `getIndexes()`, `transaction()`, `beginTransaction()`, `commit()` or `rollback()` issued after `close()` is called, even in the same tick, rejects with an error whose `cause` is `Client is closed.`, and no connection is opened. A `transaction()` already started runs to its end on its own connection. If no connection was opened, closing it is a no-op.
+Closes the shared connection after statements and multi-query schema inspections started before it have finished. After calling `close()`, the client can no longer execute queries: a `query()`, `queryResult()`, `execute()`, `ping()`, `getServerVersion()`, `getTables()`, `getColumns()`, `getPrimaryKey()`, `getIndexes()`, `transaction()`, `beginTransactionScope()`, `beginTransaction()`, `commit()` or `rollback()` issued after `close()` is called, even in the same tick, rejects with an error whose `cause` is `Client is closed.`, and no connection is opened. A `transaction()` already started runs to its end on its own connection. A [`TransactionScope`](#transactionscope) not yet ended is discarded: its connection is closed, concurrently with the shared one and without waiting for its running statements, and the server rolls its work back; later calls on it reject. `close()` resolves once those connections are closed, including the one of a `beginTransactionScope()` still opening. If no connection was opened, closing it is a no-op.
 
 ```ts
 async close(): Promise<void>
@@ -1162,6 +1197,17 @@ interface ResultTransactionClient extends TransactionClient, ResultQueryable {}
 ```
 
 `CubridClient.transaction()` accepts a `TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient>`, so the callback's `tx` has `queryResult()` and `execute()`; a callback written against `TransactionClient` is still accepted.
+
+### TransactionScope
+
+The handle [`beginTransactionScope()`](#begintransactionscopeoptions) returns. It has the methods of the `transaction()` callback's `tx` and owns a dedicated connection; `commit()` or `rollback()` ends it and closes that connection.
+
+```ts
+interface TransactionScope
+  extends ResultTransactionClient,
+    ExecutableTransactionClient,
+    PreparedTransactionClient {}
+```
 
 ### QueryParam
 

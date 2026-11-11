@@ -35,10 +35,10 @@
   },
   "scripts": {
     "build": "tsup src/index.ts --format esm,cjs --dts",
-    "test": "node --import tsx --test 'tests/client.test.ts' 'tests/logger.test.ts' 'tests/protocol.test.ts' 'tests/protocol-oracles.test.ts' 'tests/native-adapter.test.ts' 'tests/connection.test.ts' 'tests/concurrent-lifecycle.test.ts' 'tests/connection-tls.test.ts' 'tests/connection-string.test.ts' 'tests/query-utils.test.ts' 'tests/transaction-client-compat.test.ts' 'tests/schema.test.ts' && node --test tests/verify-npm-version.test.mjs",
+    "test": "node --import tsx --test 'tests/client.test.ts' 'tests/logger.test.ts' 'tests/protocol.test.ts' 'tests/protocol-oracles.test.ts' 'tests/native-adapter.test.ts' 'tests/connection.test.ts' 'tests/concurrent-lifecycle.test.ts' 'tests/connection-tls.test.ts' 'tests/connection-string.test.ts' 'tests/query-utils.test.ts' 'tests/transaction-client-compat.test.ts' 'tests/transaction-scope.test.ts' 'tests/schema.test.ts' && node --test tests/verify-npm-version.test.mjs",
     "test:integration": "node --import tsx --test 'tests/integration.test.ts'",
     "test:all": "node --import tsx --test 'tests/*.test.ts'",
-    "test:coverage": "c8 --reporter=text --reporter=lcov node --import tsx --test 'tests/client.test.ts' 'tests/logger.test.ts' 'tests/protocol.test.ts' 'tests/protocol-oracles.test.ts' 'tests/native-adapter.test.ts' 'tests/connection.test.ts' 'tests/concurrent-lifecycle.test.ts' 'tests/connection-tls.test.ts' 'tests/connection-string.test.ts' 'tests/query-utils.test.ts' 'tests/transaction-client-compat.test.ts' 'tests/schema.test.ts'",
+    "test:coverage": "c8 --reporter=text --reporter=lcov node --import tsx --test 'tests/client.test.ts' 'tests/logger.test.ts' 'tests/protocol.test.ts' 'tests/protocol-oracles.test.ts' 'tests/native-adapter.test.ts' 'tests/connection.test.ts' 'tests/concurrent-lifecycle.test.ts' 'tests/connection-tls.test.ts' 'tests/connection-string.test.ts' 'tests/query-utils.test.ts' 'tests/transaction-client-compat.test.ts' 'tests/transaction-scope.test.ts' 'tests/schema.test.ts'",
     "typecheck": "tsc --noEmit",
     "api:check": "node scripts/api-check.mjs",
     "api:update": "npm run build && node scripts/api-check.mjs --update",

@@ -337,6 +337,17 @@ interface ResultTransactionClient extends TransactionClient, ResultQueryable {
  */
 interface PreparedTransactionClient extends TransactionClient, PreparedQueryable {
 }
+/**
+ * A manual transaction returned by `CubridClient.beginTransactionScope()`. It owns
+ * a dedicated connection, so statements issued on the client meanwhile never join
+ * it. Exactly one `commit()` or `rollback()` ends it and closes that connection;
+ * every later call rejects without reaching the server.
+ *
+ * This describes a value the client returns. Members may be added to it in a
+ * minor release, so do not implement it in your own classes.
+ */
+interface TransactionScope extends ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient {
+}
 interface ConnectionLike {
     connect(): Promise<void>;
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
@@ -444,6 +455,9 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
     private sharedConnectionPromise;
     private closed;
     private readonly schemaOperations;
+    private readonly openScopes;
+    /** beginTransactionScope() calls still opening a connection, so close() can wait for them. */
+    private readonly beginningScopes;
     constructor(config: ClientConfig, connectionFactory: ConnectionFactory);
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
     queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
@@ -468,10 +482,44 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
     stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncGenerator<T, void, undefined>;
     private streamRows;
     transaction<T>(callback: TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient>, options?: TransactionOptions): Promise<T>;
+    /**
+     * Start a manual transaction on its own connection and return the handle that
+     * owns it. Statements belong to the transaction only when sent through the
+     * handle; `client.query()` and the rest keep using the shared connection in
+     * autocommit, so concurrent callers can never join it (#112).
+     *
+     * End it with exactly one `commit()` or `rollback()`, which also closes its
+     * connection; later calls on the handle reject without reaching the server.
+     * `close()` rolls back a handle that was never ended.
+     *
+     * @throws RangeError at once when an option is invalid.
+     */
+    beginTransactionScope(options?: TransactionOptions): Promise<TransactionScope>;
+    private openScope;
+    /**
+     * Start a manual transaction on the shared connection.
+     *
+     * @deprecated This 1.x method has no ownership token: any other call on this
+     * client while the transaction is open, including an unrelated caller's,
+     * joins the same server transaction. Use {@link beginTransactionScope}, or
+     * `transaction(async (tx) => ...)`, which own a dedicated connection. Kept,
+     * with its behavior unchanged, for all of 1.x. See issue #112.
+     */
     beginTransaction(): Promise<void>;
+    /**
+     * Commit the manual transaction started by {@link beginTransaction}.
+     *
+     * @deprecated Use the `commit()` of a {@link beginTransactionScope} handle. See issue #112.
+     */
     commit(): Promise<void>;
+    /**
+     * Roll back the manual transaction started by {@link beginTransaction}.
+     *
+     * @deprecated Use the `rollback()` of a {@link beginTransactionScope} handle. See issue #112.
+     */
     rollback(): Promise<void>;
     close(): Promise<void>;
+    private closeSharedConnection;
     ping(): Promise<string>;
     /**
      * Return the CUBRID server version, for example `11.4.6.1963`. It sends the
@@ -618,12 +666,16 @@ interface TransactionError extends Readonly<CubridErrorDetails> {
 declare class TransactionError extends Error {
     name: string;
     /**
-     * Set by `CubridClient.transaction()` when rolling back also failed. `cause`
+     * Set by `CubridClient.transaction()`, and by the `commit()` of a
+     * `beginTransactionScope()` handle, when rolling back also failed. `cause`
      * still holds the failure that started it. The connection is closed
      * afterwards, so the server discards the uncommitted work either way.
      */
     rollbackError?: Error;
-    /** Set by `CubridClient.transaction()` when closing its connection also failed. */
+    /**
+     * Set by `CubridClient.transaction()`, and when a `beginTransactionScope()`
+     * handle failed to end, when closing its connection also failed.
+     */
     closeError?: Error;
     constructor(message: string, options?: CubridErrorOptions);
 }
@@ -936,4 +988,4 @@ declare function buildWhere(conditions: Record<string, unknown>): {
     params: unknown[];
 };
 
-export { type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteResult, type IsolationLevel, LockTimeoutError, NativeCubridAdapter, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type StreamOptions, type Streamable, type TransactionCallback, type TransactionClient, TransactionError, type TransactionOptions, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, buildWhere, createClient, escapeIdentifier, parseConnectionString };
+export { type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteResult, type IsolationLevel, LockTimeoutError, NativeCubridAdapter, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type StreamOptions, type Streamable, type TransactionCallback, type TransactionClient, TransactionError, type TransactionOptions, type TransactionScope, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, buildWhere, createClient, escapeIdentifier, parseConnectionString };

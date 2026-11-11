@@ -1,5 +1,5 @@
 import * as schema from "./schema.js";
-import { CallbackTransaction } from "./transaction.js";
+import { CallbackTransaction, ScopedTransaction } from "./transaction.js";
 import { TransactionError } from "../errors/transaction-error.js";
 import { mapError, toError } from "../internals/map-error.js";
 import {
@@ -23,6 +23,7 @@ import type {
   StreamOptions,
   TransactionCallback,
   TransactionOptions,
+  TransactionScope,
 } from "../types/client.js";
 import type { QueryParams } from "../types/query.js";
 import type { QueryResult, QueryResultRow } from "../types/result.js";
@@ -38,6 +39,9 @@ export class CubridClient implements Queryable, ResultQueryable, Executable, Pre
   private sharedConnectionPromise: Promise<ConnectionLike> | undefined;
   private closed = false;
   private readonly schemaOperations = new Set<Promise<unknown>>();
+  private readonly openScopes = new Set<ScopedTransaction>();
+  /** beginTransactionScope() calls still opening a connection, so close() can wait for them. */
+  private readonly beginningScopes = new Set<Promise<unknown>>();
 
   constructor(
     private readonly config: ClientConfig,
@@ -259,11 +263,73 @@ export class CubridClient implements Queryable, ResultQueryable, Executable, Pre
   }
 
   /**
-   * Start a manual transaction on the shared connection. This 1.x signature
-   * has no ownership token: another caller using this client can join the
-   * same server transaction. For concurrent work use transaction(async tx =>)
-   * (a dedicated connection), or keep this client private to one operation.
-   * See docs/API_REFERENCE.md and issue #112.
+   * Start a manual transaction on its own connection and return the handle that
+   * owns it. Statements belong to the transaction only when sent through the
+   * handle; `client.query()` and the rest keep using the shared connection in
+   * autocommit, so concurrent callers can never join it (#112).
+   *
+   * End it with exactly one `commit()` or `rollback()`, which also closes its
+   * connection; later calls on the handle reject without reaching the server.
+   * `close()` rolls back a handle that was never ended.
+   *
+   * @throws RangeError at once when an option is invalid.
+   */
+  async beginTransactionScope(options?: TransactionOptions): Promise<TransactionScope> {
+    assertValidTransactionOptions(options);
+
+    if (this.closed) {
+      throw mapError("transaction", new Error("Client is closed."), "Failed to begin transaction.");
+    }
+
+    const beginning = this.openScope(options);
+    this.beginningScopes.add(beginning);
+    try {
+      return await beginning;
+    } finally {
+      this.beginningScopes.delete(beginning);
+    }
+  }
+
+  private async openScope(options: TransactionOptions | undefined): Promise<TransactionScope> {
+    let connection: ConnectionLike | undefined;
+    try {
+      connection = await this.connectionFactory(this.config);
+      await this.applyTransactionOptions(connection, {
+        ...pickTransactionOptions(this.config),
+        ...pickTransactionOptions(options),
+      });
+      await connection.beginTransaction();
+    } catch (error) {
+      await connection?.close().catch(() => {
+        // The failure to begin is the one to report.
+      });
+      throw mapError("transaction", error, "Failed to begin transaction.");
+    }
+
+    // close() may have run while the connection was opening: it could not see
+    // this transaction, so nothing would ever end it.
+    if (this.closed) {
+      await connection.close().catch(() => {
+        // The client is closed; that is the failure to report.
+      });
+      throw mapError("transaction", new Error("Client is closed."), "Failed to begin transaction.");
+    }
+
+    const scope: ScopedTransaction = new ScopedTransaction(connection, () => {
+      this.openScopes.delete(scope);
+    });
+    this.openScopes.add(scope);
+    return scope;
+  }
+
+  /**
+   * Start a manual transaction on the shared connection.
+   *
+   * @deprecated This 1.x method has no ownership token: any other call on this
+   * client while the transaction is open, including an unrelated caller's,
+   * joins the same server transaction. Use {@link beginTransactionScope}, or
+   * `transaction(async (tx) => ...)`, which own a dedicated connection. Kept,
+   * with its behavior unchanged, for all of 1.x. See issue #112.
    */
   async beginTransaction(): Promise<void> {
     try {
@@ -274,6 +340,11 @@ export class CubridClient implements Queryable, ResultQueryable, Executable, Pre
     }
   }
 
+  /**
+   * Commit the manual transaction started by {@link beginTransaction}.
+   *
+   * @deprecated Use the `commit()` of a {@link beginTransactionScope} handle. See issue #112.
+   */
   async commit(): Promise<void> {
     try {
       const connection = await this.getSharedConnection();
@@ -283,6 +354,11 @@ export class CubridClient implements Queryable, ResultQueryable, Executable, Pre
     }
   }
 
+  /**
+   * Roll back the manual transaction started by {@link beginTransaction}.
+   *
+   * @deprecated Use the `rollback()` of a {@link beginTransactionScope} handle. See issue #112.
+   */
   async rollback(): Promise<void> {
     try {
       const connection = await this.getSharedConnection();
@@ -298,6 +374,22 @@ export class CubridClient implements Queryable, ResultQueryable, Executable, Pre
     // In-flight schema lookups can still require follow-up catalog queries.
     await Promise.allSettled([...this.schemaOperations]);
 
+    // Scopes nobody ended are discarded alongside the shared connection, not
+    // before it: a scope statement may be waiting for a lock that only closing
+    // the shared connection releases. A scope still beginning sees `closed`
+    // and closes its own connection.
+    const scopes = Promise.allSettled([
+      ...this.beginningScopes,
+      ...[...this.openScopes].map((scope) => scope.discard()),
+    ]);
+    try {
+      await this.closeSharedConnection();
+    } finally {
+      await scopes;
+    }
+  }
+
+  private async closeSharedConnection(): Promise<void> {
     if (!this.sharedConnectionPromise) {
       return;
     }

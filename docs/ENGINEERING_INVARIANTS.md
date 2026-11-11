@@ -29,7 +29,6 @@ Repository-specific starting points are [API stability](API_STABILITY.md), [rele
 
 ## Existing work, not duplicate tickets
 
-- [#112: manual transaction isolation](https://github.com/cubrid-lab/cubrid-client/issues/112)
 - [#118: semantic comparison and verification](https://github.com/cubrid-lab/cubrid-client/issues/118)
 - [#120: release evidence gate](https://github.com/cubrid-lab/cubrid-client/issues/120)
 - [#150: AbortSignal/query cancellation](https://github.com/cubrid-lab/cubrid-client/issues/150)

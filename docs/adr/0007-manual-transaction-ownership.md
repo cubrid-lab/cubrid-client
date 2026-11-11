@@ -1,6 +1,6 @@
 # ADR 0007: Explicit ownership for manual transactions on a shared Node client
 
-- **Status:** Proposed — compatibility decision not yet accepted
+- **Status:** Accepted — 2026-11-11, implemented as `beginTransactionScope()`
 - **Date:** 2026-11-08
 - **Scope:** `CubridClient.beginTransaction()`, `commit()`, `rollback()`, and regular query methods
 - **Issue:** [#112](https://github.com/cubrid-lab/cubrid-client/issues/112)
@@ -63,6 +63,29 @@ A future **major** could change or remove ambiguous manual methods after
 a reviewed migration path. Do not set a version or remove 1.x methods
 merely because this ADR documents the risk.
 
+## Decision (2026-11-11)
+
+Adopt the explicit ownership capability, additively, in 1.x:
+
+- `CubridClient.beginTransactionScope(options?): Promise<TransactionScope>` opens a
+  dedicated connection, applies client then per-call `TransactionOptions`, sends
+  BEGIN and returns a handle with `query`, `queryResult`, `execute`, the prepared
+  variants, `commit()` and `rollback()`.
+- The handle keeps the `transaction()` callback's guarantees: exactly one terminal
+  outcome, later calls rejected without reaching the server, commit refused (and
+  rolled back) when a statement of the scope still running at `commit()` fails,
+  rollback after a refused COMMIT. A failure that settled before `commit()` was
+  called is the caller's to handle. Either outcome closes the connection.
+- Deliberate difference from `transaction()`: a close failure after a successful
+  commit does **not** reject, because the commit stands and a rejection would
+  invite a retry; `transaction()` keeps rethrowing it for 1.x compatibility.
+- `CubridClient.close()` discards every scope that was not ended by closing its
+  connection, concurrently with the shared connection and without first waiting
+  for its running statements: a scope statement may wait for a lock that only
+  closing the shared connection releases. The server rolls back the work.
+- `beginTransaction()`, `commit()` and `rollback()` keep their 1.x behavior and
+  are marked `@deprecated`. Removing them is a 2.0 decision, not made here.
+
 ## Rejected approaches
 
 - **Packet FIFO is sufficient:** it serializes bytes, not caller ownership.
@@ -82,17 +105,17 @@ merely because this ADR documents the risk.
 - [x] A deterministic test confirms that scoped callbacks maintain a
   dedicated connection while unrelated client queries run concurrently
   ([PR #225](https://github.com/cubrid-lab/cubrid-client/pull/225)).
-- [ ] Review a concrete public ownership-token/handle contract and
-  backward-compatibility/migration options; do **not** treat documentation
-  as an implementation.
-- [ ] Write targeted RED tests where an unrelated caller attempts SQL
-  during a manual transaction, a commit/rollback races another query,
-  and failure/close occurs with operations queued.
-- [ ] Implement the chosen safe contract with actual Green/Refactor
-  results and preserve Node 18 support throughout 1.x.
-- [ ] Execute isolated **real CUBRID** concurrent sessions across the
-  advertised database matrix, verify rollback/commit visibility and
-  no duplicate execution, and record versions and nonzero case counts.
+- [x] Review a concrete public ownership-token/handle contract and
+  backward-compatibility/migration options (see Decision).
+- [x] Targeted tests where an unrelated caller sends SQL during a scoped
+  transaction, commits race each other, a statement fails while commit
+  waits, and `close()` runs with a scope open or still beginning
+  (`tests/transaction-scope.test.ts`).
+- [x] Implement the chosen contract; Node 18 runtime support unchanged.
+- [x] Real CUBRID checks of rollback/commit visibility with an unrelated
+  concurrent write and of `close()` rolling back an open scope
+  (`tests/integration.test.ts`, "beginTransactionScope() ownership"; run
+  locally on 11.4 and across the live CI matrix).
 - [ ] Validate packed Node 18 CJS/ESM consumers and review SemVer
   impact before a published release.
 

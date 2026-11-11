@@ -306,19 +306,26 @@ await db.transaction(async (tx) => {
 
 ### Manual
 
-For fine-grained control on the shared connection:
+When commit or rollback is decided outside one callback, take a handle that owns
+its own connection. Only statements sent through `tx` belong to the transaction,
+so concurrent `db.query()` calls can never join it:
 
 ```ts
-await db.beginTransaction();
+const tx = await db.beginTransactionScope();
 try {
-  await db.query("INSERT INTO logs (msg) VALUES (?)", ["step 1"]);
-  await db.query("INSERT INTO logs (msg) VALUES (?)", ["step 2"]);
-  await db.commit();
+  await tx.query("INSERT INTO logs (msg) VALUES (?)", ["step 1"]);
+  await tx.query("INSERT INTO logs (msg) VALUES (?)", ["step 2"]);
+  await tx.commit();
 } catch (error) {
-  await db.rollback();
+  await tx.rollback().catch(() => {});
   throw error;
 }
 ```
+
+`db.beginTransaction()`, `db.commit()` and `db.rollback()` still work throughout
+1.x but are **deprecated**: they run on the shared connection, where any other
+call on `db` joins the open transaction
+([#112](https://github.com/cubrid-lab/cubrid-client/issues/112)).
 
 ## TLS/SSL
 
@@ -439,21 +446,25 @@ Executes SQL and returns typed row objects. DDL/DML statements return `[]`. BLOB
 
 Runs `callback` in an isolated transaction with exactly one commit or rollback. `options` can set `isolationLevel` and `lockTimeout` for that transaction.
 
-### `client.beginTransaction(): Promise<void>`
+### `client.beginTransactionScope(options?): Promise<TransactionScope>`
 
-Starts a transaction on the shared connection.
+Starts a transaction on a dedicated connection and returns the handle that owns it. Exactly one `tx.commit()` or `tx.rollback()` ends it and closes that connection.
 
-### `client.commit(): Promise<void>`
+### `client.beginTransaction(): Promise<void>` *(deprecated)*
+
+Starts a transaction on the shared connection. Use `beginTransactionScope()` instead.
+
+### `client.commit(): Promise<void>` *(deprecated)*
 
 Commits the active transaction on the shared connection.
 
-### `client.rollback(): Promise<void>`
+### `client.rollback(): Promise<void>` *(deprecated)*
 
 Rolls back the active transaction on the shared connection.
 
 ### `client.close(): Promise<void>`
 
-Closes the shared connection. Safe to call multiple times.
+Closes the shared connection and discards (rolls back) any `beginTransactionScope()` handle not yet ended. Safe to call multiple times.
 
 > 📖 Full API documentation: [docs/API_REFERENCE.md](docs/API_REFERENCE.md)
 
