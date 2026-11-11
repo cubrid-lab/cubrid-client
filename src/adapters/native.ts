@@ -112,8 +112,16 @@ const DEFAULT_FETCH_SIZE = 100;
 
 const QUERY_FAILED = "Failed to execute CUBRID query.";
 
-/** Loose on purpose: a needless match only costs one more backslash-mode probe. */
-const MAY_SET_SYSTEM_PARAMETERS = /system[\s\S]*parameters/i;
+/**
+ * Whether `sql` may run SET SYSTEM PARAMETERS: "system" followed anywhere later by
+ * "parameters". Loose on purpose: a needless match only costs one more
+ * backslash-mode probe. Two indexOf scans keep it linear in the SQL length.
+ */
+function maySetSystemParameters(sql: string): boolean {
+  const lower = sql.toLowerCase();
+  const system = lower.indexOf("system");
+  return system !== -1 && lower.indexOf("parameters", system + 6) !== -1;
+}
 const BATCH_FAILED = "Failed to execute CUBRID batch.";
 
 /**
@@ -1244,7 +1252,7 @@ export class NativeCubridAdapter implements DriverAdapter {
 
     // SET SYSTEM PARAMETERS can change no_backslash_escapes for this session, so a
     // statement that may do so makes the next bound statement measure it again.
-    if (MAY_SET_SYSTEM_PARAMETERS.test(sql)) {
+    if (maySetSystemParameters(sql)) {
       this.noBackslashEscapes = null;
     }
 
