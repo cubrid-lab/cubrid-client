@@ -4834,6 +4834,42 @@ describe("stream()", { skip: !available }, () => {
     });
   });
 
+  // #214: query() reads every row, so the server's SELECT stays IN_TRAN until a
+  // FETCH fails partway. A FETCH naming a handle the server does not hold is
+  // rejected with the reply stream intact, as a real mid-result failure would be.
+  test("query(): a FETCH that fails partway releases the table lock of the autocommit transaction", async () => {
+    let forged = 0;
+    const client = createClient({
+      ...TEST_CONFIG,
+      fetchSize: 1,
+      connectionFactory: async (config) => {
+        const adapter = new NativeCubridAdapter(config);
+        await adapter.connect();
+        const cas = (adapter as unknown as { cas: CASConnection }).cas;
+        const sendAndRecvOnSession = cas.sendAndRecvOnSession.bind(cas);
+        cas.sendAndRecvOnSession = (generation, header, payload) => {
+          if (payload[0] === CASFunctionCode.FETCH) {
+            forged += 1;
+            const bogus = writeFetch(0x7ffffff0, 1, 1, cas.casInfo);
+            return sendAndRecvOnSession(generation, bogus.header, bogus.payload);
+          }
+          return sendAndRecvOnSession(generation, header, payload);
+        };
+        return adapter;
+      },
+    });
+
+    try {
+      await assert.rejects(client.query(`SELECT id, pad FROM ${TABLE} ORDER BY id`));
+      assert.equal(forged, 1);
+
+      await assertTableUnlocked();
+      assert.deepEqual(await client.query("SELECT 1 AS one FROM db_root"), [{ one: 1 }]);
+    } finally {
+      await client.close();
+    }
+  });
+
   test("a throw from the loop body releases the table lock too", async () => {
     await withStreamTable(async (client) => {
       const failure = new Error("the consumer failed");
