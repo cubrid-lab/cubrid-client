@@ -317,6 +317,37 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     }
   });
 
+  // #113: timezone "utc" reads the wire fields as UTC, whatever the process TZ.
+  test("timezone utc: date and time values are the same instants under any process TZ", async () => {
+    const previous = process.env.TZ;
+    const client = createClient({ ...TEST_CONFIG, timezone: "utc" });
+    const sent = new Date(Date.UTC(2024, 1, 29, 23, 59, 59, 999));
+
+    try {
+      for (const zone of ["UTC", "Asia/Seoul", "America/Los_Angeles"]) {
+        process.env.TZ = zone;
+        const [row] = await client.query(
+          "SELECT DATETIME'2025-03-14 10:30:45.123' AS dt, TIMESTAMP'2025-03-14 10:30:45' AS ts, " +
+            "DATE'0099-12-31' AS d, TIME'10:30:45' AS t, ? AS sent FROM db_root",
+          [sent],
+        );
+
+        assert.equal((row!.dt as Date).toISOString(), "2025-03-14T10:30:45.123Z", zone);
+        assert.equal((row!.ts as Date).toISOString(), "2025-03-14T10:30:45.000Z", zone);
+        assert.equal((row!.d as Date).toISOString(), "0099-12-31T00:00:00.000Z", zone);
+        assert.equal((row!.t as Date).toISOString(), "1970-01-01T10:30:45.000Z", zone);
+        assert.equal((row!.sent as Date).getTime(), sent.getTime(), zone);
+      }
+    } finally {
+      if (previous === undefined) {
+        delete process.env.TZ;
+      } else {
+        process.env.TZ = previous;
+      }
+      await client.close();
+    }
+  });
+
   // -------------------------------------------------------------------------
   // NULL handling
   // -------------------------------------------------------------------------

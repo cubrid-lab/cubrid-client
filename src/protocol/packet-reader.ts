@@ -18,7 +18,15 @@ export class PacketReader {
   private readonly buf: Buffer;
   private offset: number;
 
-  constructor(data: Buffer, offset = 0) {
+  /**
+   * @param utcDates decode DATE, TIME, TIMESTAMP and DATETIME fields as UTC
+   * instead of in the process's local time zone (`ClientOptions.timezone`).
+   */
+  constructor(
+    data: Buffer,
+    offset = 0,
+    private readonly utcDates = false,
+  ) {
     this.buf = data;
     this.offset = offset;
   }
@@ -105,7 +113,11 @@ export class PacketReader {
    */
   subReader(length: number): PacketReader {
     this.assertAvailable(length);
-    const reader = new PacketReader(this.buf.subarray(this.offset, this.offset + length));
+    const reader = new PacketReader(
+      this.buf.subarray(this.offset, this.offset + length),
+      0,
+      this.utcDates,
+    );
     this.offset += length;
     return reader;
   }
@@ -142,7 +154,7 @@ export class PacketReader {
     const minute = this.parseShort();
     const second = this.parseShort();
     const ms = this.parseShort();
-    return localDate(year, month, day, hour, minute, second, ms);
+    return this.toDate(year, month, day, hour, minute, second, ms);
   }
 
   /** Read 6 × int16 (TIMESTAMP — no ms) and return a Date. */
@@ -153,7 +165,7 @@ export class PacketReader {
     const hour = this.parseShort();
     const minute = this.parseShort();
     const second = this.parseShort();
-    return localDate(year, month, day, hour, minute, second, 0);
+    return this.toDate(year, month, day, hour, minute, second, 0);
   }
 
   /** Read 3 × int16 (DATE only — year, month, day) and return a Date. */
@@ -161,7 +173,7 @@ export class PacketReader {
     const year = this.parseShort();
     const month = this.parseShort() - 1;
     const day = this.parseShort();
-    return localDate(year, month, day, 0, 0, 0, 0);
+    return this.toDate(year, month, day, 0, 0, 0, 0);
   }
 
   /** Read 3 × int16 (TIME only — hour, min, sec) and return a Date. */
@@ -169,7 +181,21 @@ export class PacketReader {
     const hour = this.parseShort();
     const minute = this.parseShort();
     const second = this.parseShort();
-    return new Date(1970, 0, 1, hour, minute, second);
+    return this.toDate(1970, 0, 1, hour, minute, second, 0);
+  }
+
+  private toDate(
+    year: number,
+    month: number,
+    day: number,
+    hour: number,
+    minute: number,
+    second: number,
+    ms: number,
+  ): Date {
+    return this.utcDates
+      ? utcDate(year, month, day, hour, minute, second, ms)
+      : localDate(year, month, day, hour, minute, second, ms);
   }
 
   // ---------------------------------------------------------------------------
@@ -233,3 +259,17 @@ function localDate(
   return date;
 }
 
+/** Build a UTC Date, with the same care for years 0 to 99 as localDate(). */
+function utcDate(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+  second: number,
+  ms: number,
+): Date {
+  const date = new Date(Date.UTC(2000, month, day, hour, minute, second, ms));
+  date.setUTCFullYear(year, month, day);
+  return date;
+}
