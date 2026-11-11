@@ -6,9 +6,11 @@
  */
 
 import { TextDecoder } from "node:util";
+import type { ExecuteManySetFailure } from "../errors/error-details.js";
 import {
   type CasReplyError,
   ConnectionLostError,
+  ExecuteManyError,
   isServerTransactionAbort,
   StreamBusyError,
 } from "../errors/internal-errors.js";
@@ -42,6 +44,7 @@ import {
 } from "../protocol/constants.js";
 import {
   assertPreparableSql,
+  assertSingleStatement,
   type ColumnMeta,
   encodePreparedParams,
   interpolateParams,
@@ -51,6 +54,7 @@ import {
   type PrepareAndExecuteResult,
   type PreparedBinds,
   parseExecute,
+  parseExecuteArray,
   parseFetch,
   parseGetLastInsertId,
   parseLobRead,
@@ -64,6 +68,7 @@ import {
   writeConClose,
   writeEndTran,
   writeExecute,
+  writeExecuteArray,
   writeFetch,
   writeGetLastInsertId,
   writeLobRead,
@@ -72,6 +77,7 @@ import {
 } from "../protocol/protocol.js";
 import type {
   ClientConfig,
+  ExecuteManyResult,
   ExecuteResult,
   QueryOptions,
   StreamOptions,
@@ -85,6 +91,13 @@ import { StreamCursor } from "./stream-cursor.js";
 const DEFAULT_FETCH_SIZE = 100;
 
 const QUERY_FAILED = "Failed to execute CUBRID query.";
+const BATCH_FAILED = "Failed to execute CUBRID batch.";
+
+/**
+ * Bind bytes one EXECUTE_ARRAY request carries at most, so a large batch never
+ * becomes one huge frame. A single set larger than this goes alone.
+ */
+const EXECUTE_ARRAY_MAX_BYTES = 1024 * 1024;
 
 /** A stream's maximum idle-consumer wait, unless configured otherwise. */
 const DEFAULT_CONSUMER_TIMEOUT_MS = 5000;
@@ -373,6 +386,147 @@ export class NativeCubridAdapter implements DriverAdapter {
       () => this.executeNow(sql, params, issued, binds),
       options,
     );
+  }
+
+  /**
+   * Runs one INSERT, UPDATE, DELETE or MERGE once per set in `paramSets`: one
+   * PREPARE, then EXECUTE_ARRAY requests on that handle, split by size, each
+   * carrying as many sets as fit. See `CubridClient.executeMany()` for the contract.
+   *
+   * The SQL and every value are checked and encoded when this is called, before
+   * anything is queued or sent; an empty `paramSets` resolves without sending.
+   */
+  async executeMany(
+    sql: string,
+    paramSets: readonly QueryParams[],
+    options?: QueryOptions,
+  ): Promise<ExecuteManyResult> {
+    assertValidQueryOptions(options);
+    const sets = bindManyOrRefuse(sql, paramSets);
+    if (sets.length === 0) {
+      options?.signal?.throwIfAborted();
+      return { affectedRows: 0, results: [] };
+    }
+
+    const cas = this.getOrCreateCAS();
+    const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
+    return this.inTurn(
+      "query",
+      BATCH_FAILED,
+      () => this.executeManyNow(sql, sets, issued),
+      options,
+    );
+  }
+
+  private async executeManyNow(
+    sql: string,
+    sets: readonly PreparedBinds[],
+    issued: IssuedOn,
+  ): Promise<ExecuteManyResult> {
+    try {
+      // commitAfter: in autocommit mode the batch is one transaction, committed
+      // only after every set succeeded and rolled back otherwise.
+      return await this.runOnSession(
+        sql,
+        undefined,
+        issued,
+        true,
+        true,
+        (cas, reply, generation) => this.executeArray(cas, reply, sets, generation),
+        true,
+      );
+    } catch (error) {
+      this.bindSessionLostByFirstStatement();
+      this.recordTransactionAbort(error instanceof ExecuteManyError ? error.serverAbort : error);
+      throw mapError("query", error, BATCH_FAILED);
+    } finally {
+      // Its INSERTs, committed or not, may have changed the session's value.
+      this.forgetInsertId();
+    }
+  }
+
+  /**
+   * Sends the sets on the handle in a PREPARE reply, on the session that prepared
+   * it. A SELECT, a statement without markers and a set whose size differs from
+   * the server's marker count are refused before any set runs: the CAS would run a
+   * SELECT for nothing, run nothing at all without a marker, and split values into
+   * sets by the marker count without checking that they fill them.
+   *
+   * After a request with a failed set, the rest are not sent: the batch has failed.
+   */
+  private async executeArray(
+    cas: CASConnection,
+    prepareReply: Buffer,
+    sets: readonly PreparedBinds[],
+    generation: number,
+  ): Promise<ExecuteManyResult> {
+    const statement = parsePrepare(prepareReply);
+    if (statement.statementType === StatementType.SELECT) {
+      throw new Error("executeMany() cannot run a SELECT: it reports affected rows, not rows");
+    }
+    if (statement.bindCount === 0) {
+      throw new Error(
+        "executeMany() needs a statement with at least one ? marker; the server runs nothing without one",
+      );
+    }
+    const mismatch = sets.findIndex((set) => set.count !== statement.bindCount);
+    if (mismatch !== -1) {
+      throw new Error(
+        `Parameter count mismatch: the statement has ${statement.bindCount} markers, ` +
+          `parameter set ${mismatch} has ${sets[mismatch]!.count} values`,
+      );
+    }
+
+    const results: Array<number | null> = [];
+    const failures: ExecuteManySetFailure[] = [];
+    const failed: CasReplyError[] = [];
+    for (let start = 0; start < sets.length && failed.length === 0; ) {
+      const end = requestEnd(sets, start);
+      const { header, payload } = writeExecuteArray(
+        statement.queryHandle,
+        sets.slice(start, end),
+        cas.casInfo,
+      );
+      const reply = await this.exchangeOnSession(cas, generation, header, payload);
+
+      for (const outcome of parseExecuteArray(reply, end - start, cas.protoVersion)) {
+        if (typeof outcome === "number") {
+          results.push(outcome);
+          continue;
+        }
+        failures.push({
+          index: results.length,
+          code: outcome.code ?? 0,
+          ...(outcome.origin && { origin: outcome.origin }),
+          ...(outcome.kind && { kind: outcome.kind }),
+          message: outcome.message,
+        });
+        results.push(null);
+        failed.push(outcome);
+      }
+      start = end;
+    }
+
+    const first = failed[0];
+    if (first !== undefined) {
+      const executed = results.length;
+      while (results.length < sets.length) {
+        results.push(null);
+      }
+      throw new ExecuteManyError(
+        first,
+        {
+          results,
+          failures,
+          executed,
+          rolledBack: this.autoCommit,
+        },
+        failed,
+      );
+    }
+
+    const counts = results as number[];
+    return { affectedRows: counts.reduce((sum, count) => sum + count, 0), results: counts };
   }
 
   private async executeNow(
@@ -993,6 +1147,35 @@ export class NativeCubridAdapter implements DriverAdapter {
     commitAfter = false,
     binds?: PreparedBinds,
   ): Promise<R> {
+    return this.runOnSession(
+      sql,
+      params,
+      issued,
+      commitAfter,
+      binds !== undefined,
+      async (cas, reply, generation) => {
+        const result: PrepareAndExecuteResult = binds
+          ? await this.executeHandle(cas, reply, binds, generation)
+          : parsePrepareAndExecute(reply, cas.protoVersion, this.utcDates);
+        return use(cas, result);
+      },
+    );
+  }
+
+  /**
+   * The session and transaction handling of runStatement(). It sends PREPARE when
+   * `prepared`, otherwise PREPARE_AND_EXECUTE, and `run` gets the reply while its
+   * handle is open, with the session generation every follow-up request must reach.
+   */
+  private async runOnSession<R>(
+    sql: string,
+    params: QueryParams | undefined,
+    issued: IssuedOn,
+    commitAfter: boolean,
+    prepared: boolean,
+    run: (cas: CASConnection, reply: Buffer, generation: number) => Promise<R>,
+    discardIfRollbackFails = false,
+  ): Promise<R> {
     const cas = this.getOrCreateCAS();
 
     // Reconnecting here would drop the earlier statements of this transaction
@@ -1018,7 +1201,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     // Only a backslash, CR or LF is escaped differently by the two modes, so any
     // other parameters bind the same on every session and skip the probe.
     const resolvedSql =
-      !binds && params && params.length > 0
+      !prepared && params && params.length > 0
         ? interpolateParams(
             sql,
             params,
@@ -1026,8 +1209,8 @@ export class NativeCubridAdapter implements DriverAdapter {
           )
         : sql;
 
-    const deferCommit = (commitAfter || binds !== undefined) && this.autoCommit;
-    const { header, payload } = binds
+    const deferCommit = (commitAfter || prepared) && this.autoCommit;
+    const { header, payload } = prepared
       ? writePrepare(sql, cas.casInfo)
       : writePrepareAndExecute(resolvedSql, this.autoCommit && !deferCommit, cas.casInfo);
 
@@ -1046,11 +1229,7 @@ export class NativeCubridAdapter implements DriverAdapter {
       const finished = await this.withQueryHandle(cas, responsePayload, async () => {
         await this.bindTransactionSession(cas);
 
-        const result: PrepareAndExecuteResult = binds
-          ? await this.executeHandle(cas, responsePayload, binds, generation)
-          : parsePrepareAndExecute(responsePayload, cas.protoVersion, this.utcDates);
-
-        const value = await use(cas, result);
+        const value = await run(cas, responsePayload, generation);
         if (deferCommit) {
           await this.endStatementTransaction(cas, EndTranType.COMMIT, generation);
         }
@@ -1067,7 +1246,17 @@ export class NativeCubridAdapter implements DriverAdapter {
     } catch (error) {
       if (deferCommit) {
         await this.endStatementTransaction(cas, EndTranType.ROLLBACK, generation).catch(
-          () => undefined,
+          async () => {
+            // A batch whose sets partly ran may still be on the session, and the next
+            // autocommit statement would commit it; the server discards it with the session.
+            if (
+              discardIfRollbackFails &&
+              cas.isConnected &&
+              cas.connectionGeneration === generation
+            ) {
+              await cas.discardSession();
+            }
+          },
         );
       }
       throw error;
@@ -1685,6 +1874,49 @@ function bindOrRefuse(
   } catch (error) {
     throw mapError("query", error, message);
   }
+}
+
+/**
+ * bindOrRefuse() for executeMany(): every set is checked and encoded before
+ * anything is sent, and all sets must have the same number of values.
+ */
+function bindManyOrRefuse(sql: string, paramSets: readonly QueryParams[]): PreparedBinds[] {
+  try {
+    if (!Array.isArray(paramSets)) {
+      throw new TypeError("paramSets must be an array of parameter arrays");
+    }
+    assertPreparableSql(sql);
+    assertSingleStatement(sql);
+
+    // Array.from() visits holes, which map() would skip.
+    const sets = Array.from(paramSets, (params, index) => {
+      if (!Array.isArray(params)) {
+        throw new TypeError(`parameter set ${index} is not an array`);
+      }
+      return encodePreparedParams(params);
+    });
+    const mismatch = sets.findIndex((set) => set.count !== sets[0]!.count);
+    if (mismatch !== -1) {
+      throw new Error(
+        `Parameter count mismatch: parameter set ${mismatch} has ${sets[mismatch]!.count} ` +
+          `values, parameter set 0 has ${sets[0]!.count}`,
+      );
+    }
+    return sets;
+  } catch (error) {
+    throw mapError("query", error, BATCH_FAILED);
+  }
+}
+
+/** The end of the EXECUTE_ARRAY request that starts at `start`; see EXECUTE_ARRAY_MAX_BYTES. */
+function requestEnd(sets: readonly PreparedBinds[], start: number): number {
+  let size = sets[start]!.bytes.length;
+  let end = start + 1;
+  while (end < sets.length && size + sets[end]!.bytes.length <= EXECUTE_ARRAY_MAX_BYTES) {
+    size += sets[end]!.bytes.length;
+    end++;
+  }
+  return end;
 }
 
 function toColumnInfo(column: ColumnMeta): ColumnInfo {

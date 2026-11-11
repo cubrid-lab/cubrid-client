@@ -1,4 +1,4 @@
-import type { CubridErrorDetails, CubridErrorKind } from "./error-details.js";
+import type { CubridErrorDetails, CubridErrorKind, ExecuteManyFailure } from "./error-details.js";
 import { definedErrorDetails } from "./error-details.js";
 
 /** The leading int of a CAS error reply: CAS_ERROR_INDICATOR and DBMS_ERROR_INDICATOR. */
@@ -80,4 +80,28 @@ export class ConnectionLostError extends Error {
 /** A statement stopped waiting behind a stream whose consumer stopped asking for rows. */
 export class StreamBusyError extends Error {
   readonly kind: CubridErrorKind = "stream-busy";
+}
+
+/**
+ * The server reported one or more sets of an `executeMany()` as failed. It
+ * carries the first failure's code, origin and kind, so it maps to the same
+ * error class as that failure would alone, and the outcome of every set.
+ */
+export interface ExecuteManyError extends Readonly<CubridErrorDetails> {}
+
+// biome-ignore lint/suspicious/noUnsafeDeclarationMerging: the interface only declares the readonly error details the constructor assigns
+export class ExecuteManyError extends Error {
+  /**
+   * A set that failed with -72, if any: the server then rolled back the whole
+   * transaction. With autocommit off the CAS fails the whole request instead, so
+   * this is defensive, but such a set must never let a later commit through.
+   */
+  readonly serverAbort: CasReplyError | undefined;
+
+  constructor(first: CasReplyError, batch: ExecuteManyFailure, outcomes: readonly CasReplyError[]) {
+    const index = batch.failures[0]?.index ?? 0;
+    super(`Parameter set ${index} failed: ${first.message}`, { cause: first });
+    Object.assign(this, definedErrorDetails(first), { batch });
+    this.serverAbort = outcomes.find(isServerTransactionAbort);
+  }
 }

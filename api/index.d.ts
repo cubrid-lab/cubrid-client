@@ -116,14 +116,17 @@ type ClientLogLevel = "debug" | "info" | "error";
  * parameter values, row data, credentials or error messages.
  */
 interface ClientLogFields {
-    /** `connection`, `connect`, `query`, `queryResult`, `execute`, `queryPrepared`, `queryResultPrepared`, `executePrepared`, `stream`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`. */
+    /** `connection`, `connect`, `query`, `queryResult`, `execute`, `queryPrepared`, `queryResultPrepared`, `executePrepared`, `executeMany`, `stream`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`. */
     operation?: string;
     host?: string;
     port?: number;
     database?: string;
     /** Elapsed milliseconds of the operation. */
     durationMs?: number;
-    /** Number of bound parameters of a `query`, not their values. */
+    /**
+     * Number of bound parameters of a `query`, not their values. For `executeMany`,
+     * the values of all its parameter sets together.
+     */
     paramCount?: number;
     /** Number of rows a successful `query` returned, or a `stream` handed to its consumer. */
     rowCount?: number;
@@ -255,7 +258,7 @@ interface ClientOptions {
 }
 /**
  * Options of one statement, the optional last argument of `query()`,
- * `queryResult()`, `execute()` and their `Prepared` forms.
+ * `queryResult()`, `execute()`, their `Prepared` forms and `executeMany()`.
  *
  * After an abort or a timeout while the statement was on the wire, its outcome
  * on the server is unknown: it may have run, and in autocommit mode it may be
@@ -351,6 +354,25 @@ interface PreparedQueryable {
     queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
     executePrepared(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
 }
+/**
+ * Outcome of `executeMany()`. Reported only when every set ran without error.
+ */
+interface ExecuteManyResult {
+    /** Rows changed by all sets together. */
+    affectedRows: number;
+    /** Rows each set changed, in the order of `paramSets`. */
+    results: number[];
+}
+/**
+ * Runs one INSERT, UPDATE, DELETE or MERGE once per parameter set, with
+ * server-side prepared binding: one PREPARE and EXECUTE_ARRAY requests instead
+ * of a round trip per set. See `docs/API_REFERENCE.md` for the failure semantics:
+ * in autocommit mode the batch is all or nothing, and inside a transaction a
+ * failure leaves the transaction to the caller.
+ */
+interface BatchExecutable {
+    executeMany(sql: string, paramSets: readonly QueryParams[], options?: QueryOptions): Promise<ExecuteManyResult>;
+}
 interface TransactionClient extends Queryable {
     commit(): Promise<void>;
     rollback(): Promise<void>;
@@ -381,6 +403,14 @@ interface ResultTransactionClient extends TransactionClient, ResultQueryable {
 interface PreparedTransactionClient extends TransactionClient, PreparedQueryable {
 }
 /**
+ * The transaction client `CubridClient.transaction()` passes in: a
+ * {@link TransactionClient} that can also run a statement over many parameter
+ * sets. Kept apart from `TransactionClient` so 1.x code that implements that
+ * interface keeps compiling.
+ */
+interface BatchTransactionClient extends TransactionClient, BatchExecutable {
+}
+/**
  * A manual transaction returned by `CubridClient.beginTransactionScope()`. It owns
  * a dedicated connection, so statements issued on the client meanwhile never join
  * it. Exactly one `commit()` or `rollback()` ends it and closes that connection;
@@ -389,7 +419,7 @@ interface PreparedTransactionClient extends TransactionClient, PreparedQueryable
  * This describes a value the client returns. Members may be added to it in a
  * minor release, so do not implement it in your own classes.
  */
-interface TransactionScope extends ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient {
+interface TransactionScope extends ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient, BatchTransactionClient {
 }
 interface ConnectionLike {
     connect(): Promise<void>;
@@ -412,6 +442,12 @@ interface ConnectionLike {
     queryPrepared?<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
     queryResultPrepared?<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
     executePrepared?(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
+    /**
+     * Optional so 1.x connection factories keep compiling. `executeMany()` on a
+     * client or transaction fails when its connection does not provide it, rather
+     * than running the sets one by one.
+     */
+    executeMany?(sql: string, paramSets: readonly QueryParams[], options?: QueryOptions): Promise<ExecuteManyResult>;
     beginTransaction(): Promise<void>;
     commit(): Promise<void>;
     rollback(): Promise<void>;
@@ -518,6 +554,26 @@ declare class NativeCubridAdapter implements DriverAdapter {
     queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
     queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
     executePrepared(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
+    /**
+     * Runs one INSERT, UPDATE, DELETE or MERGE once per set in `paramSets`: one
+     * PREPARE, then EXECUTE_ARRAY requests on that handle, split by size, each
+     * carrying as many sets as fit. See `CubridClient.executeMany()` for the contract.
+     *
+     * The SQL and every value are checked and encoded when this is called, before
+     * anything is queued or sent; an empty `paramSets` resolves without sending.
+     */
+    executeMany(sql: string, paramSets: readonly QueryParams[], options?: QueryOptions): Promise<ExecuteManyResult>;
+    private executeManyNow;
+    /**
+     * Sends the sets on the handle in a PREPARE reply, on the session that prepared
+     * it. A SELECT, a statement without markers and a set whose size differs from
+     * the server's marker count are refused before any set runs: the CAS would run a
+     * SELECT for nothing, run nothing at all without a marker, and split values into
+     * sets by the marker count without checking that they fill them.
+     *
+     * After a request with a failed set, the rest are not sent: the batch has failed.
+     */
+    private executeArray;
     private executeNow;
     private queryNow;
     private streamNow;
@@ -624,6 +680,12 @@ declare class NativeCubridAdapter implements DriverAdapter {
      * which leaves the session in a transaction, is rolled back.
      */
     private runStatement;
+    /**
+     * The session and transaction handling of runStatement(). It sends PREPARE when
+     * `prepared`, otherwise PREPARE_AND_EXECUTE, and `run` gets the reply while its
+     * handle is open, with the session generation every follow-up request must reach.
+     */
+    private runOnSession;
     /**
      * Sends EXECUTE for the handle in a PREPARE reply. It must reach the session
      * that prepared it: on any other session the same number is another statement
@@ -805,7 +867,7 @@ interface SchemaIndex {
     columns: SchemaIndexColumn[];
 }
 
-declare class CubridClient implements Queryable, ResultQueryable, Executable, PreparedQueryable, Streamable {
+declare class CubridClient implements Queryable, ResultQueryable, Executable, PreparedQueryable, BatchExecutable, Streamable {
     private readonly config;
     private readonly connectionFactory;
     private sharedConnectionPromise;
@@ -829,6 +891,21 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
     queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
     executePrepared(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
     /**
+     * Run one INSERT, UPDATE, DELETE or MERGE once per parameter set, with
+     * server-side prepared binding: one PREPARE, then one EXECUTE_ARRAY request
+     * for every set (several for a batch over about 1 MiB of values), instead of
+     * a round trip per set. `results` holds each set's affected rows, in order.
+     *
+     * On this client, which runs in autocommit mode, the batch is all or nothing:
+     * it is committed only when every set succeeded. Otherwise it is rolled back
+     * and rejects with a `QueryError` whose `batch` reports every set's outcome.
+     * An empty `paramSets` resolves `{ affectedRows: 0, results: [] }` and sends
+     * nothing. A SELECT, SQL holding more than one statement, a statement without
+     * a `?` marker and a set whose size is not the statement's marker count are
+     * refused. Nothing is retried. See `docs/API_REFERENCE.md`.
+     */
+    executeMany(sql: string, paramSets: readonly QueryParams[], options?: QueryOptions): Promise<ExecuteManyResult>;
+    /**
      * Run a statement and read its rows one at a time with `for await`, holding at
      * most one server reply of rows in memory. Nothing is sent before the first read.
      *
@@ -844,7 +921,7 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
      */
     stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncGenerator<T, void, undefined>;
     private streamRows;
-    transaction<T>(callback: TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient>, options?: TransactionOptions): Promise<T>;
+    transaction<T>(callback: TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient & BatchTransactionClient>, options?: TransactionOptions): Promise<T>;
     /**
      * Start a manual transaction on its own connection and return the handle that
      * owns it. Statements belong to the transaction only when sent through the
@@ -915,7 +992,7 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
 
 declare function createClient(options: ClientOptions): CubridClient;
 
-declare class CubridTransaction implements ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient {
+declare class CubridTransaction implements ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient, BatchTransactionClient {
     private readonly connection;
     constructor(connection: ConnectionLike);
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
@@ -924,6 +1001,12 @@ declare class CubridTransaction implements ResultTransactionClient, ExecutableTr
     queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
     queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
     executePrepared(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
+    /**
+     * `executeMany()` inside this transaction. A failed set rejects with every
+     * set's outcome in `batch` and leaves the transaction as it is: the sets that
+     * succeeded are still part of it, and the caller decides to roll back or not.
+     */
+    executeMany(sql: string, paramSets: readonly QueryParams[], options?: QueryOptions): Promise<ExecuteManyResult>;
     commit(): Promise<void>;
     rollback(): Promise<void>;
 }
@@ -949,6 +1032,41 @@ declare class CubridTransaction implements ResultTransactionClient, ExecutableTr
  *   whose consumer stopped asking for rows. Nothing was sent.
  */
 type CubridErrorKind = "unique-violation" | "not-null-violation" | "foreign-key-violation" | "syntax" | "semantic" | "deadlock" | "lock-timeout" | "interrupted" | "authentication" | "connection-lost" | "read-timeout" | "stream-busy";
+/** One parameter set of an `executeMany()` call that the server reported as failed. */
+interface ExecuteManySetFailure {
+    /** Position of the set in `paramSets`. */
+    index: number;
+    /** The server's error code for this set. */
+    code: number;
+    /** Who assigned `code`; see {@link CubridErrorDetails.origin}. */
+    origin?: "server" | "cas";
+    /** Classification of `code`; see {@link CubridErrorKind}. */
+    kind?: CubridErrorKind;
+    /** The server's message for this set. */
+    message: string;
+}
+/**
+ * What became of each parameter set when `executeMany()` rejected because the
+ * server reported one or more sets as failed.
+ */
+interface ExecuteManyFailure {
+    /**
+     * One entry per set in `paramSets`, in order: the rows the set changed when it
+     * ran without error, and `null` when it failed or never ran. A count is what
+     * the server reported before the outcome below, never a committed change.
+     */
+    results: ReadonlyArray<number | null>;
+    /** Every failed set, in order. The error's own `code` and `kind` are the first one's. */
+    failures: readonly ExecuteManySetFailure[];
+    /** Number of sets the server ran, with or without error; the rest never ran. */
+    executed: number;
+    /**
+     * `true` in autocommit mode: the client rolled the whole batch back, so no set
+     * was committed. `false` inside a transaction: the sets that succeeded are still
+     * part of it, uncommitted, and the caller decides whether to roll it back.
+     */
+    rolledBack: boolean;
+}
 interface CubridErrorDetails {
     /** Numeric error code of the CAS error reply. Absent for client-side failures. */
     code?: number;
@@ -966,6 +1084,11 @@ interface CubridErrorDetails {
     sqlState?: string;
     /** Classification of a known failure. Absent when the failure is not classified. */
     kind?: CubridErrorKind;
+    /**
+     * Per-set outcome of an `executeMany()` that failed because the server reported
+     * a parameter set as failed. Absent for every other failure.
+     */
+    batch?: ExecuteManyFailure;
 }
 interface CubridErrorOptions extends ErrorOptions, CubridErrorDetails {
 }
@@ -1058,4 +1181,4 @@ declare function buildWhere(conditions: Record<string, unknown>): {
     params: unknown[];
 };
 
-export { type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteResult, type IsolationLevel, LockTimeoutError, NativeCubridAdapter, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryOptions, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type StreamOptions, type Streamable, type TransactionCallback, type TransactionClient, TransactionError, type TransactionOptions, type TransactionScope, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, buildWhere, createClient, escapeIdentifier, parseConnectionString };
+export { type BatchExecutable, type BatchTransactionClient, type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteManyFailure, type ExecuteManyResult, type ExecuteManySetFailure, type ExecuteResult, type IsolationLevel, LockTimeoutError, NativeCubridAdapter, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryOptions, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type StreamOptions, type Streamable, type TransactionCallback, type TransactionClient, TransactionError, type TransactionOptions, type TransactionScope, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, buildWhere, createClient, escapeIdentifier, parseConnectionString };

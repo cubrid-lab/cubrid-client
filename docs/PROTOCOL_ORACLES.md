@@ -98,6 +98,7 @@ execute reply follow the same limit. So one reply is the unit of buffering for
 | SQL statement | CREATE_CLASS / INSERT / SELECT | 4 / 20 / 21 |
 | SQL statement | UPDATE / DELETE / CALL / CALL_SP | 22 / 23 / 24 / 126 (0x7e) |
 | CAS function | CLOSE_REQ_HANDLE / FETCH | 6 / 8 |
+| CAS function | EXECUTE_BATCH (SQL texts) / EXECUTE_ARRAY (one handle, many bind sets) | 20 / 21 |
 | CAS function | GET_GENERATED_KEYS / LOB_NEW / LOB_WRITE / LOB_READ | 34 / 35 / 36 / 37 |
 | CAS function | GET_LAST_INSERT_ID / PREPARE_AND_EXECUTE (modern) | 40 / 41 |
 
@@ -139,6 +140,35 @@ captured bytes.
   a guarantee to rely on: after a commit that deletes or updates the row, or a
   rollback, the read fails with -1020, and a LOB built by a statement is already
   gone when an autocommit reply arrives.
+
+## EXECUTE_ARRAY wire format
+
+`executeMany()` uses function 21, `CAS_FC_EXECUTE_ARRAY` in CUBRID's
+`src/broker/cas_protocol.h` (`fn_execute_array` in `cas_function.c`,
+`ux_execute_array` in `cas_execute.c`), which JDBC names
+`EXECUTE_BATCH_PREPAREDSTATEMENT` and sends from `UStatement.executeBatch()`.
+Function 20, `EXECUTE_BATCH`, carries several SQL texts instead and is not used.
+These facts come from those sources on the 10.2, 11.4 and develop branches and
+were confirmed with a raw socket client on the cubrid/cubrid 10.2 and 11.4 images
+with protocol version 7; `tests/fixtures/dml-frames.ts` holds the captured bytes.
+
+- **The request** is the prepared handle, the query timeout (protocol 4 and
+  later), the autocommit byte, then one (type, value) argument pair per marker
+  per set, in set order: the pairs an EXECUTE request sends. The CAS divides the
+  values into sets by the handle's marker count and ignores a remainder, so a set
+  with an extra value runs and the extra value is dropped without an error.
+- **The reply** is result code 0, the number of sets run, then per set either
+  its affected-row count and an 8-byte OID, or the indicator `-2`, the error
+  code and a length-prefixed message; the shard id (protocol 5 and later) last.
+- **A failed set does not stop the request.** The CAS undoes that set only and
+  runs the rest. With autocommit 1 it commits or rolls back after each set, which
+  is why the driver always sends 0 and ends the transaction itself. It stops
+  early only after ER_INTERRUPTED (`-4`), which it reports, and it fails the whole
+  request instead after a deadlock (`-72`) or a server crash with autocommit 0.
+- **A multi-statement string runs only its first statement** and reports one
+  set as successful; the later statements never run. A statement without a
+  marker runs nothing and reports zero sets. A SELECT runs and reports counts.
+  The driver refuses all three.
 
 ## Collection wire format
 

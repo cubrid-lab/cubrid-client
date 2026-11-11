@@ -213,6 +213,27 @@ It is opt-in, takes more round trips than `query()` and has no reusable statemen
 object. See [prepared binding](docs/TYPES.md#prepared-binding) for the type
 mapping, the values it refuses and where results differ.
 
+### Batch execution
+
+`executeMany()` runs one INSERT, UPDATE, DELETE or MERGE once per parameter set,
+with one PREPARE and one EXECUTE_ARRAY request instead of a round trip per set:
+
+```ts
+const { affectedRows, results } = await db.executeMany(
+  "INSERT INTO users (id, name) VALUES (?, ?)",
+  [
+    [1, "Alice"],
+    [2, "Bob"],
+  ],
+);
+```
+
+On the client the batch is all or nothing: if any set fails, nothing is
+committed and it rejects with a `QueryError` whose `batch` property reports every
+set. Inside `transaction()` or a scope a failure leaves the transaction to you.
+See [`executeMany()`](docs/API_REFERENCE.md#executemanysql-paramsets-options) and
+the [measurements](docs/PERFORMANCE.md#batch-execution).
+
 ### Date parameters are serialized in UTC
 
 `Date` parameters are rendered as a `DATETIME'YYYY-MM-DD HH:MM:SS.mmm'`
@@ -443,7 +464,7 @@ Reads a result row by row with `for await`, with bounded memory. See [Streaming 
 
 Executes SQL and returns typed row objects. DDL/DML statements return `[]`. BLOB columns return a complete `Buffer` and CLOB columns a complete `string`.
 
-`options` is a `QueryOptions` `{ signal?: AbortSignal; readTimeout?: number }`, also accepted by `queryResult`, `execute` and the `Prepared` methods on the client, `tx` and a transaction scope. An abort rejects with `signal.reason`: a statement still queued is never sent, and one already sent has its connection discarded and an unknown outcome on the server, so verify before retrying. `readTimeout` overrides the client's for that statement (`0` = none). See [Cancelling one statement](docs/API_REFERENCE.md#cancelling-one-statement).
+`options` is a `QueryOptions` `{ signal?: AbortSignal; readTimeout?: number }`, also accepted by `queryResult`, `execute`, the `Prepared` methods and `executeMany` on the client, `tx` and a transaction scope. An abort rejects with `signal.reason`: a statement still queued is never sent, and one already sent has its connection discarded and an unknown outcome on the server, so verify before retrying. `readTimeout` overrides the client's for that statement (`0` = none). See [Cancelling one statement](docs/API_REFERENCE.md#cancelling-one-statement).
 
 ### `client.transaction<T>(callback, options?): Promise<T>`
 

@@ -107,6 +107,42 @@ the measurement on your own server:
 CUBRID_TEST_PORT=33000 node --import tsx scripts/bench-prepared.ts 300
 ```
 
+## Batch execution
+
+`executeMany()` replaces round trips, not server work. Inserting N rows with a
+loop of `execute()` in autocommit mode sends 4 requests per row (PREPARE_AND_EXECUTE,
+GET_LAST_INSERT_ID, END_TRAN and the handle release), with one commit per row:
+4N requests and N commits. `executeMany()` sends PREPARE, one EXECUTE_ARRAY per
+~1 MiB of encoded values (`ceil(encoded size / 1 MiB)`, one request for typical
+rows), END_TRAN and the handle release, with one commit for the whole batch:
+
+| Rows | `execute()` loop requests | `executeMany()` requests | Commits (loop / batch) |
+| ---: | ---: | ---: | ---: |
+| 10 | 40 | 4 | 10 / 1 |
+| 100 | 400 | 4 | 100 / 1 |
+| 1000 | 4000 | 4 | 1000 / 1 |
+
+That is the claim to rely on. How much time it saves depends on what one round
+trip and one commit cost on your server. The timings below are from one host
+where each commit was very slow, so they mostly measure commits and should not be
+read as a speedup: `scripts/bench-execute-many.ts` on CUBRID 11.4.6.1963 in
+Docker (`cubrid/cubrid:11.4`), 3 rounds per size, both paths in alternating
+order into an emptied 3-column table, on a shared 6-CPU host with a load average
+of about 17 throughout. The `execute()` loop cost about 360 to 440 ms per row
+there, which is the host and the container's log flush, not the driver.
+
+| Rows | `execute()` loop median | `executeMany()` median |
+| ---: | ---: | ---: |
+| 10 | 3567.3 ms | 457.0 ms |
+| 100 | 37641.3 ms | 350.2 ms |
+| 1000 | 435797.9 ms | 475.1 ms |
+
+Repeat the measurement on your own server before drawing conclusions:
+
+```bash
+CUBRID_TEST_PORT=33000 node --import tsx scripts/bench-execute-many.ts 3 10,100,1000
+```
+
 ## Running Benchmarks
 
 1. Clone `https://github.com/cubrid-lab/cubrid-benchmark`.

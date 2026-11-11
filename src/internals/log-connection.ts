@@ -13,12 +13,24 @@ import type {
   ClientLogLevel,
   ConnectionFactory,
   ConnectionLike,
+  ExecuteManyResult,
   ExecuteResult,
   QueryOptions,
   StreamOptions,
 } from "../types/client.js";
 import type { QueryParams } from "../types/query.js";
 import type { QueryResult, QueryResultRow } from "../types/result.js";
+
+/** Values of all the sets of an `executeMany()`, without failing on a malformed argument. */
+function countValues(paramSets: readonly QueryParams[]): number {
+  if (!Array.isArray(paramSets)) {
+    return 0;
+  }
+  return paramSets.reduce(
+    (total: number, set: unknown) => total + (Array.isArray(set) ? set.length : 0),
+    0,
+  );
+}
 
 /**
  * Resolves the `logger` option. Each level is looked up when the event is
@@ -211,6 +223,17 @@ export function withLogging(factory: ConnectionFactory, logger: unknown): Connec
       ): Promise<ExecuteResult> =>
         timed("executePrepared", { paramCount: params?.length ?? 0 }, () =>
           executePrepared(sql, params, options),
+        );
+    }
+    const executeMany = inner.executeMany?.bind(inner);
+    if (executeMany) {
+      wrapped.executeMany = (
+        sql: string,
+        paramSets: readonly QueryParams[],
+        options?: QueryOptions,
+      ): Promise<ExecuteManyResult> =>
+        timed("executeMany", { paramCount: countValues(paramSets) }, () =>
+          executeMany(sql, paramSets, options),
         );
     }
     const setTransactionOptions = inner.setTransactionOptions?.bind(inner);

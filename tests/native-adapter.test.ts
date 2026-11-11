@@ -8,7 +8,7 @@ import { NativeCubridAdapter } from "../src/adapters/native.js";
 import { CubridClient } from "../src/client/client.js";
 import { createClient } from "../src/client/create-client.js";
 import { ConnectionError } from "../src/errors/connection-error.js";
-import { DeadlockError, QueryError } from "../src/errors/query-error.js";
+import { ConstraintError, DeadlockError, QueryError } from "../src/errors/query-error.js";
 import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { TransactionError } from "../src/errors/transaction-error.js";
 import { CASFunctionCode, EndTranType } from "../src/protocol/constants.js";
@@ -20,7 +20,12 @@ import type {
 } from "../src/types/client.js";
 import type { QueryParam } from "../src/types/query.js";
 import { CAPTURED_FRAMES } from "./fixtures/collection-frames.js";
-import { DML_FRAMES, LAST_INSERT_ID_FRAMES, PREPARED_FRAMES } from "./fixtures/dml-frames.js";
+import {
+  DML_FRAMES,
+  EXECUTE_ARRAY_FRAMES,
+  LAST_INSERT_ID_FRAMES,
+  PREPARED_FRAMES,
+} from "./fixtures/dml-frames.js";
 import { LOB_FRAMES, LOB_READ_REPLY_LIMIT } from "./fixtures/lob-frames.js";
 import { ZONED_FRAMES } from "./fixtures/zoned-frames.js";
 
@@ -4632,4 +4637,470 @@ test("abort listeners are removed when statements settle", { timeout: 10000 }, a
     await client.close();
     await closeStub(server);
   }
+});
+
+// ---------------------------------------------------------------------------
+// executeMany(): PREPARE once, EXECUTE_ARRAY with every set (#86)
+// ---------------------------------------------------------------------------
+
+const EXECUTE_ARRAY = CASFunctionCode.EXECUTE_ARRAY;
+const INSERT_EM = "INSERT INTO c_em (id, v) VALUES (?, ?)";
+
+/** Sets of about 330 kB each: three fit in one EXECUTE_ARRAY request, four do not. */
+const largeSets = (count: number): Array<[number, string]> =>
+  Array.from({ length: count }, (_, index) => [index + 1, "x".repeat(330_000)]);
+
+function queueBatch(fakeCAS: FakeCASConnection, prepare: string, ...replies: string[]): void {
+  fakeCAS.queueResponse(Buffer.from(prepare, "hex"));
+  for (const reply of replies) {
+    fakeCAS.queueResponse(Buffer.from(reply, "hex"));
+  }
+}
+
+test("executeMany prepares once, runs every set in one request, then commits", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  queueBatch(fakeCAS, EXECUTE_ARRAY_FRAMES.prepareInsert, EXECUTE_ARRAY_FRAMES.insertThree);
+
+  const result = await adapter.executeMany(INSERT_EM, [
+    [1, "a"],
+    [2, "b"],
+    [3, "c"],
+  ]);
+
+  assert.deepEqual(result, { affectedRows: 3, results: [1, 1, 1] });
+  assert.deepEqual(sentCodes(fakeCAS), [
+    CASFunctionCode.PREPARE,
+    EXECUTE_ARRAY,
+    CASFunctionCode.END_TRAN,
+    CASFunctionCode.CLOSE_REQ_HANDLE,
+  ]);
+  assert.equal(fakeCAS.sentPayloads[1]!.toString("hex"), EXECUTE_ARRAY_FRAMES.insertThreeRequest);
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.COMMIT]);
+  assert.deepEqual(fakeCAS.closedHandles, [3]);
+});
+
+test("executeMany reports each set's own count, 0 included", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  queueBatch(fakeCAS, EXECUTE_ARRAY_FRAMES.prepareUpdate, EXECUTE_ARRAY_FRAMES.updateTwoSets);
+
+  assert.deepEqual(
+    await adapter.executeMany("UPDATE c_em SET v = ? WHERE id > ?", [
+      ["x", 3],
+      ["y", 99],
+    ]),
+    { affectedRows: 2, results: [2, 0] },
+  );
+});
+
+test("executeMany with no sets resolves at once and sends nothing", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  fakeCAS._isConnected = false;
+
+  assert.deepEqual(await adapter.executeMany(INSERT_EM, []), { affectedRows: 0, results: [] });
+  assert.equal(fakeCAS.sendAndRecvCalls, 0);
+  assert.equal(fakeCAS.connectCalls, 0);
+});
+
+test("a failed set in autocommit rolls back the whole batch and reports every set", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  queueBatch(
+    fakeCAS,
+    EXECUTE_ARRAY_FRAMES.prepareInsert,
+    EXECUTE_ARRAY_FRAMES.insertMiddleDuplicate,
+  );
+
+  await assert.rejects(
+    adapter.executeMany(INSERT_EM, [
+      [6, "f"],
+      [1, "dup"],
+      [7, "g"],
+    ]),
+    (error: unknown) => {
+      assert.ok(error instanceof ConstraintError);
+      assert.equal(error.code, -670);
+      assert.equal(error.kind, "unique-violation");
+      assert.equal(error.batch?.rolledBack, true);
+      assert.equal(error.batch?.executed, 3);
+      assert.deepEqual(error.batch?.results, [1, null, 1]);
+      assert.equal(error.batch?.failures.length, 1);
+      const failure = error.batch?.failures[0];
+      assert.equal(failure?.index, 1);
+      assert.equal(failure?.code, -670);
+      assert.equal(failure?.origin, "server");
+      assert.equal(failure?.kind, "unique-violation");
+      assert.match(failure?.message ?? "", /^Operation would have caused one or more unique/);
+      return true;
+    },
+  );
+
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+  assert.deepEqual(fakeCAS.closedHandles, [3]);
+  assertAutocommitResumed(adapter);
+});
+
+test("a failed set inside a transaction leaves the transaction to the caller", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  await adapter.beginTransaction();
+  queueBatch(
+    fakeCAS,
+    EXECUTE_ARRAY_FRAMES.prepareInsert,
+    EXECUTE_ARRAY_FRAMES.insertMiddleDuplicate,
+  );
+
+  await assert.rejects(
+    adapter.executeMany(INSERT_EM, [
+      [6, "f"],
+      [1, "dup"],
+      [7, "g"],
+    ]),
+    (error: unknown) => {
+      assert.ok(error instanceof ConstraintError);
+      assert.equal(error.batch?.rolledBack, false);
+      assert.deepEqual(error.batch?.results, [1, null, 1]);
+      assert.equal(error.batch?.failures[0]?.index, 1);
+      return true;
+    },
+  );
+
+  assert.deepEqual(endTranTypes(fakeCAS), []);
+  assert.deepEqual(fakeCAS.closedHandles, [3]);
+
+  // Still the caller's transaction: it can go on and decide.
+  await adapter.commit();
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.COMMIT]);
+});
+
+test("a successful executeMany inside a transaction does not end it", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  await adapter.beginTransaction();
+  queueBatch(fakeCAS, EXECUTE_ARRAY_FRAMES.prepareInsert, EXECUTE_ARRAY_FRAMES.insertTwo);
+
+  assert.deepEqual(
+    await adapter.executeMany(INSERT_EM, [
+      [4, "d"],
+      [5, "e"],
+    ]),
+    { affectedRows: 2, results: [1, 1] },
+  );
+  assert.deepEqual(sentCodes(fakeCAS), [
+    CASFunctionCode.PREPARE,
+    EXECUTE_ARRAY,
+    CASFunctionCode.CLOSE_REQ_HANDLE,
+  ]);
+});
+
+test("sets of different lengths are refused before anything is sent", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  fakeCAS._isConnected = false;
+
+  await assert.rejects(adapter.executeMany(INSERT_EM, [[1, "a"], [2]]), (error: unknown) => {
+    assert.ok(error instanceof QueryError);
+    assert.match((error.cause as Error).message, /Parameter count mismatch: parameter set 1/);
+    return true;
+  });
+  assert.equal(fakeCAS.sendAndRecvCalls, 0);
+  assert.equal(fakeCAS.connectCalls, 0);
+});
+
+test("sets that do not match the server's marker count never reach EXECUTE_ARRAY", async () => {
+  for (const sets of [[[1]], [[1, "a", "extra"]]]) {
+    const { adapter, fakeCAS } = createPreparedAdapter();
+    queueBatch(fakeCAS, EXECUTE_ARRAY_FRAMES.prepareInsert);
+
+    await assert.rejects(adapter.executeMany(INSERT_EM, sets), (error: unknown) => {
+      assert.ok(error instanceof QueryError);
+      assert.match((error.cause as Error).message, /Parameter count mismatch/);
+      return true;
+    });
+    assert.ok(!sentCodes(fakeCAS).includes(EXECUTE_ARRAY));
+    assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+    assert.deepEqual(fakeCAS.closedHandles, [3]);
+  }
+});
+
+test("a SELECT is refused after PREPARE and never executed", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  queueBatch(fakeCAS, EXECUTE_ARRAY_FRAMES.prepareSelect);
+
+  await assert.rejects(
+    adapter.executeMany("SELECT v FROM c_em WHERE id = ?", [[1], [2]]),
+    (error: unknown) => {
+      assert.ok(error instanceof QueryError);
+      assert.match((error.cause as Error).message, /SELECT/);
+      return true;
+    },
+  );
+  assert.ok(!sentCodes(fakeCAS).includes(EXECUTE_ARRAY));
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+  assert.deepEqual(fakeCAS.closedHandles, [3]);
+});
+
+test("a statement without markers is refused: the server would run nothing", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  queueBatch(fakeCAS, EXECUTE_ARRAY_FRAMES.prepareNoMarker);
+
+  await assert.rejects(
+    adapter.executeMany("INSERT INTO c_em (id, v) VALUES (100, 'z')", [[]]),
+    (error: unknown) => {
+      assert.ok(error instanceof QueryError);
+      assert.match((error.cause as Error).message, /marker/);
+      return true;
+    },
+  );
+  assert.ok(!sentCodes(fakeCAS).includes(EXECUTE_ARRAY));
+});
+
+test("more than one statement, a bad value or a bad argument sends nothing", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  fakeCAS._isConnected = false;
+  const refused: Array<() => Promise<unknown>> = [
+    () => adapter.executeMany("INSERT INTO t VALUES (?); DELETE FROM t", [[1]]),
+    () =>
+      adapter.executeMany(INSERT_EM, [
+        [1, "a"],
+        [2, Number.NaN],
+      ]),
+    () => adapter.executeMany(INSERT_EM, "nope" as unknown as QueryParam[][]),
+    () => adapter.executeMany(INSERT_EM, [[1, "a"], "b" as unknown as QueryParam[]]),
+    () => adapter.executeMany("INSERT INTO t VALUES (?)\0", [[1]]),
+  ];
+
+  for (const run of refused) {
+    await assert.rejects(run, QueryError);
+  }
+  assert.equal(fakeCAS.sendAndRecvCalls, 0);
+  assert.equal(fakeCAS.connectCalls, 0);
+});
+
+test("executeMany splits a large batch by size, on one handle and one transaction", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  queueBatch(
+    fakeCAS,
+    EXECUTE_ARRAY_FRAMES.prepareInsert,
+    EXECUTE_ARRAY_FRAMES.insertThree,
+    EXECUTE_ARRAY_FRAMES.insertTwo,
+  );
+
+  const result = await adapter.executeMany(INSERT_EM, largeSets(5));
+
+  assert.deepEqual(result, { affectedRows: 5, results: [1, 1, 1, 1, 1] });
+  assert.deepEqual(sentCodes(fakeCAS), [
+    CASFunctionCode.PREPARE,
+    EXECUTE_ARRAY,
+    EXECUTE_ARRAY,
+    CASFunctionCode.END_TRAN,
+    CASFunctionCode.CLOSE_REQ_HANDLE,
+  ]);
+  const requests = fakeCAS.sentPayloads.filter((payload) => payload[0] === EXECUTE_ARRAY);
+  for (const request of requests) {
+    assert.equal(request.readInt32BE(5), 3); // the same handle
+    assert.equal(request[22], 0); // autocommit off
+    assert.ok(request.length <= 1024 * 1024);
+  }
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.COMMIT]);
+});
+
+test("a failure in a later request rolls back the requests before it", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  queueBatch(
+    fakeCAS,
+    EXECUTE_ARRAY_FRAMES.prepareInsert,
+    EXECUTE_ARRAY_FRAMES.insertThree,
+    EXECUTE_ARRAY_FRAMES.insertMiddleDuplicate,
+  );
+
+  await assert.rejects(adapter.executeMany(INSERT_EM, largeSets(6)), (error: unknown) => {
+    assert.ok(error instanceof ConstraintError);
+    assert.deepEqual(error.batch?.results, [1, 1, 1, 1, null, 1]);
+    assert.equal(error.batch?.failures[0]?.index, 4);
+    assert.equal(error.batch?.executed, 6);
+    return true;
+  });
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+});
+
+test("after a failed request the rest of the batch is never sent", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  queueBatch(
+    fakeCAS,
+    EXECUTE_ARRAY_FRAMES.prepareInsert,
+    EXECUTE_ARRAY_FRAMES.insertMiddleDuplicate,
+  );
+
+  await assert.rejects(adapter.executeMany(INSERT_EM, largeSets(6)), (error: unknown) => {
+    assert.ok(error instanceof ConstraintError);
+    assert.deepEqual(error.batch?.results, [1, null, 1, null, null, null]);
+    assert.equal(error.batch?.executed, 3);
+    return true;
+  });
+  assert.equal(sentCodes(fakeCAS).filter((code) => code === EXECUTE_ARRAY).length, 1);
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+});
+
+test("an error for the whole EXECUTE_ARRAY request rolls back and has no per-set detail", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  queueBatch(fakeCAS, EXECUTE_ARRAY_FRAMES.prepareInsert, PREPARED_FRAMES.executeCoercionError);
+
+  await assert.rejects(adapter.executeMany(INSERT_EM, [[1, "a"]]), (error: unknown) => {
+    assert.ok(error instanceof QueryError);
+    assert.equal(error.code, -494);
+    assert.equal(error.batch, undefined);
+    return true;
+  });
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+  assert.deepEqual(fakeCAS.closedHandles, [3]);
+});
+
+test("a malformed EXECUTE_ARRAY reply drops the session and commits nothing", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  queueBatch(fakeCAS, EXECUTE_ARRAY_FRAMES.prepareInsert, EXECUTE_ARRAY_FRAMES.insertTwo);
+
+  await assert.rejects(
+    adapter.executeMany(INSERT_EM, [
+      [1, "a"],
+      [2, "b"],
+      [3, "c"],
+    ]),
+    QueryError,
+  );
+  assert.equal(fakeCAS.discardCalls, 1);
+  assert.deepEqual(endTranTypes(fakeCAS), []);
+});
+
+test("a failed ROLLBACK after a failed set drops the session, so nothing is committed later", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  queueBatch(
+    fakeCAS,
+    EXECUTE_ARRAY_FRAMES.prepareInsert,
+    EXECUTE_ARRAY_FRAMES.insertMiddleDuplicate,
+  );
+  fakeCAS.queueResponse(buildSimpleResponse(0)); // CLOSE_REQ_HANDLE
+  fakeCAS.queueResponse(buildErrorResponse(-1000, "rollback refused"));
+
+  await assert.rejects(
+    adapter.executeMany(INSERT_EM, [
+      [6, "f"],
+      [1, "dup"],
+      [7, "g"],
+    ]),
+    ConstraintError,
+  );
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+  assert.equal(fakeCAS.discardCalls, 1);
+});
+
+test("executeMany forgets the session's insert id, which its INSERTs changed", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  queueBatch(fakeCAS, EXECUTE_ARRAY_FRAMES.prepareInsert, EXECUTE_ARRAY_FRAMES.insertTwo);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (adapter as any).insertIdBaseline = "1";
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (adapter as any).insertIdGeneration = fakeCAS.connectionGeneration;
+
+  await adapter.executeMany(INSERT_EM, [
+    [4, "d"],
+    [5, "e"],
+  ]);
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  assert.equal((adapter as any).insertIdBaseline, null);
+});
+
+test("executeMany with an aborted signal or invalid options sends nothing", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  fakeCAS._isConnected = false;
+  const reason = new Error("cancelled before it started");
+  const controller = new AbortController();
+  controller.abort(reason);
+
+  await assert.rejects(
+    adapter.executeMany(INSERT_EM, [[1, "a"]], { signal: controller.signal }),
+    (error) => error === reason,
+  );
+  await assert.rejects(
+    adapter.executeMany(INSERT_EM, [], { signal: controller.signal }),
+    (error) => error === reason,
+  );
+  await assert.rejects(adapter.executeMany(INSERT_EM, [[1, "a"]], { readTimeout: -1 }), RangeError);
+  assert.equal(fakeCAS.sendAndRecvCalls, 0);
+  assert.equal(fakeCAS.connectCalls, 0);
+});
+
+test("an abort while EXECUTE_ARRAY is in flight retires the socket and is never replayed", {
+  timeout: 5000,
+}, async () => {
+  const prepare = Buffer.from(EXECUTE_ARRAY_FRAMES.prepareInsert, "hex");
+  const { server, port, requests } = await createScriptedCas([
+    [prepare, STALL],
+    [INSERT_OK, CLOSE_OK],
+  ]);
+  const client = optionsClient(port);
+  const reason = new Error("stopped by the caller");
+
+  try {
+    await assert.rejects(
+      client.executeMany(INSERT_EM, [[1, "a"]], { signal: abortAfter(50, reason) }),
+      (error) => error === reason,
+    );
+
+    // No ROLLBACK or handle release followed on the retired socket, and nothing was resent.
+    assert.deepEqual(requests, [2]);
+    assert.deepEqual(await client.query("INSERT INTO t VALUES (2)"), []);
+    assert.deepEqual(requests, [2, 2]);
+  } finally {
+    await client.close();
+    await closeStub(server);
+  }
+});
+
+test("a per-query readTimeout limits each EXECUTE_ARRAY request", { timeout: 5000 }, async () => {
+  const prepare = Buffer.from(EXECUTE_ARRAY_FRAMES.prepareInsert, "hex");
+  const { server, port, requests } = await createScriptedCas([[prepare, STALL]]);
+  const client = optionsClient(port);
+
+  try {
+    await assert.rejects(
+      client.executeMany(INSERT_EM, [[1, "a"]], { readTimeout: 100 }),
+      (error: unknown) => error instanceof ReadTimeoutError && error.timeoutMs === 100,
+    );
+    assert.deepEqual(requests, [2]);
+  } finally {
+    await client.close();
+    await closeStub(server);
+  }
+});
+
+test("a set reported as -72 after another failure still blocks a later commit", async () => {
+  // Synthetic: with autocommit off the CAS fails the whole request on -72, so a
+  // per-set -72 should never arrive. If it did, the transaction is gone.
+  const entry = (code: number, text: string): Buffer => {
+    const message = Buffer.from(`${text}\0`);
+    const head = Buffer.alloc(12);
+    head.writeInt32BE(-2, 0);
+    head.writeInt32BE(code, 4);
+    head.writeInt32BE(message.length, 8);
+    return Buffer.concat([head, message]);
+  };
+  const reply = Buffer.concat([
+    Buffer.from("0000000000000002", "hex"),
+    entry(-670, "duplicate"),
+    entry(-72, "deadlock"),
+    Buffer.from("fffffffe", "hex"),
+  ]);
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  await adapter.beginTransaction();
+  fakeCAS.queueResponse(Buffer.from(EXECUTE_ARRAY_FRAMES.prepareInsert, "hex"));
+  fakeCAS.queueResponse(reply);
+
+  await assert.rejects(
+    adapter.executeMany(INSERT_EM, [
+      [1, "a"],
+      [2, "b"],
+    ]),
+    ConstraintError,
+  );
+  const sent = fakeCAS.sentPayloads.length;
+
+  await assert.rejects(adapter.commit(), TransactionError);
+  assert.equal(fakeCAS.sentPayloads.length, sent);
 });

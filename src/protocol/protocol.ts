@@ -397,6 +397,63 @@ export function assertPreparableSql(sql: string): void {
   }
 }
 
+/**
+ * EXECUTE_ARRAY runs only the first statement of `a; b` and reports success
+ * (seen on live 10.2 and 11.4 brokers), so the later statements would be lost
+ * without an error. Refuses SQL with anything but comments after a top-level
+ * `;`. It scans once with backslash escapes and once without, because the
+ * server's mode decides where a string ends, so a doubt refuses rather than runs.
+ */
+export function assertSingleStatement(sql: string): void {
+  if (hasSecondStatement(sql, true) || hasSecondStatement(sql, false)) {
+    throw new Error("executeMany() runs one statement, but the SQL text holds more than one");
+  }
+}
+
+/** The character that ends each quoted span: strings, and identifiers in `"`, backticks or brackets. */
+const QUOTE_ENDS: Readonly<Record<string, string>> = { "'": "'", '"': '"', "`": "`", "[": "]" };
+
+function hasSecondStatement(sql: string, backslashEscapes: boolean): boolean {
+  let end = "";
+  let separated = false;
+
+  for (let i = 0; i < sql.length; i++) {
+    const ch = sql[i]!;
+    const next = sql[i + 1] ?? "";
+
+    if (end !== "") {
+      // Only string quotes take backslash escapes; identifiers never do.
+      if (backslashEscapes && ch === "\\" && (end === "'" || end === '"')) {
+        i++;
+      } else if (ch === end) {
+        if (next === end && end !== "]") {
+          i++;
+        } else {
+          end = "";
+        }
+      }
+      continue;
+    }
+
+    if ((ch === "-" && next === "-") || (ch === "/" && next === "/")) {
+      const lineEnd = sql.indexOf("\n", i);
+      i = lineEnd === -1 ? sql.length : lineEnd;
+    } else if (ch === "/" && next === "*") {
+      const commentEnd = sql.indexOf("*/", i + 2);
+      i = commentEnd === -1 ? sql.length : commentEnd + 1;
+    } else if (ch === ";") {
+      separated = true;
+    } else if (!/\s/.test(ch)) {
+      if (separated) {
+        return true;
+      }
+      end = QUOTE_ENDS[ch] ?? "";
+    }
+  }
+
+  return false;
+}
+
 /** Parse PREPARE response. */
 export function parsePrepare(data: Buffer): PrepareResult {
   assertReplySize(data);
@@ -474,6 +531,113 @@ export function parseExecute(
   }
 
   return decodeReply(() => readExecution(reader, statement, responseCode, protoVersion, true));
+}
+
+// ---------------------------------------------------------------------------
+// Execute array (FC=21)
+// ---------------------------------------------------------------------------
+
+/** ER_INTERRUPTED: the only failure after which the CAS stops running the sets. */
+const ER_INTERRUPTED = -4;
+
+/**
+ * Build an EXECUTE_ARRAY request: the prepared handle runs once per set, in
+ * order (CAS `fn_execute_array`, JDBC `UStatement.writeExecuteBatchRequest`).
+ * The query timeout int is there because this client declares protocol 7. The
+ * autocommit byte is always 0, as for writePrepare(): with 1 the CAS commits or
+ * rolls back each set on its own, so a failure could leave earlier sets committed.
+ * The CAS does not check that the values fill whole sets, so the caller must.
+ */
+export function writeExecuteArray(
+  queryHandle: number,
+  sets: readonly PreparedBinds[],
+  casInfo: Buffer,
+): { header: Buffer; payload: Buffer } {
+  let size = 32;
+  for (const set of sets) {
+    size += set.bytes.length;
+  }
+
+  const w = new PacketWriter(size);
+  w.writeByte(CASFunctionCode.EXECUTE_ARRAY);
+  w.addInt(queryHandle);
+  w.addInt(0); // query timeout
+  w.addByte(0); // autocommit
+  for (const set of sets) {
+    w.writeBytes(set.bytes);
+  }
+
+  const payload = w.toBuffer();
+  const header = PacketWriter.buildHeader(payload.length, casInfo);
+  return { header, payload };
+}
+
+/**
+ * Parse an EXECUTE_ARRAY reply (CAS `ux_execute_array`): one entry per set, the
+ * affected-row count or the set's own error. The CAS runs every set and undoes
+ * only a failing one, unless the session is in autocommit, so a failure says
+ * nothing about the sets around it. It stops early only after ER_INTERRUPTED,
+ * which it reports, so any other reply that covers fewer sets than `sent` is
+ * malformed. A negative result code is an error for the whole request.
+ */
+export function parseExecuteArray(
+  data: Buffer,
+  sent: number,
+  protoVersion: number,
+): Array<number | CasReplyError> {
+  assertReplySize(data);
+  const reader = new PacketReader(data);
+  const responseCode = reader.parseInt();
+
+  if (responseCode < 0) {
+    const remaining = data.length - SIZE_INT;
+    const err = reader.readError(remaining);
+    throw new CasReplyError(
+      `CUBRID query failed (${err.code}): ${err.message}`,
+      responseCode,
+      err.code,
+    );
+  }
+
+  return decodeReply(() => {
+    const executed = reader.parseInt();
+    if (executed < 1 || executed > sent) {
+      throw new MalformedReplyError(
+        `Malformed CAS packet: execute array reported ${executed} of ${sent} sets`,
+      );
+    }
+
+    const outcomes: Array<number | CasReplyError> = [];
+    for (let index = 0; index < executed; index++) {
+      const result = reader.parseInt();
+      if (result >= 0) {
+        reader.skip(SIZE_OID);
+        outcomes.push(result);
+        continue;
+      }
+
+      const indicator = protoVersion > 2 ? result : -2;
+      const code = protoVersion > 2 ? reader.parseInt() : result;
+      const length = reader.parseInt();
+      if (length < 0) {
+        throw new MalformedReplyError(`Malformed CAS packet: error message length ${length}`);
+      }
+      const message = reader.parseNullTermString(length);
+      outcomes.push(new CasReplyError(message, indicator, code));
+    }
+
+    if (protoVersion > 4) {
+      reader.parseInt(); // shard_id
+    }
+
+    const last = outcomes[outcomes.length - 1];
+    if (executed < sent && !(last instanceof CasReplyError && last.code === ER_INTERRUPTED)) {
+      throw new MalformedReplyError(
+        `Malformed CAS packet: execute array stopped after ${executed} of ${sent} sets`,
+      );
+    }
+    return outcomes;
+  });
 }
 
 // ---------------------------------------------------------------------------

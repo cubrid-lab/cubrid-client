@@ -85,6 +85,16 @@ autocommit and transactions, and the release of each handle on every way a
 statement ends, together with a lost socket, a malformed reply, a deadlock and a
 read timeout ([#85](https://github.com/cubrid-lab/cubrid-client/issues/85)).
 
+Batch execution (`executeMany()`, EXECUTE_ARRAY) is asserted against local
+`cubrid/cubrid` 10.2 and 11.4 containers: 1000 inserted rows, a unique violation
+that rolls back the whole autocommit batch, a failure inside a transaction scope
+that leaves the transaction open, mixed types and NULL, a batch split into several
+requests, per-set update counts, the refused statements, `lastInsertId` after a
+batch and an abort during a lock wait
+([#86](https://github.com/cubrid-lab/cubrid-client/issues/86)). Both servers sent
+the same EXECUTE_ARRAY frames apart from error message text. 11.0 and 11.2 were
+not run.
+
 The `isolationLevel` and `lockTimeout` options are asserted the same way against
 local `cubrid/cubrid` 10.2, 11.0, 11.2 and 11.4 containers: the level read back from
 the server, what each level shows of a concurrent commit, the `-1158` conflict, write

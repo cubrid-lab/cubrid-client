@@ -21,6 +21,7 @@ import {
 import { PacketReader } from "../src/protocol/packet-reader.js";
 import { PacketWriter } from "../src/protocol/packet-writer.js";
 import {
+  assertSingleStatement,
   type ColumnMeta,
   encodeBindParams,
   formatValue,
@@ -2130,5 +2131,43 @@ test("parseGetLastInsertId rejects every nonpositive size except -1", () => {
       () => parseGetLastInsertId(Buffer.from("00000000" + size, "hex")),
       MalformedReplyError,
     );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// assertSingleStatement (executeMany): EXECUTE_ARRAY runs only the first statement
+// ---------------------------------------------------------------------------
+
+test("assertSingleStatement accepts one statement, with or without a trailing semicolon", () => {
+  for (const sql of [
+    "INSERT INTO t VALUES (?, ?)",
+    "INSERT INTO t VALUES (?);",
+    "INSERT INTO t VALUES (?) ;  -- done\n",
+    "INSERT INTO t VALUES (?); /* end */ ;",
+    "INSERT INTO t VALUES ('a;b', ?)",
+    "INSERT INTO t VALUES ('it''s; fine', ?)",
+    'UPDATE t SET "a;b" = ? WHERE c = 1',
+    "INSERT INTO t /* ; */ VALUES (?) -- ; DELETE FROM t",
+    "INSERT INTO [a;b] (c) VALUES (?)",
+    "INSERT INTO `a;b` (c) VALUES (?)",
+  ]) {
+    assert.doesNotThrow(() => assertSingleStatement(sql), sql);
+  }
+});
+
+test("assertSingleStatement refuses a second statement, in either backslash mode", () => {
+  for (const sql of [
+    "INSERT INTO t VALUES (?); DELETE FROM t",
+    "INSERT INTO t VALUES (?);DELETE FROM t WHERE a = ?",
+    "INSERT INTO t VALUES (?); ; UPDATE t SET a = 1",
+    // A backslash ends this string only where it is not an escape, and the reverse.
+    "INSERT INTO t VALUES ('a\\', ?); DELETE FROM t WHERE b = 'x'",
+    "INSERT INTO t VALUES ('a\\'';', ?); DELETE FROM t",
+    // Bracket and backtick identifiers hold quotes and dashes, and never take escapes.
+    "INSERT INTO [it's] (a) VALUES (?); DELETE FROM t",
+    "INSERT INTO [x--y] (a) VALUES (?); DELETE FROM t",
+    "INSERT INTO `c\\` (a) VALUES ('\\'', ?); DELETE FROM t -- `",
+  ]) {
+    assert.throws(() => assertSingleStatement(sql), /one statement/, sql);
   }
 });

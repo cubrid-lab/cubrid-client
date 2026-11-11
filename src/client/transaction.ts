@@ -2,8 +2,10 @@ import { TransactionError } from "../errors/transaction-error.js";
 import { isAbortReason, mapError, toError } from "../internals/map-error.js";
 import { assertValidQueryOptions } from "../internals/normalize-config.js";
 import type {
+  BatchTransactionClient,
   ConnectionLike,
   ExecutableTransactionClient,
+  ExecuteManyResult,
   ExecuteResult,
   PreparedTransactionClient,
   QueryOptions,
@@ -13,7 +15,11 @@ import type { QueryParams } from "../types/query.js";
 import type { QueryResult, QueryResultRow } from "../types/result.js";
 
 export class CubridTransaction
-  implements ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient
+  implements
+    ResultTransactionClient,
+    ExecutableTransactionClient,
+    PreparedTransactionClient,
+    BatchTransactionClient
 {
   constructor(private readonly connection: ConnectionLike) {}
 
@@ -85,6 +91,24 @@ export class CubridTransaction
         throw new Error("Underlying connection does not support executePrepared.");
       }
       return this.connection.executePrepared(sql, params, options);
+    });
+  }
+
+  /**
+   * `executeMany()` inside this transaction. A failed set rejects with every
+   * set's outcome in `batch` and leaves the transaction as it is: the sets that
+   * succeeded are still part of it, and the caller decides to roll back or not.
+   */
+  executeMany(
+    sql: string,
+    paramSets: readonly QueryParams[],
+    options?: QueryOptions,
+  ): Promise<ExecuteManyResult> {
+    return runStatement(options, "Transaction statement failed.", () => {
+      if (!this.connection.executeMany) {
+        throw new Error("Underlying connection does not support executeMany.");
+      }
+      return this.connection.executeMany(sql, paramSets, options);
     });
   }
 
@@ -203,6 +227,14 @@ export class CallbackTransaction extends CubridTransaction {
     options?: QueryOptions,
   ): Promise<ExecuteResult> {
     return this.track(() => super.executePrepared(sql, params, options));
+  }
+
+  override executeMany(
+    sql: string,
+    paramSets: readonly QueryParams[],
+    options?: QueryOptions,
+  ): Promise<ExecuteManyResult> {
+    return this.track(() => super.executeMany(sql, paramSets, options));
   }
 
   override commit(): Promise<void> {

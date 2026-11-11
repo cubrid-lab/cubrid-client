@@ -5468,3 +5468,280 @@ describe("Integration: per-query AbortSignal and readTimeout (#150)", { skip: !a
     }
   });
 });
+
+describe("Integration: executeMany (#86)", { skip: !available }, () => {
+  const TABLE = "cc_exec_many";
+  const INSERT = `INSERT INTO ${TABLE} (id, v) VALUES (?, ?)`;
+
+  async function withTable<T>(
+    columns: string,
+    run: (client: ReturnType<typeof createClient>) => Promise<T>,
+  ): Promise<T> {
+    const client = createClient(TEST_CONFIG);
+    try {
+      await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+      await client.query(`CREATE TABLE ${TABLE} (${columns})`);
+      return await run(client);
+    } finally {
+      await client.query(`DROP TABLE IF EXISTS ${TABLE}`).catch(() => undefined);
+      await client.close();
+    }
+  }
+
+  /** Counted on a separate client, so only committed rows are seen. */
+  async function committedRows(where = ""): Promise<number> {
+    const other = createClient(TEST_CONFIG);
+    try {
+      // COUNT(*) is a BIGINT on 11.x and an INT on 10.2.
+      const [row] = await other.query(`SELECT COUNT(*) AS n FROM ${TABLE} ${where}`);
+      return Number(row?.n);
+    } finally {
+      await other.close();
+    }
+  }
+
+  const sets = (from: number, to: number): Array<[number, string]> =>
+    Array.from({ length: to - from + 1 }, (_, index) => [from + index, `v${from + index}`]);
+
+  test("inserts 1000 rows in one batch and commits them", async () => {
+    await withTable("id INT PRIMARY KEY, v VARCHAR(20)", async (client) => {
+      const result = await client.executeMany(INSERT, sets(1, 1000));
+
+      assert.equal(result.affectedRows, 1000);
+      assert.equal(result.results.length, 1000);
+      assert.ok(result.results.every((count) => count === 1));
+      assert.equal(await committedRows(), 1000);
+      const [row] = await client.query(`SELECT SUM(id) AS s, MAX(v) AS m FROM ${TABLE}`);
+      assert.equal(Number(row?.s), 500_500);
+    });
+  });
+
+  test("a unique violation at one row rolls back the whole autocommit batch", async () => {
+    await withTable("id INT PRIMARY KEY, v VARCHAR(20)", async (client) => {
+      await client.execute(`INSERT INTO ${TABLE} VALUES (500, 'existing')`);
+
+      await assert.rejects(client.executeMany(INSERT, sets(1, 1000)), (error: unknown) => {
+        assert.ok(error instanceof ConstraintError);
+        assert.equal(error.kind, "unique-violation");
+        assert.equal(error.batch?.rolledBack, true);
+        assert.equal(error.batch?.executed, 1000);
+        assert.deepEqual(
+          error.batch?.failures.map(({ index, code }) => [index, code]),
+          [[499, error.code]],
+        );
+        assert.equal(error.batch?.results[499], null);
+        assert.equal(error.batch?.results[500], 1);
+        return true;
+      });
+
+      assert.equal(await committedRows(), 1);
+      // The shared connection is in autocommit again and nothing of the batch was left behind.
+      await client.execute(`INSERT INTO ${TABLE} VALUES (1, 'after')`);
+      assert.equal(await committedRows(), 2);
+    });
+  });
+
+  test("inside a scope a failed set leaves the transaction, and its other sets, to the caller", async () => {
+    await withTable("id INT PRIMARY KEY, v VARCHAR(20)", async (client) => {
+      const scope = await client.beginTransactionScope();
+      await scope.execute(`INSERT INTO ${TABLE} VALUES (0, 'first')`);
+
+      await assert.rejects(
+        scope.executeMany(INSERT, [
+          [1, "a"],
+          [0, "dup"],
+          [2, "b"],
+        ]),
+        (error: unknown) => {
+          assert.ok(error instanceof TransactionError);
+          assert.equal(error.kind, "unique-violation");
+          assert.equal(error.batch?.rolledBack, false);
+          assert.deepEqual(error.batch?.results, [1, null, 1]);
+          assert.equal(error.batch?.failures[0]?.index, 1);
+          return true;
+        },
+      );
+
+      // The transaction is still open and holds every set that succeeded.
+      const [inside] = await scope.query(`SELECT COUNT(*) AS n FROM ${TABLE}`);
+      assert.equal(Number(inside?.n), 3);
+      assert.equal(await committedRows(), 0);
+
+      await scope.commit();
+      assert.equal(await committedRows(), 3);
+    });
+  });
+
+  test("transaction() rolls back a callback that lets a failed batch through", async () => {
+    await withTable("id INT PRIMARY KEY, v VARCHAR(20)", async (client) => {
+      await assert.rejects(
+        client.transaction(async (tx) => {
+          await tx.executeMany(INSERT, sets(1, 10));
+          await tx.executeMany(INSERT, sets(10, 20));
+        }),
+        (error: unknown) => error instanceof TransactionError && error.batch !== undefined,
+      );
+      assert.equal(await committedRows(), 0);
+    });
+  });
+
+  test("binds mixed types and NULL in every set", async () => {
+    await withTable(
+      "id INT PRIMARY KEY, b BIGINT, d DOUBLE, s VARCHAR(50), t DATETIME, n NUMERIC(30,0), x BIT VARYING(64)",
+      async (client) => {
+        const when = new Date(Date.UTC(2024, 0, 2, 3, 4, 5, 6));
+        const result = await client.executeMany(
+          `INSERT INTO ${TABLE} (id, b, d, s, t, n, x) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [
+            [
+              1,
+              9007199254740991,
+              1.5,
+              "한글 text",
+              when,
+              12345678901234567890123n,
+              Buffer.from("abcd", "hex"),
+            ],
+            [2, null, null, null, null, null, null],
+            [3, -1n, -0.25, "", when, -5n, Buffer.from([1])],
+          ],
+        );
+        assert.deepEqual(result, { affectedRows: 3, results: [1, 1, 1] });
+
+        const utc = createClient({ ...TEST_CONFIG, timezone: "utc" });
+        try {
+          const rows = await utc.query(`SELECT * FROM ${TABLE} ORDER BY id`);
+          assert.equal(rows.length, 3);
+          assert.equal(rows[0]?.b, 9007199254740991n);
+          assert.equal(rows[0]?.d, 1.5);
+          assert.equal(rows[0]?.s, "한글 text");
+          assert.deepEqual(rows[0]?.t, when);
+          assert.equal(String(rows[0]?.n), "12345678901234567890123");
+          assert.deepEqual(rows[0]?.x, Buffer.from("abcd", "hex"));
+          assert.deepEqual(
+            Object.entries(rows[1] ?? {}).filter(([key, value]) => key !== "id" && value !== null),
+            [],
+          );
+          assert.equal(rows[2]?.b, -1n);
+          assert.equal(rows[2]?.s, "");
+          assert.equal(String(rows[2]?.n), "-5");
+        } finally {
+          await utc.close();
+        }
+      },
+    );
+  });
+
+  test("a batch over the request size is split, committed together or not at all", async () => {
+    await withTable("id INT PRIMARY KEY, v STRING", async (client) => {
+      const big = (from: number, count: number): Array<[number, string]> =>
+        Array.from({ length: count }, (_, index) => [from + index, "x".repeat(330_000)]);
+
+      assert.deepEqual(await client.executeMany(INSERT, big(1, 7)), {
+        affectedRows: 7,
+        results: [1, 1, 1, 1, 1, 1, 1],
+      });
+      assert.equal(await committedRows(), 7);
+
+      // Set 4 of 6 is in the second request; the first request's sets are rolled back too.
+      await assert.rejects(
+        client.executeMany(INSERT, [...big(100, 4), [1, "dup"], ...big(200, 1)]),
+        (error: unknown) => {
+          assert.ok(error instanceof ConstraintError);
+          assert.equal(error.batch?.failures[0]?.index, 4);
+          assert.deepEqual(error.batch?.results, [1, 1, 1, 1, null, 1]);
+          return true;
+        },
+      );
+      assert.equal(await committedRows(), 7);
+    });
+  });
+
+  test("updates report each set's own count", async () => {
+    await withTable("id INT PRIMARY KEY, v VARCHAR(20)", async (client) => {
+      await client.executeMany(INSERT, sets(1, 5));
+      assert.deepEqual(
+        await client.executeMany(`UPDATE ${TABLE} SET v = ? WHERE id > ?`, [
+          ["x", 3],
+          ["y", 99],
+          ["z", 0],
+        ]),
+        { affectedRows: 7, results: [2, 0, 5] },
+      );
+    });
+  });
+
+  test("refuses a SELECT, a second statement and a wrong marker count, then works", async () => {
+    await withTable("id INT PRIMARY KEY, v VARCHAR(20)", async (client) => {
+      for (const [sql, paramSets, pattern] of [
+        [`SELECT v FROM ${TABLE} WHERE id = ?`, [[1], [2]], /SELECT/],
+        [`${INSERT}; DELETE FROM ${TABLE}`, [[1, "a"]], /more than one/],
+        [INSERT, [[1]], /Parameter count mismatch/],
+        [INSERT, [[1, "a", "extra"]], /Parameter count mismatch/],
+        [`INSERT INTO ${TABLE} VALUES (1, 'a')`, [[]], /marker/],
+      ] as const) {
+        await assert.rejects(
+          client.executeMany(sql, paramSets as unknown as QueryParams[]),
+          (error: unknown) => {
+            assert.ok(error instanceof QueryError);
+            let root: unknown = error;
+            while (root instanceof Error && root.cause instanceof Error) {
+              root = root.cause;
+            }
+            assert.match((root as Error).message, pattern);
+            return true;
+          },
+        );
+      }
+      assert.equal(await committedRows(), 0);
+
+      assert.deepEqual(await client.executeMany(`${INSERT};`, [[1, "a"]]), {
+        affectedRows: 1,
+        results: [1],
+      });
+      assert.deepEqual(await client.executeMany(INSERT, []), { affectedRows: 0, results: [] });
+    });
+  });
+
+  test("execute() still reports the right lastInsertId after a batch", async () => {
+    await withTable("id INT AUTO_INCREMENT PRIMARY KEY, v VARCHAR(20)", async (client) => {
+      await client.execute(`INSERT INTO ${TABLE} (v) VALUES ('first')`);
+      await client.executeMany(`INSERT INTO ${TABLE} (v) VALUES (?)`, [["a"], ["b"], ["c"]]);
+      const result = await client.execute(`INSERT INTO ${TABLE} (v) VALUES ('last')`);
+      assert.equal(result.lastInsertId, 5);
+    });
+  });
+
+  test("an abort while a set waits for a lock commits nothing", async () => {
+    await withTable("id INT PRIMARY KEY, v VARCHAR(20)", async (client) => {
+      await client.executeMany(INSERT, sets(1, 2));
+      const holder = await client.beginTransactionScope();
+      await holder.execute(`UPDATE ${TABLE} SET v = 'held' WHERE id = 2`);
+      const reason = new Error("stopped by the test");
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(reason), 300);
+
+      try {
+        await assert.rejects(
+          client.executeMany(
+            `UPDATE ${TABLE} SET v = ? WHERE id = ?`,
+            [
+              ["batch", 1],
+              ["batch", 2],
+            ],
+            { signal: controller.signal },
+          ),
+          (error) => error === reason,
+        );
+      } finally {
+        await holder.rollback();
+      }
+
+      assert.equal(await committedRows("WHERE v = 'batch'"), 0);
+      assert.deepEqual(await client.executeMany(INSERT, [[3, "c"]]), {
+        affectedRows: 1,
+        results: [1],
+      });
+    });
+  });
+});

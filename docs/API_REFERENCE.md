@@ -28,7 +28,10 @@ Complete reference for every public export of `cubrid-client`.
   - [QueryOptions](#queryoptions)
   - [PreparedQueryable](#preparedqueryable)
   - [PreparedTransactionClient](#preparedtransactionclient)
+  - [BatchExecutable](#batchexecutable)
+  - [BatchTransactionClient](#batchtransactionclient)
   - [ExecuteResult](#executeresult)
+  - [ExecuteManyResult](#executemanyresult)
   - [TransactionClient](#transactionclient-interface)
   - [TransactionCallback](#transactioncallback)
   - [ResultTransactionClient](#resulttransactionclient)
@@ -252,9 +255,73 @@ const { affectedRows } = await db.executePrepared("UPDATE users SET name = ? WHE
 - **Autocommit.** The statement runs in a transaction of its own that ends with an explicit commit, or a rollback if anything failed.
 - **Cost.** A call takes more round trips than `query()`; see the [measurements](PERFORMANCE.md#prepared-binding). Do not expect it to be faster.
 
+#### `executeMany(sql, paramSets, options?)`
+
+Runs one `INSERT`, `UPDATE`, `DELETE` or `MERGE` once per parameter set, with [server-side binding](TYPES.md#prepared-binding): one PREPARE, then one EXECUTE_ARRAY request carrying every set, instead of a round trip per set.
+
+```ts
+async executeMany(
+  sql: string,
+  paramSets: readonly QueryParams[],
+  options?: QueryOptions,
+): Promise<ExecuteManyResult>
+```
+
+```ts
+const { affectedRows, results } = await db.executeMany(
+  "INSERT INTO users (id, name) VALUES (?, ?)",
+  [
+    [1, "Alice"],
+    [2, "Bob"],
+  ],
+);
+// affectedRows: 2, results: [1, 1]
+```
+
+**Returns:** [`ExecuteManyResult`](#executemanyresult): `affectedRows`, the rows changed by all sets together, and `results`, the rows each set changed, in the order of `paramSets`. It resolves only when every set ran without error.
+
+**Throws:** [`QueryError`](#queryerror), or a [`TransactionError`](#transactionerror) on `tx` and a transaction scope, when a set fails, when the statement or a value is refused, or when the connection does not provide `executeMany` (a custom `connectionFactory`). It never falls back to one statement per set.
+
+When the server reports one or more sets as failed, the error is the class the first failure has alone (a unique violation is a [`ConstraintError`](#queryerror)), with that failure's `code`, `origin` and `kind`, and a [`batch`](#error-details) property with every set's outcome:
+
+```ts
+try {
+  await db.executeMany("INSERT INTO users (id, name) VALUES (?, ?)", rows);
+} catch (error) {
+  if (error instanceof QueryError && error.batch) {
+    const [first] = error.batch.failures;
+    console.error(`row ${first.index} failed (${first.code}): ${first.message}`);
+    // error.batch.rolledBack is true here: nothing was committed.
+  }
+  throw error;
+}
+```
+
+What happens in each case:
+
+| Case | On the client (autocommit) | Inside `transaction()` or a scope |
+|------|----------------------------|-----------------------------------|
+| Every set succeeds | Committed once, after the last set. Resolves | Resolves. The rows are part of the transaction |
+| The server reports a set as failed | Nothing is committed: the whole batch is rolled back. Rejects with `batch.rolledBack: true` | Rejects with `batch.rolledBack: false`. The transaction stays open and is left to the caller; see below |
+| The server fails the whole request: a deadlock (`-72`) or a server crash, which the CAS never reports per set while autocommit is off, or any error for the request itself | Rolled back. Rejects with that error and no `batch` | As for any statement: after `-72` the server has already rolled back the transaction. Without `batch`, sets of earlier requests of the same call may still be in the transaction, so roll back |
+| A value, the SQL text, or sets of different sizes are refused | Nothing is sent | Nothing is sent |
+| The statement is a `SELECT`, has no `?` marker, or a set's size is not its marker count | Refused after PREPARE, before any set runs. Rolled back | Refused before any set runs. The transaction is untouched |
+| `paramSets` is empty | Resolves `{ affectedRows: 0, results: [] }`, nothing is sent | The same |
+| An abort or a `readTimeout` while a request is in flight | Rejects as in [Cancelling one statement](#cancelling-one-statement). The connection is discarded and the server discards the uncommitted batch. Only an abort during the final COMMIT, or the handle release after it, leaves the outcome unknown: the batch may be committed | The transaction is lost, as for any statement |
+
+- **A failed set inside a transaction.** A set fails with its own error, such as a constraint or lock timeout; the server undoes that set's changes, but the sets that succeeded, including any after the failed one in the same request, are still in the open transaction. Roll back to discard them, or commit to keep them. `batch.results` says which sets they are. The `transaction()` callback rolls back if the error escapes it.
+- **The server keeps going after a failed set**, within one request: `batch.executed` counts the sets it ran, and `batch.results` holds a count for each set that succeeded and `null` for each that failed or never ran.
+- **A failed ROLLBACK** after a failed set in autocommit mode discards the session, so the server drops the batch with it and no later statement can commit it. Statements queued behind it then fail as after a lost connection.
+- **Large batches** are split into several EXECUTE_ARRAY requests of about 1 MiB of encoded values each (a larger set goes alone), all on the same prepared handle, session and transaction. After a request with a failed set, the rest are not sent. Every value is encoded and checked when the method is called, so the encoded sets are held until it settles; one request at a time is built from them.
+- **Single statement only.** EXECUTE_ARRAY runs only the first statement of `a; b` on CUBRID 10.2 to 11.4 and reports success, so SQL text with anything but comments after a `;` is refused. A trailing `;` is accepted.
+- **No retry or replay.** A failed batch is never sent again. [`QueryOptions`](#queryoptions) apply to every request of the call: each EXECUTE_ARRAY, the END_TRAN and the handle release.
+- **Types.** The values follow the [prepared binding](TYPES.md#prepared-binding) rules of `executePrepared()`.
+- **`lastInsertId`** is not reported. A later `execute()` still reports its own generated id correctly.
+- **Cost.** See the [measurements](PERFORMANCE.md#batch-execution).
+
 #### Cancelling one statement
 
-Every statement method of the client, of the `transaction()` callback's `tx` and of a [`beginTransactionScope()`](#begintransactionscopeoptions) handle takes [`QueryOptions`](#queryoptions) as its optional last argument: `query`, `queryResult`, `execute`, `queryPrepared`, `queryResultPrepared` and `executePrepared`.
+Every statement method of the client, of the `transaction()` callback's `tx` and of a [`beginTransactionScope()`](#begintransactionscopeoptions) handle takes [`QueryOptions`](#queryoptions) as its optional last argument: `query`, `queryResult`, `execute`, `queryPrepared`, `queryResultPrepared`, `executePrepared` and `executeMany`.
 
 ```ts
 // Give up after 2 seconds, whatever the client's readTimeout.
@@ -656,6 +723,12 @@ Same signatures and behavior as the [`CubridClient` methods](#querypreparedtsql-
 
 **Throws:** [`TransactionError`](#transactionerror) if execution fails.
 
+#### `executeMany(sql, paramSets, options?)`
+
+Same signature as [`CubridClient.executeMany()`](#executemanysql-paramsets-options), but runs within the transaction's isolated connection and never commits or rolls back on its own. When a set fails it rejects with a [`TransactionError`](#transactionerror) whose `batch` reports every set, and the sets that succeeded stay in the transaction until you commit or roll back.
+
+**Throws:** [`TransactionError`](#transactionerror) if a set fails or the statement is refused.
+
 #### `commit()`
 
 Commits the transaction. Called automatically by `CubridClient.transaction()` on success, so you only need it to make the work durable before the callback ends. Rejects with a [`TransactionError`](#transactionerror) if the transaction is already complete.
@@ -834,6 +907,28 @@ try {
 | `origin` | `"server" \| "cas"` | Who assigned `code`. The database server and the CAS process number their errors in ranges that overlap, so compare a code together with its origin. Only `server` codes have a `kind`. |
 | `kind` | `CubridErrorKind` | Classification of a known failure. |
 | `sqlState` | `string` | Never set by this driver: CAS error replies carry no SQLSTATE and CUBRID documents no mapping from its codes. It stays available for a custom `connectionFactory` that has a real value to report. |
+| `batch` | `ExecuteManyFailure` | Set only when [`executeMany()`](#executemanysql-paramsets-options) failed because the server reported a parameter set as failed. `code`, `origin` and `kind` are then the first failed set's. |
+
+```ts
+interface ExecuteManyFailure {
+  /** One entry per set: its affected rows, or null when it failed or never ran. */
+  results: ReadonlyArray<number | null>;
+  /** Every failed set, in order. */
+  failures: readonly ExecuteManySetFailure[];
+  /** Sets the server ran, with or without error; the rest never ran. */
+  executed: number;
+  /** true: the batch was rolled back (autocommit). false: still in the caller's transaction. */
+  rolledBack: boolean;
+}
+
+interface ExecuteManySetFailure {
+  index: number; // position in paramSets
+  code: number;
+  origin?: "server" | "cas";
+  kind?: CubridErrorKind;
+  message: string;
+}
+```
 
 ```ts
 import { QueryError, TransactionError } from "cubrid-client";
@@ -1065,6 +1160,11 @@ interface ConnectionLike {
     options?: QueryOptions,
   ): Promise<QueryResult<T>>;
   execute?(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
+  executeMany?(
+    sql: string,
+    paramSets: readonly QueryParams[],
+    options?: QueryOptions,
+  ): Promise<ExecuteManyResult>;
   setTransactionOptions?(options: TransactionOptions): Promise<void>;
   stream?<T extends QueryResultRow = QueryResultRow>(
     sql: string,
@@ -1080,7 +1180,7 @@ interface ConnectionLike {
 
 `setTransactionOptions` is optional too, but it decides whether settings work. The client calls it on a new connection before anything else when `isolationLevel` or `lockTimeout` is in effect, and only then. Without it such a client or transaction fails rather than running without the setting. An implementation must keep the setting on every session it opens, and `NativeCubridAdapter` does. Options it is not given keep their value. The built-in adapter rejects the call inside a transaction, because changing the level there would change the running transaction.
 
-`queryResult`, `execute` and `stream` are optional so existing custom adapters keep compiling. The client passes [`QueryOptions`](#queryoptions) as the last argument of each statement method; an implementation that declares fewer parameters still compiles, and then ignores them. Calling `queryResult()` or `execute()` on a client or transaction fails when its connection does not provide it, and so does the first read of `stream()`.
+`queryResult`, `execute` and `stream` are optional so existing custom adapters keep compiling. The client passes [`QueryOptions`](#queryoptions) as the last argument of each statement method; an implementation that declares fewer parameters still compiles, and then ignores them. Calling `queryResult()`, `execute()` or `executeMany()` on a client or transaction fails when its connection does not provide it, and so does the first read of `stream()`. `executeMany()` never falls back to one statement per set.
 
 ### Queryable
 
@@ -1168,7 +1268,7 @@ interface StreamOptions {
 
 ### QueryOptions
 
-The optional last argument of `query()`, `queryResult()`, `execute()`, `queryPrepared()`, `queryResultPrepared()` and `executePrepared()`, on the client, `tx` and a transaction scope. See [Cancelling one statement](#cancelling-one-statement).
+The optional last argument of `query()`, `queryResult()`, `execute()`, `queryPrepared()`, `queryResultPrepared()`, `executePrepared()` and `executeMany()`, on the client, `tx` and a transaction scope. See [Cancelling one statement](#cancelling-one-statement).
 
 ```ts
 interface QueryOptions {
@@ -1197,6 +1297,22 @@ interface ExecuteResult {
 |-------|-------------|
 | `affectedRows` | Rows changed by `INSERT`, `UPDATE`, `DELETE` or `MERGE`, summed over a multi-statement string; 0 for DDL, `SELECT` and a statement that matched nothing. |
 | `lastInsertId` | The generated `AUTO_INCREMENT` value after an `INSERT`: a `number` if it is a safe integer, otherwise a `bigint`. Absent when no value was generated. For a multi-row `INSERT` it is the first generated id. |
+
+### ExecuteManyResult
+
+The outcome of [`executeMany()`](#executemanysql-paramsets-options), reported only when every set succeeded.
+
+```ts
+interface ExecuteManyResult {
+  affectedRows: number;
+  results: number[];
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `affectedRows` | Rows changed by all sets together. |
+| `results` | Rows each set changed, in the order of `paramSets`; 0 for a set that matched nothing. |
 
 ### TransactionClient (Interface)
 
@@ -1249,6 +1365,28 @@ A `TransactionClient` that can also bind on the server. It is a separate type so
 interface PreparedTransactionClient extends TransactionClient, PreparedQueryable {}
 ```
 
+### BatchExecutable
+
+Interface for any object that can run [`executeMany()`](#executemanysql-paramsets-options). `CubridClient` and `CubridTransaction` implement it.
+
+```ts
+interface BatchExecutable {
+  executeMany(
+    sql: string,
+    paramSets: readonly QueryParams[],
+    options?: QueryOptions,
+  ): Promise<ExecuteManyResult>;
+}
+```
+
+### BatchTransactionClient
+
+A `TransactionClient` that can also run `executeMany()`. It is a separate type so that code implementing `TransactionClient` keeps compiling.
+
+```ts
+interface BatchTransactionClient extends TransactionClient, BatchExecutable {}
+```
+
 ### TransactionCallback
 
 Type for the callback function passed to `transaction()`.
@@ -1268,7 +1406,7 @@ The transaction client that `transaction()` passes to its callback: a `Transacti
 interface ResultTransactionClient extends TransactionClient, ResultQueryable {}
 ```
 
-`CubridClient.transaction()` accepts a `TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient>`, so the callback's `tx` has `queryResult()` and `execute()`; a callback written against `TransactionClient` is still accepted.
+`CubridClient.transaction()` accepts a `TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient & BatchTransactionClient>`, so the callback's `tx` has `queryResult()`, `execute()`, the prepared methods and `executeMany()`; a callback written against `TransactionClient` is still accepted.
 
 ### TransactionScope
 
@@ -1278,7 +1416,8 @@ The handle [`beginTransactionScope()`](#begintransactionscopeoptions) returns. I
 interface TransactionScope
   extends ResultTransactionClient,
     ExecutableTransactionClient,
-    PreparedTransactionClient {}
+    PreparedTransactionClient,
+    BatchTransactionClient {}
 ```
 
 ### QueryParam

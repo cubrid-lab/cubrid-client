@@ -40,6 +40,11 @@ test("a transaction callback written against TransactionClient is still accepted
   assert.equal(await db.transaction(callback), 0);
 });
 
+test("a 1.x TransactionClient needs no executeMany", () => {
+  // Type-level check: executeMany must not become mandatory.
+  assert.equal("executeMany" in minimalTransaction, false);
+});
+
 test("a 1.x TransactionClient has no prepared methods and needs none", () => {
   // Type-level check: the prepared methods must not become mandatory.
   assert.equal("queryPrepared" in minimalTransaction, false);
