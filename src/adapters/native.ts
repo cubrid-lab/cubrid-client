@@ -1293,6 +1293,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     const responsePayload = await cas.sendAndRecv(header, payload);
 
     return this.withQueryHandle(cas, responsePayload, async () => {
+      // Reads one INT: the timezone option has nothing to apply to.
       const result = parsePrepareAndExecute(responsePayload, cas.protoVersion);
       const firstRow = result.rows[0];
       const length = firstRow ? Number(Object.values(firstRow)[0]) : NaN;

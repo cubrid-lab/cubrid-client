@@ -9,6 +9,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { CubridClient } from "../src/client/client.js";
 import { createClient } from "../src/client/create-client.js";
 import { NativeCubridAdapter } from "../src/adapters/native.js";
 import { normalizeConfig } from "../src/internals/normalize-config.js";
@@ -145,7 +146,14 @@ test("timezone option: accepted values, default and validation", () => {
   for (const timezone of ["UTC", "Z", "+09:00", "Asia/Seoul", ""]) {
     const options = { ...base, timezone } as unknown as ClientOptions;
     assert.throws(() => createClient(options), RangeError, timezone);
-    // The adapter is public and skips normalizeConfig().
+    // CubridClient and the adapter are public and skip normalizeConfig().
+    assert.throws(
+      () => new CubridClient({ ...normalizeConfig(base), timezone } as never, () => {
+        throw new Error("not reached");
+      }),
+      RangeError,
+      timezone,
+    );
     assert.throws(
       () => new NativeCubridAdapter({ ...normalizeConfig(base), timezone } as never),
       RangeError,

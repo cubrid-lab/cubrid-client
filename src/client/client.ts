@@ -4,6 +4,7 @@ import { TransactionError } from "../errors/transaction-error.js";
 import { mapError, toError } from "../internals/map-error.js";
 import {
   assertValidStreamOptions,
+  assertValidTimezone,
   assertValidTransactionOptions,
   pickTransactionOptions,
 } from "../internals/normalize-config.js";
@@ -48,6 +49,7 @@ export class CubridClient implements Queryable, ResultQueryable, Executable, Pre
     private readonly connectionFactory: ConnectionFactory,
   ) {
     assertValidTransactionOptions(config);
+    assertValidTimezone(config.timezone);
   }
 
   async query<T extends QueryResultRow = QueryResultRow>(

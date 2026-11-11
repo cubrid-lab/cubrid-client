@@ -158,8 +158,9 @@ int16, DATETIME seven) followed by the zone as NUL-terminated text.
 - Fields that are not a real date and time (year outside 1 to 9999, a day the month does not have, with leap years checked), a zone that is empty, not valid UTF-8
   or not one NUL-terminated string, and a value that does not fill its cell reject
   as a [malformed reply](#values-that-cannot-be-decoded), also for a zero date, so a damaged zero value is never reported as merely unsupported. The server itself refuses such dates (`Invalid utime`), so this only guards a damaged reply.
-- Plain DATE, TIME, TIMESTAMP and DATETIME are unchanged and still decode to a
-  local-time `Date` ([#113](https://github.com/cubrid-lab/cubrid-client/issues/113)).
+- Plain DATE, TIME, TIMESTAMP and DATETIME decode to a `Date` in the zone set by
+  the [`timezone`](API_REFERENCE.md#clientoptions) option, local by default; see
+  [date and time values](#date-and-time-values).
 
 ## JSON columns
 
@@ -263,8 +264,8 @@ These results were checked on CUBRID 10.2, 11.0, 11.2 and 11.4:
 Do not depend on SET or MULTISET order: CUBRID defines both as unordered.
 
 - **Elements** use the same JavaScript types as result columns of that type,
-  including `bigint` for BIGINT, decimal `string` for NUMERIC, local-time
-  `Date` values ([#113](https://github.com/cubrid-lab/cubrid-client/issues/113))
+  including `bigint` for BIGINT, decimal `string` for NUMERIC, `Date` values
+  decoded in the [`timezone`](#date-and-time-values) zone like columns,
   and `ZonedDateTime` for the [timezone-aware types](#timezone-aware-values).
   ENUM elements are strings, and a `SEQUENCE OF JSON` arrives as string elements.
 - **Empty** collections return `[]`. A NULL column returns `null`.
@@ -368,8 +369,9 @@ statement on both paths, and the markers of all the statements count together.
 
 - A TypeScript row type does not prove the database returned the declared
   type; explicitly validate results that cross trust boundaries.
-- Do not use local-time `Date` decoding as a canonical UTC conversion until
-  [#113](https://github.com/cubrid-lab/cubrid-client/issues/113) is resolved.
+- The default `timezone: "local"` decoding depends on the process `TZ`; use
+  `timezone: "utc"` when values must be the same instants on every host. The
+  default is a 2.0 decision ([#113](https://github.com/cubrid-lab/cubrid-client/issues/113)).
 - The required live broker/version and round-trip evidence is tracked in
   [#95](https://github.com/cubrid-lab/cubrid-client/issues/95).
 

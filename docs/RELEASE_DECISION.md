@@ -56,8 +56,9 @@ SHA and its corresponding run URL into the sign-off section below.
   fallback ([#83](https://github.com/cubrid-lab/cubrid-client/issues/83)). The `logger`
   option now emits redacted diagnostics
   ([#100](https://github.com/cubrid-lab/cubrid-client/issues/100)).
-- CUBRID DATE/DATETIME have no embedded timezone; current decoding is
-  process-timezone-sensitive ([#113](https://github.com/cubrid-lab/cubrid-client/issues/113)).
+- CUBRID DATE/DATETIME have no embedded timezone; decoding is
+  process-timezone-sensitive by default, and `timezone: "utc"` opts into
+  TZ-independent decoding ([#113](https://github.com/cubrid-lab/cubrid-client/issues/113)).
 - Query-scoped deadline/AbortSignal, full transaction ownership and full
   LOB/collection/error parity remain future work
   ([#150](https://github.com/cubrid-lab/cubrid-client/issues/150),
