@@ -365,6 +365,12 @@ How the result differs from the literal path for the same statement:
 An NCHAR column accepts text on neither path. Multi-statement strings run every
 statement on both paths, and the markers of all the statements count together.
 
+`executeMany()` binds every parameter set with these same rules, and refuses the
+whole call, before anything is sent, when one value of any set is refused. Every
+set must have the statement's marker count. It differs in one way: it runs a
+single statement, because the server's EXECUTE_ARRAY runs only the first
+statement of a multi-statement string, so such SQL text is refused.
+
 ## Cautions
 
 - A TypeScript row type does not prove the database returned the declared

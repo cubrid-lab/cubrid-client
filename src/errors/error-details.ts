@@ -32,6 +32,43 @@ export type CubridErrorKind =
   | "read-timeout"
   | "stream-busy";
 
+/** One parameter set of an `executeMany()` call that the server reported as failed. */
+export interface ExecuteManySetFailure {
+  /** Position of the set in `paramSets`. */
+  index: number;
+  /** The server's error code for this set. */
+  code: number;
+  /** Who assigned `code`; see {@link CubridErrorDetails.origin}. */
+  origin?: "server" | "cas";
+  /** Classification of `code`; see {@link CubridErrorKind}. */
+  kind?: CubridErrorKind;
+  /** The server's message for this set. */
+  message: string;
+}
+
+/**
+ * What became of each parameter set when `executeMany()` rejected because the
+ * server reported one or more sets as failed.
+ */
+export interface ExecuteManyFailure {
+  /**
+   * One entry per set in `paramSets`, in order: the rows the set changed when it
+   * ran without error, and `null` when it failed or never ran. A count is what
+   * the server reported before the outcome below, never a committed change.
+   */
+  results: ReadonlyArray<number | null>;
+  /** Every failed set, in order. The error's own `code` and `kind` are the first one's. */
+  failures: readonly ExecuteManySetFailure[];
+  /** Number of sets the server ran, with or without error; the rest never ran. */
+  executed: number;
+  /**
+   * `true` in autocommit mode: the client rolled the whole batch back, so no set
+   * was committed. `false` inside a transaction: the sets that succeeded are still
+   * part of it, uncommitted, and the caller decides whether to roll it back.
+   */
+  rolledBack: boolean;
+}
+
 export interface CubridErrorDetails {
   /** Numeric error code of the CAS error reply. Absent for client-side failures. */
   code?: number;
@@ -49,6 +86,11 @@ export interface CubridErrorDetails {
   sqlState?: string;
   /** Classification of a known failure. Absent when the failure is not classified. */
   kind?: CubridErrorKind;
+  /**
+   * Per-set outcome of an `executeMany()` that failed because the server reported
+   * a parameter set as failed. Absent for every other failure.
+   */
+  batch?: ExecuteManyFailure;
 }
 
 export interface CubridErrorOptions extends ErrorOptions, CubridErrorDetails {}
@@ -59,11 +101,13 @@ export function definedErrorDetails({
   origin,
   sqlState,
   kind,
+  batch,
 }: CubridErrorDetails = {}): CubridErrorDetails {
   return {
     ...(code !== undefined && { code }),
     ...(origin !== undefined && { origin }),
     ...(sqlState !== undefined && { sqlState }),
     ...(kind !== undefined && { kind }),
+    ...(batch !== undefined && { batch }),
   };
 }

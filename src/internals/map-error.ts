@@ -1,7 +1,12 @@
 import { ConnectionError } from "../errors/connection-error.js";
 import type { CubridErrorDetails, CubridErrorOptions } from "../errors/error-details.js";
 import { definedErrorDetails } from "../errors/error-details.js";
-import { CasReplyError, ConnectionLostError, StreamBusyError } from "../errors/internal-errors.js";
+import {
+  CasReplyError,
+  ConnectionLostError,
+  ExecuteManyError,
+  StreamBusyError,
+} from "../errors/internal-errors.js";
 import {
   ConstraintError,
   DeadlockError,
@@ -69,6 +74,7 @@ function findErrorDetails(error: Error): CubridErrorDetails {
 
     if (
       current instanceof CasReplyError ||
+      current instanceof ExecuteManyError ||
       current instanceof ConnectionLostError ||
       current instanceof StreamBusyError ||
       current instanceof QueryError ||

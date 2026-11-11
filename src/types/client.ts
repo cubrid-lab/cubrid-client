@@ -25,14 +25,17 @@ export type ClientLogLevel = "debug" | "info" | "error";
  * parameter values, row data, credentials or error messages.
  */
 export interface ClientLogFields {
-  /** `connection`, `connect`, `query`, `queryResult`, `execute`, `queryPrepared`, `queryResultPrepared`, `executePrepared`, `stream`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`. */
+  /** `connection`, `connect`, `query`, `queryResult`, `execute`, `queryPrepared`, `queryResultPrepared`, `executePrepared`, `executeMany`, `stream`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`. */
   operation?: string;
   host?: string;
   port?: number;
   database?: string;
   /** Elapsed milliseconds of the operation. */
   durationMs?: number;
-  /** Number of bound parameters of a `query`, not their values. */
+  /**
+   * Number of bound parameters of a `query`, not their values. For `executeMany`,
+   * the values of all its parameter sets together.
+   */
   paramCount?: number;
   /** Number of rows a successful `query` returned, or a `stream` handed to its consumer. */
   rowCount?: number;
@@ -170,7 +173,7 @@ export interface ClientOptions {
 
 /**
  * Options of one statement, the optional last argument of `query()`,
- * `queryResult()`, `execute()` and their `Prepared` forms.
+ * `queryResult()`, `execute()`, their `Prepared` forms and `executeMany()`.
  *
  * After an abort or a timeout while the statement was on the wire, its outcome
  * on the server is unknown: it may have run, and in autocommit mode it may be
@@ -298,6 +301,31 @@ export interface PreparedQueryable {
   ): Promise<ExecuteResult>;
 }
 
+/**
+ * Outcome of `executeMany()`. Reported only when every set ran without error.
+ */
+export interface ExecuteManyResult {
+  /** Rows changed by all sets together. */
+  affectedRows: number;
+  /** Rows each set changed, in the order of `paramSets`. */
+  results: number[];
+}
+
+/**
+ * Runs one INSERT, UPDATE, DELETE or MERGE once per parameter set, with
+ * server-side prepared binding: one PREPARE and EXECUTE_ARRAY requests instead
+ * of a round trip per set. See `docs/API_REFERENCE.md` for the failure semantics:
+ * in autocommit mode the batch is all or nothing, and inside a transaction a
+ * failure leaves the transaction to the caller.
+ */
+export interface BatchExecutable {
+  executeMany(
+    sql: string,
+    paramSets: readonly QueryParams[],
+    options?: QueryOptions,
+  ): Promise<ExecuteManyResult>;
+}
+
 export interface TransactionClient extends Queryable {
   commit(): Promise<void>;
   rollback(): Promise<void>;
@@ -332,6 +360,14 @@ export interface ResultTransactionClient extends TransactionClient, ResultQuerya
 export interface PreparedTransactionClient extends TransactionClient, PreparedQueryable {}
 
 /**
+ * The transaction client `CubridClient.transaction()` passes in: a
+ * {@link TransactionClient} that can also run a statement over many parameter
+ * sets. Kept apart from `TransactionClient` so 1.x code that implements that
+ * interface keeps compiling.
+ */
+export interface BatchTransactionClient extends TransactionClient, BatchExecutable {}
+
+/**
  * A manual transaction returned by `CubridClient.beginTransactionScope()`. It owns
  * a dedicated connection, so statements issued on the client meanwhile never join
  * it. Exactly one `commit()` or `rollback()` ends it and closes that connection;
@@ -343,7 +379,8 @@ export interface PreparedTransactionClient extends TransactionClient, PreparedQu
 export interface TransactionScope
   extends ResultTransactionClient,
     ExecutableTransactionClient,
-    PreparedTransactionClient {}
+    PreparedTransactionClient,
+    BatchTransactionClient {}
 
 export interface ConnectionLike {
   connect(): Promise<void>;
@@ -386,6 +423,16 @@ export interface ConnectionLike {
     params?: QueryParams,
     options?: QueryOptions,
   ): Promise<ExecuteResult>;
+  /**
+   * Optional so 1.x connection factories keep compiling. `executeMany()` on a
+   * client or transaction fails when its connection does not provide it, rather
+   * than running the sets one by one.
+   */
+  executeMany?(
+    sql: string,
+    paramSets: readonly QueryParams[],
+    options?: QueryOptions,
+  ): Promise<ExecuteManyResult>;
   beginTransaction(): Promise<void>;
   commit(): Promise<void>;
   rollback(): Promise<void>;

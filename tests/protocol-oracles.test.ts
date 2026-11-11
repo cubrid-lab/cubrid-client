@@ -8,6 +8,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import { CasReplyError } from "../src/errors/internal-errors.js";
 import { CASFunctionCode, CUBRIDDataType, StatementType } from "../src/protocol/constants.js";
 import {
   encodeBindParams,
@@ -15,19 +16,21 @@ import {
   type LobLocator,
   MalformedReplyError,
   parseExecute,
+  parseExecuteArray,
   parseFetch,
   parseLobRead,
   parsePrepare,
   parsePrepareAndExecute,
   UnsupportedValueError,
   writeExecute,
+  writeExecuteArray,
   writeFetch,
   writeLobRead,
   writePrepare,
 } from "../src/protocol/protocol.js";
 import { ZonedDateTime } from "../src/types/zoned-date-time.js";
 import { CAPTURED_FRAMES, type CapturedFrame } from "./fixtures/collection-frames.js";
-import { PREPARED_FRAMES } from "./fixtures/dml-frames.js";
+import { EXECUTE_ARRAY_FRAMES, PREPARED_FRAMES } from "./fixtures/dml-frames.js";
 import { LOB_FRAMES } from "./fixtures/lob-frames.js";
 import { ZONED_FRAMES } from "./fixtures/zoned-frames.js";
 
@@ -123,6 +126,8 @@ test("literal CAS function codes are not CCI values or SQL statement IDs", () =>
   assert.equal(CASFunctionCode.FETCH, 8);
   assert.equal(CASFunctionCode.GET_LAST_INSERT_ID, 40);
   assert.equal(CASFunctionCode.PREPARE_AND_EXECUTE, 41);
+  // CAS_FC_EXECUTE_ARRAY in cas_protocol.h; JDBC's EXECUTE_BATCH_PREPAREDSTATEMENT.
+  assert.equal(CASFunctionCode.EXECUTE_ARRAY, 21);
   const req = writeFetch(7, 0, 10, Buffer.alloc(4));
   assert.equal(req.payload[0], 8);
 });
@@ -1439,4 +1444,90 @@ test("an EXECUTE reply cut off before its column info flag or shard id is malfor
       MalformedReplyError,
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// EXECUTE_ARRAY (function code 21): one prepared handle, many bind sets
+// ---------------------------------------------------------------------------
+
+test("EXECUTE_ARRAY is the request a live broker accepted, byte for byte", () => {
+  const sets = [
+    [1, "a"],
+    [2, "b"],
+    [3, "c"],
+  ].map((set) => encodePreparedParams(set));
+  const { payload } = writeExecuteArray(3, sets, Buffer.alloc(4));
+
+  assert.equal(payload.toString("hex"), EXECUTE_ARRAY_FRAMES.insertThreeRequest);
+  assert.equal(payload[0], 21);
+});
+
+test("an EXECUTE_ARRAY reply gives each set's affected rows", () => {
+  assert.deepEqual(parseExecuteArray(frame(EXECUTE_ARRAY_FRAMES.insertThree), 3, 7), [1, 1, 1]);
+  assert.deepEqual(parseExecuteArray(frame(EXECUTE_ARRAY_FRAMES.insertTwo), 2, 7), [1, 1]);
+  assert.deepEqual(parseExecuteArray(frame(EXECUTE_ARRAY_FRAMES.updateTwoSets), 2, 7), [2, 0]);
+});
+
+test("a failed set in an EXECUTE_ARRAY reply keeps its code, origin and message", () => {
+  for (const hex of [
+    EXECUTE_ARRAY_FRAMES.insertMiddleDuplicate,
+    EXECUTE_ARRAY_FRAMES.insertMiddleDuplicate102,
+  ]) {
+    const [first, failed, last] = parseExecuteArray(frame(hex), 3, 7);
+
+    assert.equal(first, 1);
+    assert.equal(last, 1);
+    assert.ok(failed instanceof CasReplyError);
+    assert.equal(failed.code, -670);
+    assert.equal(failed.origin, "server");
+    assert.equal(failed.kind, "unique-violation");
+    assert.match(failed.message, /^Operation would have caused one or more unique constraint/);
+    assert.doesNotMatch(failed.message, /\0/);
+  }
+});
+
+test("an EXECUTE_ARRAY reply that covers fewer sets than were sent is malformed", () => {
+  assert.throws(
+    () => parseExecuteArray(frame(EXECUTE_ARRAY_FRAMES.insertTwo), 3, 7),
+    MalformedReplyError,
+  );
+  assert.throws(
+    () => parseExecuteArray(frame(EXECUTE_ARRAY_FRAMES.insertThree), 2, 7),
+    MalformedReplyError,
+  );
+});
+
+test("an EXECUTE_ARRAY reply may stop early only after an interrupted set", () => {
+  // Synthetic: the CAS stops after a set that failed with ER_INTERRUPTED (-4).
+  const message = Buffer.from("interrupted\0");
+  const reply = Buffer.concat([
+    i32(0),
+    i32(2),
+    i32(1),
+    Buffer.alloc(8),
+    i32(-2),
+    i32(-4),
+    i32(message.length),
+    message,
+    i32(-2),
+  ]);
+
+  const [done, interrupted] = parseExecuteArray(reply, 3, 7);
+  assert.equal(done, 1);
+  assert.ok(interrupted instanceof CasReplyError);
+  assert.equal(interrupted.kind, "interrupted");
+});
+
+test("an EXECUTE_ARRAY reply cut off inside a set or before its shard id is malformed", () => {
+  const whole = EXECUTE_ARRAY_FRAMES.insertMiddleDuplicate;
+  for (const cut of [whole.length - 8, 120, 40]) {
+    assert.throws(() => parseExecuteArray(frame(whole.slice(0, cut)), 3, 7), MalformedReplyError);
+  }
+});
+
+test("a negative EXECUTE_ARRAY result code is the server's error for the whole request", () => {
+  assert.throws(
+    () => parseExecuteArray(frame(PREPARED_FRAMES.executeCoercionError), 1, 7),
+    (error: unknown) => error instanceof CasReplyError && error.code === -494,
+  );
 });

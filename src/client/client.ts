@@ -8,11 +8,14 @@ import {
   pickTransactionOptions,
 } from "../internals/normalize-config.js";
 import type {
+  BatchExecutable,
+  BatchTransactionClient,
   ClientConfig,
   ConnectionFactory,
   ConnectionLike,
   Executable,
   ExecutableTransactionClient,
+  ExecuteManyResult,
   ExecuteResult,
   PreparedQueryable,
   PreparedTransactionClient,
@@ -39,7 +42,7 @@ import * as schema from "./schema.js";
 import { CallbackTransaction, ScopedTransaction } from "./transaction.js";
 
 export class CubridClient
-  implements Queryable, ResultQueryable, Executable, PreparedQueryable, Streamable
+  implements Queryable, ResultQueryable, Executable, PreparedQueryable, BatchExecutable, Streamable
 {
   private sharedConnectionPromise: Promise<ConnectionLike> | undefined;
   private closed = false;
@@ -163,6 +166,38 @@ export class CubridClient
   }
 
   /**
+   * Run one INSERT, UPDATE, DELETE or MERGE once per parameter set, with
+   * server-side prepared binding: one PREPARE, then one EXECUTE_ARRAY request
+   * for every set (several for a batch over about 1 MiB of values), instead of
+   * a round trip per set. `results` holds each set's affected rows, in order.
+   *
+   * On this client, which runs in autocommit mode, the batch is all or nothing:
+   * it is committed only when every set succeeded. Otherwise it is rolled back
+   * and rejects with a `QueryError` whose `batch` reports every set's outcome.
+   * An empty `paramSets` resolves `{ affectedRows: 0, results: [] }` and sends
+   * nothing. A SELECT, SQL holding more than one statement, a statement without
+   * a `?` marker and a set whose size is not the statement's marker count are
+   * refused. Nothing is retried. See `docs/API_REFERENCE.md`.
+   */
+  executeMany(
+    sql: string,
+    paramSets: readonly QueryParams[],
+    options?: QueryOptions,
+  ): Promise<ExecuteManyResult> {
+    return runStatement(
+      options,
+      "Statement failed.",
+      () => this.getSharedConnection(),
+      (connection) => {
+        if (!connection.executeMany) {
+          throw new Error("Underlying connection does not support executeMany.");
+        }
+        return connection.executeMany(sql, paramSets, options);
+      },
+    );
+  }
+
+  /**
    * Run a statement and read its rows one at a time with `for await`, holding at
    * most one server reply of rows in memory. Nothing is sent before the first read.
    *
@@ -239,7 +274,10 @@ export class CubridClient
   async transaction<T>(
     callback: TransactionCallback<
       T,
-      ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient
+      ResultTransactionClient &
+        ExecutableTransactionClient &
+        PreparedTransactionClient &
+        BatchTransactionClient
     >,
     options?: TransactionOptions,
   ): Promise<T> {

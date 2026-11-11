@@ -472,3 +472,26 @@ test("logger reports the prepared methods without SQL, parameters or rows", asyn
   assert.equal(logged.includes(PARAM), false);
   assert.equal(logged.includes(ROW_VALUE), false);
 });
+
+test("logger reports executeMany with the number of values, never the values", async () => {
+  const { logger, entries } = recorder();
+  const connection = fakeConnection();
+  connection.executeMany = async () => ({ affectedRows: 2, results: [1, 1] });
+  const c = client(logger, connection);
+  const sql = `INSERT INTO t VALUES ('${SQL_LITERAL}', ?, ?)`;
+
+  assert.deepEqual(
+    await c.executeMany(sql, [
+      [PARAM, 1],
+      [PARAM, 2],
+    ]),
+    { affectedRows: 2, results: [1, 1] },
+  );
+
+  const entry = entries.find((e) => e.fields.operation === "executeMany");
+  assert.equal(entry?.level, "debug");
+  assert.equal(entry?.fields.paramCount, 4);
+  const logged = JSON.stringify(entries);
+  assert.equal(logged.includes(SQL_LITERAL), false);
+  assert.equal(logged.includes(PARAM), false);
+});

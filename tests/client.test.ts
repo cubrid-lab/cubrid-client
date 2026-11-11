@@ -4,7 +4,11 @@ import { CubridClient } from "../src/client/client.js";
 import { createClient } from "../src/client/create-client.js";
 import { CubridTransaction } from "../src/client/transaction.js";
 import { ConnectionError } from "../src/errors/connection-error.js";
-import { CasReplyError, ConnectionLostError } from "../src/errors/internal-errors.js";
+import {
+  CasReplyError,
+  ConnectionLostError,
+  ExecuteManyError,
+} from "../src/errors/internal-errors.js";
 import {
   ConstraintError,
   DeadlockError,
@@ -18,8 +22,10 @@ import { mapError } from "../src/internals/map-error.js";
 import { normalizeConfig } from "../src/internals/normalize-config.js";
 import { MalformedReplyError, UnsupportedValueError } from "../src/protocol/protocol.js";
 import type {
+  BatchTransactionClient,
   ClientOptions,
   ConnectionLike,
+  ExecuteManyResult,
   ExecuteResult,
   PreparedTransactionClient,
   QueryOptions,
@@ -3165,4 +3171,114 @@ test("the logging wrapper forwards QueryOptions", async () => {
     connection.calls.map(([method, , , forwarded]) => [method, forwarded]),
     QUERY_METHODS.map((method) => [method, options]),
   );
+});
+
+// ---------------------------------------------------------------------------
+// executeMany(): forwarded to the connection, never emulated (#86)
+// ---------------------------------------------------------------------------
+
+test("executeMany reaches the connection's own on a client, in transaction() and in a scope", async () => {
+  const calls: string[] = [];
+  const connection = Object.assign(new FakeConnection(), {
+    async executeMany(sql: string, paramSets: readonly QueryParams[]): Promise<ExecuteManyResult> {
+      calls.push(`${sql} ${paramSets.length}`);
+      return { affectedRows: paramSets.length, results: paramSets.map(() => 1) };
+    },
+  });
+  const client = createClient(baseOptions({ connectionFactory: () => connection }));
+
+  assert.deepEqual(await client.executeMany("a", [[1], [2]]), {
+    affectedRows: 2,
+    results: [1, 1],
+  });
+  await client.transaction(async (tx) => {
+    await tx.executeMany("b", [[1]]);
+  });
+  const scope = await client.beginTransactionScope();
+  await scope.executeMany("c", [[1], [2], [3]]);
+  await scope.commit();
+
+  assert.deepEqual(calls, ["a 2", "b 1", "c 3"]);
+  assert.deepEqual(connection.queries, []);
+});
+
+test("executeMany never falls back to one statement per set on a connection without it", async () => {
+  const connection = new FakeConnection();
+  const client = createClient(baseOptions({ connectionFactory: () => connection }));
+
+  await assert.rejects(
+    client.executeMany("INSERT INTO t VALUES (?)", [[1]]),
+    (error: Error) =>
+      error instanceof QueryError &&
+      error.cause instanceof Error &&
+      error.cause.message === "Underlying connection does not support executeMany.",
+  );
+  const inTransaction = (tx: BatchTransactionClient) =>
+    tx.executeMany("INSERT INTO t VALUES (?)", [[1]]);
+  await assert.rejects(() => client.transaction(inTransaction), TransactionError);
+  assert.deepEqual(connection.queries, []);
+});
+
+test("tx.executeMany after the transaction completed rejects and sends nothing", async () => {
+  let sent = 0;
+  const connection = Object.assign(new FakeConnection(), {
+    async executeMany(): Promise<ExecuteManyResult> {
+      sent += 1;
+      return { affectedRows: 0, results: [] };
+    },
+  });
+  const client = createClient(baseOptions({ connectionFactory: () => connection }));
+
+  await client.transaction(async (tx) => {
+    await tx.commit();
+    await assert.rejects(tx.executeMany("INSERT INTO t VALUES (?)", [[1]]), TransactionError);
+  });
+  assert.equal(sent, 0);
+});
+
+test("a failed set keeps its per-set detail through a transaction and its rollback", async () => {
+  const batch = {
+    results: [1, null],
+    failures: [
+      {
+        index: 1,
+        code: -670,
+        origin: "server" as const,
+        kind: "unique-violation" as const,
+        message: "duplicate",
+      },
+    ],
+    executed: 2,
+    rolledBack: false,
+  };
+  const connection = Object.assign(new FakeConnection(), {
+    async executeMany(): Promise<ExecuteManyResult> {
+      throw mapError(
+        "query",
+        new ExecuteManyError(new CasReplyError("duplicate", -2, -670), batch, []),
+        "Failed to execute CUBRID batch.",
+      );
+    },
+  });
+  const client = createClient(baseOptions({ connectionFactory: () => connection }));
+
+  const scope = await client.beginTransactionScope();
+  await assert.rejects(scope.executeMany("INSERT INTO t VALUES (?)", [[1], [1]]), (error) => {
+    assert.ok(error instanceof TransactionError);
+    assert.equal(error.kind, "unique-violation");
+    assert.deepEqual(error.batch, batch);
+    return true;
+  });
+  await scope.rollback();
+
+  await assert.rejects(
+    client.transaction((tx) => tx.executeMany("INSERT INTO t VALUES (?)", [[1], [1]])),
+    (error) => {
+      assert.ok(error instanceof TransactionError);
+      assert.deepEqual(error.batch, batch);
+      return true;
+    },
+  );
+  assert.equal(connection.rollbackCalls, 2);
+  assert.equal(connection.commitCalls, 0);
 });

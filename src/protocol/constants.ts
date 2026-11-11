@@ -69,6 +69,7 @@ export enum CASFunctionCode {
   SCHEMA_INFO = 9,
   GET_DB_VERSION = 15,
   EXECUTE_BATCH = 20,
+  EXECUTE_ARRAY = 21,
   CON_CLOSE = 31,
   CHECK_CAS = 32,
   LOB_READ = 37,

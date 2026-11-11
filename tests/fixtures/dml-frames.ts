@@ -123,3 +123,58 @@ export const PREPARED_FRAMES = {
     "fffffffefffffe1253656d616e7469633a2043616e6e6f7420636f6572636520686f73742076617220" +
     "746f207479706520696e74656765722e2000",
 } as const;
+
+/**
+ * EXECUTE_ARRAY (function code 21) frames, with the PREPARE replies they follow,
+ * captured byte for byte from cubrid/cubrid:11.4 and 10.2 through a raw socket
+ * client speaking protocol version 7, on a table created with
+ * `CREATE TABLE c_em (id INT PRIMARY KEY, v VARCHAR(20))`. Both servers sent
+ * identical bytes for every frame except two: the text of the -670 message and
+ * the table name in the SELECT metadata, which 10.2 does not qualify with the
+ * owner. The 10.2 duplicate-key reply is kept as `insertMiddleDuplicate102`.
+ * They are literal bytes, never produced by the code under test.
+ */
+export const EXECUTE_ARRAY_FRAMES = {
+  /** `INSERT INTO c_em (id, v) VALUES (?, ?)`: handle 3, INSERT (0x14), two markers. */
+  prepareInsert: "00000003ffffffff14000000020000000000",
+  /** The request that ran `[[1, "a"], [2, "b"], [3, "c"]]` on handle 3: function code 21,
+   * the handle, query timeout 0, autocommit 0, then one (type, value) pair per marker per set. */
+  insertThreeRequest:
+    "150000000400000003000000040000000000000001000000000108000000040000000100000001010000" +
+    "000261000000000108000000040000000200000001010000000262000000000108000000040000000300" +
+    "00000101000000026300",
+  /** Result code 0, three sets, each 1 row and an 8-byte OID, then the shard id. */
+  insertThree:
+    "000000000000000300000001000000000000000000000001000000000000000000000001000000000000" +
+    "0000fffffffe",
+  /** `[[4, "d"], [5, "e"]]`: two sets of one row each. */
+  insertTwo: "0000000000000002000000010000000000000000000000010000000000000000fffffffe",
+  /** `[[6, "f"], [1, "dup"], [7, "g"]]`: the second set hits the primary key. Its entry is
+   * the DBMS indicator -2, code -670 and the message; the server went on and ran the third set. */
+  insertMiddleDuplicate:
+    "0000000000000003000000010000000000000000fffffffefffffd62000000aa4f7065726174696f6e20" +
+    "776f756c64206861766520636175736564206f6e65206f72206d6f726520756e6971756520636f6e7374" +
+    "7261696e742076696f6c6174696f6e732e20494e44455820706b5f635f656d5f696428422b747265653a" +
+    "20307c343238387c3432383929204f4e20434c415353206462612e635f656d28434c4153535f4f49443a" +
+    "20307c3139377c39292e206b65793a2031284f49443a20307c343335337c37292e000000000100000000" +
+    "00000000fffffffe",
+  /** The same reply from 10.2: only the message text differs. */
+  insertMiddleDuplicate102:
+    "0000000000000003000000010000000000000000fffffffefffffd62000000a74f7065726174696f6e20" +
+    "776f756c64206861766520636175736564206f6e65206f72206d6f726520756e6971756520636f6e7374" +
+    "7261696e742076696f6c6174696f6e732e20494e44455820706b5f635f656d5f696428422b747265653a" +
+    "20307c333339327c3333393329204f4e20434c41535320635f656d28434c4153535f4f49443a20307c32" +
+    "30327c36292e206b65793a2031284f49443a20307c333435377c3132292e000000000100000000000000" +
+    "00fffffffe",
+  /** `UPDATE c_em SET v = ? WHERE id > ?`: UPDATE (0x16), two markers. */
+  prepareUpdate: "00000003ffffffff16000000020000000000",
+  /** `[["x", 3], ["y", 99]]` over ids 1 to 5: 2 rows, then 0 rows. */
+  updateTwoSets: "0000000000000002000000020000000000000000000000000000000000000000fffffffe",
+  /** `SELECT v FROM c_em WHERE id = ?`: SELECT (0x15), one marker. */
+  prepareSelect:
+    "00000003ffffffff15000000010000000001830200000000001400000002760000000001000000000964" +
+    "62612e635f656d0000000000054e554c4c0000000000000000",
+  /** `INSERT INTO c_em (id, v) VALUES (100, 'z')`: no marker. EXECUTE_ARRAY on it runs nothing
+   * and reports zero sets. */
+  prepareNoMarker: "00000003ffffffff14000000000000000000",
+} as const;

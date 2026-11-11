@@ -7,6 +7,8 @@ export type {
   CubridErrorDetails,
   CubridErrorKind,
   CubridErrorOptions,
+  ExecuteManyFailure,
+  ExecuteManySetFailure,
 } from "./errors/error-details.js";
 export {
   ConstraintError,
@@ -18,6 +20,8 @@ export {
 export { ReadTimeoutError } from "./errors/read-timeout-error.js";
 export { TransactionError } from "./errors/transaction-error.js";
 export type {
+  BatchExecutable,
+  BatchTransactionClient,
   ClientConfig,
   ClientLogFields,
   ClientLogger,
@@ -27,6 +31,7 @@ export type {
   ConnectionLike,
   Executable,
   ExecutableTransactionClient,
+  ExecuteManyResult,
   ExecuteResult,
   IsolationLevel,
   PreparedQueryable,
