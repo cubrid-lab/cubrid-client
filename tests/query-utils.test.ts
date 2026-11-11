@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { findPlaceholders, interpolateParams } from "../src/protocol/protocol.js";
 import { buildWhere, escapeIdentifier } from "../src/utils/query.js";
 
 test("escapeIdentifier wraps names in brackets", () => {
@@ -44,4 +45,22 @@ test("buildWhere keeps values parameterized against SQL injection", () => {
 
   assert.equal(result.clause, "WHERE [name] = ?");
   assert.deepEqual(result.params, [payload]);
+});
+
+test("a ? in a buildWhere identifier is not a marker: only the value is bound", () => {
+  const { clause, params } = buildWhere({ "a?": 42 });
+
+  assert.equal(clause, "WHERE [a?] = ?");
+  for (const mode of [true, false]) {
+    assert.equal(interpolateParams(clause, params, mode), "WHERE [a?] = 42");
+  }
+});
+
+test("a key that closes its bracket cannot hide the marker behind a comment", () => {
+  // CUBRID ends [id] at the first ]: ]] is not an escape, so the server reads a
+  // stray ] (a syntax error) and the client finds no marker for the value.
+  const { clause, params } = buildWhere({ "id] OR 1=1 --": 7 });
+
+  assert.deepEqual(findPlaceholders(clause, true), []);
+  assert.throws(() => interpolateParams(clause, params, true), /Parameter count mismatch/);
 });

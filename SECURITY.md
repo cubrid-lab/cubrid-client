@@ -49,7 +49,14 @@ Examples include:
 
 When using cubrid-client, follow these security best practices:
 
-- Always use parameterized queries to prevent SQL injection
+- Always use parameterized queries to prevent SQL injection. `query()` and
+  `execute()` render the values into the SQL text as escaped literals, and refuse
+  a value or a value count they cannot place safely (see
+  [Sending JavaScript parameters](docs/TYPES.md#sending-javascript-parameters)).
+  `queryPrepared()`, `queryResultPrepared()` and `executePrepared()` send the
+  values as typed binds, so no value ever becomes SQL text
+- Never build identifiers or SQL text from untrusted input: values are the only
+  safe input
 - Keep cubrid-client updated to the latest version
 - Use secure connection parameters when connecting to CUBRID databases
 - Follow the principle of least privilege for database credentials
