@@ -1,6 +1,6 @@
 # Contributing to cubrid-client
 
-**Issue titles:** use a type-only prefix such as `feat:` or `bug:`, without a module scope. **PR and commit titles:** continue to use the existing Conventional Commits format and local validators. See the [shared policy](https://github.com/cubrid-lab/.github/blob/main/docs/ISSUE_PR_COMMIT_STANDARD.md) for evidence, acceptance criteria and triage responsibilities.
+**Issue titles:** use a type-only prefix such as `feat:` or `bug:`, without a module scope. **PR and commit titles:** continue to use the existing Conventional Commits format and local validators. See [AGENTS.md](AGENTS.md) for evidence, acceptance criteria and triage responsibilities.
 
 Thank you for your interest in contributing! This document provides guidelines
 and instructions for contributing to the project.
@@ -16,13 +16,16 @@ and instructions for contributing to the project.
 
 ---
 
+**Supported consumer runtime (1.x):** Node 18 and Node 20 remain supported for the entire `cubrid-client@1.x` line. Developers may use Node 22 (`.nvmrc`) for tools, but must not raise `engines.node` or ship Node >18-only output in a 1.x release. Confirm packed ESM/CJS under Node 18; future runtime-floor changes require a 2.0 MAJOR review. See [ADR 0006](docs/adr/0006-node-18-support-through-1x.md).
+
 ## Development Setup
 
 ### Prerequisites
 
-- Node.js 18 or later
-- Git
-- Docker (for integration tests)
+- Node.js 22 recommended for local development tooling; the published library continues to declare Node.js >=18 for **consumers**
+- Git and npm
+- A separately provisioned disposable CUBRID broker only for actual database integration tests (no root Docker Compose file is included)
+- Setup and known limitations: [Development setup](docs/DEVELOPMENT_SETUP.md)
 
 ### Installation
 
@@ -31,14 +34,26 @@ and instructions for contributing to the project.
 git clone https://github.com/cubrid-lab/cubrid-client.git
 cd cubrid-client
 
-# Install dependencies
-npm install
+# Install locked dependencies reproducibly
+npm ci
 
 # Build
 npm run build
 ```
 
 ---
+
+
+
+## Test-driven implementation
+
+For bug fixes or behavioral features, start from a reviewed interface/SQL/transaction design. Use the [TDD decision](docs/adr/0004-test-first-development.md): **Red** (run a new focused test and capture the genuine target failure), **Green** (smallest production change passing that test), **Refactor** (rerun related tests and final PR CI). In the PR description record the failing assertion/error **actually observed**, the passing assertion, which regressions ran, and whether real CUBRID validation ran or remains unverified. A mock-only pass cannot establish server compatibility; the exact release candidate still requires full live DB validation. No deliberate failing tests or skipped release checks may be left to satisfy the TDD process. For documentation and upstream feasibility work, describe the design/probe evidence rather than forcing an irrelevant Red test. The ADR and design contracts are proposals until reviewed and accepted.
+
+## CUBRID correctness and regression evidence
+
+For changes to CUBRID protocol, connection lifecycle, error handling, results, SQL execution, supported versions or releases, read [this repository's engineering invariants](docs/ENGINEERING_INVARIANTS.md) **before** implementation and review. The checks describe this Node.js driver's own protocol, API, and compatibility requirements. In the pull request, describe the behavioral invariant affected, the normal and failure cases tested, and which checks were offline, real CUBRID or independently compared with JDBC. State the exact CUBRID/runtime/driver versions and test outcomes when claiming database compatibility. **Do not mark tests as passed when they were skipped, missing or never executed.**
+
+For documentation-only or nonbehavioral changes, explain why a database run is unnecessary rather than manufacturing an integration result. The final **release candidate** still follows the repository's full live-CUBRID release gate, separate from ordinary PR path optimization. These expectations supplement, and do not weaken, the established review/CI rules.
 
 ## Running Tests
 
@@ -154,24 +169,16 @@ check that the diff is cosmetic.
 
 ## Code Style
 
-This project uses [Biome](https://biomejs.dev/) for linting and formatting.
-
-### Rules
-
-- **Indent**: Tabs
-- **Line width**: 100 characters
-- **Quote style**: Double quotes
-- **Semicolons**: Always
-
-### Running Checks
+This repository's committed `.editorconfig` specifies 2-space indentation, UTF-8 and LF line endings. `package.json` currently **does not include Biome or an ESLint lint script**; do not run an unpinned `npx biome` installation or claim lint verification. Keep style changes scoped and use the existing build/typecheck/test/API checks until a formatter/linter is explicitly selected in a separate reviewed tooling change.
 
 ```bash
-# Check lint and format
-npx biome check src/ tests/
-
-# Auto-fix
-npx biome check --write src/ tests/
+npm run typecheck
+npm test
+npm run build
+npm run api:check
 ```
+
+See [Development setup](docs/DEVELOPMENT_SETUP.md) for the reproducible baseline and separate live CUBRID tests.
 
 ---
 
@@ -208,10 +215,7 @@ scrutiny. No existing repository CI or release safeguards are waived.
    `npm run build && npm run api:check` (see
    [Public API compatibility](#public-api-compatibility)).
 
-4. **Run lint checks**:
-   ```bash
-   npx biome check src/ tests/
-   ```
+4. **Review formatting and tooling** against `.editorconfig`, and report real validation commands from `package.json`. The repository has no configured Biome command today; do not claim a lint pass from an uninstalled tool.
 
 ### PR Content
 

@@ -43,6 +43,8 @@ See [API stability and compatibility](docs/API_STABILITY.md) for the precise
 contract and migration policy. Version numbers do not establish full live
 CUBRID compatibility; review the version support evidence and release notes.
 
+**Node support policy:** All `cubrid-client@1.x` releases retain Node 18 and Node 20 support. Node 22 is recommended for **building/contributing**, not a higher consumer runtime minimum. Any removal of Node 18 is considered no earlier than a separately reviewed **2.0 MAJOR** release. [ADR 0006](docs/adr/0006-node-18-support-through-1x.md) records this commitment; actual Node 18 packed-artifact tests are required for releases.
+
 ## Installation
 
 ```bash
@@ -522,6 +524,11 @@ graph TD
 ```
 
 ## Development
+
+### Reproducible contributor setup
+
+Use the [development setup guide](docs/DEVELOPMENT_SETUP.md) for the actual language-specific toolchain, clean dependency install, offline tests, **real CUBRID integration readiness** and known setup blockers. The [ADR index](docs/adr/README.md) records proposed release, architecture, TDD and setup decisions. Documentation alone is not a claim that those tests have run or that an unverified runtime/database version is supported.
+
 
 ```bash
 git clone https://github.com/cubrid-lab/cubrid-client.git

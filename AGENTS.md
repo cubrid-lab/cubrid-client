@@ -1,8 +1,8 @@
 # AGENTS.md
 
-## Shared issue and pull request policy
+## Issue and pull request guidance (cubrid-client)
 
-See [cubrid-lab issue, PR, and commit standard](https://github.com/cubrid-lab/.github/blob/main/docs/ISSUE_PR_COMMIT_STANDARD.md). Issues use a simple type-only title (`feat: ...`, `bug: ...`, `docs: ...`) without required module names. Describe the problem or goal, relevant evidence, and a verifiable outcome; keep implementation details provisional. Triage owns validity, duplicates, scope, priority and size. Pull requests and commits use the existing Conventional Commits/CI requirements and document actual changes and checks. Do not include internal agent instructions or personal comments in public issue prose.
+Follow [CONTRIBUTING.md](CONTRIBUTING.md) and the local issue forms. Issues use a simple type-only title (`feat: ...`, `bug: ...`, `docs: ...`) without required module names. Describe the problem or goal, relevant evidence, and a verifiable outcome; keep implementation details provisional. Triage owns validity, duplicates, scope, priority and size. Pull requests and commits use the existing Conventional Commits/CI requirements and document actual changes and checks. Do not include internal agent instructions or personal comments in public issue prose.
 
 
 ## Purpose
@@ -19,6 +19,29 @@ See [cubrid-lab issue, PR, and commit standard](https://github.com/cubrid-lab/.g
 - Preserve typed query ergonomics and transaction behavior unless intentionally redesigning the contract.
 - Prefer compatibility-safe changes because this repo is library code.
 - Add or update tests for any protocol or public client behavior change.
+
+
+
+
+## Node.js 18 compatibility through 1.x
+
+For **every `cubrid-client@1.x` release**, preserve `engines.node >=18` and the existing Node 20 support commitment; see [ADR 0006](docs/adr/0006-node-18-support-through-1x.md) and [API stability](docs/API_STABILITY.md#nodejs-support-schedule). Node 22 is the contributor/toolchain baseline **only**. Validate the actual packed ESM/CJS consumer under Node 18 before a 1.x release. Raising the runtime floor is a separately approved **2.0 MAJOR** consideration, never a 1.x patch/minor workaround.
+
+## Development setup before design and TDD implementation
+
+Use the repository-specific [development setup guide](docs/DEVELOPMENT_SETUP.md) and [setup ADR 0005](docs/adr/0005-development-setup.md) (**Proposed**) before changing driver behavior or development tooling. Verify the **actual** manifest, supported developer toolchain, dependency resolution, read-only offline checks, and availability/absence of real CUBRID integration separately. Do not invent an unavailable Docker Compose file, integration test, lint command, or npm package artifact. A successful unit build is not a successful real-database test or a published package. Record observed setup blockers as issues; do not silently change the published Node.js engine minimum, package exports, or dependency compatibility, weaken CI, or modify release credentials to make onboarding appear green.
+
+## Test-first implementation after architecture review
+
+Before implementing a CUBRID behavior change, check the approved API/SQL/protocol contract and [TDD ADR 0004](docs/adr/0004-test-first-development.md) (**currently Proposed**). Follow **Red → Green → Refactor** in focused slices: execute a deterministic failure for the intended reason first, implement the smallest fix, rerun the case and relevant regressions, then refactor. Explain the initial failure and actual checks in the PR without inventing command output. A final PR must pass its required CI; never keep a deliberately failing regression as proof of Red. Confirm database-dependent behavior through real CUBRID tests and the release candidate matrix; mocks alone cannot certify it. Upstream feasibility prototypes and docs-only changes are exempt from ritual Red steps but must show their own accurate evidence. Release policy and architecture decisions must be approved before classifying design as completed.
+
+## Architecture decisions and release order
+
+Read the [repository ADR index](docs/adr/README.md) before proposing changes to public behavior, release contracts, Node.js driver design, transaction ownership or package compatibility. ADR 0001 records release governance; ADR 0002 records this driver's correctness and evidence requirements; native Node.js architecture ADR 0003 remains **Proposed** in this PR. Do not treat a Proposed ADR as approved. Adopt the release policy before accepting the architecture ADR; require actual tested evidence before claiming implementation or release readiness. Use the [ADR template](docs/adr/TEMPLATE.md) for material new decisions, not for every trivial change.
+
+## CUBRID correctness lessons and native regression review
+
+Before changing protocol, SQL generation, transaction handling, result handling, type codecs, connection recovery or release claims, review [the repository-specific engineering invariants](docs/ENGINEERING_INVARIANTS.md). These requirements address this driver's own CAS protocol and public Node.js/TypeScript contracts. Verify them with repository-specific tests and observed CUBRID behavior. Distinguish mock tests, live CUBRID execution and independent differential evidence; never claim a check ran without its actual CI result. For an unrelated docs-only change, the checklist is advisory and does not mandate unnecessary database jobs. Existing repository review and merge requirements remain authoritative.
 
 ## Development Workflow (cubrid-lab org standard)
 
@@ -82,7 +105,7 @@ documentation, presentations, and other maintainer-facing writing.
   Do not substitute `P1`/`P2` for repository priority labels.
 - When an internal identifier is necessary for accurate cross-reference,
   **describe the subject first**, then add the identifier in context:
-  `pycubrid introduction (0:20; storyboard shot P1)`. Use descriptive
+  `driver introduction (0:20; storyboard shot 1)`. Use descriptive
   names and timestamps, section titles, or paths wherever practical.
 - Use natural, actionable wording. Prefer `Listen to the full narration and
   verify the pronunciation of each project name` to `Maintainer full listen`.
@@ -97,15 +120,13 @@ documentation, presentations, and other maintainer-facing writing.
   separate lookup table. Edit an existing editable comment to correct unclear
   wording rather than adding redundant follow-up comments.
 
-This is a shared writing convention, not a new CI check, reviewer approval,
-or merge gate. Keep existing repository-specific technical and safety rules.
+These are local writing expectations, not a new CI check, reviewer approval,
+or merge gate. This repository's TypeScript API, CAS protocol, test and release requirements remain authoritative.
 
 ### Self-explanatory code comments, tests and review text
 
 Source comments, test names and test comments, examples, PR descriptions
-and review replies follow the organization rule in
-[Explanations in code, tests, reviews and agent-written text](https://github.com/cubrid-lab/.github/blob/main/docs/ISSUE_PR_COMMIT_STANDARD.md#6-explanations-in-code-tests-reviews-and-agent-written-text)
-(section 6 of the shared standard; it is linked here, not copied). In short:
+and review replies follow the local explanation rule below:
 say what happens, why it matters and which constraint applies, then add an
 issue number or scenario code only for traceability. The TLS upgrade comment
 on `upgradeToTls` in `src/protocol/connection.ts` is a good local model: it
@@ -140,3 +161,7 @@ issues because their own events may not trigger this workflow.
 
 This process never guesses issue urgency or creates another PR gate. Existing
 quality, security and release expectations still apply.
+
+## Repository ownership for issues and pull requests
+
+This repository owns the Node.js/TypeScript CAS driver and its npm-published API, transaction/error and compatibility contracts. Issue and PR titles, descriptions, ADR rationale and release claims must describe this package's own observable behavior and tests; do not present another project's design, incident history, roadmap or language-specific policy as governing authority. A linked external implementation can provide independent comparison evidence only. An actual npm consumer/adapter dependency may be cited by its tested public contract, not as an implementation or release prerequisite. Review issue/PR body, ADR, contributor guides, and release notes for misplaced project names before merge; do not block legitimate verified JDBC comparisons.
