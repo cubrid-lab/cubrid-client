@@ -39,12 +39,14 @@ import {
   EndTranType,
   ISOLATION_LEVEL_CODES,
   LOB_READ_CHUNK_SIZE,
+  LOB_WRITE_CHUNK_SIZE,
   StatementType,
   TYPE_NAMES,
 } from "../protocol/constants.js";
 import {
   assertPreparableSql,
   assertSingleStatement,
+  bindLobHandles,
   type ColumnMeta,
   encodePreparedParams,
   interpolateParams,
@@ -57,12 +59,15 @@ import {
   parseExecuteArray,
   parseFetch,
   parseGetLastInsertId,
+  parseLobNew,
   parseLobRead,
+  parseLobWrite,
   parsePrepare,
   parsePrepareAndExecute,
   parseSimpleResponse,
   readQueryHandle,
   setColumn,
+  setLobHandleSize,
   UnsupportedValueError,
   writeCloseReqHandle,
   writeConClose,
@@ -71,7 +76,9 @@ import {
   writeExecuteArray,
   writeFetch,
   writeGetLastInsertId,
+  writeLobNew,
   writeLobRead,
+  writeLobWrite,
   writePrepare,
   writePrepareAndExecute,
 } from "../protocol/protocol.js";
@@ -83,6 +90,16 @@ import type {
   StreamOptions,
   TransactionOptions,
 } from "../types/client.js";
+import {
+  consumeSource,
+  isLobParam,
+  isStreamSource,
+  type LobParam,
+  LobParamError,
+  lobChunks,
+  type PreparedQueryParam,
+  refuseLobParams,
+} from "../types/lob.js";
 import type { QueryParams } from "../types/query.js";
 import type { ColumnInfo, QueryResult, QueryResultRow } from "../types/result.js";
 import type { DriverAdapter } from "./base.js";
@@ -266,6 +283,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     options?: QueryOptions,
   ): Promise<QueryResult<T>> {
     assertValidQueryOptions(options);
+    refuseLobParams(params);
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
     return this.inTurn(
@@ -287,6 +305,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     options?: StreamOptions,
   ): AsyncGenerator<T, void, undefined> {
     assertValidStreamOptions(options);
+    refuseLobParams(params);
     return this.streamRows<T>(sql, params, options);
   }
 
@@ -336,6 +355,7 @@ export class NativeCubridAdapter implements DriverAdapter {
 
   async execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult> {
     assertValidQueryOptions(options);
+    refuseLobParams(params);
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
     return this.inTurn(
@@ -348,7 +368,7 @@ export class NativeCubridAdapter implements DriverAdapter {
 
   async queryPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
-    params?: QueryParams,
+    params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
   ): Promise<T[]> {
     return (await this.queryResultPrepared<T>(sql, params, options)).rows;
@@ -356,7 +376,7 @@ export class NativeCubridAdapter implements DriverAdapter {
 
   async queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
-    params?: QueryParams,
+    params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
   ): Promise<QueryResult<T>> {
     assertValidQueryOptions(options);
@@ -366,14 +386,14 @@ export class NativeCubridAdapter implements DriverAdapter {
     return this.inTurn(
       "query",
       QUERY_FAILED,
-      () => this.queryNow<T>(sql, params, issued, binds),
+      () => this.queryNow<T>(sql, undefined, issued, binds),
       options,
     );
   }
 
   async executePrepared(
     sql: string,
-    params?: QueryParams,
+    params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
   ): Promise<ExecuteResult> {
     assertValidQueryOptions(options);
@@ -383,7 +403,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     return this.inTurn(
       "query",
       "Failed to execute CUBRID statement.",
-      () => this.executeNow(sql, params, issued, binds),
+      () => this.executeNow(sql, undefined, issued, binds),
       options,
     );
   }
@@ -1282,9 +1302,70 @@ export class NativeCubridAdapter implements DriverAdapter {
       );
     }
 
-    const { header, payload } = writeExecute(statement, binds, cas.casInfo);
+    const ready = binds.lobs ? await this.uploadLobs(cas, generation, binds) : binds;
+    const { header, payload } = writeExecute(statement, ready, cas.casInfo);
     const reply = await this.exchangeOnSession(cas, generation, header, payload);
     return parseExecute(reply, statement, cas.protoVersion, this.utcDates);
+  }
+
+  /**
+   * Uploads every blob() and clob() parameter of `binds` on the session that
+   * prepared the statement, after PREPARE so bad SQL fails before any upload, and
+   * returns the binds with each LOB's handle in place. The LOBs belong to the
+   * statement's transaction: runOnSession() commits or rolls back an autocommit
+   * statement, and a caller's transaction stays the caller's. A handle is never
+   * reused: each statement creates its own.
+   */
+  private async uploadLobs(
+    cas: CASConnection,
+    generation: number,
+    binds: PreparedBinds,
+  ): Promise<PreparedBinds> {
+    const handles: Buffer[] = [];
+    for (const { param } of binds.lobs ?? []) {
+      handles.push(await this.uploadLob(cas, generation, param));
+    }
+    return bindLobHandles(binds, handles);
+  }
+
+  /**
+   * LOB_NEW, then one LOB_WRITE per LOB_WRITE_CHUNK_SIZE bytes, each checked to
+   * have stored everything sent. The source is read only as fast as the writes
+   * are answered, and the handle EXECUTE gets states the size written.
+   */
+  private async uploadLob(
+    cas: CASConnection,
+    generation: number,
+    param: LobParam,
+  ): Promise<Buffer> {
+    consumeSource(param.source);
+    const type = param.kind === "blob" ? CUBRIDDataType.BLOB : CUBRIDDataType.CLOB;
+    const chunks = lobChunks(param, LOB_WRITE_CHUNK_SIZE);
+    let handle: Buffer;
+    let offset = 0;
+    try {
+      const created = writeLobNew(type, cas.casInfo);
+      handle = parseLobNew(
+        await this.exchangeOnSession(cas, generation, created.header, created.payload),
+        type,
+      );
+      for (;;) {
+        // The signal also stops a wait on the source, not only on the server.
+        const next = await cas.awaitScoped(chunks.next());
+        if (next.done) {
+          break;
+        }
+        const { header, payload } = writeLobWrite(handle, offset, next.value, cas.casInfo);
+        const reply = await this.exchangeOnSession(cas, generation, header, payload);
+        offset += parseLobWrite(reply, next.value.length);
+      }
+    } catch (error) {
+      // Not awaited: a source that never yields would hold the statement.
+      chunks.return(undefined).catch(() => undefined);
+      destroySource(param);
+      throw error;
+    }
+    return setLobHandleSize(handle, offset);
   }
 
   private async exchangeOnSession(
@@ -1865,7 +1946,7 @@ export class NativeCubridAdapter implements DriverAdapter {
  */
 function bindOrRefuse(
   sql: string,
-  params: QueryParams | undefined,
+  params: readonly PreparedQueryParam[] | undefined,
   message: string,
 ): PreparedBinds {
   try {
@@ -1893,6 +1974,12 @@ function bindManyOrRefuse(sql: string, paramSets: readonly QueryParams[]): Prepa
       if (!Array.isArray(params)) {
         throw new TypeError(`parameter set ${index} is not an array`);
       }
+      if (params.some(isLobParam)) {
+        throw new LobParamError(
+          `parameter set ${index} holds a blob() or clob() value, which executeMany() cannot ` +
+            "send; use executePrepared() for each row",
+        );
+      }
       return encodePreparedParams(params);
     });
     const mismatch = sets.findIndex((set) => set.count !== sets[0]!.count);
@@ -1917,6 +2004,14 @@ function requestEnd(sets: readonly PreparedBinds[], start: number): number {
     end++;
   }
   return end;
+}
+
+/** A stream source is read only once, so a failed upload releases one that can be destroyed. */
+function destroySource(param: LobParam): void {
+  const source = param.source as { destroy?: unknown };
+  if (isStreamSource(param.source) && typeof source.destroy === "function") {
+    (source.destroy as () => void).call(source);
+  }
 }
 
 function toColumnInfo(column: ColumnMeta): ColumnInfo {

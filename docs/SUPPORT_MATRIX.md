@@ -95,6 +95,18 @@ batch and an abort during a lock wait
 the same EXECUTE_ARRAY frames apart from error message text. 11.0 and 11.2 were
 not run.
 
+BLOB and CLOB writes (`blob()` and `clob()` on the prepared methods, LOB_NEW and
+LOB_WRITE) are asserted against local `cubrid/cubrid` 10.2, 11.0, 11.2 and 11.4
+containers, 9/9 cases on each: an 8 MiB BLOB from a `Buffer` and from a `Readable`
+read back byte for byte, a CLOB with 3- and 4-byte characters across the 128 KiB
+boundary, an empty BLOB against NULL, an autocommit failure after a LOB_WRITE with
+the session reused, `scope.rollback()`, an abort while waiting on the source and
+one with a LOB_WRITE in flight, a commit after a failed upload in a transaction,
+and the refusal on the literal path
+([#103](https://github.com/cubrid-lab/cubrid-client/issues/103)). The LOB_NEW and
+LOB_WRITE frames were captured from 10.2 and 11.4 and differ only in the locator
+text.
+
 The `isolationLevel` and `lockTimeout` options are asserted the same way against
 local `cubrid/cubrid` 10.2, 11.0, 11.2 and 11.4 containers: the level read back from
 the server, what each level shows of a concurrent commit, the `-1158` conflict, write

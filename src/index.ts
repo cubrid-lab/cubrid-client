@@ -47,6 +47,8 @@ export type {
   TransactionOptions,
   TransactionScope,
 } from "./types/client.js";
+export type { BlobSource, ClobSource, LobParam, PreparedQueryParam } from "./types/lob.js";
+export { blob, clob } from "./types/lob.js";
 export type { QueryParam, QueryParams } from "./types/query.js";
 export type {
   CollectionElement,

@@ -1,5 +1,40 @@
+import { Readable } from 'node:stream';
+
 type QueryParam = string | number | boolean | bigint | Date | Buffer | null;
 type QueryParams = readonly QueryParam[];
+
+/** Content for {@link blob}: bytes, or a stream of byte chunks read once. */
+type BlobSource = Buffer | Uint8Array | AsyncIterable<Buffer | Uint8Array> | Readable;
+/**
+ * Content for {@link clob}: text, UTF-8 bytes, or a stream of either read once.
+ * Bytes must be valid UTF-8 and text must not hold a lone surrogate.
+ */
+type ClobSource = string | Buffer | AsyncIterable<string | Buffer | Uint8Array> | Readable;
+/**
+ * A BLOB or CLOB parameter, made by {@link blob} or {@link clob}. The prepared
+ * methods upload its content with LOB_NEW and LOB_WRITE before the statement
+ * runs; every other method refuses it with a TypeError before anything is sent.
+ */
+interface LobParam {
+    readonly kind: "blob" | "clob";
+    readonly source: BlobSource | ClobSource;
+}
+/** A parameter of `queryPrepared()`, `queryResultPrepared()` and `executePrepared()`. */
+type PreparedQueryParam = QueryParam | LobParam;
+/**
+ * A BLOB parameter for the prepared methods. A Buffer or Uint8Array is sent as
+ * it is and can be used again; an empty one is an empty BLOB, not NULL. An
+ * AsyncIterable or Readable is read once, chunk by chunk, while the statement
+ * runs. A plain Buffer parameter, without blob(), still binds as VARBIT.
+ */
+declare function blob(source: BlobSource): LobParam;
+/**
+ * A CLOB parameter for the prepared methods, stored as UTF-8. A string is
+ * encoded, a Buffer must already be UTF-8, and an AsyncIterable or Readable may
+ * yield either and is read once. Content that is not valid UTF-8 or text with a
+ * lone surrogate fails the statement with a TypeError, and nothing is stored.
+ */
+declare function clob(source: ClobSource): LobParam;
 
 /** The CUBRID type a {@link ZonedDateTime} was read from. */
 type ZonedDateTimeType = "TIMESTAMPTZ" | "TIMESTAMPLTZ" | "DATETIMETZ" | "DATETIMELTZ";
@@ -350,9 +385,9 @@ interface Executable {
  * docs/TYPES.md. The methods without `Prepared` keep rendering SQL literals.
  */
 interface PreparedQueryable {
-    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
-    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
-    executePrepared(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
+    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<T[]>;
+    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<QueryResult<T>>;
+    executePrepared(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<ExecuteResult>;
 }
 /**
  * Outcome of `executeMany()`. Reported only when every set ran without error.
@@ -439,9 +474,9 @@ interface ConnectionLike {
      * on a client or transaction fail when their connection does not provide
      * them, rather than falling back to SQL literals.
      */
-    queryPrepared?<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
-    queryResultPrepared?<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
-    executePrepared?(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
+    queryPrepared?<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<T[]>;
+    queryResultPrepared?<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<QueryResult<T>>;
+    executePrepared?(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<ExecuteResult>;
     /**
      * Optional so 1.x connection factories keep compiling. `executeMany()` on a
      * client or transaction fails when its connection does not provide it, rather
@@ -551,9 +586,9 @@ declare class NativeCubridAdapter implements DriverAdapter {
     stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncGenerator<T, void, undefined>;
     private streamRows;
     execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
-    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
-    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
-    executePrepared(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
+    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<T[]>;
+    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<QueryResult<T>>;
+    executePrepared(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<ExecuteResult>;
     /**
      * Runs one INSERT, UPDATE, DELETE or MERGE once per set in `paramSets`: one
      * PREPARE, then EXECUTE_ARRAY requests on that handle, split by size, each
@@ -693,6 +728,21 @@ declare class NativeCubridAdapter implements DriverAdapter {
      * parameters, so the count is checked against the server's here.
      */
     private executeHandle;
+    /**
+     * Uploads every blob() and clob() parameter of `binds` on the session that
+     * prepared the statement, after PREPARE so bad SQL fails before any upload, and
+     * returns the binds with each LOB's handle in place. The LOBs belong to the
+     * statement's transaction: runOnSession() commits or rolls back an autocommit
+     * statement, and a caller's transaction stays the caller's. A handle is never
+     * reused: each statement creates its own.
+     */
+    private uploadLobs;
+    /**
+     * LOB_NEW, then one LOB_WRITE per LOB_WRITE_CHUNK_SIZE bytes, each checked to
+     * have stored everything sent. The source is read only as fast as the writes
+     * are answered, and the handle EXECUTE gets states the size written.
+     */
+    private uploadLob;
     private exchangeOnSession;
     /** Ends the transaction of a statement run by runStatement(commitAfter), on its own session. */
     private endStatementTransaction;
@@ -887,9 +937,9 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
     queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
     execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
-    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
-    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
-    executePrepared(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
+    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<T[]>;
+    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<QueryResult<T>>;
+    executePrepared(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<ExecuteResult>;
     /**
      * Run one INSERT, UPDATE, DELETE or MERGE once per parameter set, with
      * server-side prepared binding: one PREPARE, then one EXECUTE_ARRAY request
@@ -980,6 +1030,12 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
     getIndexes(table: string, options?: SchemaOptions): Promise<SchemaIndex[]>;
     /** Run catalog inspections on a captured shared connection until completion. */
     private runSchemaOperation;
+    /**
+     * getSharedConnection() for a method that renders SQL literals, refusing blob()
+     * and clob() first. Not async: an extra await would let a statement issued later
+     * take the connection's turn first.
+     */
+    private literalConnection;
     private getSharedConnection;
     private prepareSharedConnection;
     /**
@@ -998,9 +1054,9 @@ declare class CubridTransaction implements ResultTransactionClient, ExecutableTr
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
     queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
     execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
-    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
-    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
-    executePrepared(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
+    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<T[]>;
+    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<QueryResult<T>>;
+    executePrepared(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<ExecuteResult>;
     /**
      * `executeMany()` inside this transaction. A failed set rejects with every
      * set's outcome in `batch` and leaves the transaction as it is: the sets that
@@ -1181,4 +1237,4 @@ declare function buildWhere(conditions: Record<string, unknown>): {
     params: unknown[];
 };
 
-export { type BatchExecutable, type BatchTransactionClient, type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteManyFailure, type ExecuteManyResult, type ExecuteManySetFailure, type ExecuteResult, type IsolationLevel, LockTimeoutError, NativeCubridAdapter, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryOptions, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type StreamOptions, type Streamable, type TransactionCallback, type TransactionClient, TransactionError, type TransactionOptions, type TransactionScope, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, buildWhere, createClient, escapeIdentifier, parseConnectionString };
+export { type BatchExecutable, type BatchTransactionClient, type BlobSource, type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type ClobSource, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteManyFailure, type ExecuteManyResult, type ExecuteManySetFailure, type ExecuteResult, type IsolationLevel, type LobParam, LockTimeoutError, NativeCubridAdapter, type PreparedQueryParam, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryOptions, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type StreamOptions, type Streamable, type TransactionCallback, type TransactionClient, TransactionError, type TransactionOptions, type TransactionScope, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, blob, buildWhere, clob, createClient, escapeIdentifier, parseConnectionString };

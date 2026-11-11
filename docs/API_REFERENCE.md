@@ -37,6 +37,9 @@ Complete reference for every public export of `cubrid-client`.
   - [ResultTransactionClient](#resulttransactionclient)
   - [QueryParam](#queryparam)
   - [QueryParams](#queryparams)
+  - [blob() and clob()](#blob-and-clob)
+  - [LobParam, BlobSource and ClobSource](#lobparam-blobsource-and-clobsource)
+  - [PreparedQueryParam](#preparedqueryparam)
   - [QueryResultRow](#queryresultrow)
   - [QueryResult](#queryresult)
   - [ColumnInfo](#columninfo)
@@ -226,24 +229,24 @@ Opt-in server-side binding: the same results as `query()`, `queryResult()` and `
 ```ts
 async queryPrepared<T extends QueryResultRow = QueryResultRow>(
   sql: string,
-  params?: QueryParams,
+  params?: readonly PreparedQueryParam[],
   options?: QueryOptions,
 ): Promise<T[]>
 
 async queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
   sql: string,
-  params?: QueryParams,
+  params?: readonly PreparedQueryParam[],
   options?: QueryOptions,
 ): Promise<QueryResult<T>>
 
 async executePrepared(
   sql: string,
-  params?: QueryParams,
+  params?: readonly PreparedQueryParam[],
   options?: QueryOptions,
 ): Promise<ExecuteResult>
 ```
 
-**Throws:** [`QueryError`](#queryerror) if execution fails, if a value is refused, if the number of values differs from the statement's markers, or if a custom `connectionFactory` connection does not provide the method. They never fall back to SQL literals.
+**Throws:** [`QueryError`](#queryerror) if execution fails, if a value is refused, if the number of values differs from the statement's markers, or if a custom `connectionFactory` connection does not provide the method. They never fall back to SQL literals. A [`blob()` or `clob()`](#blob-and-clob) stream that was already read, a stream chunk of the wrong type and CLOB content that is not valid UTF-8 reject with a `TypeError`, unwrapped.
 
 ```ts
 const rows = await db.queryPrepared<{ id: number }>("SELECT id FROM users WHERE name = ?", [name]);
@@ -254,6 +257,17 @@ const { affectedRows } = await db.executePrepared("UPDATE users SET name = ? WHE
 - **Lifecycle.** Each call prepares, executes and releases its own handle, so a handle is never kept between calls or carried to another session. There is no reusable statement object.
 - **Autocommit.** The statement runs in a transaction of its own that ends with an explicit commit, or a rollback if anything failed.
 - **Cost.** A call takes more round trips than `query()`; see the [measurements](PERFORMANCE.md#prepared-binding). Do not expect it to be faster.
+- **BLOB and CLOB content.** A [`blob()` or `clob()`](#blob-and-clob) value is uploaded with LOB_NEW and LOB_WRITE after PREPARE and before EXECUTE, so bad SQL fails before any upload. The content belongs to the statement's transaction: in autocommit mode a failure rolls it back with the statement, and inside a transaction it is committed or rolled back with the transaction. `readTimeout` limits each LOB_NEW and LOB_WRITE reply, and `signal` also stops a wait on a stream source; nothing else limits a source that never yields. The upload holds the connection's turn, so a source must not wait on a statement of the same client or transaction: that statement would wait for the upload forever. See [writing BLOB and CLOB](TYPES.md#writing-blob-and-clob).
+
+```ts
+import { blob, clob } from "cubrid-client";
+
+await db.executePrepared("UPDATE docs SET body = ?, notes = ? WHERE id = ?", [
+  blob(pdfBytes),
+  clob(markdownText),
+  1,
+]);
+```
 
 #### `executeMany(sql, paramSets, options?)`
 
@@ -339,7 +353,7 @@ What happens depends on where the statement is when the signal aborts:
 |------|--------|-----------------------------|
 | Already aborted when called | Rejects at once with `signal.reason` | Nothing is sent, and no connection is opened |
 | Waiting behind other statements on the connection | Leaves the queue and rejects with `signal.reason` | Nothing is sent. The session and the other statements are unaffected |
-| Sent: waiting for its reply, or for any FETCH, LOB_READ or END_TRAN of the same statement | Rejects with `signal.reason` as soon as the signal aborts | The CAS socket is discarded, so a late reply can never be read as another request's answer. The statement is never retried or replayed |
+| Sent: waiting for its reply, or for any FETCH, LOB_NEW, LOB_WRITE, LOB_READ or END_TRAN of the same statement, or for the next chunk of a [`blob()` or `clob()`](#blob-and-clob) stream it is uploading | Rejects with `signal.reason` as soon as the signal aborts | The CAS socket is discarded, so a late reply can never be read as another request's answer. The statement is never retried or replayed |
 | Already settled | Nothing | The abort is ignored |
 
 - **The outcome is unknown after an abort in flight.** The server may still run the statement to its end, and in autocommit mode it may be committed; nothing asks the server to stop it. Verify the outcome before running a statement that is not idempotent again, as after a [`ReadTimeoutError`](#readtimeouterror).
@@ -721,7 +735,7 @@ async execute(sql: string, params?: QueryParams, options?: QueryOptions): Promis
 
 Same signatures and behavior as the [`CubridClient` methods](#querypreparedtsql-params-queryresultpreparedtsql-params-executepreparedsql-params), but run within the transaction's isolated connection. Nothing is committed until the transaction is.
 
-**Throws:** [`TransactionError`](#transactionerror) if execution fails.
+**Throws:** [`TransactionError`](#transactionerror) if execution fails, or the `TypeError` of a misused [`blob()` or `clob()`](#blob-and-clob), unwrapped. A callback that rethrows it makes `transaction()` reject with a `TransactionError` whose `cause` it is.
 
 #### `executeMany(sql, paramSets, options?)`
 
@@ -1180,7 +1194,7 @@ interface ConnectionLike {
 
 `setTransactionOptions` is optional too, but it decides whether settings work. The client calls it on a new connection before anything else when `isolationLevel` or `lockTimeout` is in effect, and only then. Without it such a client or transaction fails rather than running without the setting. An implementation must keep the setting on every session it opens, and `NativeCubridAdapter` does. Options it is not given keep their value. The built-in adapter rejects the call inside a transaction, because changing the level there would change the running transaction.
 
-`queryResult`, `execute` and `stream` are optional so existing custom adapters keep compiling. The client passes [`QueryOptions`](#queryoptions) as the last argument of each statement method; an implementation that declares fewer parameters still compiles, and then ignores them. Calling `queryResult()`, `execute()` or `executeMany()` on a client or transaction fails when its connection does not provide it, and so does the first read of `stream()`. `executeMany()` never falls back to one statement per set.
+`queryResult`, `execute` and `stream` are optional so existing custom adapters keep compiling. The optional `queryPrepared`, `queryResultPrepared` and `executePrepared` take `readonly PreparedQueryParam[]`, as on [`PreparedQueryable`](#preparedqueryable); a custom connection that does not upload LOBs should refuse a [`LobParam`](#lobparam-blobsource-and-clobsource). The client passes [`QueryOptions`](#queryoptions) as the last argument of each statement method; an implementation that declares fewer parameters still compiles, and then ignores them. Calling `queryResult()`, `execute()` or `executeMany()` on a client or transaction fails when its connection does not provide it, and so does the first read of `stream()`. `executeMany()` never falls back to one statement per set.
 
 ### Queryable
 
@@ -1341,19 +1355,19 @@ Interface for any object that can run a statement with [server-side binding](TYP
 interface PreparedQueryable {
   queryPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
-    params?: QueryParams,
+    params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
   ): Promise<T[]>;
   queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
-    params?: QueryParams,
+    params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
   ): Promise<QueryResult<T>>;
   executePrepared(
-  sql: string,
-  params?: QueryParams,
-  options?: QueryOptions,
-): Promise<ExecuteResult>;
+    sql: string,
+    params?: readonly PreparedQueryParam[],
+    options?: QueryOptions,
+  ): Promise<ExecuteResult>;
 }
 ```
 
@@ -1442,7 +1456,7 @@ type QueryParam =
 | `boolean` | `SMALLINT` (0 or 1) | `true` |
 | `bigint` | `BIGINT` | `9007199254740993n` |
 | `Date` | `DATETIME` / `TIMESTAMP` | `new Date()` |
-| `Buffer` | `BLOB` / `BIT VARYING` | `Buffer.from("data")` |
+| `Buffer` | `BIT VARYING` (also stored into a `BLOB` column) | `Buffer.from("data")` |
 | `null` | `NULL` | `null` |
 
 Note: `BIGINT` columns in query results are returned as JavaScript `bigint` values (not `number`), so the full signed 64-bit range is preserved.
@@ -1483,6 +1497,57 @@ Array of query parameter values.
 ```ts
 type QueryParams = readonly QueryParam[];
 ```
+
+### blob() and clob()
+
+Wrap BLOB or CLOB content for `queryPrepared()`, `queryResultPrepared()` and `executePrepared()`, on the client, `tx` and a transaction scope.
+
+```ts
+function blob(source: BlobSource): LobParam;
+function clob(source: ClobSource): LobParam;
+```
+
+```ts
+import { createReadStream } from "node:fs";
+import { blob, clob } from "cubrid-client";
+
+await db.executePrepared("INSERT INTO docs (id, body, notes) VALUES (?, ?, ?)", [
+  1,
+  blob(createReadStream("report.pdf")),
+  clob("Résumé 😀"),
+]);
+```
+
+- **Upload.** Each value is sent with one LOB_NEW request, then one LOB_WRITE per 128 KiB, after PREPARE and before EXECUTE, on the statement's own session and transaction. The server must report every byte of each LOB_WRITE as written, or the statement fails.
+- **Memory.** A stream source is read with `for await`, one chunk at a time and only as fast as the server answers, so the driver holds at most one 128 KiB chunk besides the source's own buffer. A `Buffer`, `Uint8Array` or `string` is held by your code anyway; a `string` is encoded about 128 KiB at a time.
+- **Encoding.** A CLOB is stored as UTF-8. A `string` is encoded, and a surrogate pair split between two chunks of a stream is joined. A `Buffer` must already be UTF-8. Bytes that are not UTF-8, or text with a lone surrogate, reject the statement with a `TypeError` and it is rolled back in autocommit mode.
+- **Empty and NULL.** `blob(Buffer.alloc(0))` and `clob("")` store an empty BLOB or CLOB, not NULL. Pass `null` for SQL NULL.
+- **Single use.** An `AsyncIterable` or `Readable` source is consumed when its upload starts. Using it again after that, or passing the same stream twice to one statement, rejects with a `TypeError` before anything is sent. Two statements given the same stream before either has started are both accepted, and the second rejects with a `TypeError` once it is prepared, and is rolled back. A failed upload destroys the `Readable` whose upload failed; the sources of later LOB parameters are left unread. A `Buffer`, `Uint8Array` or `string` can be used any number of times.
+- **Refused elsewhere.** `query()`, `queryResult()`, `execute()`, `stream()` and `executeMany()` reject a `LobParam` with a `TypeError` before anything is sent, rather than sending it as the text `'[object Object]'`. Validate your sources: `blob()` and `clob()` throw a `TypeError` at once for a source of the wrong type.
+- **Plain `Buffer`.** A `Buffer` without `blob()` still binds as `BIT VARYING`, as before.
+- **Versions.** Supported on CUBRID 10.2, 11.0, 11.2 and 11.4. See [writing BLOB and CLOB](TYPES.md#writing-blob-and-clob) for transactions, failures and cost.
+
+### LobParam, BlobSource and ClobSource
+
+```ts
+type BlobSource = Buffer | Uint8Array | AsyncIterable<Buffer | Uint8Array> | Readable;
+type ClobSource = string | Buffer | AsyncIterable<string | Buffer | Uint8Array> | Readable;
+
+interface LobParam {
+  readonly kind: "blob" | "clob";
+  readonly source: BlobSource | ClobSource;
+}
+```
+
+A `LobParam` is frozen. Only `blob()` and `clob()` make one: an object of the same shape built by hand is not recognized.
+
+### PreparedQueryParam
+
+```ts
+type PreparedQueryParam = QueryParam | LobParam;
+```
+
+A parameter of the prepared methods. Every other method takes `QueryParams`, which has no `LobParam`.
 
 ### QueryResultRow
 

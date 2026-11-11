@@ -213,6 +213,27 @@ It is opt-in, takes more round trips than `query()` and has no reusable statemen
 object. See [prepared binding](docs/TYPES.md#prepared-binding) for the type
 mapping, the values it refuses and where results differ.
 
+### Writing BLOB and CLOB
+
+Wrap the content in `blob()` or `clob()` and pass it to a prepared method. The
+driver uploads it in 128 KiB pieces before the statement runs, so a stream is
+never held in memory whole:
+
+```ts
+import { createReadStream } from "node:fs";
+import { blob, clob } from "cubrid-client";
+
+await db.executePrepared("INSERT INTO docs (id, body, notes) VALUES (?, ?, ?)", [
+  1,
+  blob(createReadStream("report.pdf")),
+  clob("Résumé 😀"),
+]);
+```
+
+A CLOB is stored as UTF-8. A stream source is read once; an empty `blob()` is an
+empty BLOB, not NULL. A plain `Buffer` still binds as `BIT VARYING`. Supported on
+CUBRID 10.2 to 11.4; see [writing BLOB and CLOB](docs/TYPES.md#writing-blob-and-clob).
+
 ### Batch execution
 
 `executeMany()` runs one INSERT, UPDATE, DELETE or MERGE once per parameter set,

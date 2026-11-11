@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { getEventListeners } from "node:events";
 import { createServer, type Socket as NetSocket, type Server } from "node:net";
+import { Readable } from "node:stream";
 import test from "node:test";
 import { inspect } from "node:util";
-
 import { NativeCubridAdapter } from "../src/adapters/native.js";
 import { CubridClient } from "../src/client/client.js";
 import { createClient } from "../src/client/create-client.js";
@@ -18,6 +18,7 @@ import type {
   ExecutableTransactionClient,
   ResultTransactionClient,
 } from "../src/types/client.js";
+import { blob, clob } from "../src/types/lob.js";
 import type { QueryParam } from "../src/types/query.js";
 import { CAPTURED_FRAMES } from "./fixtures/collection-frames.js";
 import {
@@ -26,7 +27,7 @@ import {
   LAST_INSERT_ID_FRAMES,
   PREPARED_FRAMES,
 } from "./fixtures/dml-frames.js";
-import { LOB_FRAMES, LOB_READ_REPLY_LIMIT } from "./fixtures/lob-frames.js";
+import { LOB_FRAMES, LOB_READ_REPLY_LIMIT, LOB_WRITE_FRAMES } from "./fixtures/lob-frames.js";
 import { ZONED_FRAMES } from "./fixtures/zoned-frames.js";
 
 // ---------------------------------------------------------------------------
@@ -198,6 +199,11 @@ class FakeCASConnection {
   /** The real connection limits the requests `run` makes; this one only runs it. */
   async runScoped<T>(_scope: unknown, run: () => Promise<T>): Promise<T> {
     return run();
+  }
+
+  /** The real connection lets the scope's signal stop this wait; this one only waits. */
+  async awaitScoped<T>(pending: Promise<T>): Promise<T> {
+    return pending;
   }
 
   async close(beforeClose?: () => Promise<void>): Promise<void> {
@@ -5103,4 +5109,390 @@ test("a set reported as -72 after another failure still blocks a later commit", 
 
   await assert.rejects(adapter.commit(), TransactionError);
   assert.equal(fakeCAS.sentPayloads.length, sent);
+});
+
+// ---------------------------------------------------------------------------
+// Writing BLOB and CLOB content: LOB_NEW and LOB_WRITE before EXECUTE (#103)
+// ---------------------------------------------------------------------------
+
+const LOB_CHUNK = 128 * 1024;
+const UPDATE_LOB = "UPDATE t SET b = ? WHERE id = ?";
+/** An EXECUTE reply for an UPDATE of one row. */
+const UPDATE_ONE = "00000001000000000116000000010000000000000000000000000000000000fffffffe";
+
+function lobWriteReply(count: number): Buffer {
+  const reply = Buffer.alloc(4);
+  reply.writeInt32BE(count, 0);
+  return reply;
+}
+
+/** PREPARE of a statement with two markers, LOB_NEW, then one reply per LOB_WRITE of `sizes`. */
+function queueLobUpload(
+  fakeCAS: FakeCASConnection,
+  sizes: number[],
+  newReply: string = LOB_WRITE_FRAMES.newBlobReply,
+): void {
+  fakeCAS.queueResponse(Buffer.from(EXECUTE_ARRAY_FRAMES.prepareInsert, "hex"));
+  fakeCAS.queueResponse(Buffer.from(newReply, "hex"));
+  for (const size of sizes) {
+    fakeCAS.queueResponse(lobWriteReply(size));
+  }
+}
+
+/** Offset and bytes of every LOB_WRITE, after the handle. */
+function lobWrites(fakeCAS: FakeCASConnection): Array<{ offset: number; data: Buffer }> {
+  return fakeCAS.sentPayloads
+    .filter((payload) => payload[0] === CASFunctionCode.LOB_WRITE)
+    .map((payload) => {
+      const at = 1 + 4 + payload.readInt32BE(1);
+      return {
+        offset: Number(payload.readBigInt64BE(at + 4)),
+        data: payload.subarray(at + 16, at + 16 + payload.readInt32BE(at + 12)),
+      };
+    });
+}
+
+/** The handle bound by the EXECUTE request: the LOB, then the id 1 as the last value. */
+function boundHandle(fakeCAS: FakeCASConnection, type = 0x17): Buffer {
+  const execute = fakeCAS.sentPayloads.find((payload) => payload[0] === CASFunctionCode.EXECUTE);
+  assert.ok(execute);
+  const id = Buffer.from("00000001080000000400000001", "hex");
+  assert.ok(execute.subarray(execute.length - id.length).equals(id));
+  const at = execute.lastIndexOf(Buffer.from([0, 0, 0, 1, type]));
+  assert.ok(at > 0);
+  const length = execute.readInt32BE(at + 5);
+  assert.equal(at + 9 + length, execute.length - id.length);
+  return execute.subarray(at + 9, at + 9 + length);
+}
+
+test("blob(): PREPARE, LOB_NEW, 128 KiB LOB_WRITEs, then EXECUTE with the sized handle", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  const content = Buffer.alloc(300_000, 7);
+  queueLobUpload(fakeCAS, [LOB_CHUNK, LOB_CHUNK, 300_000 - 2 * LOB_CHUNK]);
+  fakeCAS.queueResponse(preparedReply(UPDATE_ONE));
+
+  assert.deepEqual(await adapter.executePrepared(UPDATE_LOB, [blob(content), 1]), {
+    affectedRows: 1,
+  });
+
+  assert.deepEqual(sentCodes(fakeCAS), [
+    CASFunctionCode.PREPARE,
+    CASFunctionCode.LOB_NEW,
+    CASFunctionCode.LOB_WRITE,
+    CASFunctionCode.LOB_WRITE,
+    CASFunctionCode.LOB_WRITE,
+    CASFunctionCode.EXECUTE,
+    CASFunctionCode.END_TRAN,
+    CASFunctionCode.CLOSE_REQ_HANDLE,
+  ]);
+  assert.equal(fakeCAS.sentPayloads[1]!.toString("hex"), LOB_WRITE_FRAMES.newBlobRequest);
+  assert.deepEqual(
+    lobWrites(fakeCAS).map(({ offset, data }) => [offset, data.length]),
+    [
+      [0, LOB_CHUNK],
+      [LOB_CHUNK, LOB_CHUNK],
+      [2 * LOB_CHUNK, 300_000 - 2 * LOB_CHUNK],
+    ],
+  );
+  assert.ok(Buffer.concat(lobWrites(fakeCAS).map(({ data }) => data)).equals(content));
+
+  const handle = boundHandle(fakeCAS);
+  const created = Buffer.from(LOB_WRITE_FRAMES.newBlobReply, "hex").subarray(4);
+  assert.equal(handle.readBigInt64BE(4), 300_000n);
+  assert.ok(handle.subarray(12).equals(created.subarray(12)));
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.COMMIT]);
+});
+
+test("blob() of an empty Buffer creates an empty BLOB with no LOB_WRITE", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  queueLobUpload(fakeCAS, []);
+  fakeCAS.queueResponse(preparedReply(UPDATE_ONE));
+
+  await adapter.executePrepared(UPDATE_LOB, [blob(Buffer.alloc(0)), 1]);
+
+  assert.deepEqual(lobWrites(fakeCAS), []);
+  assert.equal(boundHandle(fakeCAS).readBigInt64BE(4), 0n);
+});
+
+test("small stream chunks are merged into full LOB_WRITEs and a Uint8Array is accepted", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  const pieces = Array.from({ length: 40 }, (_, i) => new Uint8Array(5000).fill(i));
+  queueLobUpload(fakeCAS, [LOB_CHUNK, 200_000 - LOB_CHUNK]);
+  fakeCAS.queueResponse(preparedReply(UPDATE_ONE));
+
+  await adapter.executePrepared(UPDATE_LOB, [blob(Readable.from(pieces)), 1]);
+
+  const writes = lobWrites(fakeCAS);
+  assert.deepEqual(
+    writes.map(({ offset, data }) => [offset, data.length]),
+    [
+      [0, LOB_CHUNK],
+      [LOB_CHUNK, 200_000 - LOB_CHUNK],
+    ],
+  );
+  assert.ok(Buffer.concat(writes.map(({ data }) => data)).equals(Buffer.concat(pieces)));
+  assert.equal(boundHandle(fakeCAS).readBigInt64BE(4), 200_000n);
+});
+
+test("clob(): a surrogate pair split between two stream strings is one character", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  const expected = Buffer.from("a\u{1F600}b", "utf-8");
+  queueLobUpload(fakeCAS, [expected.length], LOB_WRITE_FRAMES.newClobReply);
+  fakeCAS.queueResponse(preparedReply(UPDATE_ONE));
+
+  await adapter.executePrepared(UPDATE_LOB, [clob(Readable.from(["a\uD83D", "\uDE00b"])), 1]);
+
+  assert.equal(fakeCAS.sentPayloads[1]!.toString("hex"), "230000000400000018");
+  assert.ok(lobWrites(fakeCAS)[0]!.data.equals(expected));
+  assert.equal(boundHandle(fakeCAS, 0x18).readBigInt64BE(4), BigInt(expected.length));
+});
+
+test("clob(): 3- and 4-byte characters across the 128 KiB boundary arrive as UTF-8", async () => {
+  // One character starts at each of the last bytes before the boundary.
+  const text = `${"x".repeat(LOB_CHUNK - 2)}\u{1F600}${"\uD55C".repeat(3)}${"y".repeat(10)}`;
+  const expected = Buffer.from(text, "utf-8");
+  for (const source of [text, Readable.from(Array.from(text.match(/[\s\S]{1,1000}/g) ?? []))]) {
+    const { adapter, fakeCAS } = createPreparedAdapter();
+    queueLobUpload(
+      fakeCAS,
+      [LOB_CHUNK, expected.length - LOB_CHUNK],
+      LOB_WRITE_FRAMES.newClobReply,
+    );
+    fakeCAS.queueResponse(preparedReply(UPDATE_ONE));
+
+    await adapter.executePrepared(UPDATE_LOB, [clob(source), 1]);
+
+    const writes = lobWrites(fakeCAS);
+    assert.deepEqual(
+      writes.map(({ data }) => data.length),
+      [LOB_CHUNK, expected.length - LOB_CHUNK],
+    );
+    assert.ok(Buffer.concat(writes.map(({ data }) => data)).equals(expected));
+  }
+});
+
+for (const [name, source] of [
+  ["a Buffer that is not UTF-8", () => Buffer.from([0x61, 0xff])],
+  ["a stream that ends inside a character", () => Readable.from([Buffer.from([0xe2, 0x82])])],
+  [
+    "bytes that end inside a character before text",
+    () => Readable.from([Buffer.from([0xe2]), "a"]),
+  ],
+  ["a lone high surrogate at the end", () => Readable.from(["a\uD83D"])],
+  ["a lone low surrogate", () => "a\uDE00"],
+  ["a high surrogate followed by bytes", () => Readable.from(["\uD83D", Buffer.from("a")])],
+  ["a stream chunk that is a number", () => Readable.from([1], { objectMode: true })],
+] as const) {
+  test(`clob() of ${name} is refused with a TypeError and rolled back, never executed`, async () => {
+    const { adapter, fakeCAS } = createPreparedAdapter();
+    queueLobUpload(fakeCAS, [1, 1], LOB_WRITE_FRAMES.newClobReply);
+
+    await assert.rejects(
+      adapter.executePrepared(UPDATE_LOB, [clob(source() as never), 1]),
+      TypeError,
+    );
+
+    assert.ok(!sentCodes(fakeCAS).includes(CASFunctionCode.EXECUTE));
+    assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+  });
+}
+
+test("a blob() stream chunk that is not bytes is refused with a TypeError", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  queueLobUpload(fakeCAS, []);
+
+  await assert.rejects(
+    adapter.executePrepared(UPDATE_LOB, [blob(Readable.from(["text"])), 1]),
+    (error: Error) => error instanceof TypeError && /yielded a string/.test(error.message),
+  );
+  assert.ok(!sentCodes(fakeCAS).includes(CASFunctionCode.EXECUTE));
+});
+
+test("a LOB_WRITE that stores fewer bytes than sent fails the statement and rolls back", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  queueLobUpload(fakeCAS, [LOB_CHUNK - 1]);
+
+  await assert.rejects(
+    adapter.executePrepared(UPDATE_LOB, [blob(Buffer.alloc(LOB_CHUNK + 1)), 1]),
+    (error: Error) =>
+      error instanceof QueryError &&
+      (error.cause as Error).message ===
+        `CUBRID LOB write stored ${LOB_CHUNK - 1} of ${LOB_CHUNK} bytes`,
+  );
+
+  assert.equal(lobWrites(fakeCAS).length, 1);
+  assert.ok(!sentCodes(fakeCAS).includes(CASFunctionCode.EXECUTE));
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+  assert.equal(fakeCAS.discardCalls, 0);
+});
+
+test("a LOB_WRITE server error reports its code and rolls the autocommit statement back", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  fakeCAS.queueResponse(Buffer.from(EXECUTE_ARRAY_FRAMES.prepareInsert, "hex"));
+  fakeCAS.queueResponse(Buffer.from(LOB_WRITE_FRAMES.newBlobReply, "hex"));
+  fakeCAS.queueResponse(Buffer.from(LOB_WRITE_FRAMES.writeGapReply, "hex"));
+
+  await assert.rejects(
+    adapter.executePrepared(UPDATE_LOB, [blob(Buffer.from("abc")), 1]),
+    (error: Error) => error instanceof QueryError && (error as QueryError).code === -1016,
+  );
+
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+});
+
+test("a failed PREPARE uploads nothing and leaves a stream source unread", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  const source = Readable.from([Buffer.from("abc")]);
+  fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.prepareSyntaxError));
+
+  await assert.rejects(adapter.executePrepared(UPDATE_LOB, [blob(source), 1]), QueryError);
+  assert.ok(!sentCodes(fakeCAS).includes(CASFunctionCode.LOB_NEW));
+
+  queueLobUpload(fakeCAS, [3]);
+  fakeCAS.queueResponse(preparedReply(UPDATE_ONE));
+  await adapter.executePrepared(UPDATE_LOB, [blob(source), 1]);
+  assert.equal(lobWrites(fakeCAS)[0]!.data.toString(), "abc");
+});
+
+test("a stream source already uploaded is refused with a TypeError before anything is sent", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  const source = Readable.from([Buffer.from("abc")]);
+  queueLobUpload(fakeCAS, [3]);
+  fakeCAS.queueResponse(preparedReply(UPDATE_ONE));
+  await adapter.executePrepared(UPDATE_LOB, [blob(source), 1]);
+  const sent = fakeCAS.sentPayloads.length;
+
+  await assert.rejects(
+    adapter.executePrepared(UPDATE_LOB, [blob(source), 2]),
+    (error: Error) => error instanceof TypeError && /already been read/.test(error.message),
+  );
+  assert.equal(fakeCAS.sentPayloads.length, sent);
+});
+
+test("a failed upload consumes its stream source, which cannot be retried", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  const source = Readable.from([Buffer.from("abc")]);
+  fakeCAS.queueResponse(Buffer.from(EXECUTE_ARRAY_FRAMES.prepareInsert, "hex"));
+  fakeCAS.queueResponse(Buffer.from(LOB_WRITE_FRAMES.newBlobReply, "hex"));
+  fakeCAS.queueResponse(Buffer.from(LOB_WRITE_FRAMES.writeGapReply, "hex"));
+  await assert.rejects(adapter.executePrepared(UPDATE_LOB, [blob(source), 1]), QueryError);
+
+  await assert.rejects(adapter.executePrepared(UPDATE_LOB, [blob(source), 1]), TypeError);
+  assert.equal(source.destroyed, true);
+});
+
+test("inside a transaction a failed upload sends no END_TRAN, and the caller can still commit", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  await adapter.beginTransaction();
+  queueLobUpload(fakeCAS, [2]);
+
+  await assert.rejects(
+    adapter.executePrepared(UPDATE_LOB, [blob(Buffer.from("abc")), 1]),
+    QueryError,
+  );
+  assert.deepEqual(endTranTypes(fakeCAS), []);
+
+  await adapter.commit();
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.COMMIT]);
+});
+
+const lobValues = (): QueryParam[] => [blob(Buffer.from("a")) as never, clob("b") as never];
+
+for (const [method, run] of [
+  ["query", (adapter: NativeCubridAdapter) => adapter.query("SELECT ?", lobValues())],
+  ["queryResult", (adapter: NativeCubridAdapter) => adapter.queryResult("SELECT ?", lobValues())],
+  ["execute", (adapter: NativeCubridAdapter) => adapter.execute("UPDATE t SET b = ?", lobValues())],
+  [
+    "stream",
+    async (adapter: NativeCubridAdapter) => {
+      for await (const _row of adapter.stream("SELECT ?", lobValues())) {
+        // Never reached.
+      }
+    },
+  ],
+  [
+    "executeMany",
+    (adapter: NativeCubridAdapter) =>
+      adapter.executeMany("UPDATE t SET b = ?", [[1], lobValues().slice(0, 1)]),
+  ],
+] as const) {
+  test(`${method}() refuses blob() and clob() with a TypeError before anything is sent`, async () => {
+    const { adapter, fakeCAS } = createPreparedAdapter();
+    fakeCAS._isConnected = false;
+
+    await assert.rejects(async () => {
+      await run(adapter);
+    }, TypeError);
+
+    assert.equal(fakeCAS.connectCalls, 0);
+    assert.deepEqual(fakeCAS.sentPayloads, []);
+  });
+}
+
+test("the client refuses blob() on a literal method with a TypeError before connecting", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  let connections = 0;
+  const client = new CubridClient(DEFAULT_CONFIG, () => {
+    connections += 1;
+    return adapter;
+  });
+
+  for (const run of [
+    () => client.query("SELECT ?", lobValues()),
+    () => client.queryResult("SELECT ?", lobValues()),
+    () => client.execute("UPDATE t SET b = ?", lobValues()),
+  ]) {
+    await assert.rejects(run(), (error: unknown) => error instanceof TypeError);
+  }
+  assert.throws(() => client.stream("SELECT ?", lobValues()), TypeError);
+  assert.equal(connections, 0);
+
+  // executeMany() is refused by the connection, still before any statement.
+  await assert.rejects(client.executeMany("UPDATE t SET b = ?", [lobValues()]), TypeError);
+  assert.deepEqual(fakeCAS.sentPayloads, []);
+});
+
+test("clob() accepts Uint8Array stream chunks, as web streams yield them", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  const bytes = new TextEncoder().encode("hé");
+  queueLobUpload(fakeCAS, [bytes.length], LOB_WRITE_FRAMES.newClobReply);
+  fakeCAS.queueResponse(preparedReply(UPDATE_ONE));
+
+  await adapter.executePrepared(UPDATE_LOB, [clob(Readable.from([bytes])), 1]);
+
+  assert.equal(lobWrites(fakeCAS)[0]!.data.toString("utf-8"), "hé");
+});
+
+test("a LOB_NEW failure destroys the Readable source it consumed", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  const source = Readable.from([Buffer.from("abc")]);
+  fakeCAS.queueResponse(Buffer.from(EXECUTE_ARRAY_FRAMES.prepareInsert, "hex"));
+  fakeCAS.queueResponse(Buffer.from(LOB_WRITE_FRAMES.newBadTypeReply, "hex"));
+
+  await assert.rejects(adapter.executePrepared(UPDATE_LOB, [blob(source), 1]), QueryError);
+
+  assert.equal(source.destroyed, true);
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+});
+
+test("a transaction refuses blob() with a TypeError, and transaction() wraps it", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  const client = new CubridClient(DEFAULT_CONFIG, () => adapter);
+
+  await assert.rejects(
+    client.transaction(async (tx) => {
+      for (const run of [
+        () => tx.query("SELECT ?", lobValues()),
+        () => tx.queryResult("SELECT ?", lobValues()),
+        () => tx.execute("UPDATE t SET b = ?", lobValues()),
+        () => tx.executeMany("UPDATE t SET b = ?", [lobValues()]),
+      ]) {
+        await assert.rejects(run(), (error: unknown) => error instanceof TypeError);
+      }
+      await tx.query("SELECT ?", lobValues());
+    }),
+    (error: unknown) => error instanceof TransactionError && error.cause instanceof TypeError,
+  );
+
+  assert.ok(!sentCodes(fakeCAS).includes(CASFunctionCode.PREPARE_AND_EXECUTE));
 });

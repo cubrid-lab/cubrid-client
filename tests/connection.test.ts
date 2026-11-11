@@ -2170,3 +2170,49 @@ test("CASConnection connect — a handshake that fails after the socket opened i
     await closeServer(server);
   }
 });
+
+// ---------------------------------------------------------------------------
+// awaitScoped(): a statement's signal also stops a wait that is not a request
+// ---------------------------------------------------------------------------
+
+test("awaitScoped returns the value when no signal stops it", async () => {
+  const cas = new CASConnection(DEFAULT_CONFIG);
+  assert.equal(await cas.awaitScoped(Promise.resolve(5)), 5);
+  const scope = { signal: new AbortController().signal, sent: true, aborted: false };
+  assert.equal(await cas.runScoped(scope, () => cas.awaitScoped(Promise.resolve(6))), 6);
+  assert.equal(scope.aborted, false);
+});
+
+test("an abort stops awaitScoped; after a request was written it discards the session", async () => {
+  for (const sent of [false, true]) {
+    const cas = new CASConnection(DEFAULT_CONFIG);
+    const controller = new AbortController();
+    const reason = new Error("stop");
+    const scope = { signal: controller.signal, sent, aborted: false };
+    let rejectNever!: (error: Error) => void;
+    const never = new Promise<never>((_resolve, reject) => {
+      rejectNever = reject;
+    });
+
+    const waiting = cas.runScoped(scope, () => cas.awaitScoped(never));
+    controller.abort(reason);
+
+    await assert.rejects(waiting, (error: unknown) => error === reason);
+    assert.equal(scope.aborted, true);
+    assert.equal(cas.failedExchanges, sent ? 1 : 0);
+    // The abandoned wait failing later is not an unhandled rejection.
+    rejectNever(new Error("late"));
+  }
+});
+
+test("awaitScoped with a signal already aborted does not wait", async () => {
+  const cas = new CASConnection(DEFAULT_CONFIG);
+  const controller = new AbortController();
+  controller.abort(new Error("before"));
+  const scope = { signal: controller.signal, sent: false, aborted: false };
+
+  await assert.rejects(
+    cas.runScoped(scope, () => cas.awaitScoped(new Promise(() => undefined))),
+    /before/,
+  );
+});
