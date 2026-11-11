@@ -169,10 +169,7 @@ export interface ClientOptions {
 }
 
 export interface Queryable {
-  query<T extends QueryResultRow = QueryResultRow>(
-    sql: string,
-    params?: QueryParams,
-  ): Promise<T[]>;
+  query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
 }
 
 /** Runs a statement and reports its rows with their column metadata. */
@@ -276,10 +273,9 @@ export interface TransactionClient extends Queryable {
  */
 export interface ExecutableTransactionClient extends TransactionClient, Executable {}
 
-export type TransactionCallback<
-  T,
-  Tx extends TransactionClient = TransactionClient,
-> = (tx: Tx) => Promise<T>;
+export type TransactionCallback<T, Tx extends TransactionClient = TransactionClient> = (
+  tx: Tx,
+) => Promise<T>;
 
 /**
  * The transaction client `CubridClient.transaction()` passes in: a
@@ -313,10 +309,7 @@ export interface TransactionScope
 
 export interface ConnectionLike {
   connect(): Promise<void>;
-  query<T extends QueryResultRow = QueryResultRow>(
-    sql: string,
-    params?: QueryParams,
-  ): Promise<T[]>;
+  query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
   /**
    * Optional so 1.x connection factories keep compiling. `queryResult()` on a
    * client or transaction fails when its connection does not provide it.
@@ -367,6 +360,4 @@ export interface ConnectionLike {
   ping?(): Promise<string>;
 }
 
-export type ConnectionFactory = (
-  config: ClientConfig,
-) => ConnectionLike | Promise<ConnectionLike>;
+export type ConnectionFactory = (config: ClientConfig) => ConnectionLike | Promise<ConnectionLike>;

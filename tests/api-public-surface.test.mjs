@@ -1,5 +1,5 @@
-import test from "node:test";
 import assert from "node:assert/strict";
+import test from "node:test";
 import { publicDeclarationSurface } from "../scripts/api-public-surface.mjs";
 
 const baseline = `
@@ -42,5 +42,8 @@ test("detects public runtime and TypeScript contract changes", () => {
 });
 
 test("normalizes line endings and declaration comments", () => {
-  assert.equal(publicDeclarationSurface(baseline.replaceAll("\n", "\r\n")), publicDeclarationSurface(baseline));
+  assert.equal(
+    publicDeclarationSurface(baseline.replaceAll("\n", "\r\n")),
+    publicDeclarationSurface(baseline),
+  );
 });

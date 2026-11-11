@@ -36,10 +36,13 @@ export function publicDeclarationSurface(contents) {
       }),
   ]);
   try {
-    return ts.createPrinter({
-      removeComments: true,
-      newLine: ts.NewLineKind.LineFeed,
-    }).printFile(transformed.transformed[0]).trimEnd();
+    return ts
+      .createPrinter({
+        removeComments: true,
+        newLine: ts.NewLineKind.LineFeed,
+      })
+      .printFile(transformed.transformed[0])
+      .trimEnd();
   } finally {
     transformed.dispose();
   }

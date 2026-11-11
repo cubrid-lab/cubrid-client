@@ -11,28 +11,28 @@
  */
 
 import { Socket } from "node:net";
-import { connect as tlsConnect, type TLSSocket } from "node:tls";
+import { type TLSSocket, connect as tlsConnect } from "node:tls";
+import { ConnectionLostError } from "../errors/internal-errors.js";
+import { ReadTimeoutError } from "../errors/read-timeout-error.js";
+import { parseConnectionString } from "../utils/connection-string.js";
 import {
   CASFunctionCode,
   DEFAULT_MAX_FRAME_LENGTH,
   SIZE_CAS_INFO,
   SIZE_DATA_LENGTH,
 } from "./constants.js";
-import { ConnectionLostError } from "../errors/internal-errors.js";
-import { ReadTimeoutError } from "../errors/read-timeout-error.js";
-import { parseConnectionString } from "../utils/connection-string.js";
 import {
-  writeClientInfoExchange,
-  parseClientInfoExchange,
-  writeOpenDatabase,
-  parseOpenDatabase,
-  writeGetDbVersion,
-  parseGetDbVersion,
-  writeCheckCas,
-  parseCheckCas,
-  parseSimpleResponse,
-  writeSetDbParameter,
   type OpenDatabaseResult,
+  parseCheckCas,
+  parseClientInfoExchange,
+  parseGetDbVersion,
+  parseOpenDatabase,
+  parseSimpleResponse,
+  writeCheckCas,
+  writeClientInfoExchange,
+  writeGetDbVersion,
+  writeOpenDatabase,
+  writeSetDbParameter,
 } from "./protocol.js";
 
 const RETRY_BASE_DELAY_MS = 100;
@@ -636,7 +636,10 @@ export class CASConnection {
    * operation cannot deadlock or poison the queue.
    */
   private enqueue<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.queue.then(() => fn(), () => fn());
+    const run = this.queue.then(
+      () => fn(),
+      () => fn(),
+    );
     this.queue = run.then(
       () => undefined,
       () => undefined,
@@ -782,9 +785,7 @@ export class CASConnection {
     const maxFrameLength = this.config.maxFrameLength ?? DEFAULT_MAX_FRAME_LENGTH;
 
     if (dataLength < 0 || dataLength > maxFrameLength) {
-      throw new Error(
-        `Invalid CAS frame length ${dataLength} (expected 0 to ${maxFrameLength})`,
-      );
+      throw new Error(`Invalid CAS frame length ${dataLength} (expected 0 to ${maxFrameLength})`);
     }
 
     return this.recvExact(socket, dataLength + SIZE_CAS_INFO);

@@ -40,10 +40,22 @@ const insert = `INSERT INTO ${table} (id, name) VALUES (?, ?)`;
 let nextId = 2000;
 
 const workloads: readonly Workload[] = [
-  ["select by primary key", (r) => client.query(byKey, [r % 1000]), (r) => client.queryPrepared(byKey, [r % 1000])],
+  [
+    "select by primary key",
+    (r) => client.query(byKey, [r % 1000]),
+    (r) => client.queryPrepared(byKey, [r % 1000]),
+  ],
   ["select 1000 rows", () => client.query(scan, [1000]), () => client.queryPrepared(scan, [1000])],
-  ["update by primary key", (r) => client.execute(update, ["u", r % 1000]), (r) => client.executePrepared(update, ["u", r % 1000])],
-  ["insert one row", () => client.execute(insert, [nextId++, "n"]), () => client.executePrepared(insert, [nextId++, "n"])],
+  [
+    "update by primary key",
+    (r) => client.execute(update, ["u", r % 1000]),
+    (r) => client.executePrepared(update, ["u", r % 1000]),
+  ],
+  [
+    "insert one row",
+    () => client.execute(insert, [nextId++, "n"]),
+    () => client.executePrepared(insert, [nextId++, "n"]),
+  ],
 ];
 
 try {

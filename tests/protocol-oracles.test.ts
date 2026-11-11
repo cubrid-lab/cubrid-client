@@ -5,30 +5,31 @@
  * CUBRID source. They must NOT be generated from the enums under test.
  * Provenance: docs/PROTOCOL_ORACLES.md.
  */
-import test from "node:test";
+
 import assert from "node:assert/strict";
+import test from "node:test";
 import { CASFunctionCode, CUBRIDDataType, StatementType } from "../src/protocol/constants.js";
 import {
   encodeBindParams,
   encodePreparedParams,
-  LobLocator,
+  type LobLocator,
   MalformedReplyError,
   parseExecute,
   parseFetch,
-  parsePrepare,
   parseLobRead,
+  parsePrepare,
   parsePrepareAndExecute,
   UnsupportedValueError,
   writeExecute,
   writeFetch,
-  writePrepare,
   writeLobRead,
+  writePrepare,
 } from "../src/protocol/protocol.js";
+import { ZonedDateTime } from "../src/types/zoned-date-time.js";
 import { CAPTURED_FRAMES, type CapturedFrame } from "./fixtures/collection-frames.js";
 import { PREPARED_FRAMES } from "./fixtures/dml-frames.js";
 import { LOB_FRAMES } from "./fixtures/lob-frames.js";
 import { ZONED_FRAMES } from "./fixtures/zoned-frames.js";
-import { ZonedDateTime } from "../src/types/zoned-date-time.js";
 
 const i32 = (value: number): Buffer => {
   const b = Buffer.alloc(4);
@@ -48,28 +49,37 @@ const i16 = (value: number): Buffer => {
 function selectWire(wireType: number, rawValue: Buffer | null, name = "value"): Buffer {
   const column = Buffer.from(`${name}\0`, "utf8");
   return Buffer.concat([
-    i32(7),                         // query handle
-    i32(0),                         // cache lifetime
-    Buffer.from([21]),              // SQL SELECT statement code
-    i32(0),                         // bind count
-    Buffer.from([0]),               // updatable
-    i32(1),                         // column count
-    Buffer.from([wireType]),        // exact CCI column type ID
-    i16(0),                         // scale
-    i32(19),                        // precision
-    i32(column.length), column,     // name
-    i32(column.length), column,     // real name
-    i32(1), Buffer.from([0]),       // table name
-    Buffer.from([1]),               // nullable
-    i32(1), Buffer.from([0]),       // default value
-    Buffer.alloc(7),                // column flags
-    i32(1),                         // total tuples
-    Buffer.from([0]),               // cache_reusable
-    i32(1),                         // result info count
-    Buffer.from([21]),              // result info statement SELECT
-    i32(1), Buffer.alloc(8), i32(0), i32(0), // result info
-    i32(0), i32(1),                 // inline fetch success, 1 tuple
-    i32(1), Buffer.alloc(8),        // cursor position, OID
+    i32(7), // query handle
+    i32(0), // cache lifetime
+    Buffer.from([21]), // SQL SELECT statement code
+    i32(0), // bind count
+    Buffer.from([0]), // updatable
+    i32(1), // column count
+    Buffer.from([wireType]), // exact CCI column type ID
+    i16(0), // scale
+    i32(19), // precision
+    i32(column.length),
+    column, // name
+    i32(column.length),
+    column, // real name
+    i32(1),
+    Buffer.from([0]), // table name
+    Buffer.from([1]), // nullable
+    i32(1),
+    Buffer.from([0]), // default value
+    Buffer.alloc(7), // column flags
+    i32(1), // total tuples
+    Buffer.from([0]), // cache_reusable
+    i32(1), // result info count
+    Buffer.from([21]), // result info statement SELECT
+    i32(1),
+    Buffer.alloc(8),
+    i32(0),
+    i32(0), // result info
+    i32(0),
+    i32(1), // inline fetch success, 1 tuple
+    i32(1),
+    Buffer.alloc(8), // cursor position, OID
     i32(rawValue === null ? -1 : rawValue.length),
     ...(rawValue === null ? [] : [rawValue]),
   ]);
@@ -119,11 +129,13 @@ test("literal CAS function codes are not CCI values or SQL statement IDs", () =>
 
 test("literal BIGINT type 21 decodes exact signed 64-bit boundaries", () => {
   const positive = parsePrepareAndExecute(
-    selectWire(21, Buffer.from("7fffffffffffffff", "hex")), 1,
+    selectWire(21, Buffer.from("7fffffffffffffff", "hex")),
+    1,
   );
   assert.equal(positive.rows[0]?.value, 9223372036854775807n);
   const negative = parsePrepareAndExecute(
-    selectWire(21, Buffer.from("8000000000000000", "hex")), 1,
+    selectWire(21, Buffer.from("8000000000000000", "hex")),
+    1,
   );
   assert.equal(negative.rows[0]?.value, -9223372036854775808n);
 });
@@ -137,9 +149,11 @@ test("literal BIGINT bind packet retains its exact type byte", () => {
 test("unsupported non-NULL bytes are errors and never fabricated SQL NULL", () => {
   for (const type of [16, 17, 18, 19, 20, 26, 34, 99]) {
     const wire = selectWire(type, Buffer.from("01020304", "hex"));
-    assert.throws(() => parsePrepareAndExecute(wire, 1), (error: Error) =>
-      error.message.includes(`wire type ${type}`) &&
-      error.message.includes('column "value"'));
+    assert.throws(
+      () => parsePrepareAndExecute(wire, 1),
+      (error: Error) =>
+        error.message.includes(`wire type ${type}`) && error.message.includes('column "value"'),
+    );
   }
 });
 
@@ -189,23 +203,33 @@ test("a zero-byte value is an empty Buffer only for BIT and VARBIT, and never fo
     [{ x: Buffer.alloc(0), t: "after" }],
   );
   for (const type of [5, 6]) {
-    assert.deepEqual(parsePrepareAndExecute(selectWire(type, Buffer.alloc(0)), 1).rows[0]?.value, Buffer.alloc(0));
+    assert.deepEqual(
+      parsePrepareAndExecute(selectWire(type, Buffer.alloc(0)), 1).rows[0]?.value,
+      Buffer.alloc(0),
+    );
     assert.equal(parsePrepareAndExecute(selectWire(type, null), 1).rows[0]?.value, null);
   }
 
   // No decoder: OBJECT, JSON (never sent below protocol 8) and a code CCI does not define.
   for (const type of [19, 34, 99]) {
-    assert.throws(() => parsePrepareAndExecute(selectWire(type, Buffer.alloc(0)), 1), (error: Error) =>
-      error instanceof UnsupportedValueError && error.message.includes(`wire type ${type}, 0 bytes`));
+    assert.throws(
+      () => parsePrepareAndExecute(selectWire(type, Buffer.alloc(0)), 1),
+      (error: Error) =>
+        error instanceof UnsupportedValueError &&
+        error.message.includes(`wire type ${type}, 0 bytes`),
+    );
   }
 
   // Decodable, but CAS counts the NUL of text and writes fixed widths in full.
   for (const type of [2, 8, 21, 23, 29, 30, 31, 32]) {
-    assert.throws(() => parsePrepareAndExecute(selectWire(type, Buffer.alloc(0)), 1), (error: Error) =>
-      error instanceof MalformedReplyError &&
-      error.message.includes(`wire type ${type}, 0 bytes`) &&
-      // The reason is one step down the cause chain, not behind a repeated message.
-      !(error.cause as Error).message.startsWith("Failed to decode"));
+    assert.throws(
+      () => parsePrepareAndExecute(selectWire(type, Buffer.alloc(0)), 1),
+      (error: Error) =>
+        error instanceof MalformedReplyError &&
+        error.message.includes(`wire type ${type}, 0 bytes`) &&
+        // The reason is one step down the cause chain, not behind a repeated message.
+        !(error.cause as Error).message.startsWith("Failed to decode"),
+    );
   }
 });
 
@@ -213,12 +237,14 @@ test("a NULL-typed column never turns a typed cell without value bytes into null
   // Cell of size 1 holding only the type header: the literal OBJECT code 19.
   assert.throws(
     () => parsePrepareAndExecute(selectWire(0, Buffer.from([19])), 1),
-    (error: Error) => error instanceof UnsupportedValueError && /wire type 19, 0 bytes/.test(error.message),
+    (error: Error) =>
+      error instanceof UnsupportedValueError && /wire type 19, 0 bytes/.test(error.message),
   );
   // Cell of size 0 has no room for the header, which must not come from the next bytes.
   assert.throws(
     () => parsePrepareAndExecute(selectWire(0, Buffer.alloc(0)), 1),
-    (error: Error) => error instanceof MalformedReplyError && /invalid cell length 0/.test(error.message),
+    (error: Error) =>
+      error instanceof MalformedReplyError && /invalid cell length 0/.test(error.message),
   );
 });
 
@@ -378,7 +404,8 @@ test("a zero date element rejects as unsupported, and structural damage still wi
   const second = "0000000607e400010002";
   assert.ok(hex.includes(second));
   assert.throws(
-    () => parsePrepareAndExecute(Buffer.from(hex.replace(second, "0000000707e400010002"), "hex"), 7),
+    () =>
+      parsePrepareAndExecute(Buffer.from(hex.replace(second, "0000000707e400010002"), "hex"), 7),
     (error: Error) => error instanceof MalformedReplyError,
   );
 });
@@ -386,7 +413,13 @@ test("a zero date element rejects as unsupported, and structural damage still wi
 test("an all-zero value of the wrong width is malformed, not a zero date", () => {
   // Only DATE 6, DATETIME 14 and TIMESTAMP 12 bytes can be the zero date. Any other
   // width contradicts its cell, so the reply is malformed and the session is dropped.
-  for (const [wireType, size] of [[22, 6], [15, 6], [13, 7], [13, 14], [15, 14]] as const) {
+  for (const [wireType, size] of [
+    [22, 6],
+    [15, 6],
+    [13, 7],
+    [13, 14],
+    [15, 14],
+  ] as const) {
     assert.throws(
       () => parsePrepareAndExecute(selectWire(wireType, Buffer.alloc(size)), 1),
       (error: Error) => error instanceof MalformedReplyError,
@@ -415,13 +448,19 @@ test("parseFetch decodes collections with the metadata of the executed query", (
   const text = Buffer.from("fetch\0");
   const fetched = parseFetch(
     Buffer.concat([
-      i32(0), i32(1),
-      i32(5), Buffer.alloc(8),
-      i32(4), cell("00000005"),
-      i32(13), cell("08000000010000000400000007"),
-      i32(5), cell("0000000000"),
+      i32(0),
+      i32(1),
+      i32(5),
+      Buffer.alloc(8),
+      i32(4),
+      cell("00000005"),
+      i32(13),
+      cell("08000000010000000400000007"),
+      i32(5),
+      cell("0000000000"),
       i32(-1),
-      i32(text.length), text,
+      i32(text.length),
+      text,
     ]),
     columns,
   );
@@ -447,20 +486,64 @@ const causeOf = (error: Error): string =>
 
 for (const [problem, cell, reason] of [
   // Lengths: the 21-byte cell of the valid case with one field changed.
-  ["an element length past the cell", "00000015080000000200000004000000010000000500000002", /cannot read 5 bytes/],
-  ["an element length past the packet", "00000015080000000200000004000000017fffffff00000002", /cannot read 2147483647 bytes/],
-  ["a negative element length below NULL", "0000001508000000020000000400000001fffffffe00000002", /invalid length -2/],
-  ["a zero length on a type that cannot be empty", "00000015080000000200000004000000010000000000000002", /invalid length 0/],
-  ["a count that exceeds the cell", "00000015087fffffff00000004000000010000000400000002", /count 2147483647/],
-  ["a count larger than the elements", "00000015080000000300000004000000010000000400000002", /element 2 has no length/],
-  ["a count smaller than the elements", "00000015080000000100000004000000010000000400000002", /uses 13 of its 21 bytes/],
+  [
+    "an element length past the cell",
+    "00000015080000000200000004000000010000000500000002",
+    /cannot read 5 bytes/,
+  ],
+  [
+    "an element length past the packet",
+    "00000015080000000200000004000000017fffffff00000002",
+    /cannot read 2147483647 bytes/,
+  ],
+  [
+    "a negative element length below NULL",
+    "0000001508000000020000000400000001fffffffe00000002",
+    /invalid length -2/,
+  ],
+  [
+    "a zero length on a type that cannot be empty",
+    "00000015080000000200000004000000010000000000000002",
+    /invalid length 0/,
+  ],
+  [
+    "a count that exceeds the cell",
+    "00000015087fffffff00000004000000010000000400000002",
+    /count 2147483647/,
+  ],
+  [
+    "a count larger than the elements",
+    "00000015080000000300000004000000010000000400000002",
+    /element 2 has no length/,
+  ],
+  [
+    "a count smaller than the elements",
+    "00000015080000000100000004000000010000000400000002",
+    /uses 13 of its 21 bytes/,
+  ],
   ["a negative count", "0000001508ffffffff00000004000000010000000400000002", /count -1/],
-  ["a non-NULL element without an element type", "00000015000000000200000004000000010000000400000002", /Unsupported CUBRID CAS value type 0/],
+  [
+    "a non-NULL element without an element type",
+    "00000015000000000200000004000000010000000400000002",
+    /Unsupported CUBRID CAS value type 0/,
+  ],
   // Element payloads that disagree with their type, in a cell of the right size.
-  ["an int element shorter than its type", "0000001308000000020000000400000001000000020000", /bounds|out of range/],
-  ["an int element longer than its type", "00000016080000000200000004000000010000000500000000" + "02", /uses 4 of its 5 bytes/],
+  [
+    "an int element shorter than its type",
+    "0000001308000000020000000400000001000000020000",
+    /bounds|out of range/,
+  ],
+  [
+    "an int element longer than its type",
+    "00000016080000000200000004000000010000000500000000" + "02",
+    /uses 4 of its 5 bytes/,
+  ],
   // Cell lengths.
-  ["a cell longer than its elements", "00000019080000000200000004000000010000000400000002ffffffff", /uses 21 of its 25 bytes/],
+  [
+    "a cell longer than its elements",
+    "00000019080000000200000004000000010000000400000002ffffffff",
+    /uses 21 of its 25 bytes/,
+  ],
   ["a cell shorter than its header", "000000040800000002", /has no header/],
   ["a zero-length collection cell", "00000000", /invalid cell length 0/],
   ["a cell length below NULL", "fffffffe", /invalid cell length -2/],
@@ -507,15 +590,51 @@ const NESTED_BLOB = "0000000d" + "17" + "00000001" + BLOB_ELEMENT;
 const NESTED_CLOB = "0000000d" + "18" + "00000001" + BLOB_ELEMENT;
 
 for (const [problem, cell, reason] of [
-  ["a length past the cell", "0000000d" + "17" + "00000001" + "00000005" + "01020304", /cannot read 5 bytes/],
-  ["a later element below NULL", "00000011" + "17" + "00000002" + BLOB_ELEMENT + "fffffffe", /invalid length -2/],
-  ["a later element with no length", "00000011" + "17" + "00000003" + BLOB_ELEMENT + "ffffffff", /element 2 has no length/],
-  ["a cell longer than its elements", "0000000f" + "17" + "00000001" + BLOB_ELEMENT + "0000", /uses 13 of its 15 bytes/],
-  ["a later element of a type without any decoder", "00000013" + "63" + "00000002" + "00000002" + "0102" + "00000005" + "01020304", /cannot read 5 bytes/],
+  [
+    "a length past the cell",
+    "0000000d" + "17" + "00000001" + "00000005" + "01020304",
+    /cannot read 5 bytes/,
+  ],
+  [
+    "a later element below NULL",
+    "00000011" + "17" + "00000002" + BLOB_ELEMENT + "fffffffe",
+    /invalid length -2/,
+  ],
+  [
+    "a later element with no length",
+    "00000011" + "17" + "00000003" + BLOB_ELEMENT + "ffffffff",
+    /element 2 has no length/,
+  ],
+  [
+    "a cell longer than its elements",
+    "0000000f" + "17" + "00000001" + BLOB_ELEMENT + "0000",
+    /uses 13 of its 15 bytes/,
+  ],
+  [
+    "a later element of a type without any decoder",
+    "00000013" + "63" + "00000002" + "00000002" + "0102" + "00000005" + "01020304",
+    /cannot read 5 bytes/,
+  ],
   // A SEQUENCE whose second nested cell has an int element claiming 5 of its 4 bytes.
-  ["damage in a later nested cell", "00000027" + "12" + "00000002" + NESTED_BLOB + "0000000d" + "08" + "00000001" + "00000005" + "00000001", /cannot read 5 bytes/],
+  [
+    "damage in a later nested cell",
+    "00000027" +
+      "12" +
+      "00000002" +
+      NESTED_BLOB +
+      "0000000d" +
+      "08" +
+      "00000001" +
+      "00000005" +
+      "00000001",
+    /cannot read 5 bytes/,
+  ],
   // The unsupported element is itself nested, and the damage is in the outer cell.
-  ["damage after a nested unsupported cell", "0000001a" + "12" + "00000002" + NESTED_BLOB + "fffffffe", /invalid length -2/],
+  [
+    "damage after a nested unsupported cell",
+    "0000001a" + "12" + "00000002" + NESTED_BLOB + "fffffffe",
+    /invalid length -2/,
+  ],
 ] as const) {
   test(`an unsupported collection element does not hide ${problem}`, () => {
     assert.throws(
@@ -541,8 +660,16 @@ test("a complete collection keeps its first unsupported element, and damage outr
     },
   );
   // The same walk reaches the second cell: damage there outranks the first error.
-  const damaged = "00000027" + "12" + "00000002" + NESTED_BLOB +
-    "0000000d" + "18" + "00000001" + "00000005" + "01020304";
+  const damaged =
+    "00000027" +
+    "12" +
+    "00000002" +
+    NESTED_BLOB +
+    "0000000d" +
+    "18" +
+    "00000001" +
+    "00000005" +
+    "01020304";
   assert.throws(
     () => parsePrepareAndExecute(withCell(damaged), 7),
     (error: Error) => error instanceof MalformedReplyError,
@@ -568,16 +695,23 @@ test("very deep nesting rejects instead of crashing the process", () => {
     body.writeInt32BE(1, offset + 1);
     body.writeInt32BE(body.length - offset - levelSize, offset + 5);
   }
-  assert.throws(() => parseFetch(
-    Buffer.concat([i32(0), i32(1), i32(1), Buffer.alloc(8), i32(body.length), body]),
-    [{ ...decodeFrame(CAPTURED_FRAMES.setDeduplicated).columns[0]!, type: CUBRIDDataType.SEQUENCE }],
-  ));
+  assert.throws(() =>
+    parseFetch(Buffer.concat([i32(0), i32(1), i32(1), Buffer.alloc(8), i32(body.length), body]), [
+      {
+        ...decodeFrame(CAPTURED_FRAMES.setDeduplicated).columns[0]!,
+        type: CUBRIDDataType.SEQUENCE,
+      },
+    ]),
+  );
 });
 
 test("a scalar value that disagrees with its cell length rejects", () => {
   // An int column declares 3 bytes: reading 4 would consume the next cell's first byte.
   const wire = selectWire(8, Buffer.from("000000", "hex"));
-  assert.throws(() => parsePrepareAndExecute(Buffer.concat([wire, Buffer.alloc(4)]), 1), /Failed to decode/);
+  assert.throws(
+    () => parsePrepareAndExecute(Buffer.concat([wire, Buffer.alloc(4)]), 1),
+    /Failed to decode/,
+  );
   // The same for a bigint column that declares more than its 8 bytes.
   const long = selectWire(21, Buffer.from("000000000000002a00", "hex"));
   assert.throws(() => parsePrepareAndExecute(long, 1), /Failed to decode/);
@@ -614,14 +748,25 @@ test("LOB_READ is CAS function 37 and its request matches the captured bytes", (
 test("captured LOB cells decode to a size and locator on relative and absolute paths", () => {
   for (const frame of [LOB_FRAMES.selectRows, LOB_FRAMES.selectRowsAbsolutePaths]) {
     const { rows } = parsePrepareAndExecute(Buffer.from(frame.hex, "hex"), 7);
-    const sizes = rows.map((row) => [row.id, (row.b as LobLocator)?.size, (row.c as LobLocator)?.size]);
+    const sizes = rows.map((row) => [
+      row.id,
+      (row.b as LobLocator)?.size,
+      (row.c as LobLocator)?.size,
+    ]);
 
-    assert.deepEqual(sizes, [[1, 3, 2], [2, 0, 0], [3, undefined, undefined]]);
+    assert.deepEqual(sizes, [
+      [1, 3, 2],
+      [2, 0, 0],
+      [3, undefined, undefined],
+    ]);
     assert.equal(rows[2]!.b, null);
     assert.equal(rows[2]!.c, null);
     assert.equal((rows[0]!.b as LobLocator).type, 23);
     assert.equal((rows[0]!.c as LobLocator).type, 24);
-    assert.equal((rows[0]!.b as LobLocator).handle.subarray(16).toString("latin1").slice(0, 5), "file:");
+    assert.equal(
+      (rows[0]!.b as LobLocator).handle.subarray(16).toString("latin1").slice(0, 5),
+      "file:",
+    );
   }
 });
 
@@ -647,10 +792,7 @@ for (const [name, reply, requested] of [
   ["an error envelope with no code", "fffffffe", 3],
 ] as const) {
   test(`a LOB_READ reply with ${name} is malformed`, () => {
-    assert.throws(
-      () => parseLobRead(Buffer.from(reply, "hex"), requested),
-      MalformedReplyError,
-    );
+    assert.throws(() => parseLobRead(Buffer.from(reply, "hex"), requested), MalformedReplyError);
   });
 }
 
@@ -658,13 +800,33 @@ const LOCATOR = Buffer.from("file:ces_1/t.1\0", "latin1");
 
 for (const [name, cell, cause] of [
   ["shorter than its header", Buffer.alloc(15), /has no header/],
-  ["with the other LOB's db_type", lobCell(34, 3n, LOCATOR.length, LOCATOR), /db_type 34 in a column of type 23/],
+  [
+    "with the other LOB's db_type",
+    lobCell(34, 3n, LOCATOR.length, LOCATOR),
+    /db_type 34 in a column of type 23/,
+  ],
   ["with a negative size", lobCell(33, -1n, LOCATOR.length, LOCATOR), /LOB size -1/],
-  ["with a size past safe integers", lobCell(33, 2n ** 53n, LOCATOR.length, LOCATOR), /LOB size 9007199254740992/],
-  ["whose locator overruns the cell", lobCell(33, 3n, LOCATOR.length + 1, LOCATOR), /value uses 32 of its 31 bytes/],
-  ["whose locator stops short of the cell", lobCell(33, 3n, LOCATOR.length - 1, LOCATOR), /value uses 30 of its 31 bytes/],
+  [
+    "with a size past safe integers",
+    lobCell(33, 2n ** 53n, LOCATOR.length, LOCATOR),
+    /LOB size 9007199254740992/,
+  ],
+  [
+    "whose locator overruns the cell",
+    lobCell(33, 3n, LOCATOR.length + 1, LOCATOR),
+    /value uses 32 of its 31 bytes/,
+  ],
+  [
+    "whose locator stops short of the cell",
+    lobCell(33, 3n, LOCATOR.length - 1, LOCATOR),
+    /value uses 30 of its 31 bytes/,
+  ],
   ["with an empty locator", lobCell(33, 0n, 0, Buffer.alloc(0)), /locator of 0 bytes has no NUL/],
-  ["whose locator has no trailing NUL", lobCell(33, 3n, 4, Buffer.from("file")), /locator of 4 bytes has no NUL/],
+  [
+    "whose locator has no trailing NUL",
+    lobCell(33, 3n, 4, Buffer.from("file")),
+    /locator of 4 bytes has no NUL/,
+  ],
 ] as const) {
   test(`a LOB cell ${name} is malformed`, () => {
     assert.throws(
@@ -713,53 +875,163 @@ const zonedCollection = (frame: { hex: string }): { c: unknown; t: unknown } => 
 
 test("captured zoned values keep their fields and the zone text the server sent", () => {
   const cases: Array<[{ hex: string; sql: string }, Record<string, unknown>]> = [
-    [ZONED_FRAMES.timestamptzOffset, {
-      type: "TIMESTAMPTZ", year: 2020, month: 1, day: 2, hour: 3, minute: 4, second: 5,
-      millisecond: 0, zone: "+09:00",
-    }],
-    [ZONED_FRAMES.timestamptzHalfHour, {
-      type: "TIMESTAMPTZ", year: 2020, month: 7, day: 2, hour: 3, minute: 4, second: 5,
-      millisecond: 0, zone: "-05:30",
-    }],
-    [ZONED_FRAMES.timestamptzRegion, {
-      type: "TIMESTAMPTZ", year: 2020, month: 1, day: 2, hour: 3, minute: 4, second: 5,
-      millisecond: 0, zone: "America/New_York EST",
-    }],
+    [
+      ZONED_FRAMES.timestamptzOffset,
+      {
+        type: "TIMESTAMPTZ",
+        year: 2020,
+        month: 1,
+        day: 2,
+        hour: 3,
+        minute: 4,
+        second: 5,
+        millisecond: 0,
+        zone: "+09:00",
+      },
+    ],
+    [
+      ZONED_FRAMES.timestamptzHalfHour,
+      {
+        type: "TIMESTAMPTZ",
+        year: 2020,
+        month: 7,
+        day: 2,
+        hour: 3,
+        minute: 4,
+        second: 5,
+        millisecond: 0,
+        zone: "-05:30",
+      },
+    ],
+    [
+      ZONED_FRAMES.timestamptzRegion,
+      {
+        type: "TIMESTAMPTZ",
+        year: 2020,
+        month: 1,
+        day: 2,
+        hour: 3,
+        minute: 4,
+        second: 5,
+        millisecond: 0,
+        zone: "America/New_York EST",
+      },
+    ],
     // LTZ values arrive in the session zone: the server's default UTC, or Asia/Seoul after
     // SET TIME ZONE, which also moves 03:04:05 America/New_York in July to 16:04:05 KST.
-    [ZONED_FRAMES.timestampltz, {
-      type: "TIMESTAMPLTZ", year: 2020, month: 1, day: 1, hour: 18, minute: 4, second: 5,
-      millisecond: 0, zone: "UTC UTC",
-    }],
-    [ZONED_FRAMES.timestampltzSeoul, {
-      type: "TIMESTAMPLTZ", year: 2020, month: 1, day: 2, hour: 3, minute: 4, second: 5,
-      millisecond: 0, zone: "Asia/Seoul KST",
-    }],
-    [ZONED_FRAMES.datetimetzOffset, {
-      type: "DATETIMETZ", year: 2020, month: 1, day: 2, hour: 3, minute: 4, second: 5,
-      millisecond: 678, zone: "+09:00",
-    }],
-    [ZONED_FRAMES.datetimetzRegion, {
-      type: "DATETIMETZ", year: 2020, month: 7, day: 2, hour: 3, minute: 4, second: 5,
-      millisecond: 999, zone: "America/New_York EDT",
-    }],
-    [ZONED_FRAMES.datetimeltz, {
-      type: "DATETIMELTZ", year: 2020, month: 1, day: 1, hour: 18, minute: 4, second: 5,
-      millisecond: 678, zone: "UTC UTC",
-    }],
-    [ZONED_FRAMES.datetimeltzSeoul, {
-      type: "DATETIMELTZ", year: 2020, month: 7, day: 2, hour: 16, minute: 4, second: 5,
-      millisecond: 500, zone: "Asia/Seoul KST",
-    }],
+    [
+      ZONED_FRAMES.timestampltz,
+      {
+        type: "TIMESTAMPLTZ",
+        year: 2020,
+        month: 1,
+        day: 1,
+        hour: 18,
+        minute: 4,
+        second: 5,
+        millisecond: 0,
+        zone: "UTC UTC",
+      },
+    ],
+    [
+      ZONED_FRAMES.timestampltzSeoul,
+      {
+        type: "TIMESTAMPLTZ",
+        year: 2020,
+        month: 1,
+        day: 2,
+        hour: 3,
+        minute: 4,
+        second: 5,
+        millisecond: 0,
+        zone: "Asia/Seoul KST",
+      },
+    ],
+    [
+      ZONED_FRAMES.datetimetzOffset,
+      {
+        type: "DATETIMETZ",
+        year: 2020,
+        month: 1,
+        day: 2,
+        hour: 3,
+        minute: 4,
+        second: 5,
+        millisecond: 678,
+        zone: "+09:00",
+      },
+    ],
+    [
+      ZONED_FRAMES.datetimetzRegion,
+      {
+        type: "DATETIMETZ",
+        year: 2020,
+        month: 7,
+        day: 2,
+        hour: 3,
+        minute: 4,
+        second: 5,
+        millisecond: 999,
+        zone: "America/New_York EDT",
+      },
+    ],
+    [
+      ZONED_FRAMES.datetimeltz,
+      {
+        type: "DATETIMELTZ",
+        year: 2020,
+        month: 1,
+        day: 1,
+        hour: 18,
+        minute: 4,
+        second: 5,
+        millisecond: 678,
+        zone: "UTC UTC",
+      },
+    ],
+    [
+      ZONED_FRAMES.datetimeltzSeoul,
+      {
+        type: "DATETIMELTZ",
+        year: 2020,
+        month: 7,
+        day: 2,
+        hour: 16,
+        minute: 4,
+        second: 5,
+        millisecond: 500,
+        zone: "Asia/Seoul KST",
+      },
+    ],
     // The extremes of the range: year 1 and year 9999 with a +14:00 offset.
-    [ZONED_FRAMES.datetimetzMin, {
-      type: "DATETIMETZ", year: 1, month: 1, day: 1, hour: 0, minute: 0, second: 0,
-      millisecond: 0, zone: "+00:00",
-    }],
-    [ZONED_FRAMES.datetimetzMax, {
-      type: "DATETIMETZ", year: 9999, month: 12, day: 31, hour: 23, minute: 59, second: 59,
-      millisecond: 999, zone: "+14:00",
-    }],
+    [
+      ZONED_FRAMES.datetimetzMin,
+      {
+        type: "DATETIMETZ",
+        year: 1,
+        month: 1,
+        day: 1,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        millisecond: 0,
+        zone: "+00:00",
+      },
+    ],
+    [
+      ZONED_FRAMES.datetimetzMax,
+      {
+        type: "DATETIMETZ",
+        year: 9999,
+        month: 12,
+        day: 31,
+        hour: 23,
+        minute: 59,
+        second: 59,
+        millisecond: 999,
+        zone: "+14:00",
+      },
+    ],
   ];
   for (const [frame, fields] of cases) {
     const { tz, t } = zonedRow(frame);
@@ -834,24 +1106,44 @@ test("a zoned cell that breaks its layout is malformed and never a value", () =>
     ["a day of 0", 30, Buffer.concat([fields(2020, 1, 0, 3, 4, 5), zone("UTC UTC\0")])],
     ["an hour of 24", 29, Buffer.concat([fields(2020, 1, 2, 24, 4, 5), zone("+09:00\0")])],
     ["a negative year", 29, Buffer.concat([fields(-1, 1, 2, 3, 4, 5), zone("+09:00\0")])],
-    ["milliseconds of 1000", 31, Buffer.concat([fields(2020, 1, 2, 3, 4, 5, 1000), zone("+09:00\0")])],
+    [
+      "milliseconds of 1000",
+      31,
+      Buffer.concat([fields(2020, 1, 2, 3, 4, 5, 1000), zone("+09:00\0")]),
+    ],
     ["year 10000", 31, Buffer.concat([fields(10000, 1, 2, 3, 4, 5, 6), zone("+09:00\0")])],
-    ["February 29 of a common year", 29, Buffer.concat([fields(2021, 2, 29, 3, 4, 5), zone("+09:00\0")])],
+    [
+      "February 29 of a common year",
+      29,
+      Buffer.concat([fields(2021, 2, 29, 3, 4, 5), zone("+09:00\0")]),
+    ],
     ["February 29 of 1900", 29, Buffer.concat([fields(1900, 2, 29, 3, 4, 5), zone("+09:00\0")])],
     ["April 31", 29, Buffer.concat([fields(2020, 4, 31, 3, 4, 5), zone("+09:00\0")])],
     ["a DATETIME shaped cell with no zone", 31, datetime],
-    ["a TIMESTAMP shaped cell in a DATETIMETZ column", 32, Buffer.concat([timestamp, zone("+9\0")])],
+    [
+      "a TIMESTAMP shaped cell in a DATETIMETZ column",
+      32,
+      Buffer.concat([timestamp, zone("+9\0")]),
+    ],
   ];
   for (const [name, type, cell] of cases) {
     assert.throws(
       () => parsePrepareAndExecute(selectWire(type, cell), 1),
-      (error: Error) => error instanceof MalformedReplyError && error.message.includes(`wire type ${type}`),
+      (error: Error) =>
+        error instanceof MalformedReplyError && error.message.includes(`wire type ${type}`),
       name,
     );
   }
 
   // Real leap days and month ends decode.
-  for (const [y, m, d] of [[2020, 2, 29], [2000, 2, 29], [2021, 2, 28], [1900, 2, 28], [9999, 12, 31], [1, 1, 1]]) {
+  for (const [y, m, d] of [
+    [2020, 2, 29],
+    [2000, 2, 29],
+    [2021, 2, 28],
+    [1900, 2, 28],
+    [9999, 12, 31],
+    [1, 1, 1],
+  ]) {
     const value = parsePrepareAndExecute(
       selectWire(29, Buffer.concat([fields(y!, m!, d!, 3, 4, 5), zone("+09:00\0")])),
       1,
@@ -860,10 +1152,8 @@ test("a zoned cell that breaks its layout is malformed and never a value", () =>
   }
 
   // The same layouts that are valid decode, so the cases above fail for their stated reason.
-  const ok = parsePrepareAndExecute(
-    selectWire(31, Buffer.concat([datetime, zone("+09:00\0")])),
-    1,
-  ).rows[0]?.value;
+  const ok = parsePrepareAndExecute(selectWire(31, Buffer.concat([datetime, zone("+09:00\0")])), 1)
+    .rows[0]?.value;
   assert.equal(String(ok), "2020-01-02 03:04:05.678 +09:00");
 });
 
@@ -940,17 +1230,30 @@ test("EXECUTE sends the ten fixed arguments, then each type and value", () => {
   assert.equal(
     payload.toString("hex"),
     "03" +
-      "00000004" + "00000001" + // handle
-      "00000001" + "02" + // EXECUTE_QUERY_ALL, so `a; b` runs both statements
-      "00000004" + "00000000" + // max_col_size
-      "00000004" + "00000000" + // max_row_size
+      "00000004" +
+      "00000001" + // handle
+      "00000001" +
+      "02" + // EXECUTE_QUERY_ALL, so `a; b` runs both statements
+      "00000004" +
+      "00000000" + // max_col_size
+      "00000004" +
+      "00000000" + // max_row_size
       "00000000" + // empty CALL-mode argument
-      "00000001" + "01" + // inline fetch of a SELECT
-      "00000001" + "00" + // autocommit
-      "00000001" + "00" + // forward_only
-      "00000008" + "00000000" + "00000000" + // cache time
-      "00000004" + "00000000" + // query timeout
-      "00000001" + "08" + "00000004" + "00000007", // INT 7
+      "00000001" +
+      "01" + // inline fetch of a SELECT
+      "00000001" +
+      "00" + // autocommit
+      "00000001" +
+      "00" + // forward_only
+      "00000008" +
+      "00000000" +
+      "00000000" + // cache time
+      "00000004" +
+      "00000000" + // query timeout
+      "00000001" +
+      "08" +
+      "00000004" +
+      "00000007", // INT 7
   );
 });
 
@@ -977,7 +1280,10 @@ test("prepared binds have literal type bytes and layouts", () => {
     [1.5, "000000010c" + "00000008" + "3ff8000000000000"],
     [9223372036854775807n, "0000000115" + "00000008" + "7fffffffffffffff"],
     [-9223372036854775808n, "0000000115" + "00000008" + "8000000000000000"],
-    [9223372036854775808n, "0000000107" + "00000014" + "39323233333732303336383534373735383038" + "00"],
+    [
+      9223372036854775808n,
+      "0000000107" + "00000014" + "39323233333732303336383534373735383038" + "00",
+    ],
     ["ab", "0000000101" + "00000003" + "6162" + "00"],
     ["", "0000000101" + "00000001" + "00"],
     ["\ud55c", "0000000101" + "00000004" + "ed959c" + "00"],
@@ -1047,12 +1353,16 @@ test("a type header longer than its cell is malformed", () => {
   );
   assert.throws(
     () => parseExecute(frame(hex), statement, 7),
-    (error: Error) => error instanceof MalformedReplyError && /overruns the cell of column "v"/.test(error.message),
+    (error: Error) =>
+      error instanceof MalformedReplyError && /overruns the cell of column "v"/.test(error.message),
   );
 });
 
 test("an EXECUTE reply handle stays PREPARE's, not its leading tuple count", () => {
-  const statement = { ...parsePrepare(frame(PREPARED_FRAMES.prepareUntypedMarker)), queryHandle: 9 };
+  const statement = {
+    ...parsePrepare(frame(PREPARED_FRAMES.prepareUntypedMarker)),
+    queryHandle: 9,
+  };
   const result = parseExecute(frame(PREPARED_FRAMES.executeUntypedInt), statement, 7);
   assert.equal(result.queryHandle, 9);
   assert.equal(result.totalTupleCount, 1);
@@ -1077,8 +1387,14 @@ test("an impossible column info flag in an EXECUTE reply is malformed", () => {
 test("a statement failure inside an EXECUTE reply is the server's error", () => {
   const statement = parsePrepare(frame(PREPARED_FRAMES.prepareUntypedMarker));
   const wire = Buffer.concat([
-    i32(1), Buffer.from([0]), i32(1), Buffer.from([20]), i32(-2),
-    i32(-670), i32(4), Buffer.from("dup\0"),
+    i32(1),
+    Buffer.from([0]),
+    i32(1),
+    Buffer.from([20]),
+    i32(-2),
+    i32(-670),
+    i32(4),
+    Buffer.from("dup\0"),
   ]);
   assert.throws(
     () => parseExecute(wire, statement, 7),
@@ -1100,8 +1416,16 @@ test("captured PREPARE and EXECUTE server errors keep their codes", () => {
 
 /** An EXECUTE reply to an UPDATE of two rows: the result record, the column info flag, the shard id. */
 const EXECUTE_UPDATE =
-  "00000002" + "00" + "00000001" + "16" + "00000002" + "0000000000000000" + "00000000" + "00000000" +
-  "00" + "fffffffe";
+  "00000002" +
+  "00" +
+  "00000001" +
+  "16" +
+  "00000002" +
+  "0000000000000000" +
+  "00000000" +
+  "00000000" +
+  "00" +
+  "fffffffe";
 
 test("an EXECUTE reply cut off before its column info flag or shard id is malformed", () => {
   const statement = parsePrepare(frame(PREPARED_FRAMES.prepareUntypedMarker));

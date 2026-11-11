@@ -58,7 +58,7 @@ export const OPEN_DB_TOTAL_SIZE =
 // CAS function codes
 // ---------------------------------------------------------------------------
 
-export const enum CASFunctionCode {
+export enum CASFunctionCode {
   END_TRAN = 1,
   PREPARE = 2,
   EXECUTE = 3,
@@ -80,7 +80,7 @@ export const enum CASFunctionCode {
 // Transaction types (used with END_TRAN)
 // ---------------------------------------------------------------------------
 
-export const enum EndTranType {
+export enum EndTranType {
   COMMIT = 1,
   ROLLBACK = 2,
 }
@@ -90,7 +90,7 @@ export const enum EndTranType {
 // ---------------------------------------------------------------------------
 
 /** CCI_PARAM_*. There is no autocommit entry: the CAS ignores that parameter. */
-export const enum DbParameter {
+export enum DbParameter {
   ISOLATION_LEVEL = 1,
   /** In milliseconds. The server reads any negative value as no limit. */
   LOCK_TIMEOUT = 2,
@@ -116,7 +116,7 @@ export const EXECUTE_QUERY_ALL = 0x02;
 // Source: T_CCI_U_TYPE (CCI_U_TYPE_*) in CUBRID/cubrid src/broker/broker_cas_cci.h
 // ---------------------------------------------------------------------------
 
-export const enum CUBRIDDataType {
+export enum CUBRIDDataType {
   NULL = 0,
   CHAR = 1,
   STRING = 2,
@@ -159,7 +159,7 @@ export const enum CUBRIDDataType {
 // CCI names; there is no short alias such as CREATE or DROP because CREATE
 // INDEX, CREATE TRIGGER etc. have their own ids. Only ids verified against
 // CCI, node-cubrid and pycubrid are listed.
-export const enum StatementType {
+export enum StatementType {
   ALTER_CLASS = 0,
   ALTER_SERIAL = 1,
   COMMIT_WORK = 2,

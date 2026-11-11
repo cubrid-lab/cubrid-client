@@ -1,20 +1,20 @@
-import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { createServer, type Server, type Socket as NetSocket } from "node:net";
+import { createServer, type Socket as NetSocket, type Server } from "node:net";
+import test from "node:test";
 
 import { ConnectionLostError } from "../src/errors/internal-errors.js";
 import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { CASConnection, type CASConnectionConfig } from "../src/protocol/connection.js";
 import {
   CAS_MAGIC,
+  CAS_PROTOCOL_VERSION,
   CAS_VERSION,
+  CASFunctionCode,
   CLIENT_JDBC,
+  SIZE_BROKER_INFO,
   SIZE_CAS_INFO,
   SIZE_DATA_LENGTH,
-  SIZE_BROKER_INFO,
-  CAS_PROTOCOL_VERSION,
-  CASFunctionCode,
 } from "../src/protocol/constants.js";
 
 // ---------------------------------------------------------------------------
@@ -1023,10 +1023,7 @@ test("CASConnection rejects a truncated frame and does not reuse the socket", as
       /Connection (ended|closed) while reading/,
     );
     assert.equal(cas.isConnected, false);
-    await assert.rejects(
-      cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD),
-      /not connected/,
-    );
+    await assert.rejects(cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD), /not connected/);
   } finally {
     await closeServer(server);
   }
@@ -1044,9 +1041,7 @@ test("CASConnection reconnects cleanly after retiring a socket", async () => {
         socket.once("data", () => {
           // Bytes after the bad length must not leak into the next connection.
           socket.write(
-            connection === 1
-              ? Buffer.concat([frameHeader(-5), CAS_INFO])
-              : frameResponse(CAS_INFO),
+            connection === 1 ? Buffer.concat([frameHeader(-5), CAS_INFO]) : frameResponse(CAS_INFO),
           );
         });
       });
@@ -1143,7 +1138,12 @@ test("an OUT_TRAN reply keeps the session, verified by one CHECK_CAS before the 
       // That reply reported a transaction, so the next request needs no probe.
       await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
 
-      assert.deepEqual(requests, [`1:${REQUEST}`, `1:${CHECK_CAS}`, `1:${REQUEST}`, `1:${REQUEST}`]);
+      assert.deepEqual(requests, [
+        `1:${REQUEST}`,
+        `1:${CHECK_CAS}`,
+        `1:${REQUEST}`,
+        `1:${REQUEST}`,
+      ]);
       assert.equal(cas.connectionGeneration, 1);
     });
   } finally {
@@ -1196,11 +1196,16 @@ const ERROR_REPLY = Buffer.from("ffffffff0000232700", "hex");
 for (const [failure, failProbe] of [
   ["closes the socket", (socket: NetSocket) => socket.destroy()],
   ["resets the socket", (socket: NetSocket) => socket.resetAndDestroy()],
-  ["answers with an error", (socket: NetSocket) => socket.write(frameResponse(Buffer.concat([CAS_INFO, ERROR_REPLY])))],
+  [
+    "answers with an error",
+    (socket: NetSocket) => socket.write(frameResponse(Buffer.concat([CAS_INFO, ERROR_REPLY]))),
+  ],
   ["sends an impossible frame", (socket: NetSocket) => socket.write(frameHeader(-5))],
   ["stays silent", () => {}],
 ] as const) {
-  test(`a CAS that ${failure} on the probe is replaced before the request is first sent`, { timeout: 5000 }, async () => {
+  test(`a CAS that ${failure} on the probe is replaced before the request is first sent`, {
+    timeout: 5000,
+  }, async () => {
     const { server, port, requests } = await recordingBroker((socket, code, session) => {
       if (code === CHECK_CAS && session === 1) {
         failProbe(socket);
@@ -1313,7 +1318,10 @@ test("session parameters reach each new session before any request, and CHECK_CA
 });
 
 for (const [failure, fail] of [
-  ["refuses a parameter", (socket: NetSocket) => socket.write(frameResponse(Buffer.concat([CAS_INFO, ERROR_REPLY])))],
+  [
+    "refuses a parameter",
+    (socket: NetSocket) => socket.write(frameResponse(Buffer.concat([CAS_INFO, ERROR_REPLY]))),
+  ],
   ["closes the socket", (socket: NetSocket) => socket.destroy()],
 ] as const) {
   test(`a new session that ${failure} is never used`, async () => {
@@ -1359,7 +1367,9 @@ for (const [failure, fail] of [
   });
 }
 
-test("a silent CAS during session setup is reported as a read timeout", { timeout: 5000 }, async () => {
+test("a silent CAS during session setup is reported as a read timeout", {
+  timeout: 5000,
+}, async () => {
   const { server, port } = await recordingBroker(() => {});
   const cas = new CASConnection({
     ...DEFAULT_CONFIG,
@@ -1383,7 +1393,9 @@ test("setSessionParameters applies to the open session and to every session afte
     if (code === SET_DB_PARAMETER) {
       set.push(`${session}:${setParameter(frame)}`);
     }
-    socket.write(frameResponse(code === SET_DB_PARAMETER ? Buffer.concat([OUT_TRAN, SET_OK]) : CAS_INFO));
+    socket.write(
+      frameResponse(code === SET_DB_PARAMETER ? Buffer.concat([OUT_TRAN, SET_OK]) : CAS_INFO),
+    );
   });
 
   try {
@@ -1403,7 +1415,9 @@ test("setSessionParameters applies to the open session and to every session afte
 
 test("setSessionParameters on a closed connection only records them", async () => {
   const { server, port, requests } = await recordingBroker((socket, code) => {
-    socket.write(frameResponse(code === SET_DB_PARAMETER ? Buffer.concat([OUT_TRAN, SET_OK]) : CAS_INFO));
+    socket.write(
+      frameResponse(code === SET_DB_PARAMETER ? Buffer.concat([OUT_TRAN, SET_OK]) : CAS_INFO),
+    );
   });
   const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
 
@@ -1433,9 +1447,7 @@ test("setSessionParameters on a closed connection only records them", async () =
 test("setSessionParameters that fails drops the session, so it cannot run with the old values", async () => {
   const { server, port } = await recordingBroker((socket, code) => {
     socket.write(
-      frameResponse(
-        code === SET_DB_PARAMETER ? Buffer.concat([CAS_INFO, ERROR_REPLY]) : CAS_INFO,
-      ),
+      frameResponse(code === SET_DB_PARAMETER ? Buffer.concat([CAS_INFO, ERROR_REPLY]) : CAS_INFO),
     );
   });
 
@@ -1499,7 +1511,9 @@ async function connectWithReadTimeout(port: number): Promise<CASConnection> {
   return cas;
 }
 
-test("an unset readTimeout still bounds a handshake the broker never answers, without a retry", { timeout: 20000 }, async () => {
+test("an unset readTimeout still bounds a handshake the broker never answers, without a retry", {
+  timeout: 20000,
+}, async () => {
   let connections = 0;
   const { server, port } = await createMockBroker((socket) => {
     connections += 1;
@@ -1556,7 +1570,9 @@ test("the default handshake limit does not apply to later requests", async () =>
   }
 });
 
-test("readTimeout rejects and retires the socket when the server stops responding", { timeout: 5000 }, async () => {
+test("readTimeout rejects and retires the socket when the server stops responding", {
+  timeout: 5000,
+}, async () => {
   let serverSocketClosed: () => void = () => {};
   const closed = new Promise<void>((resolve) => {
     serverSocketClosed = resolve;
@@ -1598,7 +1614,9 @@ for (const [name, partial] of [
   });
 }
 
-test("readTimeout measures inactivity, so a slow frame that keeps arriving completes", { timeout: 5000 }, async () => {
+test("readTimeout measures inactivity, so a slow frame that keeps arriving completes", {
+  timeout: 5000,
+}, async () => {
   const framed = frameResponse(Buffer.concat([CAS_INFO, Buffer.alloc(2, 0xab)]));
   const { server, port } = await brokerWith(async (socket) => {
     for (const byte of framed) {
@@ -1664,7 +1682,9 @@ test("readTimeout does not count time spent waiting in the queue", { timeout: 50
   }
 });
 
-test("after a readTimeout the queue moves on and queued work is not sent on a new session", { timeout: 5000 }, async () => {
+test("after a readTimeout the queue moves on and queued work is not sent on a new session", {
+  timeout: 5000,
+}, async () => {
   let connections = 0;
   const requestsByConnection = [0, 0, 0];
   const { server, port } = await createMockBroker((socket) => {
@@ -1705,7 +1725,9 @@ test("after a readTimeout the queue moves on and queued work is not sent on a ne
   }
 });
 
-test("close() queued behind a stalled request finishes after the readTimeout", { timeout: 5000 }, async () => {
+test("close() queued behind a stalled request finishes after the readTimeout", {
+  timeout: 5000,
+}, async () => {
   const { server, port } = await brokerWith(() => {});
 
   try {
@@ -1722,7 +1744,9 @@ test("close() queued behind a stalled request finishes after the readTimeout", {
   }
 });
 
-test("readTimeout bounds a request the server has stopped reading", { timeout: 15000 }, async () => {
+test("readTimeout bounds a request the server has stopped reading", {
+  timeout: 15000,
+}, async () => {
   let serverSocket: NetSocket | undefined;
   const { server, port } = await createMockBroker((socket) => {
     serverSocket = socket;
@@ -1751,7 +1775,9 @@ test("readTimeout bounds a request the server has stopped reading", { timeout: 1
   }
 });
 
-test("readTimeout rejects when the broker never sends the redirect port", { timeout: 5000 }, async () => {
+test("readTimeout rejects when the broker never sends the redirect port", {
+  timeout: 5000,
+}, async () => {
   const { server, port } = await createMockBroker((socket) => {
     socket.on("error", () => {});
     socket.resume();
@@ -1767,7 +1793,9 @@ test("readTimeout rejects when the broker never sends the redirect port", { time
   }
 });
 
-test("readTimeout rejects when OpenDatabase is never answered, and connect can retry", { timeout: 5000 }, async () => {
+test("readTimeout rejects when OpenDatabase is never answered, and connect can retry", {
+  timeout: 5000,
+}, async () => {
   let connections = 0;
   const { server, port } = await createMockBroker((socket) => {
     const connection = ++connections;
@@ -1795,7 +1823,9 @@ test("readTimeout rejects when OpenDatabase is never answered, and connect can r
   }
 });
 
-test("readTimeout bounds the replacement of a CAS that stopped answering", { timeout: 5000 }, async () => {
+test("readTimeout bounds the replacement of a CAS that stopped answering", {
+  timeout: 5000,
+}, async () => {
   let connections = 0;
   const { server, port } = await createMockBroker((socket) => {
     const connection = ++connections;
@@ -1826,7 +1856,9 @@ test("readTimeout bounds the replacement of a CAS that stopped answering", { tim
 });
 
 for (const readTimeout of [undefined, 0]) {
-  test(`readTimeout ${readTimeout} leaves a silent server waiting, as 1.x did`, { timeout: 5000 }, async () => {
+  test(`readTimeout ${readTimeout} leaves a silent server waiting, as 1.x did`, {
+    timeout: 5000,
+  }, async () => {
     let serverSocket: NetSocket | undefined;
     const { server, port } = await brokerWith((socket) => {
       serverSocket = socket;

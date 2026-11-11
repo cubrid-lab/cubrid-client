@@ -1,4 +1,9 @@
-import type { ClientConfig, ClientOptions, StreamOptions, TransactionOptions } from "../types/client.js";
+import type {
+  ClientConfig,
+  ClientOptions,
+  StreamOptions,
+  TransactionOptions,
+} from "../types/client.js";
 
 /** Largest delay Node.js timers support. */
 const MAX_READ_TIMEOUT = 2 ** 31 - 1;
@@ -113,9 +118,7 @@ export function normalizeConfig(options: ClientOptions): ClientConfig {
     readTimeout !== undefined &&
     !(Number.isFinite(readTimeout) && readTimeout >= 0 && readTimeout <= MAX_READ_TIMEOUT)
   ) {
-    throw new RangeError(
-      `readTimeout must be between 0 and ${MAX_READ_TIMEOUT} milliseconds.`,
-    );
+    throw new RangeError(`readTimeout must be between 0 and ${MAX_READ_TIMEOUT} milliseconds.`);
   }
 
   assertValidRetryCount(options.maxConnectionRetryCount);

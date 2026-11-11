@@ -170,10 +170,28 @@ check that the diff is cosmetic.
 
 ## Code Style
 
-This repository's committed `.editorconfig` specifies 2-space indentation, UTF-8 and LF line endings. `package.json` currently **does not include Biome or an ESLint lint script**; do not run an unpinned `npx biome` installation or claim lint verification. Keep style changes scoped and use the existing build/typecheck/test/API checks until a formatter/linter is explicitly selected in a separate reviewed tooling change.
+[Biome](https://biomejs.dev), pinned as an exact dev dependency, formats and lints
+`src`, `tests`, `scripts` and `examples` (`biome.json`). It follows `.editorconfig`:
+2-space indentation, double quotes, semicolons, lines up to 100 columns, sorted
+imports.
+
+| Command | What it does |
+| --- | --- |
+| `npm run typecheck` | `tsc --noEmit` |
+| `npm run lint` | Lint only, no changes |
+| `npm run format:check` | Formatting only, no changes |
+| `npm run lint:ci` | Formatting, lint and import order together, no changes; what CI runs |
+| `npm run format` | Rewrite formatting |
+| `npm run lint:fix` | Rewrite formatting, import order and safe lint fixes |
+
+Lint **errors** and any formatting or import-order difference fail CI; lint
+warnings are reported but do not. `tests/lint-policy.test.mjs` proves the policy
+rejects violations. Silence a rule only on the line that needs it, with
+`// biome-ignore <rule>: <reason>`.
 
 ```bash
 npm run typecheck
+npm run lint:ci
 npm test
 npm run build
 npm run api:check
@@ -216,7 +234,7 @@ scrutiny. No existing repository CI or release safeguards are waived.
    `npm run build && npm run api:check` (see
    [Public API compatibility](#public-api-compatibility)).
 
-4. **Review formatting and tooling** against `.editorconfig`, and report real validation commands from `package.json`. The repository has no configured Biome command today; do not claim a lint pass from an uninstalled tool.
+4. **Run `npm run lint:ci`** (or `npm run lint:fix` to apply fixes), and report the real validation commands from `package.json` you ran.
 
 ### PR Content
 

@@ -1,49 +1,49 @@
-import test from "node:test";
 import assert from "node:assert/strict";
+import test from "node:test";
 
 import { CasReplyError } from "../src/errors/internal-errors.js";
-import { PacketWriter } from "../src/protocol/packet-writer.js";
-import { PacketReader } from "../src/protocol/packet-reader.js";
 import {
-  CASFunctionCode,
-  CUBRIDDataType,
   CAS_MAGIC,
   CAS_VERSION,
+  CASFunctionCode,
   CLIENT_JDBC,
+  CUBRIDDataType,
   EndTranType,
-  StatementType,
-  SIZE_CAS_INFO,
-  SIZE_INT,
-  TYPE_NAMES,
-  PREPARE_NORMAL,
   EXECUTE_NORMAL,
   EXECUTE_QUERY_ALL,
   OPEN_DB_TOTAL_SIZE,
+  PREPARE_NORMAL,
+  SIZE_CAS_INFO,
+  SIZE_INT,
+  StatementType,
+  TYPE_NAMES,
 } from "../src/protocol/constants.js";
+import { PacketReader } from "../src/protocol/packet-reader.js";
+import { PacketWriter } from "../src/protocol/packet-writer.js";
 import {
-  writeClientInfoExchange,
-  parseClientInfoExchange,
-  writeOpenDatabase,
-  parseOpenDatabase,
-  writePrepareAndExecute,
-  parsePrepareAndExecute,
-  readQueryHandle,
-  writeFetch,
-  parseFetch,
-  writeCloseReqHandle,
-  writeEndTran,
-  writeSetDbParameter,
-  writeGetDbVersion,
-  parseGetDbVersion,
-  writeConClose,
-  parseSimpleResponse,
-  encodeBindParams,
-  interpolateParams,
-  formatValue,
-  writeGetLastInsertId,
-  parseGetLastInsertId,
-  MalformedReplyError,
   type ColumnMeta,
+  encodeBindParams,
+  formatValue,
+  interpolateParams,
+  MalformedReplyError,
+  parseClientInfoExchange,
+  parseFetch,
+  parseGetDbVersion,
+  parseGetLastInsertId,
+  parseOpenDatabase,
+  parsePrepareAndExecute,
+  parseSimpleResponse,
+  readQueryHandle,
+  writeClientInfoExchange,
+  writeCloseReqHandle,
+  writeConClose,
+  writeEndTran,
+  writeFetch,
+  writeGetDbVersion,
+  writeGetLastInsertId,
+  writeOpenDatabase,
+  writePrepareAndExecute,
+  writeSetDbParameter,
 } from "../src/protocol/protocol.js";
 import { DML_FRAMES, LAST_INSERT_ID_FRAMES } from "./fixtures/dml-frames.js";
 
@@ -192,13 +192,13 @@ test("PacketWriter addDouble writes int32(8) prefix then double", () => {
 
 test("PacketWriter addBytes writes int32(len) prefix then raw bytes", () => {
   const w = new PacketWriter(16);
-  const data = Buffer.from([0xAA, 0xBB]);
+  const data = Buffer.from([0xaa, 0xbb]);
   w.addBytes(data);
   const buf = w.toBuffer();
   assert.equal(buf.length, 6);
   assert.equal(buf.readInt32BE(0), 2);
-  assert.equal(buf[4], 0xAA);
-  assert.equal(buf[5], 0xBB);
+  assert.equal(buf[4], 0xaa);
+  assert.equal(buf[5], 0xbb);
 });
 
 test("PacketWriter addNull writes int32(0)", () => {
@@ -217,11 +217,11 @@ test("PacketWriter addDatetime writes 7 shorts with int32(14) prefix", () => {
   assert.equal(buf.length, 18); // 4 + 14
   assert.equal(buf.readInt32BE(0), 14);
   assert.equal(buf.readInt16BE(4), 2025); // year
-  assert.equal(buf.readInt16BE(6), 3);    // month
-  assert.equal(buf.readInt16BE(8), 14);   // day
-  assert.equal(buf.readInt16BE(10), 10);  // hour
-  assert.equal(buf.readInt16BE(12), 30);  // minute
-  assert.equal(buf.readInt16BE(14), 45);  // second
+  assert.equal(buf.readInt16BE(6), 3); // month
+  assert.equal(buf.readInt16BE(8), 14); // day
+  assert.equal(buf.readInt16BE(10), 10); // hour
+  assert.equal(buf.readInt16BE(12), 30); // minute
+  assert.equal(buf.readInt16BE(14), 45); // second
   assert.equal(buf.readInt16BE(16), 123); // millisecond
 });
 
@@ -275,12 +275,12 @@ test("PacketWriter length returns current write position", () => {
 // ---------------------------------------------------------------------------
 
 test("PacketReader parseByte reads single signed byte", () => {
-  const r = new PacketReader(Buffer.from([0xFF]));
+  const r = new PacketReader(Buffer.from([0xff]));
   assert.equal(r.parseByte(), -1);
 });
 
 test("PacketReader parseUByte reads single unsigned byte", () => {
-  const r = new PacketReader(Buffer.from([0xFF]));
+  const r = new PacketReader(Buffer.from([0xff]));
   assert.equal(r.parseUByte(), 255);
 });
 
@@ -352,12 +352,18 @@ test("PacketReader parseCASInfo reads 4 bytes", () => {
 test("PacketReader parseDatetime reads 7 shorts and creates Date", () => {
   const buf = Buffer.alloc(14);
   let offset = 0;
-  buf.writeInt16BE(2025, offset); offset += 2;
-  buf.writeInt16BE(3, offset); offset += 2;    // March
-  buf.writeInt16BE(14, offset); offset += 2;
-  buf.writeInt16BE(10, offset); offset += 2;
-  buf.writeInt16BE(30, offset); offset += 2;
-  buf.writeInt16BE(45, offset); offset += 2;
+  buf.writeInt16BE(2025, offset);
+  offset += 2;
+  buf.writeInt16BE(3, offset);
+  offset += 2; // March
+  buf.writeInt16BE(14, offset);
+  offset += 2;
+  buf.writeInt16BE(10, offset);
+  offset += 2;
+  buf.writeInt16BE(30, offset);
+  offset += 2;
+  buf.writeInt16BE(45, offset);
+  offset += 2;
   buf.writeInt16BE(123, offset);
 
   const r = new PacketReader(buf);
@@ -374,7 +380,7 @@ test("PacketReader parseDatetime reads 7 shorts and creates Date", () => {
 test("PacketReader parseDate reads date only, zeroes time", () => {
   const buf = Buffer.alloc(6);
   buf.writeInt16BE(2025, 0);
-  buf.writeInt16BE(6, 2);   // June
+  buf.writeInt16BE(6, 2); // June
   buf.writeInt16BE(15, 4);
 
   const r = new PacketReader(buf);
@@ -387,7 +393,9 @@ test("PacketReader parseDate reads date only, zeroes time", () => {
 for (const year of [1, 99, 100, 9999]) {
   test(`PacketReader keeps year ${year} out of the 1900s for DATE, DATETIME and TIMESTAMP`, () => {
     const buf = Buffer.alloc(14);
-    [year, 3, 14, 10, 30, 45, 123].forEach((v, i) => buf.writeInt16BE(v, i * 2));
+    [year, 3, 14, 10, 30, 45, 123].forEach((v, i) => {
+      buf.writeInt16BE(v, i * 2);
+    });
 
     const dt = new PacketReader(buf).parseDatetime();
     assert.equal(dt.getFullYear(), year);
@@ -409,9 +417,9 @@ for (const year of [1, 99, 100, 9999]) {
 
 test("PacketReader parseTime reads time only", () => {
   const buf = Buffer.alloc(6);
-  buf.writeInt16BE(10, 0);  // hour
-  buf.writeInt16BE(30, 2);  // minute
-  buf.writeInt16BE(45, 4);  // second
+  buf.writeInt16BE(10, 0); // hour
+  buf.writeInt16BE(30, 2); // minute
+  buf.writeInt16BE(45, 4); // second
 
   const r = new PacketReader(buf);
   const d = r.parseTime();
@@ -467,11 +475,11 @@ test("PacketReader with initial offset", () => {
 test("PacketReader parseTimestamp reads 6 shorts (no ms)", () => {
   const buf = Buffer.alloc(12);
   buf.writeInt16BE(2025, 0);
-  buf.writeInt16BE(6, 2);    // June
-  buf.writeInt16BE(15, 4);   // day
-  buf.writeInt16BE(14, 6);   // hour
-  buf.writeInt16BE(30, 8);   // minute
-  buf.writeInt16BE(59, 10);  // second
+  buf.writeInt16BE(6, 2); // June
+  buf.writeInt16BE(15, 4); // day
+  buf.writeInt16BE(14, 6); // hour
+  buf.writeInt16BE(30, 8); // minute
+  buf.writeInt16BE(59, 10); // second
 
   const r = new PacketReader(buf);
   const d = r.parseTimestamp();
@@ -482,7 +490,6 @@ test("PacketReader parseTimestamp reads 6 shorts (no ms)", () => {
   assert.equal(d.getMinutes(), 30);
   assert.equal(d.getSeconds(), 59);
 });
-
 
 // ---------------------------------------------------------------------------
 // Constants tests
@@ -614,10 +621,14 @@ test("parseOpenDatabase parses successful response", () => {
   const buf = Buffer.alloc(4 + 4 + 8 + 4);
   let offset = 0;
   // CAS_INFO
-  buf[0] = 0x01; buf[1] = 0x02; buf[2] = 0x03; buf[3] = 0x04;
+  buf[0] = 0x01;
+  buf[1] = 0x02;
+  buf[2] = 0x03;
+  buf[3] = 0x04;
   offset = 4;
   // responseCode (>= 0 means success)
-  buf.writeInt32BE(1, offset); offset += 4;
+  buf.writeInt32BE(1, offset);
+  offset += 4;
   // brokerInfo (8 bytes) — byte[4] = protoVersion
   buf[offset + 4] = 0x02; // protoVersion = 2 (masked with 0x3F)
   offset += 8;
@@ -635,14 +646,20 @@ test("parseOpenDatabase throws on error response", () => {
   // CAS_INFO(4) + responseCode(-1)(4) + errorCode(4) + errorMessage
   const errMsg = "Access denied\0";
   const buf = Buffer.alloc(4 + 4 + 4 + errMsg.length);
-  buf[0] = 0x01; buf[1] = 0x02; buf[2] = 0x03; buf[3] = 0x04;
+  buf[0] = 0x01;
+  buf[1] = 0x02;
+  buf[2] = 0x03;
+  buf[3] = 0x04;
   buf.writeInt32BE(-1, 4);
   buf.writeInt32BE(-111, 8);
   buf.write(errMsg, 12, "utf-8");
 
-  assert.throws(() => parseOpenDatabase(buf), (err: Error) => {
-    return err.message.includes("-111") && err.message.includes("Access denied");
-  });
+  assert.throws(
+    () => parseOpenDatabase(buf),
+    (err: Error) => {
+      return err.message.includes("-111") && err.message.includes("Access denied");
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -710,9 +727,12 @@ test("parseFetch handles error response", () => {
   buf.writeInt32BE(-500, 4);
   buf.write(errMsg, 8, "utf-8");
 
-  assert.throws(() => parseFetch(buf, []), (err: Error) => {
-    return err.message.includes("-500") && err.message.includes("Fetch error");
-  });
+  assert.throws(
+    () => parseFetch(buf, []),
+    (err: Error) => {
+      return err.message.includes("-500") && err.message.includes("Fetch error");
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -783,9 +803,12 @@ test("parseGetDbVersion throws on error", () => {
   buf.writeInt32BE(-999, 4);
   buf.write(errMsg, 8, "utf-8");
 
-  assert.throws(() => parseGetDbVersion(buf), (err: Error) => {
-    return err.message.includes("-999");
-  });
+  assert.throws(
+    () => parseGetDbVersion(buf),
+    (err: Error) => {
+      return err.message.includes("-999");
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -816,9 +839,12 @@ test("parseSimpleResponse throws on negative code", () => {
   buf.writeInt32BE(-42, 4);
   buf.write(errMsg, 8, "utf-8");
 
-  assert.throws(() => parseSimpleResponse(buf), (err: Error) => {
-    return err.message.includes("-42") && err.message.includes("Operation failed");
-  });
+  assert.throws(
+    () => parseSimpleResponse(buf),
+    (err: Error) => {
+      return err.message.includes("-42") && err.message.includes("Operation failed");
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -892,11 +918,11 @@ test("encodeBindParams encodes Date as DATETIME", () => {
 });
 
 test("encodeBindParams encodes Buffer as VARBIT", () => {
-  const data = Buffer.from([0xAA, 0xBB, 0xCC]);
+  const data = Buffer.from([0xaa, 0xbb, 0xcc]);
   const buf = encodeBindParams([data]);
   assert.equal(buf.readInt32BE(0), 1 + 3); // type_byte + data length
   assert.equal(buf[4], CUBRIDDataType.VARBIT);
-  assert.deepEqual([...buf.subarray(5, 8)], [0xAA, 0xBB, 0xCC]);
+  assert.deepEqual([...buf.subarray(5, 8)], [0xaa, 0xbb, 0xcc]);
 });
 
 test("encodeBindParams fallback stringifies unknown types", () => {
@@ -949,7 +975,7 @@ test("interpolateParams handles Date", () => {
 });
 
 test("interpolateParams handles Buffer", () => {
-  const result = interpolateParams("SELECT ?", [Buffer.from([0xAA, 0xBB])], true);
+  const result = interpolateParams("SELECT ?", [Buffer.from([0xaa, 0xbb])], true);
   assert.equal(result, "SELECT X'aabb'");
 });
 
@@ -992,15 +1018,9 @@ test("interpolateParams handles no params in SQL", () => {
 
 test("interpolateParams is backslash-mode aware for string params", () => {
   // Literal mode (CUBRID default): backslash preserved verbatim.
-  assert.equal(
-    interpolateParams("SELECT ?", ["C:\\temp"], true),
-    "SELECT 'C:\\temp'",
-  );
+  assert.equal(interpolateParams("SELECT ?", ["C:\\temp"], true), "SELECT 'C:\\temp'");
   // Escape mode: backslash doubled.
-  assert.equal(
-    interpolateParams("SELECT ?", ["C:\\temp"], false),
-    "SELECT 'C:\\\\temp'",
-  );
+  assert.equal(interpolateParams("SELECT ?", ["C:\\temp"], false), "SELECT 'C:\\\\temp'");
 });
 
 // ---------------------------------------------------------------------------
@@ -1120,7 +1140,7 @@ test("formatValue formats Date using UTC getters", () => {
 });
 
 test("formatValue formats Buffer", () => {
-  assert.equal(formatValue(Buffer.from([0xDE, 0xAD]), true), "X'dead'");
+  assert.equal(formatValue(Buffer.from([0xde, 0xad]), true), "X'dead'");
 });
 
 test("formatValue stringifies unknown types", () => {
@@ -1138,9 +1158,12 @@ test("parsePrepareAndExecute throws on error response", () => {
   buf.writeInt32BE(-493, 4);
   buf.write(errMsg, 8, "utf-8");
 
-  assert.throws(() => parsePrepareAndExecute(buf, 1), (err: Error) => {
-    return err.message.includes("-493") && err.message.includes("Syntax error");
-  });
+  assert.throws(
+    () => parsePrepareAndExecute(buf, 1),
+    (err: Error) => {
+      return err.message.includes("-493") && err.message.includes("Syntax error");
+    },
+  );
 });
 
 test("StatementType values match the CUBRID CCI/CAS statement type ids", () => {
@@ -1181,15 +1204,24 @@ test("parsePrepareAndExecute reports literal statement codes from the wire", () 
   for (const code of [0, 4, 9, 17, 20, 22, 23, 24]) {
     const buf = Buffer.alloc(64);
     let offset = 0;
-    buf.writeInt32BE(1, offset); offset += 4; // queryHandle
-    buf.writeInt32BE(0, offset); offset += 4; // cache lifetime
-    buf.writeInt8(code, offset); offset += 1; // statement type
-    buf.writeInt32BE(0, offset); offset += 4; // bind count
-    buf.writeInt8(0, offset); offset += 1; // is_updatable
-    buf.writeInt32BE(0, offset); offset += 4; // column count
-    buf.writeInt32BE(0, offset); offset += 4; // total tuple count
-    buf.writeInt8(0, offset); offset += 1; // cache_reusable
-    buf.writeInt32BE(0, offset); offset += 4; // result count
+    buf.writeInt32BE(1, offset);
+    offset += 4; // queryHandle
+    buf.writeInt32BE(0, offset);
+    offset += 4; // cache lifetime
+    buf.writeInt8(code, offset);
+    offset += 1; // statement type
+    buf.writeInt32BE(0, offset);
+    offset += 4; // bind count
+    buf.writeInt8(0, offset);
+    offset += 1; // is_updatable
+    buf.writeInt32BE(0, offset);
+    offset += 4; // column count
+    buf.writeInt32BE(0, offset);
+    offset += 4; // total tuple count
+    buf.writeInt8(0, offset);
+    offset += 1; // cache_reusable
+    buf.writeInt32BE(0, offset);
+    offset += 4; // result count
     const result = parsePrepareAndExecute(buf.subarray(0, offset), 1);
     assert.equal(result.statementType, code);
     assert.deepEqual(result.rows, []);
@@ -1221,24 +1253,39 @@ test("parsePrepareAndExecute parses non-SELECT result", () => {
   // + totalTupleCount(4) + cacheReusable(1) + resultCount(4) + resultInfo(17 per result)
   const buf = Buffer.alloc(128);
   let offset = 0;
-  buf.writeInt32BE(1, offset); offset += 4;       // queryHandle = 1
-  buf.writeInt32BE(0, offset); offset += 4;       // cache lifetime
-  buf.writeInt8(StatementType.INSERT, offset); offset += 1; // INSERT
-  buf.writeInt32BE(0, offset); offset += 4;       // bind count = 0
-  buf.writeInt8(0, offset); offset += 1;          // not updatable
-  buf.writeInt32BE(0, offset); offset += 4;       // column count = 0
+  buf.writeInt32BE(1, offset);
+  offset += 4; // queryHandle = 1
+  buf.writeInt32BE(0, offset);
+  offset += 4; // cache lifetime
+  buf.writeInt8(StatementType.INSERT, offset);
+  offset += 1; // INSERT
+  buf.writeInt32BE(0, offset);
+  offset += 4; // bind count = 0
+  buf.writeInt8(0, offset);
+  offset += 1; // not updatable
+  buf.writeInt32BE(0, offset);
+  offset += 4; // column count = 0
   // Execute portion
-  buf.writeInt32BE(1, offset); offset += 4;       // total tuple count = 1
-  buf.writeInt8(0, offset); offset += 1;          // cache_reusable
-  buf.writeInt32BE(1, offset); offset += 4;       // result count = 1
+  buf.writeInt32BE(1, offset);
+  offset += 4; // total tuple count = 1
+  buf.writeInt8(0, offset);
+  offset += 1; // cache_reusable
+  buf.writeInt32BE(1, offset);
+  offset += 4; // result count = 1
   // Result info (21 bytes = byte + int + OID(8) + cacheTimeSec + cacheTimeUsec)
-  buf.writeInt8(StatementType.INSERT, offset); offset += 1; // stmt type
-  buf.writeInt32BE(1, offset); offset += 4;       // affected rows
+  buf.writeInt8(StatementType.INSERT, offset);
+  offset += 1; // stmt type
+  buf.writeInt32BE(1, offset);
+  offset += 4; // affected rows
   // OID (8 bytes)
-  buf.writeInt32BE(0, offset); offset += 4;       // oid part 1
-  buf.writeInt32BE(0, offset); offset += 4;       // oid part 2
-  buf.writeInt32BE(0, offset); offset += 4;       // cache time seconds
-  buf.writeInt32BE(0, offset); offset += 4;       // cache time microseconds
+  buf.writeInt32BE(0, offset);
+  offset += 4; // oid part 1
+  buf.writeInt32BE(0, offset);
+  offset += 4; // oid part 2
+  buf.writeInt32BE(0, offset);
+  offset += 4; // cache time seconds
+  buf.writeInt32BE(0, offset);
+  offset += 4; // cache time microseconds
 
   const result = parsePrepareAndExecute(buf.subarray(0, offset), 1);
   assert.equal(result.queryHandle, 1);
@@ -1414,10 +1461,7 @@ test("parsePrepareAndExecute SELECT with BIGINT column", () => {
 test("parsePrepareAndExecute SELECT with negative BIGINT column (wire code 21)", () => {
   const data = Buffer.alloc(8);
   data.writeBigInt64BE(-9223372036854775808n, 0);
-  const buf = buildSelectResponseForTypes(
-    [{ name: "val", type: 21 }],
-    [[{ type: 21, data }]],
-  );
+  const buf = buildSelectResponseForTypes([{ name: "val", type: 21 }], [[{ type: 21, data }]]);
   const result = parsePrepareAndExecute(buf, 1);
   assert.equal(result.rows[0]!.val, -9223372036854775808n);
 });
@@ -1461,8 +1505,8 @@ test("parsePrepareAndExecute SELECT with MONETARY column (reads as double)", () 
 test("parsePrepareAndExecute SELECT with DATE column", () => {
   const data = Buffer.alloc(6);
   data.writeInt16BE(2025, 0); // year
-  data.writeInt16BE(3, 2);    // month
-  data.writeInt16BE(14, 4);   // day
+  data.writeInt16BE(3, 2); // month
+  data.writeInt16BE(14, 4); // day
   const buf = buildSelectResponseForTypes(
     [{ name: "val", type: CUBRIDDataType.DATE }],
     [[{ type: CUBRIDDataType.DATE, data }]],
@@ -1495,11 +1539,11 @@ test("parsePrepareAndExecute SELECT with TIME column", () => {
 test("parsePrepareAndExecute SELECT with TIMESTAMP column", () => {
   const data = Buffer.alloc(12);
   data.writeInt16BE(2025, 0); // year
-  data.writeInt16BE(6, 2);    // month
-  data.writeInt16BE(15, 4);   // day
-  data.writeInt16BE(14, 6);   // hour
-  data.writeInt16BE(30, 8);   // min
-  data.writeInt16BE(0, 10);   // sec
+  data.writeInt16BE(6, 2); // month
+  data.writeInt16BE(15, 4); // day
+  data.writeInt16BE(14, 6); // hour
+  data.writeInt16BE(30, 8); // min
+  data.writeInt16BE(0, 10); // sec
   const buf = buildSelectResponseForTypes(
     [{ name: "val", type: CUBRIDDataType.TIMESTAMP }],
     [[{ type: CUBRIDDataType.TIMESTAMP, data }]],
@@ -1516,13 +1560,13 @@ test("parsePrepareAndExecute SELECT with TIMESTAMP column", () => {
 
 test("parsePrepareAndExecute SELECT with DATETIME column", () => {
   const data = Buffer.alloc(14);
-  data.writeInt16BE(2025, 0);  // year
-  data.writeInt16BE(1, 2);     // month
-  data.writeInt16BE(1, 4);     // day
-  data.writeInt16BE(0, 6);     // hour
-  data.writeInt16BE(0, 8);     // min
-  data.writeInt16BE(0, 10);    // sec
-  data.writeInt16BE(500, 12);  // ms
+  data.writeInt16BE(2025, 0); // year
+  data.writeInt16BE(1, 2); // month
+  data.writeInt16BE(1, 4); // day
+  data.writeInt16BE(0, 6); // hour
+  data.writeInt16BE(0, 8); // min
+  data.writeInt16BE(0, 10); // sec
+  data.writeInt16BE(500, 12); // ms
   const buf = buildSelectResponseForTypes(
     [{ name: "val", type: CUBRIDDataType.DATETIME }],
     [[{ type: CUBRIDDataType.DATETIME, data }]],
@@ -1535,7 +1579,7 @@ test("parsePrepareAndExecute SELECT with DATETIME column", () => {
 });
 
 test("parsePrepareAndExecute SELECT with BIT/VARBIT column returns Buffer", () => {
-  const data = Buffer.from([0xDE, 0xAD, 0xBE, 0xEF]);
+  const data = Buffer.from([0xde, 0xad, 0xbe, 0xef]);
   const buf = buildSelectResponseForTypes(
     [{ name: "val", type: CUBRIDDataType.BIT }],
     [[{ type: CUBRIDDataType.BIT, data }]],
@@ -1543,11 +1587,11 @@ test("parsePrepareAndExecute SELECT with BIT/VARBIT column returns Buffer", () =
   const result = parsePrepareAndExecute(buf, 1);
   assert.equal(result.rows.length, 1);
   assert.ok(Buffer.isBuffer(result.rows[0]!.val));
-  assert.deepEqual([...(result.rows[0]!.val as Buffer)], [0xDE, 0xAD, 0xBE, 0xEF]);
+  assert.deepEqual([...(result.rows[0]!.val as Buffer)], [0xde, 0xad, 0xbe, 0xef]);
 });
 
 test("parsePrepareAndExecute SELECT with VARBIT column returns Buffer", () => {
-  const data = Buffer.from([0xFF]);
+  const data = Buffer.from([0xff]);
   const buf = buildSelectResponseForTypes(
     [{ name: "val", type: CUBRIDDataType.VARBIT }],
     [[{ type: CUBRIDDataType.VARBIT, data }]],
@@ -1572,7 +1616,7 @@ test("parsePrepareAndExecute SELECT with NULL type returns null", () => {
   const nullTypeData = Buffer.alloc(4);
   nullTypeData[0] = CUBRIDDataType.STRING;
   nullTypeData[1] = 0x78; // 'x'
-  nullTypeData[2] = 0;    // null terminator
+  nullTypeData[2] = 0; // null terminator
   // size = 3 bytes (type byte + "x\0"), but the size includes the type byte
   // so the original size=4, minus 1 for type byte = 3 remaining
   const buf2 = buildSelectResponseForTypes(
@@ -1639,10 +1683,7 @@ test("unknown and unsupported non-NULL wire values are never returned as SQL NUL
 test("a real NULL and a valid empty string remain distinct", () => {
   const buf = buildSelectResponseForTypes(
     [{ name: "val", type: 2 }], // CCI_U_TYPE_STRING
-    [
-      [{ type: 2, data: null }],
-      [{ type: 2, data: Buffer.from([0]) }],
-    ],
+    [[{ type: 2, data: null }], [{ type: 2, data: Buffer.from([0]) }]],
   );
   const result = parsePrepareAndExecute(buf, 1);
   assert.equal(result.rows.length, 2);
@@ -1767,25 +1808,40 @@ test("parsePrepareAndExecute with protoVersion > 4 reads shard_id", () => {
   // Build a minimal INSERT response with extra bytes for proto v5+ fields
   const buf = Buffer.alloc(128);
   let offset = 0;
-  buf.writeInt32BE(1, offset); offset += 4;       // queryHandle = 1
-  buf.writeInt32BE(0, offset); offset += 4;       // cache lifetime
-  buf.writeInt8(StatementType.INSERT, offset); offset += 1;
-  buf.writeInt32BE(0, offset); offset += 4;       // bind count
-  buf.writeInt8(0, offset); offset += 1;          // not updatable
-  buf.writeInt32BE(0, offset); offset += 4;       // column count = 0
-  buf.writeInt32BE(1, offset); offset += 4;       // total tuple count
-  buf.writeInt8(0, offset); offset += 1;          // cache_reusable
-  buf.writeInt32BE(1, offset); offset += 4;       // result count = 1
+  buf.writeInt32BE(1, offset);
+  offset += 4; // queryHandle = 1
+  buf.writeInt32BE(0, offset);
+  offset += 4; // cache lifetime
+  buf.writeInt8(StatementType.INSERT, offset);
+  offset += 1;
+  buf.writeInt32BE(0, offset);
+  offset += 4; // bind count
+  buf.writeInt8(0, offset);
+  offset += 1; // not updatable
+  buf.writeInt32BE(0, offset);
+  offset += 4; // column count = 0
+  buf.writeInt32BE(1, offset);
+  offset += 4; // total tuple count
+  buf.writeInt8(0, offset);
+  offset += 1; // cache_reusable
+  buf.writeInt32BE(1, offset);
+  offset += 4; // result count = 1
   // resultInfo
-  buf.writeInt8(StatementType.INSERT, offset); offset += 1;
-  buf.writeInt32BE(1, offset); offset += 4;       // affected rows
-  offset += 8;                                      // OID
-  buf.writeInt32BE(0, offset); offset += 4;       // cache sec
-  buf.writeInt32BE(0, offset); offset += 4;       // cache usec
+  buf.writeInt8(StatementType.INSERT, offset);
+  offset += 1;
+  buf.writeInt32BE(1, offset);
+  offset += 4; // affected rows
+  offset += 8; // OID
+  buf.writeInt32BE(0, offset);
+  offset += 4; // cache sec
+  buf.writeInt32BE(0, offset);
+  offset += 4; // cache usec
   // Proto v2+ field: includes_column_info
-  buf.writeInt8(0, offset); offset += 1;
+  buf.writeInt8(0, offset);
+  offset += 1;
   // Proto v5+ field: shard_id
-  buf.writeInt32BE(42, offset); offset += 4;
+  buf.writeInt32BE(42, offset);
+  offset += 4;
 
   const result = parsePrepareAndExecute(buf.subarray(0, offset), 7);
   assert.equal(result.queryHandle, 1);
@@ -1857,9 +1913,17 @@ test("parseFetch with zero tupleCount returns empty rows", () => {
   const columns: ColumnMeta[] = [
     {
       type: CUBRIDDataType.STRING,
-      scale: 0, precision: 255, name: "val", realName: "val",
-      tableName: "", isNullable: true, defaultValue: "",
-      isAutoIncrement: false, isUniqueKey: false, isPrimaryKey: false, isForeignKey: false,
+      scale: 0,
+      precision: 255,
+      name: "val",
+      realName: "val",
+      tableName: "",
+      isNullable: true,
+      defaultValue: "",
+      isAutoIncrement: false,
+      isUniqueKey: false,
+      isPrimaryKey: false,
+      isForeignKey: false,
     },
   ];
 

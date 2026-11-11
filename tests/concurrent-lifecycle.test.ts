@@ -17,9 +17,10 @@
  * - CAS_INFO[0] is 1 inside a transaction and 0 after it ends. CHECK_CAS always
  *   replies 1, even on an idle session.
  */
-import test from "node:test";
+
 import assert from "node:assert/strict";
-import { createServer, type Server, type Socket as NetSocket } from "node:net";
+import { createServer, type Socket as NetSocket, type Server } from "node:net";
+import test from "node:test";
 import { setFlagsFromString } from "node:v8";
 import { runInNewContext } from "node:vm";
 
@@ -128,7 +129,13 @@ function encodeRows(rows: Row[], firstPosition: number): Buffer {
   return Buffer.concat(parts);
 }
 
-function executeReply(handle: number, statementType: number, columns: string[], total: number, inline: Buffer | null): Buffer {
+function executeReply(
+  handle: number,
+  statementType: number,
+  columns: string[],
+  total: number,
+  inline: Buffer | null,
+): Buffer {
   const resultInfo = Buffer.alloc(21);
   resultInfo.writeInt8(statementType, 0);
   resultInfo.writeInt32BE(total, 1);
@@ -451,7 +458,11 @@ class FakeCas {
     }
 
     const page = cursor.rows.slice(start, start + size);
-    if (start + size >= cursor.rows.length && session.inTransaction && this.isAutocommitCursor(session)) {
+    if (
+      start + size >= cursor.rows.length &&
+      session.inTransaction &&
+      this.isAutocommitCursor(session)
+    ) {
       this.endTransaction(session);
     }
 
@@ -511,29 +522,39 @@ function ownerRuns(requests: WireRequest[]): string[] {
 // Results stay with the query that asked for them
 // ---------------------------------------------------------------------------
 
-test("concurrent SELECTs that need FETCH each return exactly their own rows", { timeout: 10000 }, async () => {
+test("concurrent SELECTs that need FETCH each return exactly their own rows", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     const owners = ["a", "b", "c", "d", "e", "f"];
 
     const results = await Promise.all(owners.map((owner) => client.query(selectFor(owner))));
 
-    owners.forEach((owner, index) => assert.deepEqual(results[index], rowsOf(owner)));
+    owners.forEach((owner, index) => {
+      assert.deepEqual(results[index], rowsOf(owner));
+    });
     assert.ok(cas.of(CASFunctionCode.FETCH).length >= owners.length, "the rows must need FETCH");
     assert.equal(cas.refusedFetches, 0);
   });
 });
 
-test("repeated Promise.all rounds on one client keep returning exact rows", { timeout: 10000 }, async () => {
+test("repeated Promise.all rounds on one client keep returning exact rows", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client) => {
     for (let round = 0; round < 10; round += 1) {
       const owners = [`a${round}`, `b${round}`, `c${round}`];
       const results = await Promise.all(owners.map((owner) => client.query(selectFor(owner))));
-      owners.forEach((owner, index) => assert.deepEqual(results[index], rowsOf(owner)));
+      owners.forEach((owner, index) => {
+        assert.deepEqual(results[index], rowsOf(owner));
+      });
     }
   });
 });
 
-test("one query finishes its requests before the next query starts", { timeout: 10000 }, async () => {
+test("one query finishes its requests before the next query starts", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     await Promise.all(["a", "b", "c"].map((owner) => client.query(selectFor(owner))));
 
@@ -542,7 +563,9 @@ test("one query finishes its requests before the next query starts", { timeout: 
   });
 });
 
-test("parameterized concurrent queries probe the backslash mode once per session and keep their rows", { timeout: 10000 }, async () => {
+test("parameterized concurrent queries probe the backslash mode once per session and keep their rows", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     const owners = ["a", "b", "c"];
 
@@ -552,7 +575,9 @@ test("parameterized concurrent queries probe the backslash mode once per session
       ),
     );
 
-    owners.forEach((owner, index) => assert.deepEqual(results[index], rowsOf(owner)));
+    owners.forEach((owner, index) => {
+      assert.deepEqual(results[index], rowsOf(owner));
+    });
     const probes = cas.requests.filter((request) => request.sql?.includes("CHAR_LENGTH"));
     const statements = cas.requests.filter((request) => request.sql?.includes("note = "));
     assert.equal(statements.length, owners.length);
@@ -563,7 +588,9 @@ test("parameterized concurrent queries probe the backslash mode once per session
   });
 });
 
-test("parameters that both backslash modes render alike are sent without a probe", { timeout: 10000 }, async () => {
+test("parameters that both backslash modes render alike are sent without a probe", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     await client.query("SELECT id, owner FROM items WHERE owner = ? AND n = ?", ["a", 7]);
 
@@ -575,7 +602,9 @@ test("parameters that both backslash modes render alike are sent without a probe
 // Statements that end the server transaction
 // ---------------------------------------------------------------------------
 
-test("an autocommit INSERT issued mid-SELECT does not close that SELECT's cursor", { timeout: 10000 }, async () => {
+test("an autocommit INSERT issued mid-SELECT does not close that SELECT's cursor", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     const [before, inserted, after] = await Promise.all([
       client.query(selectFor("a")),
@@ -590,7 +619,9 @@ test("an autocommit INSERT issued mid-SELECT does not close that SELECT's cursor
   });
 });
 
-test("a ping issued mid-SELECT does not close that SELECT's cursor", { timeout: 10000 }, async () => {
+test("a ping issued mid-SELECT does not close that SELECT's cursor", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     const [rows, version] = await Promise.all([client.query(selectFor("a")), client.ping()]);
 
@@ -608,7 +639,9 @@ test("a ping issued mid-SELECT does not close that SELECT's cursor", { timeout: 
 // A ping never ends a transaction
 // ---------------------------------------------------------------------------
 
-test("a ping commits only outside a transaction, by its exact bytes", { timeout: 10000 }, async () => {
+test("a ping commits only outside a transaction, by its exact bytes", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     await client.ping();
     assert.deepEqual(
@@ -623,10 +656,7 @@ test("a ping commits only outside a transaction, by its exact bytes", { timeout:
     assert.equal(await client.ping(), "11.4.0.0000");
     assert.deepEqual(
       cas.frames.map((frame) => frame.toString("hex")),
-      [
-        "00000001" + "01000000" + "20",
-        "00000006" + "01000000" + "0f" + "00000001" + "00",
-      ],
+      ["00000001" + "01000000" + "20", "00000006" + "01000000" + "0f" + "00000001" + "00"],
     );
 
     await client.query("INSERT INTO t VALUES (2)");
@@ -636,7 +666,9 @@ test("a ping commits only outside a transaction, by its exact bytes", { timeout:
   });
 });
 
-test("getServerVersion keeps a transaction open, by its exact bytes", { timeout: 10000 }, async () => {
+test("getServerVersion keeps a transaction open, by its exact bytes", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     await client.beginTransaction();
     await client.query("INSERT INTO t VALUES (1)");
@@ -645,10 +677,7 @@ test("getServerVersion keeps a transaction open, by its exact bytes", { timeout:
     assert.equal(await client.getServerVersion(), "11.4.0.0000");
     assert.deepEqual(
       cas.frames.map((frame) => frame.toString("hex")),
-      [
-        "00000001" + "01000000" + "20",
-        "00000006" + "01000000" + "0f" + "00000001" + "00",
-      ],
+      ["00000001" + "01000000" + "20", "00000006" + "01000000" + "0f" + "00000001" + "00"],
     );
 
     await client.query("INSERT INTO t VALUES (2)");
@@ -673,7 +702,9 @@ test("a ping inside a transaction fails when CHECK_CAS does", { timeout: 10000 }
   });
 });
 
-test("a failing statement rejects alone and the queries around it keep their rows", { timeout: 10000 }, async () => {
+test("a failing statement rejects alone and the queries around it keep their rows", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     const [first, failed, last] = await Promise.allSettled([
       client.query(selectFor("a")),
@@ -690,7 +721,9 @@ test("a failing statement rejects alone and the queries around it keep their row
   });
 });
 
-test("a FETCH error closes the failing query's handle and no other", { timeout: 10000 }, async () => {
+test("a FETCH error closes the failing query's handle and no other", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     cas.failFetchOf = "a";
 
@@ -704,7 +737,10 @@ test("a FETCH error closes the failing query's handle and no other", { timeout: 
     assert.deepEqual(other.status === "fulfilled" && other.value, rowsOf("b"));
     const fetchOfA = cas.of(CASFunctionCode.FETCH).find((request) => request.owner === "a");
     const closes = cas.of(CASFunctionCode.CLOSE_REQ_HANDLE);
-    assert.equal(closes.some((request) => request.handle === fetchOfA?.handle), true);
+    assert.equal(
+      closes.some((request) => request.handle === fetchOfA?.handle),
+      true,
+    );
     assert.equal(cas.refusedFetches, 0);
   });
 });
@@ -713,7 +749,9 @@ test("a FETCH error closes the failing query's handle and no other", { timeout: 
 // Reconnects never carry a request onto another session, and nothing is retried
 // ---------------------------------------------------------------------------
 
-test("a lost socket rejects the queries waiting on it without sending them anywhere", { timeout: 10000 }, async () => {
+test("a lost socket rejects the queries waiting on it without sending them anywhere", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     await client.ping();
     cas.dropAtFetchOf = "a";
@@ -726,12 +764,17 @@ test("a lost socket rejects the queries waiting on it without sending them anywh
     assert.equal(lost.status, "rejected");
     assert.equal(queued.status, "rejected");
     const executions = cas.of(CASFunctionCode.PREPARE_AND_EXECUTE);
-    assert.deepEqual(executions.map((request) => request.owner), ["a"]);
+    assert.deepEqual(
+      executions.map((request) => request.owner),
+      ["a"],
+    );
     assert.equal(cas.of(CASFunctionCode.CLOSE_REQ_HANDLE).length, 0);
   });
 });
 
-test("an INSERT queued on a new client is not sent after the first query loses its socket", { timeout: 10000 }, async () => {
+test("an INSERT queued on a new client is not sent after the first query loses its socket", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     cas.dropAtFetchOf = "a";
 
@@ -743,11 +786,16 @@ test("an INSERT queued on a new client is not sent after the first query loses i
     assert.equal(lost.status, "rejected");
     assert.equal(queued.status, "rejected");
     const executions = cas.of(CASFunctionCode.PREPARE_AND_EXECUTE);
-    assert.deepEqual(executions.map((request) => request.owner), ["a"]);
+    assert.deepEqual(
+      executions.map((request) => request.owner),
+      ["a"],
+    );
   });
 });
 
-test("an INSERT queued on a new client is not sent after the first query times out", { timeout: 10000 }, async () => {
+test("an INSERT queued on a new client is not sent after the first query times out", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     cas.stallAtExecuteOf = "a";
 
@@ -760,11 +808,16 @@ test("an INSERT queued on a new client is not sent after the first query times o
     assert.ok(timedOut.status === "rejected" && timedOut.reason instanceof ReadTimeoutError);
     assert.equal(queued.status, "rejected");
     const executions = cas.of(CASFunctionCode.PREPARE_AND_EXECUTE);
-    assert.deepEqual(executions.map((request) => request.owner), ["a"]);
+    assert.deepEqual(
+      executions.map((request) => request.owner),
+      ["a"],
+    );
   }, 100);
 });
 
-test("a ping that reconnects does not release the INSERT queued behind a lost socket", { timeout: 10000 }, async () => {
+test("a ping that reconnects does not release the INSERT queued behind a lost socket", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     await client.ping();
     cas.dropAtFetchOf = "a";
@@ -779,11 +832,16 @@ test("a ping that reconnects does not release the INSERT queued behind a lost so
     assert.equal(health.status, "fulfilled");
     assert.equal(queued.status, "rejected");
     const executions = cas.of(CASFunctionCode.PREPARE_AND_EXECUTE);
-    assert.deepEqual(executions.map((request) => request.owner), ["a"]);
+    assert.deepEqual(
+      executions.map((request) => request.owner),
+      ["a"],
+    );
   });
 });
 
-test("an INSERT waiting behind a malformed reply is not sent, and the next query recovers", { timeout: 10000 }, async () => {
+test("an INSERT waiting behind a malformed reply is not sent, and the next query recovers", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     await client.ping();
     cas.malformExecuteOf = "a";
@@ -805,7 +863,9 @@ test("an INSERT waiting behind a malformed reply is not sent, and the next query
   });
 });
 
-test("db.query() exposes a malformed reply by its name further down the cause chain", { timeout: 10000 }, async () => {
+test("db.query() exposes a malformed reply by its name further down the cause chain", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     cas.malformExecuteOf = "a";
 
@@ -818,7 +878,9 @@ test("db.query() exposes a malformed reply by its name further down the cause ch
   });
 });
 
-test("a ping that reconnects does not release the INSERT queued behind a malformed reply", { timeout: 10000 }, async () => {
+test("a ping that reconnects does not release the INSERT queued behind a malformed reply", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     await client.ping();
     cas.malformExecuteOf = "a";
@@ -833,11 +895,16 @@ test("a ping that reconnects does not release the INSERT queued behind a malform
     assert.equal(health.status, "fulfilled");
     assert.equal(queued.status, "rejected");
     const executions = cas.of(CASFunctionCode.PREPARE_AND_EXECUTE);
-    assert.deepEqual(executions.map((request) => request.owner), ["a"]);
+    assert.deepEqual(
+      executions.map((request) => request.owner),
+      ["a"],
+    );
   });
 });
 
-test("a query queued behind a failed first connect still gets its own attempt", { timeout: 10000 }, async () => {
+test("a query queued behind a failed first connect still gets its own attempt", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     cas.refuseConnections = 1;
 
@@ -852,7 +919,9 @@ test("a query queued behind a failed first connect still gets its own attempt", 
   });
 });
 
-test("the next query after a lost socket runs once on a new session, with nothing replayed", { timeout: 10000 }, async () => {
+test("the next query after a lost socket runs once on a new session, with nothing replayed", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     cas.dropAtFetchOf = "a";
     await assert.rejects(client.query(selectFor("a")));
@@ -860,12 +929,23 @@ test("the next query after a lost socket runs once on a new session, with nothin
     assert.deepEqual(await client.query(selectFor("b")), rowsOf("b"));
 
     const executions = cas.of(CASFunctionCode.PREPARE_AND_EXECUTE);
-    assert.deepEqual(executions.map((request) => [request.owner, request.session]), [["a", 1], ["b", 2]]);
-    assert.deepEqual(cas.of(CASFunctionCode.CLOSE_REQ_HANDLE).map((request) => request.session), [2]);
+    assert.deepEqual(
+      executions.map((request) => [request.owner, request.session]),
+      [
+        ["a", 1],
+        ["b", 2],
+      ],
+    );
+    assert.deepEqual(
+      cas.of(CASFunctionCode.CLOSE_REQ_HANDLE).map((request) => request.session),
+      [2],
+    );
   });
 });
 
-test("a query issued right after close rejects and leaves no session open", { timeout: 10000 }, async () => {
+test("a query issued right after close rejects and leaves no session open", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     assert.deepEqual(await client.query(selectFor("a")), rowsOf("a"));
 
@@ -876,7 +956,10 @@ test("a query issued right after close rejects and leaves no session open", { ti
     await assert.rejects(client.query(selectFor("c")));
 
     const executions = cas.of(CASFunctionCode.PREPARE_AND_EXECUTE);
-    assert.deepEqual(executions.map((request) => request.owner), ["a"]);
+    assert.deepEqual(
+      executions.map((request) => request.owner),
+      ["a"],
+    );
     for (let waited = 0; cas.sockets.size > 0 && waited < 2000; waited += 10) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
@@ -884,12 +967,16 @@ test("a query issued right after close rejects and leaves no session open", { ti
   });
 });
 
-test("the session released by one query's commit never receives another query's FETCH", { timeout: 10000 }, async () => {
+test("the session released by one query's commit never receives another query's FETCH", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     await Promise.all(["a", "b"].map((owner) => client.query(selectFor(owner))));
 
     const executedOn = new Map(
-      cas.of(CASFunctionCode.PREPARE_AND_EXECUTE).map((request) => [request.owner, request.session]),
+      cas
+        .of(CASFunctionCode.PREPARE_AND_EXECUTE)
+        .map((request) => [request.owner, request.session]),
     );
     for (const fetch of cas.of(CASFunctionCode.FETCH)) {
       assert.equal(fetch.session, executedOn.get(fetch.owner));
@@ -933,12 +1020,20 @@ test("rollback ends only the statements issued before it", { timeout: 10000 }, a
     assert.deepEqual(inside, rowsOf("a"));
     assert.deepEqual(outside, rowsOf("b"));
     const executions = cas.of(CASFunctionCode.PREPARE_AND_EXECUTE);
-    assert.deepEqual(executions.map((request) => [request.owner, request.autocommit]), [["a", false], ["b", true]]);
+    assert.deepEqual(
+      executions.map((request) => [request.owner, request.autocommit]),
+      [
+        ["a", false],
+        ["b", true],
+      ],
+    );
     assert.equal(cas.of(CASFunctionCode.END_TRAN)[0]?.tranType, EndTranType.ROLLBACK);
   });
 });
 
-test("beginTransaction applies only to statements issued after it", { timeout: 10000 }, async () => {
+test("beginTransaction applies only to statements issued after it", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     await Promise.all([
       client.query(selectFor("a")),
@@ -948,11 +1043,19 @@ test("beginTransaction applies only to statements issued after it", { timeout: 1
     ]);
 
     const executions = cas.of(CASFunctionCode.PREPARE_AND_EXECUTE);
-    assert.deepEqual(executions.map((request) => [request.owner, request.autocommit]), [["a", true], ["b", false]]);
+    assert.deepEqual(
+      executions.map((request) => [request.owner, request.autocommit]),
+      [
+        ["a", true],
+        ["b", false],
+      ],
+    );
   });
 });
 
-test("a failed statement inside transaction() rolls back after its siblings finish", { timeout: 10000 }, async () => {
+test("a failed statement inside transaction() rolls back after its siblings finish", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     const results: PromiseSettledResult<unknown>[] = [];
 
@@ -965,7 +1068,10 @@ test("a failed statement inside transaction() rolls back after its siblings fini
     );
     await new Promise((resolve) => setImmediate(resolve));
 
-    assert.deepEqual(results.map((result) => result.status), ["fulfilled", "rejected", "fulfilled"]);
+    assert.deepEqual(
+      results.map((result) => result.status),
+      ["fulfilled", "rejected", "fulfilled"],
+    );
     const order = cas.requests.map((request) => request.code);
     assert.ok(order.lastIndexOf(CASFunctionCode.FETCH) < order.indexOf(CASFunctionCode.END_TRAN));
     assert.equal(cas.of(CASFunctionCode.END_TRAN)[0]?.tranType, EndTranType.ROLLBACK);
@@ -973,7 +1079,9 @@ test("a failed statement inside transaction() rolls back after its siblings fini
   });
 });
 
-test("close waits for a running query instead of cutting off its FETCHes", { timeout: 10000 }, async () => {
+test("close waits for a running query instead of cutting off its FETCHes", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     const running = client.query(selectFor("a"));
     const closing = client.close();
@@ -988,7 +1096,9 @@ test("close waits for a running query instead of cutting off its FETCHes", { tim
 // One session across autocommit statements, verified with CHECK_CAS
 // ---------------------------------------------------------------------------
 
-test("consecutive autocommit statements stay on one session, with one CHECK_CAS between them", { timeout: 10000 }, async () => {
+test("consecutive autocommit statements stay on one session, with one CHECK_CAS between them", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     await client.query("INSERT INTO items VALUES (1)");
     await client.query(selectFor("a"));
@@ -996,19 +1106,25 @@ test("consecutive autocommit statements stay on one session, with one CHECK_CAS 
 
     assert.deepEqual([...new Set(cas.requests.map((request) => request.session))], [1]);
     const statements = cas.requests.filter(
-      ({ code }) => code === CASFunctionCode.PREPARE_AND_EXECUTE || code === CASFunctionCode.CHECK_CAS,
+      ({ code }) =>
+        code === CASFunctionCode.PREPARE_AND_EXECUTE || code === CASFunctionCode.CHECK_CAS,
     );
-    assert.deepEqual(statements.map(({ code }) => code), [
-      CASFunctionCode.PREPARE_AND_EXECUTE,
-      CASFunctionCode.CHECK_CAS,
-      CASFunctionCode.PREPARE_AND_EXECUTE,
-      CASFunctionCode.CHECK_CAS,
-      CASFunctionCode.PREPARE_AND_EXECUTE,
-    ]);
+    assert.deepEqual(
+      statements.map(({ code }) => code),
+      [
+        CASFunctionCode.PREPARE_AND_EXECUTE,
+        CASFunctionCode.CHECK_CAS,
+        CASFunctionCode.PREPARE_AND_EXECUTE,
+        CASFunctionCode.CHECK_CAS,
+        CASFunctionCode.PREPARE_AND_EXECUTE,
+      ],
+    );
   });
 });
 
-test("the backslash mode is measured once across autocommit statements", { timeout: 10000 }, async () => {
+test("the backslash mode is measured once across autocommit statements", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     await client.query("INSERT INTO items VALUES (?)", ["a\\b"]);
     await client.query("INSERT INTO items VALUES (?)", ["c\\d"]);
@@ -1019,7 +1135,9 @@ test("the backslash mode is measured once across autocommit statements", { timeo
   });
 });
 
-test("statements queued behind a probe that finds the CAS gone run once on the new session", { timeout: 10000 }, async () => {
+test("statements queued behind a probe that finds the CAS gone run once on the new session", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     await client.query("INSERT INTO items VALUES (0)");
     cas.dropAtCheckCas = true;
@@ -1030,7 +1148,10 @@ test("statements queued behind a probe that finds the CAS gone run once on the n
       client.query("INSERT INTO items VALUES (3)"),
     ]);
 
-    assert.deepEqual(results.map(({ status }) => status), ["fulfilled", "fulfilled", "fulfilled"]);
+    assert.deepEqual(
+      results.map(({ status }) => status),
+      ["fulfilled", "fulfilled", "fulfilled"],
+    );
     assert.deepEqual(cas.of(CASFunctionCode.CHECK_CAS)[0]?.session, 1);
     assert.deepEqual(
       cas.of(CASFunctionCode.PREPARE_AND_EXECUTE).map(({ session, sql }) => [session, sql]),
@@ -1044,7 +1165,9 @@ test("statements queued behind a probe that finds the CAS gone run once on the n
   });
 });
 
-test("a CAS that goes to another client after its reply does not fail the statements behind it", { timeout: 10000 }, async () => {
+test("a CAS that goes to another client after its reply does not fail the statements behind it", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     await client.query("INSERT INTO items VALUES (0)");
     cas.dropAtClose = true;
@@ -1054,7 +1177,10 @@ test("a CAS that goes to another client after its reply does not fail the statem
       client.query("INSERT INTO items VALUES (2)"),
     ]);
 
-    assert.deepEqual(results.map(({ status }) => status), ["fulfilled", "fulfilled"]);
+    assert.deepEqual(
+      results.map(({ status }) => status),
+      ["fulfilled", "fulfilled"],
+    );
     assert.equal(cas.of(CASFunctionCode.PREPARE_AND_EXECUTE).length, 3);
     assert.equal(cas.of(CASFunctionCode.PREPARE_AND_EXECUTE).at(-1)?.session, 2);
   });
@@ -1065,7 +1191,10 @@ async function openTransactionWithWork(client: ReturnType<typeof createClient>):
   await client.query("INSERT INTO items VALUES (1)");
 }
 
-async function assertNothingCommits(client: ReturnType<typeof createClient>, cas: FakeCas): Promise<void> {
+async function assertNothingCommits(
+  client: ReturnType<typeof createClient>,
+  cas: FakeCas,
+): Promise<void> {
   await assert.rejects(client.query("INSERT INTO items VALUES (3)"), QueryError);
   await assert.rejects(client.commit(), TransactionError);
   assert.deepEqual(cas.of(CASFunctionCode.END_TRAN), []);
@@ -1076,7 +1205,9 @@ for (const [name, code, statement] of [
   ["FETCH", CASFunctionCode.FETCH, selectFor("a")],
   ["handle release", CASFunctionCode.CLOSE_REQ_HANDLE, selectFor("a")],
 ] as const) {
-  test(`a ${name} reply that reports no open transaction fails the transaction`, { timeout: 10000 }, async () => {
+  test(`a ${name} reply that reports no open transaction fails the transaction`, {
+    timeout: 10000,
+  }, async () => {
     await withClient(async (client, cas) => {
       await openTransactionWithWork(client);
       cas.reportOutOfTransactionTo = code;
@@ -1088,7 +1219,9 @@ for (const [name, code, statement] of [
   });
 }
 
-test("a ping reply that reports no open transaction is not hidden by the replies after it", { timeout: 10000 }, async () => {
+test("a ping reply that reports no open transaction is not hidden by the replies after it", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     await openTransactionWithWork(client);
     cas.reportOutOfTransactionTo = CASFunctionCode.GET_DB_VERSION;
@@ -1101,7 +1234,9 @@ test("a ping reply that reports no open transaction is not hidden by the replies
   });
 });
 
-test("commit refuses a transaction that a ping reply reported as over", { timeout: 10000 }, async () => {
+test("commit refuses a transaction that a ping reply reported as over", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     await openTransactionWithWork(client);
     cas.reportOutOfTransactionTo = CASFunctionCode.GET_DB_VERSION;
@@ -1113,7 +1248,9 @@ test("commit refuses a transaction that a ping reply reported as over", { timeou
   });
 });
 
-test("a ping before a transaction's first statement does not count against it", { timeout: 10000 }, async () => {
+test("a ping before a transaction's first statement does not count against it", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     await client.query("INSERT INTO items VALUES (0)");
     await client.beginTransaction();
@@ -1126,7 +1263,9 @@ test("a ping before a transaction's first statement does not count against it", 
   });
 });
 
-test("FETCH stays on its session without a probe when the execute reply says OUT_TRAN", { timeout: 10000 }, async () => {
+test("FETCH stays on its session without a probe when the execute reply says OUT_TRAN", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     await client.query("INSERT INTO items VALUES (1)");
     await client.ping();
@@ -1176,7 +1315,9 @@ function isStreamBusy(error: { kind?: string; message: string }): boolean {
   return true;
 }
 
-test("stream: yields every row in order across FETCHes and releases the handle", { timeout: 10000 }, async () => {
+test("stream: yields every row in order across FETCHes and releases the handle", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     const rows: unknown[] = [];
 
@@ -1192,7 +1333,9 @@ test("stream: yields every row in order across FETCHes and releases the handle",
   });
 });
 
-test("stream: sends nothing before the first read, and a FETCH only when a window runs out", { timeout: 10000 }, async () => {
+test("stream: sends nothing before the first read, and a FETCH only when a window runs out", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     const rows = client.stream(STREAM_SELECT);
     await settle();
@@ -1210,7 +1353,9 @@ test("stream: sends nothing before the first read, and a FETCH only when a windo
   });
 });
 
-test("stream: memory stays bounded by one reply over a result far larger than the heap limit asserted", { timeout: 60000 }, async () => {
+test("stream: memory stays bounded by one reply over a result far larger than the heap limit asserted", {
+  timeout: 60000,
+}, async () => {
   setFlagsFromString("--expose-gc");
   const collectGarbage = runInNewContext("gc") as () => void;
   const ROW_TOTAL = 300_000;
@@ -1245,7 +1390,9 @@ test("stream: memory stays bounded by one reply over a result far larger than th
   });
 });
 
-test("stream: break closes the handle and ends the autocommit transaction that held its lock", { timeout: 10000 }, async () => {
+test("stream: break closes the handle and ends the autocommit transaction that held its lock", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     for await (const row of client.stream(STREAM_SELECT)) {
       assert.ok(row);
@@ -1263,23 +1410,30 @@ test("stream: break closes the handle and ends the autocommit transaction that h
   });
 });
 
-test("stream: a throw from the loop body keeps its error and releases the handle", { timeout: 10000 }, async () => {
+test("stream: a throw from the loop body keeps its error and releases the handle", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     const failure = new Error("the consumer failed");
 
-    await assert.rejects(async () => {
-      for await (const row of client.stream(STREAM_SELECT)) {
-        assert.ok(row);
-        throw failure;
-      }
-    }, (error) => error === failure);
+    await assert.rejects(
+      async () => {
+        for await (const row of client.stream(STREAM_SELECT)) {
+          assert.ok(row);
+          throw failure;
+        }
+      },
+      (error) => error === failure,
+    );
 
     assertStreamReleased(cas);
     assert.deepEqual(await client.query(selectFor("next")), rowsOf("next"));
   });
 });
 
-test("stream: return() and throw() on the iterator release the handle", { timeout: 10000 }, async () => {
+test("stream: return() and throw() on the iterator release the handle", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     const returned = client.stream(STREAM_SELECT);
     await readRows(returned, 1);
@@ -1289,14 +1443,19 @@ test("stream: return() and throw() on the iterator release the handle", { timeou
     const thrown = client.stream(STREAM_SELECT);
     await readRows(thrown, 1);
     const failure = new Error("stop reading");
-    await assert.rejects(() => thrown.throw(failure), (error) => error === failure);
+    await assert.rejects(
+      () => thrown.throw(failure),
+      (error) => error === failure,
+    );
     assertStreamReleased(cas, 2);
 
     assert.deepEqual(await thrown.next(), { done: true, value: undefined });
   });
 });
 
-test("stream: return() before the first read never sends the statement", { timeout: 10000 }, async () => {
+test("stream: return() before the first read never sends the statement", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     const rows = client.stream(STREAM_SELECT);
     await rows.return();
@@ -1306,7 +1465,9 @@ test("stream: return() before the first read never sends the statement", { timeo
   });
 });
 
-test("stream: a break inside a transaction leaves the transaction to its owner", { timeout: 10000 }, async () => {
+test("stream: a break inside a transaction leaves the transaction to its owner", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     await client.beginTransaction();
     await client.query("INSERT INTO items VALUES (1)");
@@ -1325,7 +1486,9 @@ test("stream: a break inside a transaction leaves the transaction to its owner",
   });
 });
 
-test("stream: a statement issued meanwhile waits until the stream is drained", { timeout: 10000 }, async () => {
+test("stream: a statement issued meanwhile waits until the stream is drained", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     const rows = client.stream(STREAM_SELECT);
     await readRows(rows, 1);
@@ -1344,7 +1507,9 @@ test("stream: a statement issued meanwhile waits until the stream is drained", {
   });
 });
 
-test("stream: a statement issued meanwhile runs as soon as the stream closes early", { timeout: 10000 }, async () => {
+test("stream: a statement issued meanwhile runs as soon as the stream closes early", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client) => {
     const rows = client.stream(STREAM_SELECT);
     await readRows(rows, 1);
@@ -1356,13 +1521,18 @@ test("stream: a statement issued meanwhile runs as soon as the stream closes ear
   });
 });
 
-test("stream: a query awaited inside the loop rejects instead of hanging, and sends nothing", { timeout: 10000 }, async () => {
+test("stream: a query awaited inside the loop rejects instead of hanging, and sends nothing", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
-    await assert.rejects(async () => {
-      for await (const row of client.stream(STREAM_SELECT, undefined, { consumerTimeout: 30 })) {
-        await client.query(`SELECT ${String(row.id)} FROM items`);
-      }
-    }, (error: QueryError) => error instanceof QueryError && isStreamBusy(error));
+    await assert.rejects(
+      async () => {
+        for await (const row of client.stream(STREAM_SELECT, undefined, { consumerTimeout: 30 })) {
+          await client.query(`SELECT ${String(row.id)} FROM items`);
+        }
+      },
+      (error: QueryError) => error instanceof QueryError && isStreamBusy(error),
+    );
 
     assert.equal(cas.of(CASFunctionCode.PREPARE_AND_EXECUTE).length, 1);
     assertStreamReleased(cas);
@@ -1370,7 +1540,9 @@ test("stream: a query awaited inside the loop rejects instead of hanging, and se
   });
 });
 
-test("stream: each kind of statement is refused with its own error class and the stream survives", { timeout: 10000 }, async () => {
+test("stream: each kind of statement is refused with its own error class and the stream survives", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     const rows = client.stream(STREAM_SELECT, undefined, { consumerTimeout: 10 });
     await readRows(rows, 1);
@@ -1399,7 +1571,9 @@ test("stream: each kind of statement is refused with its own error class and the
   });
 });
 
-test("stream: a statement keeps waiting while the consumer keeps reading", { timeout: 10000 }, async () => {
+test("stream: a statement keeps waiting while the consumer keeps reading", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client) => {
     const CONSUMER_TIMEOUT = 150;
     const PAUSE = 30;
@@ -1432,7 +1606,9 @@ test("stream: consumerTimeout 0 refuses a statement at once", { timeout: 10000 }
   });
 });
 
-test("stream: a statement's limit runs from when it was issued, not from the consumer's last read", { timeout: 10000 }, async () => {
+test("stream: a statement's limit runs from when it was issued, not from the consumer's last read", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client) => {
     const rows = client.stream(STREAM_SELECT, undefined, { consumerTimeout: 200 });
     await readRows(rows, 1);
@@ -1446,7 +1622,9 @@ test("stream: a statement's limit runs from when it was issued, not from the con
   });
 });
 
-test("stream: an abandoned iterator cannot hang later statements or close()", { timeout: 10000 }, async () => {
+test("stream: an abandoned iterator cannot hang later statements or close()", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     const rows = client.stream(STREAM_SELECT, undefined, { consumerTimeout: 10 });
     await readRows(rows, 1);
@@ -1462,7 +1640,9 @@ test("stream: an abandoned iterator cannot hang later statements or close()", { 
   });
 });
 
-test("stream: a result that fits its last window releases the turn before the consumer reads it", { timeout: 10000 }, async () => {
+test("stream: a result that fits its last window releases the turn before the consumer reads it", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     cas.rowCounts.set("small", 3);
     const seen: unknown[] = [];
@@ -1476,7 +1656,9 @@ test("stream: a result that fits its last window releases the turn before the co
   });
 });
 
-test("stream: a second stream waits for the first and never overlaps it", { timeout: 10000 }, async () => {
+test("stream: a second stream waits for the first and never overlaps it", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     const collect = async (owner: string): Promise<unknown[]> => {
       const rows: unknown[] = [];
@@ -1507,7 +1689,9 @@ test("stream: a query issued first runs first", { timeout: 10000 }, async () => 
   });
 });
 
-test("stream: abort releases the handle and the turn while the consumer is away", { timeout: 10000 }, async () => {
+test("stream: abort releases the handle and the turn while the consumer is away", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     const controller = new AbortController();
     const reason = new Error("no longer wanted");
@@ -1525,12 +1709,17 @@ test("stream: abort releases the handle and the turn while the consumer is away"
       [EndTranType.COMMIT],
     );
 
-    await assert.rejects(() => rows.next(), (error) => error === reason);
+    await assert.rejects(
+      () => rows.next(),
+      (error) => error === reason,
+    );
     assert.deepEqual(await rows.next(), { done: true, value: undefined });
   });
 });
 
-test("stream: abort during a FETCH waits for its reply and then releases the handle on the same session", { timeout: 10000 }, async () => {
+test("stream: abort during a FETCH waits for its reply and then releases the handle on the same session", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     const controller = new AbortController();
     const rows = client.stream(STREAM_SELECT, undefined, { signal: controller.signal });
@@ -1564,7 +1753,9 @@ test("stream: an aborted signal sends nothing", { timeout: 10000 }, async () => 
   });
 });
 
-test("stream: aborting a stream that waits for its turn rejects at once and sends nothing", { timeout: 10000 }, async () => {
+test("stream: aborting a stream that waits for its turn rejects at once and sends nothing", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     const first = client.stream(selectFor("a"));
     await readRows(first, 1);
@@ -1597,7 +1788,9 @@ test("stream: a finished stream stops listening to its signal", { timeout: 10000
       return Reflect.apply(removeEventListener, this, args);
     } as typeof removeEventListener;
 
-    for await (const row of client.stream(STREAM_SELECT, undefined, { signal: controller.signal })) {
+    for await (const row of client.stream(STREAM_SELECT, undefined, {
+      signal: controller.signal,
+    })) {
       assert.equal(listeners, 1);
       assert.ok(row);
       break;
@@ -1607,7 +1800,9 @@ test("stream: a finished stream stops listening to its signal", { timeout: 10000
   });
 });
 
-test("stream: rows before a failed FETCH are delivered, then the error, with the handle released", { timeout: 10000 }, async () => {
+test("stream: rows before a failed FETCH are delivered, then the error, with the handle released", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     cas.failFetchOf = "s";
     const rows: unknown[] = [];
@@ -1628,7 +1823,9 @@ test("stream: rows before a failed FETCH are delivered, then the error, with the
   });
 });
 
-test("stream: a read timeout on a FETCH rejects with ReadTimeoutError and drops the session", { timeout: 10000 }, async () => {
+test("stream: a read timeout on a FETCH rejects with ReadTimeoutError and drops the session", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     cas.stallAtFetchOf = "s";
 
@@ -1646,7 +1843,9 @@ test("stream: a read timeout on a FETCH rejects with ReadTimeoutError and drops 
   }, 100);
 });
 
-test("stream: waiting for the consumer does not count towards readTimeout", { timeout: 10000 }, async () => {
+test("stream: waiting for the consumer does not count towards readTimeout", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client) => {
     const rows = client.stream(STREAM_SELECT);
     await readRows(rows, 1);
@@ -1657,31 +1856,42 @@ test("stream: waiting for the consumer does not count towards readTimeout", { ti
   }, 50);
 });
 
-test("stream: a lost socket during a FETCH fails the stream as connection-lost and the next query reconnects", { timeout: 10000 }, async () => {
+test("stream: a lost socket during a FETCH fails the stream as connection-lost and the next query reconnects", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     cas.dropAtFetchOf = "s";
 
-    await assert.rejects(async () => {
-      for await (const row of client.stream(STREAM_SELECT)) {
-        assert.ok(row);
-      }
-    }, (error: QueryError) => error instanceof QueryError && error.kind === "connection-lost");
+    await assert.rejects(
+      async () => {
+        for await (const row of client.stream(STREAM_SELECT)) {
+          assert.ok(row);
+        }
+      },
+      (error: QueryError) => error instanceof QueryError && error.kind === "connection-lost",
+    );
 
     assert.deepEqual(await client.query(selectFor("next")), rowsOf("next"));
     assert.equal(cas.of(CASFunctionCode.CLOSE_REQ_HANDLE).at(-1)?.session, 2);
   });
 });
 
-test("stream: a malformed FETCH reply retires the session without another request on it", { timeout: 10000 }, async () => {
+test("stream: a malformed FETCH reply retires the session without another request on it", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     cas.malformFetchOf = "s";
 
-    await assert.rejects(async () => {
-      for await (const row of client.stream(STREAM_SELECT)) {
-        assert.ok(row);
-      }
-    }, (error: QueryError) => (error.cause as Error).cause instanceof Error
-      && ((error.cause as Error).cause as Error).name === "MalformedReplyError");
+    await assert.rejects(
+      async () => {
+        for await (const row of client.stream(STREAM_SELECT)) {
+          assert.ok(row);
+        }
+      },
+      (error: QueryError) =>
+        (error.cause as Error).cause instanceof Error &&
+        ((error.cause as Error).cause as Error).name === "MalformedReplyError",
+    );
 
     assert.equal(cas.of(CASFunctionCode.CLOSE_REQ_HANDLE).length, 0);
     assert.equal(cas.of(CASFunctionCode.END_TRAN).length, 0);
@@ -1702,7 +1912,9 @@ test("stream: a malformed execute reply retires the session too", { timeout: 100
   });
 });
 
-test("stream: -72 on a FETCH marks the transaction as rolled back until it is acknowledged", { timeout: 10000 }, async () => {
+test("stream: -72 on a FETCH marks the transaction as rolled back until it is acknowledged", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     const deadlock = errorReply(-72, "deadlock victim");
     deadlock.writeInt32BE(-2, 0);
@@ -1729,23 +1941,30 @@ test("stream: -72 on a FETCH marks the transaction as rolled back until it is ac
   });
 });
 
-test("stream: a transaction the server ended during the stream is reported, not reused", { timeout: 10000 }, async () => {
+test("stream: a transaction the server ended during the stream is reported, not reused", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     await client.beginTransaction();
     await client.query("INSERT INTO items VALUES (1)");
     cas.reportOutOfTransactionTo = CASFunctionCode.FETCH;
 
-    await assert.rejects(async () => {
-      for await (const row of client.stream(STREAM_SELECT)) {
-        assert.ok(row);
-      }
-    }, (error: QueryError) => error.kind === "connection-lost");
+    await assert.rejects(
+      async () => {
+        for await (const row of client.stream(STREAM_SELECT)) {
+          assert.ok(row);
+        }
+      },
+      (error: QueryError) => error.kind === "connection-lost",
+    );
 
     await assert.rejects(() => client.commit(), TransactionError);
   });
 });
 
-test("stream: close() ends an open stream and releases its handle first", { timeout: 10000 }, async () => {
+test("stream: close() ends an open stream and releases its handle first", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     const rows = client.stream(STREAM_SELECT);
     await readRows(rows, 1);
@@ -1758,7 +1977,9 @@ test("stream: close() ends an open stream and releases its handle first", { time
   });
 });
 
-test("stream: a statement that is not a SELECT yields no rows and releases its handle", { timeout: 10000 }, async () => {
+test("stream: a statement that is not a SELECT yields no rows and releases its handle", {
+  timeout: 10000,
+}, async () => {
   await withClient(async (client, cas) => {
     assert.deepEqual(await client.stream("INSERT INTO items VALUES (1)").next(), {
       done: true,
@@ -1780,7 +2001,10 @@ test("stream: an empty result ends at once", { timeout: 10000 }, async () => {
   await withClient(async (client, cas) => {
     cas.rowCounts.set("none", 0);
 
-    assert.deepEqual(await client.stream(selectFor("none")).next(), { done: true, value: undefined });
+    assert.deepEqual(await client.stream(selectFor("none")).next(), {
+      done: true,
+      value: undefined,
+    });
     assertStreamReleased(cas);
   });
 });
@@ -1793,7 +2017,9 @@ function fetchSizes(cas: FakeCas): number[] {
     .map((frame) => frame.readInt32BE(FETCH_SIZE_OFFSET));
 }
 
-test("fetchSize: a stream sends its option, and otherwise the client's, and otherwise 100, as query() does", { timeout: 10000 }, async () => {
+test("fetchSize: a stream sends its option, and otherwise the client's, and otherwise 100, as query() does", {
+  timeout: 10000,
+}, async () => {
   const drain = async (rows: AsyncIterable<unknown>): Promise<void> => {
     for await (const row of rows) {
       assert.ok(row);
@@ -1815,7 +2041,13 @@ test("fetchSize: a stream sends its option, and otherwise the client's, and othe
 
   const cas = new FakeCas();
   const port = await cas.start();
-  const client = createClient({ host: "127.0.0.1", port, database: "testdb", user: "dba", fetchSize: 60 });
+  const client = createClient({
+    host: "127.0.0.1",
+    port,
+    database: "testdb",
+    user: "dba",
+    fetchSize: 60,
+  });
 
   try {
     await drain(client.stream(STREAM_SELECT));

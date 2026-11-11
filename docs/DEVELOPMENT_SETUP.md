@@ -15,12 +15,13 @@ node --version
 npm --version
 npm ci
 npm run typecheck
+npm run lint:ci
 npm test
 npm run build
 npm run api:check
 ```
 
-Run `npm run test:coverage` for offline coverage. `npm run check` runs type checking and offline coverage tests. The package uses Node's built-in test runner with `tsx`, `tsup`, TypeScript and `c8`; do not replace this with Vitest or run undocumented Biome commands. Current `CONTRIBUTING.md` still contains a historical `npx biome` instruction, but `package.json` does not declare Biome. Until it is reconciled, **do not claim the Biome command is part of the verified default setup**.
+Run `npm run test:coverage` for offline coverage. `npm run check` runs type checking and offline coverage tests. `npm run lint:ci` checks formatting, lint and import order with the pinned Biome dev dependency without changing files; `npm run lint:fix` applies fixes (see [Code Style](../CONTRIBUTING.md#code-style)). The package uses Node's built-in test runner with `tsx`, `tsup`, TypeScript and `c8`; do not replace this with Vitest.
 
 ## Node.js 18 consumer verification during 1.x
 
@@ -54,6 +55,6 @@ npm pack --dry-run
 
 - [ ] `npm ci`, typecheck, offline tests and build succeed on the selected Node 22 dev environment, with actual log/output recorded.
 - [ ] `npm run api:check` and package exports are tested on the exact candidate if applicable.
-- [ ] The historical Biome command is reconciled with real dependencies; no arbitrary new lint tool is assumed installed.
+- [x] Biome is a pinned dev dependency with `lint`, `format:check` and `lint:ci` scripts, run by CI ([#217](https://github.com/cubrid-lab/cubrid-client/issues/217)).
 - [ ] Real CUBRID tests are distinguished from offline tests. If no server, record **not run**, not passed.
 - [ ] Release QA remains separate from onboarding. See [design sign-off](DESIGN_SIGNOFF.md), [engineering invariants](ENGINEERING_INVARIANTS.md), [release process](RELEASE_PROCESS.md).

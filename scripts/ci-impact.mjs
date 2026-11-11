@@ -32,8 +32,10 @@ export function classify(event, paths) {
       return { runtime: true, docs: true, reason: "unrecognized change status: fail closed" };
     }
     const [, status, path] = match;
-    const doc = DOC_EXT.test(path) &&
-      (path.startsWith("docs/") || !path.includes("/") ||
+    const doc =
+      DOC_EXT.test(path) &&
+      (path.startsWith("docs/") ||
+        !path.includes("/") ||
         path.startsWith(".github/ISSUE_TEMPLATE/") ||
         path.startsWith(".github/PULL_REQUEST_TEMPLATE/"));
     if (doc || RELEASE_TOOL.has(path)) docs = true;

@@ -6,12 +6,12 @@
  * Node.js re-reads process.env.TZ on assignment, so each case runs under
  * several zones in one process, including ones with DST and a half-hour offset.
  */
-import test from "node:test";
-import assert from "node:assert/strict";
 
+import assert from "node:assert/strict";
+import test from "node:test";
+import { NativeCubridAdapter } from "../src/adapters/native.js";
 import { CubridClient } from "../src/client/client.js";
 import { createClient } from "../src/client/create-client.js";
-import { NativeCubridAdapter } from "../src/adapters/native.js";
 import { normalizeConfig } from "../src/internals/normalize-config.js";
 import { PacketReader } from "../src/protocol/packet-reader.js";
 import { formatValue } from "../src/protocol/protocol.js";
@@ -35,7 +35,9 @@ function withTZ(zone: string, run: () => void): void {
 
 function shorts(...values: number[]): Buffer {
   const buf = Buffer.alloc(values.length * 2);
-  values.forEach((value, index) => buf.writeInt16BE(value, index * 2));
+  values.forEach((value, index) => {
+    buf.writeInt16BE(value, index * 2);
+  });
   return buf;
 }
 
@@ -55,17 +57,23 @@ test("utc: TIMESTAMP, DATE and TIME decode to fixed instants under every process
   for (const zone of ZONES) {
     withTZ(zone, () => {
       assert.equal(
-        utc(shorts(2025, 3, 14, 10, 30, 45)).parseTimestamp().getTime(),
+        utc(shorts(2025, 3, 14, 10, 30, 45))
+          .parseTimestamp()
+          .getTime(),
         Date.UTC(2025, 2, 14, 10, 30, 45),
         zone,
       );
       assert.equal(
-        utc(shorts(2025, 6, 15)).parseDate().toISOString(),
+        utc(shorts(2025, 6, 15))
+          .parseDate()
+          .toISOString(),
         "2025-06-15T00:00:00.000Z",
         zone,
       );
       assert.equal(
-        utc(shorts(10, 30, 45)).parseTime().toISOString(),
+        utc(shorts(10, 30, 45))
+          .parseTime()
+          .toISOString(),
         "1970-01-01T10:30:45.000Z",
         zone,
       );
@@ -97,8 +105,17 @@ test("utc: a Date parameter written and read back is the same instant under ever
       const literal = formatValue(sent, true);
       assert.equal(literal, "DATETIME'2024-02-29 23:59:59.999'", zone);
 
-      const fields = literal.match(/(\d+)-(\d+)-(\d+) (\d+):(\d+):(\d+)\.(\d+)/)!.slice(1).map(Number);
-      assert.equal(utc(shorts(...fields)).parseDatetime().getTime(), sent.getTime(), zone);
+      const fields = literal
+        .match(/(\d+)-(\d+)-(\d+) (\d+):(\d+):(\d+)\.(\d+)/)!
+        .slice(1)
+        .map(Number);
+      assert.equal(
+        utc(shorts(...fields))
+          .parseDatetime()
+          .getTime(),
+        sent.getTime(),
+        zone,
+      );
     });
   }
 });
@@ -124,7 +141,12 @@ test("utc: years 1 to 99 stay out of the 1900s", () => {
       [value.getUTCMonth(), value.getUTCDate(), value.getUTCHours(), value.getUTCMilliseconds()],
       [11, 31, 23, 999],
     );
-    assert.equal(utc(shorts(year, 2, 28)).parseDate().getUTCFullYear(), year);
+    assert.equal(
+      utc(shorts(year, 2, 28))
+        .parseDate()
+        .getUTCFullYear(),
+      year,
+    );
   }
 });
 
@@ -148,9 +170,10 @@ test("timezone option: accepted values, default and validation", () => {
     assert.throws(() => createClient(options), RangeError, timezone);
     // CubridClient and the adapter are public and skip normalizeConfig().
     assert.throws(
-      () => new CubridClient({ ...normalizeConfig(base), timezone } as never, () => {
-        throw new Error("not reached");
-      }),
+      () =>
+        new CubridClient({ ...normalizeConfig(base), timezone } as never, () => {
+          throw new Error("not reached");
+        }),
       RangeError,
       timezone,
     );

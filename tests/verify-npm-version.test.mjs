@@ -1,13 +1,17 @@
-import test from "node:test";
 import assert from "node:assert/strict";
+import test from "node:test";
 import { checkNpmVersion } from "../scripts/verify-npm-version.mjs";
 
 test("exact npm version is accepted, without trusting the latest dist-tag", () => {
   const stub = (bin, args, options) => {
     assert.equal(bin, "npm");
     assert.deepEqual(args, [
-      "view", "cubrid-client@1.2.0", "version", "--json",
-      "--fetch-retries=0", "--registry=https://registry.npmjs.org/",
+      "view",
+      "cubrid-client@1.2.0",
+      "version",
+      "--json",
+      "--fetch-retries=0",
+      "--registry=https://registry.npmjs.org/",
     ]);
     assert.equal(options.timeout, 30000);
     return { status: 0, stdout: '"1.2.0"\n', stderr: "" };
@@ -31,8 +35,14 @@ test("unexpected successful response is not a matching publication", () => {
 });
 
 test("invalid JSON and process errors fail closed", () => {
-  assert.equal(checkNpmVersion("1.2.0", () => ({ status: 0, stdout: "bad" })).status, "unavailable");
-  assert.equal(checkNpmVersion("1.2.0", () => ({ error: new Error("DNS lookup failed") })).status, "unavailable");
+  assert.equal(
+    checkNpmVersion("1.2.0", () => ({ status: 0, stdout: "bad" })).status,
+    "unavailable",
+  );
+  assert.equal(
+    checkNpmVersion("1.2.0", () => ({ error: new Error("DNS lookup failed") })).status,
+    "unavailable",
+  );
 });
 
 test("untrusted version syntax cannot be passed to npm", () => {

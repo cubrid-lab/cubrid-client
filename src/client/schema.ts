@@ -1,4 +1,6 @@
 import { QueryError } from "../errors/query-error.js";
+import type { QueryParams } from "../types/query.js";
+import type { QueryResultRow } from "../types/result.js";
 import type {
   SchemaColumn,
   SchemaIndex,
@@ -7,8 +9,6 @@ import type {
   SchemaPrimaryKey,
   SchemaTable,
 } from "../types/schema.js";
-import type { QueryParams } from "../types/query.js";
-import type { QueryResultRow } from "../types/result.js";
 
 export type SchemaQuery = (sql: string, params?: QueryParams) => Promise<QueryResultRow[]>;
 

@@ -1,10 +1,11 @@
 export function escapeIdentifier(name: string): string {
-  return `[${name.replace(/\]/g, "]]" )}]`;
+  return `[${name.replace(/\]/g, "]]")}]`;
 }
 
-export function buildWhere(
-  conditions: Record<string, unknown>,
-): { clause: string; params: unknown[] } {
+export function buildWhere(conditions: Record<string, unknown>): {
+  clause: string;
+  params: unknown[];
+} {
   const entries = Object.entries(conditions);
 
   if (entries.length === 0) {

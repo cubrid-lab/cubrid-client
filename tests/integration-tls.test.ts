@@ -2,9 +2,10 @@
  * Real SSL=ON CUBRID broker tests. The workflow provisions the broker and
  * installs a short-lived CA; normal offline runs may skip this opt-in suite.
  */
-import test from "node:test";
+
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import test from "node:test";
 import { createClient } from "../src/client/create-client.js";
 
 const required = process.env.CUBRID_TLS_REQUIRED === "1";
@@ -25,7 +26,9 @@ const base = {
 };
 const ca = caFile ? readFileSync(caFile, "utf8") : "";
 
-test("real CUBRID SSL=ON: verified certificate and SQL round trip", { skip: !available }, async () => {
+test("real CUBRID SSL=ON: verified certificate and SQL round trip", {
+  skip: !available,
+}, async () => {
   const client = createClient({
     ...base,
     ssl: { ca, servername: "localhost" },
@@ -41,7 +44,9 @@ test("real CUBRID SSL=ON: verified certificate and SQL round trip", { skip: !ava
   }
 });
 
-test("real CUBRID SSL=ON: self-signed certificate is rejected without its CA", { skip: !available }, async () => {
+test("real CUBRID SSL=ON: self-signed certificate is rejected without its CA", {
+  skip: !available,
+}, async () => {
   const client = createClient({ ...base, ssl: true });
   try {
     await assert.rejects(client.query("SELECT 1 AS result"));
@@ -50,7 +55,9 @@ test("real CUBRID SSL=ON: self-signed certificate is rejected without its CA", {
   }
 });
 
-test("real CUBRID SSL=ON: valid CA cannot bypass hostname verification", { skip: !available }, async () => {
+test("real CUBRID SSL=ON: valid CA cannot bypass hostname verification", {
+  skip: !available,
+}, async () => {
   const client = createClient({ ...base, ssl: { ca, servername: "not-the-broker.invalid" } });
   try {
     await assert.rejects(client.query("SELECT 1 AS result"));

@@ -1,5 +1,5 @@
-import test from "node:test";
 import assert from "node:assert/strict";
+import test from "node:test";
 
 import { createClient } from "../src/client/create-client.js";
 import {
@@ -229,6 +229,7 @@ test("an async or thenable logger that rejects or throws is contained", async ()
       debug() {
         calls += 1;
         return {
+          // biome-ignore lint/suspicious/noThenProperty: a broken thenable is what this test feeds the logger
           then() {
             throw new Error("then broke");
           },
@@ -402,7 +403,10 @@ test("a failed stream is logged as an error without its message", async () => {
 test("stream is exposed only when the connection supports it, and checks its options at once", async () => {
   const { logger } = recorder();
 
-  await assert.rejects(() => client(logger, fakeConnection()).stream("SELECT 1").next(), QueryError);
+  await assert.rejects(
+    () => client(logger, fakeConnection()).stream("SELECT 1").next(),
+    QueryError,
+  );
   assert.throws(
     () => client(logger, streamingConnection()).stream("SELECT 1", undefined, { fetchSize: 0 }),
     RangeError,

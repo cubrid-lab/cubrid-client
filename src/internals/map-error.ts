@@ -1,6 +1,6 @@
 import { ConnectionError } from "../errors/connection-error.js";
-import { definedErrorDetails } from "../errors/error-details.js";
 import type { CubridErrorDetails, CubridErrorOptions } from "../errors/error-details.js";
+import { definedErrorDetails } from "../errors/error-details.js";
 import { CasReplyError, ConnectionLostError, StreamBusyError } from "../errors/internal-errors.js";
 import {
   ConstraintError,
