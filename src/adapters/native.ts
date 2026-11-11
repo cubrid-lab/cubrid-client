@@ -45,11 +45,13 @@ import {
 } from "../protocol/constants.js";
 import {
   assertLiteralParams,
+  assertParameterCount,
   assertPreparableSql,
   assertSingleStatement,
   bindLobHandles,
   type ColumnMeta,
   encodePreparedParams,
+  findPlaceholders,
   interpolateParams,
   LobLocator,
   MalformedReplyError,
@@ -109,6 +111,9 @@ import { StreamCursor } from "./stream-cursor.js";
 const DEFAULT_FETCH_SIZE = 100;
 
 const QUERY_FAILED = "Failed to execute CUBRID query.";
+
+/** Loose on purpose: a needless match only costs one more backslash-mode probe. */
+const MAY_SET_SYSTEM_PARAMETERS = /system[\s\S]*parameters/i;
 const BATCH_FAILED = "Failed to execute CUBRID batch.";
 
 /**
@@ -284,14 +289,13 @@ export class NativeCubridAdapter implements DriverAdapter {
     options?: QueryOptions,
   ): Promise<QueryResult<T>> {
     assertValidQueryOptions(options);
-    refuseLobParams(params);
-    literalOrRefuse(params, QUERY_FAILED);
+    const values = literalOrRefuse(sql, params, QUERY_FAILED);
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
     return this.inTurn(
       "query",
       QUERY_FAILED,
-      () => this.queryNow<T>(sql, params, issued, undefined),
+      () => this.queryNow<T>(sql, values, issued, undefined),
       options,
     );
   }
@@ -307,8 +311,11 @@ export class NativeCubridAdapter implements DriverAdapter {
     options?: StreamOptions,
   ): AsyncGenerator<T, void, undefined> {
     assertValidStreamOptions(options);
-    refuseLobParams(params);
-    return this.streamRows<T>(sql, params, options);
+    // Read once here, so the blob()/clob() refusal stays synchronous and checks
+    // the same values that are sent.
+    const values = params === undefined ? undefined : Array.from(params);
+    refuseLobParams(values);
+    return this.streamRows<T>(sql, values, options);
   }
 
   private async *streamRows<T extends QueryResultRow>(
@@ -318,7 +325,7 @@ export class NativeCubridAdapter implements DriverAdapter {
   ): AsyncGenerator<T, void, undefined> {
     const signal = options?.signal;
     signal?.throwIfAborted();
-    literalOrRefuse(params, QUERY_FAILED);
+    const values = literalOrRefuse(sql, params, QUERY_FAILED);
 
     const cursor = new StreamCursor(options?.consumerTimeout ?? DEFAULT_CONSUMER_TIMEOUT_MS);
     const fetchSize = options?.fetchSize ?? this.config.fetchSize ?? DEFAULT_FETCH_SIZE;
@@ -332,7 +339,7 @@ export class NativeCubridAdapter implements DriverAdapter {
       cursor.run(
         this.inTurn("query", QUERY_FAILED, async () => {
           if (cursor.begin()) {
-            await this.streamNow(cursor, sql, params, fetchSize, issued);
+            await this.streamNow(cursor, sql, values, fetchSize, issued);
           }
         }),
       );
@@ -358,14 +365,13 @@ export class NativeCubridAdapter implements DriverAdapter {
 
   async execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult> {
     assertValidQueryOptions(options);
-    refuseLobParams(params);
-    literalOrRefuse(params, "Failed to execute CUBRID statement.");
+    const values = literalOrRefuse(sql, params, "Failed to execute CUBRID statement.");
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
     return this.inTurn(
       "query",
       "Failed to execute CUBRID statement.",
-      () => this.executeNow(sql, params, issued, undefined),
+      () => this.executeNow(sql, values, issued, undefined),
       options,
     );
   }
@@ -1222,16 +1228,25 @@ export class NativeCubridAdapter implements DriverAdapter {
     // backslash mode was measured on.
     await cas.ensureSession();
 
-    // Only a backslash, CR or LF is escaped differently by the two modes, so any
-    // other parameters bind the same on every session and skip the probe.
+    // Only a backslash, CR or LF is escaped differently by the two modes, and only
+    // a backslash in a quoted span of the SQL can move its markers, so anything
+    // else binds the same on every session and skips the probe.
     const resolvedSql =
-      !prepared && params && params.length > 0
+      !prepared && params !== undefined
         ? interpolateParams(
             sql,
             params,
-            needsBackslashMode(params) ? await this.ensureBackslashMode(cas) : true,
+            needsBackslashMode(params) || findPlaceholders(sql) === undefined
+              ? await this.ensureBackslashMode(cas)
+              : true,
           )
         : sql;
+
+    // SET SYSTEM PARAMETERS can change no_backslash_escapes for this session, so a
+    // statement that may do so makes the next bound statement measure it again.
+    if (MAY_SET_SYSTEM_PARAMETERS.test(sql)) {
+      this.noBackslashEscapes = null;
+    }
 
     const deferCommit = (commitAfter || prepared) && this.autoCommit;
     const { header, payload } = prepared
@@ -1290,8 +1305,8 @@ export class NativeCubridAdapter implements DriverAdapter {
   /**
    * Sends EXECUTE for the handle in a PREPARE reply. It must reach the session
    * that prepared it: on any other session the same number is another statement
-   * or nothing. The CAS ignores extra values and the literal path ignores extra
-   * parameters, so the count is checked against the server's here.
+   * or nothing. The CAS ignores extra values, so the count is checked against
+   * the server's here.
    */
   private async executeHandle(
     cas: CASConnection,
@@ -1943,15 +1958,34 @@ export class NativeCubridAdapter implements DriverAdapter {
 }
 
 /**
- * Checks the values of a statement sent as SQL text when it is called, before it
- * waits for its turn or sends anything, as bindOrRefuse() does for a prepared one.
+ * Checks a statement sent as SQL text when it is called, before it waits for its
+ * turn or sends anything, as bindOrRefuse() does for a prepared one: every value,
+ * and the number of values against the SQL's `?` markers. Only when the server's
+ * backslash mode decides where the markers are is the count checked later, once
+ * that mode is known and still before the statement is sent. Without `params` the
+ * SQL is sent as written.
+ *
+ * Returns a copy of the values, read once: an accessor or a Proxy could otherwise
+ * answer the backslash-mode check and the rendering differently. A blob() or
+ * clob() value is refused first, with the TypeError of refuseLobParams().
  */
-function literalOrRefuse(params: QueryParams | undefined, message: string): void {
+function literalOrRefuse(
+  sql: string,
+  params: QueryParams | undefined,
+  message: string,
+): QueryParams | undefined {
   if (params === undefined) {
-    return;
+    return undefined;
   }
+  const values = Array.from(params);
+  refuseLobParams(values);
   try {
-    assertLiteralParams(params);
+    assertLiteralParams(values);
+    const markers = findPlaceholders(sql);
+    if (markers !== undefined) {
+      assertParameterCount(markers.length, values.length);
+    }
+    return values;
   } catch (error) {
     throw mapError("query", error, message);
   }

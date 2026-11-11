@@ -909,6 +909,119 @@ test("a value the literal path cannot render is refused before connecting or sen
   }
 });
 
+test("too few or too many values are refused before connecting or sending (#243)", async () => {
+  const cases: Array<[string, QueryParam[]]> = [
+    ["SELECT ?", [1, 2]],
+    ["SELECT ?, ?", [1]],
+    ["SELECT ?", []],
+    ["SELECT 1 // ?", [1]],
+    ["SELECT [a?] FROM t", [1]],
+  ];
+  for (const [sql, params] of cases) {
+    const calls: Array<(adapter: NativeCubridAdapter) => Promise<unknown>> = [
+      (adapter) => adapter.query(sql, params),
+      (adapter) => adapter.execute(sql, params),
+      async (adapter) => {
+        for await (const _row of adapter.stream(sql, params)) {
+          // unreachable
+        }
+      },
+    ];
+    for (const call of calls) {
+      const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+      fakeCAS._isConnected = false;
+      await assert.rejects(call(adapter), (error: unknown) => {
+        assert.ok(error instanceof QueryError);
+        assert.match((error.cause as Error).message, /Parameter count mismatch/);
+        return true;
+      });
+      assert.equal(fakeCAS.sendAndRecvCalls, 0, sql);
+      assert.equal(fakeCAS.connectCalls, 0, sql);
+    }
+  }
+});
+
+test("SQL without params is still sent as written", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(buildDMLResponse(20, 1));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+  await adapter.query("UPDATE t SET a = '?' // ?");
+  assert.match(fakeCAS.sentPayloads[0]!.toString("latin1"), /UPDATE t SET a = '\?' \/\/ \?/);
+});
+
+test("markers that depend on the backslash mode are counted after the probe, before the SQL is sent", async () => {
+  const sql = "SELECT 'it\\'s', ?";
+  const userSql = (fakeCAS: FakeCASConnection): string[] =>
+    fakeCAS.sentPayloads
+      .filter((payload) => payload[0] === CASFunctionCode.PREPARE_AND_EXECUTE)
+      .map((payload) => payload.toString("latin1"))
+      .filter((text) => !text.includes("CHAR_LENGTH"));
+
+  // no_backslash_escapes=yes: 'it\' is a string and the rest an unterminated one,
+  // so there is no marker for the value.
+  {
+    const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (adapter as any).noBackslashEscapes = null;
+    queueProbeResponse(fakeCAS, "2");
+    await assert.rejects(adapter.query(sql, ["x' OR 1=1 --"]), (error: unknown) => {
+      assert.ok(error instanceof QueryError);
+      assert.match((error.cause as Error).message, /Parameter count mismatch/);
+      return true;
+    });
+    assert.deepEqual(userSql(fakeCAS), []);
+  }
+
+  // no_backslash_escapes=no: one string and one marker.
+  {
+    const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (adapter as any).noBackslashEscapes = null;
+    queueProbeResponse(fakeCAS, "1");
+    fakeCAS.queueResponse(buildSelectResponse([{ name: "v", type: 2 }], [["1"]]));
+    fakeCAS.queueResponse(buildSimpleResponse(0));
+    await adapter.query(sql, ["x' OR 1=1 --"]);
+    const [sent] = userSql(fakeCAS);
+    assert.ok(sent?.includes("SELECT 'it\\'s', 'x'' OR 1=1 --'"), sent);
+  }
+});
+
+test("the values are read once, so a getter cannot pass the mode check and then change", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(); // measured: literal mode
+  let reads = 0;
+  const params: QueryParam[] = [];
+  Object.defineProperty(params, 0, {
+    enumerable: true,
+    get: () => (++reads === 1 ? "a" : "\\' OR 1=1 -- "),
+  });
+  fakeCAS.queueResponse(buildDMLResponse(20, 1));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+  await adapter.query("DELETE FROM t WHERE n = ?", params);
+
+  assert.equal(reads, 1);
+  assert.match(fakeCAS.sentPayloads[0]!.toString("latin1"), /DELETE FROM t WHERE n = 'a'/);
+});
+
+test("a statement that may set system parameters makes the next bound one probe again", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(); // measured: literal mode
+  const sentSql = (): string[] =>
+    fakeCAS.sentPayloads
+      .filter((payload) => payload[0] === CASFunctionCode.PREPARE_AND_EXECUTE)
+      .map((payload) => payload.toString("latin1"));
+
+  fakeCAS.queueResponse(buildDMLResponse(20, 0));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+  await adapter.query("SET SYSTEM PARAMETERS 'no_backslash_escapes=no'");
+
+  queueProbeResponse(fakeCAS, "1");
+  fakeCAS.queueResponse(buildDMLResponse(20, 1));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+  await adapter.query("UPDATE t SET v = ?", ["a\\'b"]);
+  const sent = sentSql();
+  assert.match(sent[1]!, /CHAR_LENGTH/);
+  assert.ok(sent[2]!.includes("UPDATE t SET v = 'a\\\\''b'"), sent[2]);
+});
+
 // ---------------------------------------------------------------------------
 // query() — error handling
 // ---------------------------------------------------------------------------

@@ -130,7 +130,7 @@ async query<T extends QueryResultRow = QueryResultRow>(
 
 **Returns:** `Promise<T[]>` — Array of result rows typed as `T`.
 
-**Throws:** [`QueryError`](#queryerror) if execution fails, or if a value is [refused](TYPES.md#sending-javascript-parameters) before anything is sent. A `RangeError` or `TypeError` for an invalid option, [`ReadTimeoutError`](#readtimeouterror) after `readTimeout`, and `signal.reason`, unchanged, after an abort.
+**Throws:** [`QueryError`](#queryerror) if execution fails, or if a value is [refused](TYPES.md#sending-javascript-parameters), or the number of values differs from the SQL's `?` markers, before anything is sent. A `RangeError` or `TypeError` for an invalid option, [`ReadTimeoutError`](#readtimeouterror) after `readTimeout`, and `signal.reason`, unchanged, after an abort.
 
 **Type Parameter:** `T` defaults to `QueryResultRow` (`Record<string, unknown>`). Pass a custom type for typed results.
 
@@ -180,7 +180,7 @@ async queryResult<T extends QueryResultRow = QueryResultRow>(
 
 **Returns:** a [`QueryResult<T>`](#queryresult): `rows` is exactly what `query<T>()` returns, and `columns` describes every select-list column in order. `query()` itself is unchanged and still returns `T[]`.
 
-**Throws:** [`QueryError`](#queryerror) if execution fails or a value is [refused](TYPES.md#sending-javascript-parameters) before anything is sent, including when a custom `connectionFactory` connection has no `queryResult()` method.
+**Throws:** [`QueryError`](#queryerror) if execution fails or a value is [refused](TYPES.md#sending-javascript-parameters), or the number of values differs from the SQL's `?` markers, before anything is sent, including when a custom `connectionFactory` connection has no `queryResult()` method.
 
 ```ts
 const { rows, columns } = await db.queryResult(
@@ -203,7 +203,7 @@ async execute(sql: string, params?: QueryParams, options?: QueryOptions): Promis
 
 **Returns:** [`ExecuteResult`](#executeresult) `{ affectedRows, lastInsertId? }`.
 
-**Throws:** [`QueryError`](#queryerror) if execution fails, if a value is [refused](TYPES.md#sending-javascript-parameters) before anything is sent, or if the connection returned by a custom `connectionFactory` has no `execute()` method.
+**Throws:** [`QueryError`](#queryerror) if execution fails, if a value is [refused](TYPES.md#sending-javascript-parameters), or the number of values differs from the SQL's `?` markers, before anything is sent, or if the connection returned by a custom `connectionFactory` has no `execute()` method.
 
 ```ts
 const created = await db.execute("INSERT INTO users (name) VALUES (?)", ["Alice"]);
@@ -384,7 +384,7 @@ stream<T extends QueryResultRow = QueryResultRow>(
 | `params` | [`QueryParams`](#queryparams) | `undefined` | Positional parameter values |
 | `options` | [`StreamOptions`](#streamoptions) | `undefined` | `fetchSize`, `signal` and `consumerTimeout` |
 
-**Throws:** `RangeError` at once for an invalid option. Everything else rejects the read that met it: [`QueryError`](#queryerror) for a failed statement or FETCH, or when a value is [refused](TYPES.md#sending-javascript-parameters) before anything is sent, [`ReadTimeoutError`](#readtimeouterror) after `readTimeout`, and `signal.reason`, unchanged, after an abort. Rows that arrived before a failure are delivered first.
+**Throws:** `RangeError` at once for an invalid option. Everything else rejects the read that met it: [`QueryError`](#queryerror) for a failed statement or FETCH, or when a value is [refused](TYPES.md#sending-javascript-parameters), or the number of values differs from the SQL's `?` markers, before anything is sent, [`ReadTimeoutError`](#readtimeouterror) after `readTimeout`, and `signal.reason`, unchanged, after an abort. Rows that arrived before a failure are delivered first.
 
 ```ts
 for await (const row of db.stream<{ id: number }>("SELECT id FROM orders", [], {

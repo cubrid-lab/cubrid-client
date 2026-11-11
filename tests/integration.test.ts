@@ -41,6 +41,7 @@ import type { TransactionClient } from "../src/types/client.js";
 import { blob, clob } from "../src/types/lob.js";
 import type { QueryParam, QueryParams } from "../src/types/query.js";
 import { ZonedDateTime } from "../src/types/zoned-date-time.js";
+import { buildWhere } from "../src/utils/query.js";
 
 const TEST_CONFIG = {
   host: "127.0.0.1",
@@ -6104,6 +6105,218 @@ describe("Integration: negative literal parameters (#242)", { skip: !available }
         [2, 10],
         [3, 10],
       ]);
+    });
+  });
+});
+
+describe("Integration: where a ? is a marker (#243)", { skip: !available }, () => {
+  const TABLE = "cc_lexer_243";
+  type Client = ReturnType<typeof createClient>;
+
+  async function withRows<T>(run: (client: Client) => Promise<T>): Promise<T> {
+    const client = createClient(TEST_CONFIG);
+    try {
+      await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+      await client.query(`CREATE TABLE ${TABLE} (id INT PRIMARY KEY, v VARCHAR(100))`);
+      await client.query(`INSERT INTO ${TABLE} VALUES (1, 'a'), (2, 'b'), (3, 'c')`);
+      return await run(client);
+    } finally {
+      await client.query(`DROP TABLE IF EXISTS ${TABLE}`).catch(() => undefined);
+      await client.close();
+    }
+  }
+
+  async function rows(client: Client): Promise<Array<[number, string]>> {
+    const result = await client.query<{ id: number; v: string }>(
+      `SELECT id, v FROM ${TABLE} ORDER BY id`,
+    );
+    return result.map((row) => [row.id, row.v]);
+  }
+
+  const UNCHANGED: Array<[number, string]> = [
+    [1, "a"],
+    [2, "b"],
+    [3, "c"],
+  ];
+
+  function rootCause(error: unknown): Error {
+    let current = error as Error;
+    while (current.cause instanceof Error) {
+      current = current.cause;
+    }
+    return current;
+  }
+
+  /** `true` with the CUBRID default no_backslash_escapes=yes. */
+  async function noBackslashEscapes(client: Client): Promise<boolean> {
+    const [row] = await client.query("SELECT CHAR_LENGTH('\\\\') AS n FROM db_root");
+    return Number(row?.n) === 2;
+  }
+
+  test("an UPDATE with ? in comments and quotes before its WHERE changes only that row", async () => {
+    await withRows(async (client) => {
+      const result = await client.execute(
+        `UPDATE ${TABLE} SET v = ? /* ? */ WHERE id = ? AND v <> '?' // ?\n AND v <> ?`,
+        ["x", 2, "zzz"],
+      );
+      assert.equal(result.affectedRows, 1);
+      assert.deepEqual(await rows(client), [
+        [1, "a"],
+        [2, "x"],
+        [3, "c"],
+      ]);
+
+      // CR ends the comment on the server too, so the last ? is bound.
+      await client.execute(`UPDATE ${TABLE} SET v = ? WHERE id = ? -- note ?\r AND v <> ?`, [
+        "y",
+        3,
+        "zzz",
+      ]);
+      assert.deepEqual(await rows(client), [
+        [1, "a"],
+        [2, "x"],
+        [3, "y"],
+      ]);
+    });
+  });
+
+  test("a DELETE with a trailing WHERE and an injection payload deletes only what it names", async () => {
+    await withRows(async (client) => {
+      const payload = "x' OR 1=1 --";
+      const none = await client.execute(`DELETE FROM ${TABLE} WHERE v = ? -- ?`, [payload]);
+      assert.equal(none.affectedRows, 0);
+      assert.deepEqual(await rows(client), UNCHANGED);
+
+      const one = await client.execute(
+        `DELETE FROM ${TABLE} WHERE v = 'b' AND id = ? /* /* ? */ AND 1 = ?`,
+        [2, 1],
+      );
+      assert.equal(one.affectedRows, 1);
+      assert.deepEqual(await rows(client), [
+        [1, "a"],
+        [3, "c"],
+      ]);
+    });
+  });
+
+  test("too few or too many values are refused and change nothing", async () => {
+    await withRows(async (client) => {
+      for (const [sql, params] of [
+        [`DELETE FROM ${TABLE} WHERE id = ?`, [1, 2]],
+        [`UPDATE ${TABLE} SET v = ? WHERE id = ?`, ["z"]],
+        [`DELETE FROM ${TABLE} WHERE id = 1 // ?`, [1]],
+        [`DELETE FROM ${TABLE} WHERE v = '?'`, [1]],
+        ["SELECT ? FROM db_root", [1, 2]],
+      ] as const) {
+        await assert.rejects(client.execute(sql, params), (error: unknown) => {
+          assert.ok(error instanceof QueryError);
+          assert.match(rootCause(error).message, /Parameter count mismatch/, sql);
+          return true;
+        });
+      }
+      assert.deepEqual(await rows(client), UNCHANGED);
+    });
+  });
+
+  test("'it\\'s' with an injection payload follows the server's backslash mode", async () => {
+    await withRows(async (client) => {
+      const payload = "x' OR 1=1 --";
+      const sql = `SELECT 'it\\'s' AS a, ? AS b FROM ${TABLE} WHERE id = 1`;
+      if (await noBackslashEscapes(client)) {
+        // 'it\' is a string and s' ... another: no marker for the value. The server
+        // agrees that the text is not one valid statement.
+        await assert.rejects(client.query(sql, [payload]), (error: unknown) => {
+          assert.ok(error instanceof QueryError);
+          assert.match(rootCause(error).message, /Parameter count mismatch/);
+          return true;
+        });
+        await assert.rejects(client.query(sql.replace("?", "'x'")), (error: unknown) => {
+          assert.ok(error instanceof SqlSyntaxError);
+          assert.equal(error.code, -493);
+          return true;
+        });
+      } else {
+        const [row] = await client.query(sql, [payload]);
+        assert.deepEqual(row, { a: "it's", b: payload });
+        // "a\" is an identifier with ansi_quotes=yes and an unterminated string with
+        // ansi_quotes=no, which the client cannot see, so it refuses to guess.
+        await assert.rejects(
+          client.query(`DELETE FROM ${TABLE} WHERE v = "a\\" OR id = ?`, [1]),
+          (error: unknown) => {
+            assert.ok(error instanceof QueryError);
+            assert.match(rootCause(error).message, /ansi_quotes/);
+            return true;
+          },
+        );
+      }
+      assert.deepEqual(await rows(client), UNCHANGED);
+    });
+  });
+
+  test("doubled delimiters, nested-looking comments, // comments and UTF-8 bind only real markers", async () => {
+    const client = createClient(TEST_CONFIG);
+    try {
+      const [row] = await client.query(
+        "// leading ?\nSELECT 'it''s ?' AS a, ? AS b, 1 AS \"x\"\"y\", 1 AS `y``z`, " +
+          "/* /* ? */ ? AS c, '한글 ?' AS 이름 FROM db_root -- ?",
+        ["값 ?", -1],
+      );
+      assert.deepEqual(
+        Object.fromEntries(Object.entries(row!).map(([key, value]) => [key, String(value)])),
+        { a: "it's ?", b: "값 ?", 'x"y': "1", "y`z": "1", c: "-1", 이름: "한글 ?" },
+      );
+
+      // The broker counts a ? inside a quoted identifier as a host variable of its
+      // own (-1007, bind count), although the grammar reads it as part of the name.
+      for (const name of ['"x""?"', "`y``?`", "[z?]"]) {
+        await assert.rejects(client.query(`SELECT ? AS ${name} FROM db_root`, [1]), {
+          code: -1007,
+        });
+      }
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("a session that changes no_backslash_escapes is measured again before the next value", async () => {
+    const adapter = new NativeCubridAdapter(TEST_CONFIG);
+    const value = "\\' OR 1=1 -- ";
+    try {
+      for (const mode of ["no", "yes", "no"]) {
+        // The first statement measures the mode; SET then changes it on this session.
+        assert.deepEqual(await adapter.query("SELECT ? AS v FROM db_root", [value]), [
+          { v: value },
+        ]);
+        await adapter.query(`SET SYSTEM PARAMETERS 'no_backslash_escapes=${mode}'`);
+        assert.deepEqual(await adapter.query("SELECT ? AS v FROM db_root", [value]), [
+          { v: value },
+        ]);
+      }
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  test("buildWhere keeps a ? in an identifier and binds only the value", async () => {
+    await withRows(async (client) => {
+      const { clause, params } = buildWhere({ "v?": "b" });
+      assert.equal(clause, "WHERE [v?] = ?");
+      // The broker counts the ? inside [v?] as a host variable (-1007): the client
+      // bound only the value, and nothing runs.
+      await assert.rejects(
+        client.execute(`DELETE FROM ${TABLE} ${clause}`, params as QueryParam[]),
+        {
+          code: -1007,
+        },
+      );
+      assert.deepEqual(await rows(client), UNCHANGED);
+
+      const plain = buildWhere({ v: "b" });
+      const result = await client.execute(
+        `DELETE FROM ${TABLE} ${plain.clause}`,
+        plain.params as QueryParam[],
+      );
+      assert.equal(result.affectedRows, 1);
     });
   });
 });

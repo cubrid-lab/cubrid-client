@@ -25,6 +25,7 @@ import {
   assertSingleStatement,
   type ColumnMeta,
   encodeBindParams,
+  findPlaceholders,
   formatValue,
   interpolateParams,
   MalformedReplyError,
@@ -1007,11 +1008,131 @@ test("interpolateParams handles escaped quotes", () => {
   assert.equal(result, "SELECT * FROM t WHERE name = 'O''Brien' AND id = 1");
 });
 
-test("interpolateParams throws on insufficient params", () => {
-  assert.throws(
-    () => interpolateParams("SELECT ?, ?", [1], true),
-    (err: Error) => err.message.includes("Not enough parameters"),
-  );
+test("interpolateParams refuses too few and too many values, in either mode", () => {
+  for (const mode of [true, false]) {
+    for (const [sql, params] of [
+      ["SELECT ?, ?", [1]],
+      ["SELECT ?", [1, 2]],
+      ["SELECT ?", []],
+      ["SELECT 1", [1]],
+      ["SELECT '?'", [1]],
+    ] as const) {
+      assert.throws(
+        () => interpolateParams(sql, params, mode),
+        /Parameter count mismatch: the SQL has \d+ \? markers, but \d+ values were given/,
+        sql,
+      );
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The SQL lexer: where a ? is a marker (#243). Expectations follow what CUBRID
+// 10.2 and 11.4 brokers were seen to do, not this lexer.
+// ---------------------------------------------------------------------------
+
+test("a ? inside any quoted span or comment is not a marker", () => {
+  for (const mode of [true, false]) {
+    for (const sql of [
+      "SELECT 'a?' AS v, ?",
+      "SELECT 'it''s ?' AS v, ?",
+      'SELECT "a?" AS v, ?',
+      'SELECT 1 AS "a""?", ?',
+      "SELECT 1 AS `a?`, ?",
+      "SELECT 1 AS `a``?`, ?",
+      "SELECT 1 AS [a?], ?",
+      "SELECT 1 /* ? */, ?",
+      "SELECT 1 /* /* ? */, ?",
+      "SELECT 1 -- ?\n, ?",
+      "SELECT 1 -- ?\r, ?",
+      "SELECT 1 -- ?\r\n, ?",
+      "SELECT 1 // ?\n, ?",
+      "SELECT 1 // ?\r, ?",
+      "SELECT 1--?\n, ?",
+      "SELECT '한글 ?' AS 이름, ?",
+    ]) {
+      assert.equal(findPlaceholders(sql, mode)?.length, 1, sql);
+      assert.equal(interpolateParams(sql, [7], mode), sql.replace(/\?$/, "7"), sql);
+    }
+  }
+});
+
+test("a // comment hides its ? and the next line's ? is bound", () => {
+  assert.equal(interpolateParams("// comment ?\nSELECT ?", [1], true), "// comment ?\nSELECT 1");
+  assert.equal(interpolateParams("// comment ?\rSELECT ?", [1], true), "// comment ?\rSELECT 1");
+});
+
+test("a line comment runs to the end of the text and only CR or LF ends it", () => {
+  for (const sql of [
+    "SELECT 1 -- ?",
+    "SELECT 1 // ?",
+    "SELECT 1 -- c\u2028 ?",
+    "SELECT 1 -- c\u0085 ?",
+    "SELECT 1 /* ?",
+  ]) {
+    assert.deepEqual(findPlaceholders(sql, true), [], sql);
+    assert.throws(() => interpolateParams(sql, [1], true), /Parameter count mismatch/, sql);
+  }
+});
+
+test("# is not a comment and a bracket identifier ends at its first ]", () => {
+  assert.equal(interpolateParams("SELECT 1 # ?", [2], true), "SELECT 1 # 2");
+  // The server reads [a] and then ]: ]] is not an escape, so this ? is outside.
+  assert.equal(findPlaceholders("SELECT [a]]?]", true)?.length, 1);
+});
+
+test("CR or LF in a value cannot end a comment or quoted span early", () => {
+  for (const mode of [true, false]) {
+    const sql = interpolateParams(
+      "SELECT ? -- note ?\nFROM t WHERE id = ? // ?",
+      ["x\r\n-- ', 1); DELETE FROM t; --", 1],
+      mode,
+    );
+    // The value stays one string literal: the rest of the statement is unchanged.
+    assert.ok(sql.endsWith(" -- note ?\nFROM t WHERE id = 1 // ?"), sql);
+    assert.deepEqual(findPlaceholders(sql, mode), []);
+    assert.doesNotThrow(() => assertSingleStatement(sql));
+  }
+});
+
+test("a backslash escapes only in escape mode, so 'it\\'s' lexes differently per mode", () => {
+  const sql = "SELECT 'it\\'s', ?";
+  const payload = "x' OR 1=1 --";
+  // no_backslash_escapes=yes: 'it\' ends the string and s', ? is an unterminated
+  // string the server refuses, so no ? is a marker and the value is refused.
+  assert.deepEqual(findPlaceholders(sql, true), []);
+  assert.throws(() => interpolateParams(sql, [payload], true), /Parameter count mismatch/);
+  // no_backslash_escapes=no: one string, then one marker.
+  assert.equal(interpolateParams(sql, [payload], false), "SELECT 'it\\'s', 'x'' OR 1=1 --'");
+  // Before the mode is known the two disagree.
+  assert.equal(findPlaceholders(sql), undefined);
+
+  assert.equal(interpolateParams("SELECT 'a\\', ?", [1], true), "SELECT 'a\\', 1");
+  assert.throws(() => interpolateParams("SELECT 'a\\', ?", [1], false), /Parameter count/);
+  assert.equal(interpolateParams("SELECT 'a\\\\', ?", [1], false), "SELECT 'a\\\\', 1");
+});
+
+test("backticks and brackets never take a backslash escape", () => {
+  for (const mode of [true, false]) {
+    assert.equal(interpolateParams("SELECT 1 AS `a\\`, ?", [1], mode), "SELECT 1 AS `a\\`, 1");
+    assert.equal(interpolateParams("SELECT 1 AS [a\\], ?", [1], mode), "SELECT 1 AS [a\\], 1");
+  }
+});
+
+test('in escape mode a "..." span with a backslash is refused when ansi_quotes would decide', () => {
+  // An identifier with ansi_quotes=yes, where \\ is ordinary; a string with
+  // ansi_quotes=no, where \\" is an escaped quote. The client cannot see which.
+  const sql = 'SELECT "a\\", ?';
+  assert.equal(interpolateParams(sql, [1], true), 'SELECT "a\\", 1');
+  assert.throws(() => interpolateParams(sql, [1], false), /ansi_quotes/);
+  // A backslash that moves no marker is not ambiguous.
+  assert.equal(interpolateParams('SELECT "a\\\\b", ?', [1], false), 'SELECT "a\\\\b", 1');
+});
+
+test("only SQL with a backslash needs the backslash mode to find its markers", () => {
+  assert.deepEqual(findPlaceholders("SELECT ?, '?', ?"), [7, 15]);
+  assert.deepEqual(findPlaceholders("SELECT 'a\\\\', ?"), [14]);
+  assert.equal(findPlaceholders("SELECT 'a\\'', ?"), undefined);
 });
 
 test("interpolateParams handles no params in SQL", () => {
@@ -2240,6 +2361,17 @@ test("assertSingleStatement refuses a second statement, in either backslash mode
     "INSERT INTO [it's] (a) VALUES (?); DELETE FROM t",
     "INSERT INTO [x--y] (a) VALUES (?); DELETE FROM t",
     "INSERT INTO `c\\` (a) VALUES ('\\'', ?); DELETE FROM t -- `",
+    // CR ends a line comment as LF does, and // is a comment like --.
+    "INSERT INTO t VALUES (?) -- c\r; DELETE FROM t",
+    "INSERT INTO t VALUES (?) // c\r; DELETE FROM t",
+    "INSERT INTO t VALUES (?) // c\n; DELETE FROM t",
+    // Only ASCII whitespace may follow the ;.
+    "INSERT INTO t VALUES (?);\uFEFF",
+    "INSERT INTO t VALUES (?);\u00a0",
+    // ]] is not an escape: the identifier ends at the first ].
+    "INSERT INTO [a]];] VALUES (?); DELETE FROM t",
+    // A double-quoted span is a string, with escapes, only with ansi_quotes=no.
+    'INSERT INTO t VALUES ("a\\", ?); DELETE FROM t WHERE b = "x"',
   ]) {
     assert.throws(() => assertSingleStatement(sql), /one statement/, sql);
   }

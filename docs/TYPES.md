@@ -387,7 +387,10 @@ The public `query(sql, params)` method renders values into SQL text
 is the opt-in [`queryPrepared()` family](#prepared-binding) below.
 The SQL literal escaping rules depend on the server's `no_backslash_escapes`
 setting, negotiated on each physical session: a reconnect measures it again
-before a string containing a backslash, CR or LF is bound on the new session.
+before a string containing a backslash, CR or LF is bound on the new session, and
+so does any statement whose text mentions `SYSTEM` and `PARAMETERS`, since
+`SET SYSTEM PARAMETERS 'no_backslash_escapes=...'` changes the mode for the
+session. The values are read once, when the method is called.
 Other parameters render the same in both modes and are sent without that probe.
 
 | JavaScript parameter | Current SQL literal behavior |
@@ -401,6 +404,25 @@ Other parameters render the same in both modes and are sent without that probe.
 | `null`, `undefined` | SQL `NULL` |
 | `blob()`, `clob()` | Refused with a `TypeError`: use a prepared method |
 | Anything else | Refused: an object, array, function or symbol is never converted with `String()` |
+
+The values replace the `?` markers that CUBRID's lexer would read as code, as
+measured on 10.2 and 11.4 brokers. A `?` is not a marker inside a `'...'` string,
+a `"..."` span (an identifier with `ansi_quotes=yes`, the default, or a string),
+a `` `...` `` identifier (a doubled backtick is a backtick), a `[...]` identifier (which ends
+at the first `]`; `]]` is not an escape), a `/* */` comment (not nested; an
+unterminated one runs to the end), or a `--` or `//` comment, which ends at CR or
+LF. `#` is not a comment. Quotes are escaped by doubling them, and a backslash
+escapes the next character only in strings and only with
+`no_backslash_escapes=no`. The number of values must equal the number of markers:
+too few or too many reject with a `QueryError` before anything is sent. When a
+backslash in the SQL makes the markers depend on the backslash mode, the session
+is probed first, and the count is checked before the statement is sent. In escape
+mode a `"..."` span holding a backslash is refused when `ansi_quotes`, which the
+client cannot see, would move a marker. A call without `params` sends the SQL as
+written.
+
+The broker itself counts a `?` inside a quoted identifier as a host variable, so a
+statement with an identifier such as `[a?]` fails with `-1007` on either path.
 
 A negative number is parenthesized because the SQL text can put a minus sign
 before the marker: `b-?` with `-1` would otherwise read `b--1`, and `--` starts a
@@ -441,7 +463,7 @@ error never contains the value.
 How the result differs from the literal path for the same statement:
 
 - **Parameter count.** The number of values must equal the server's marker
-  count. Extra values reject; the literal path ignores them.
+  count, as on the literal path, which counts the markers itself.
 - **Fractions.** The literal path sends `1.5` as a NUMERIC literal, so
   `SELECT ?` returns the string `"1.5"`; here it returns the number `1.5`. The
   value stored in a DOUBLE column is exact, where a NUMERIC literal can round

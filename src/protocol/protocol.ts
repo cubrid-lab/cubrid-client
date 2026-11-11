@@ -409,57 +409,14 @@ export function assertPreparableSql(sql: string): void {
  * EXECUTE_ARRAY runs only the first statement of `a; b` and reports success
  * (seen on live 10.2 and 11.4 brokers), so the later statements would be lost
  * without an error. Refuses SQL with anything but comments after a top-level
- * `;`. It scans once with backslash escapes and once without, because the
- * server's mode decides where a string ends, so a doubt refuses rather than runs.
+ * `;`. It scans under every lexing the server could use (see LexRules), because
+ * the server's settings decide where a quoted span ends, so a doubt refuses
+ * rather than runs.
  */
 export function assertSingleStatement(sql: string): void {
-  if (hasSecondStatement(sql, true) || hasSecondStatement(sql, false)) {
+  if (ALL_LEX_RULES.some((rules) => scanSql(sql, rules).secondStatement)) {
     throw new Error("executeMany() runs one statement, but the SQL text holds more than one");
   }
-}
-
-/** The character that ends each quoted span: strings, and identifiers in `"`, backticks or brackets. */
-const QUOTE_ENDS: Readonly<Record<string, string>> = { "'": "'", '"': '"', "`": "`", "[": "]" };
-
-function hasSecondStatement(sql: string, backslashEscapes: boolean): boolean {
-  let end = "";
-  let separated = false;
-
-  for (let i = 0; i < sql.length; i++) {
-    const ch = sql[i]!;
-    const next = sql[i + 1] ?? "";
-
-    if (end !== "") {
-      // Only string quotes take backslash escapes; identifiers never do.
-      if (backslashEscapes && ch === "\\" && (end === "'" || end === '"')) {
-        i++;
-      } else if (ch === end) {
-        if (next === end && end !== "]") {
-          i++;
-        } else {
-          end = "";
-        }
-      }
-      continue;
-    }
-
-    if ((ch === "-" && next === "-") || (ch === "/" && next === "/")) {
-      const lineEnd = sql.indexOf("\n", i);
-      i = lineEnd === -1 ? sql.length : lineEnd;
-    } else if (ch === "/" && next === "*") {
-      const commentEnd = sql.indexOf("*/", i + 2);
-      i = commentEnd === -1 ? sql.length : commentEnd + 1;
-    } else if (ch === ";") {
-      separated = true;
-    } else if (!/\s/.test(ch)) {
-      if (separated) {
-        return true;
-      }
-      end = QUOTE_ENDS[ch] ?? "";
-    }
-  }
-
-  return false;
 }
 
 /** Parse PREPARE response. */
@@ -1418,131 +1375,184 @@ function writePreparedDate(w: PacketWriter, value: Date): void {
 // ---------------------------------------------------------------------------
 
 /**
- * Interpolate parameters into SQL string (client-side).
+ * How a CUBRID session lexes the SQL text, which decides where a `?` marker can
+ * be. Measured on CUBRID 10.2 and 11.4 brokers:
  *
- * CUBRID's CAS protocol does not reliably support server-side bind
- * parameters for all drivers, so we use client-side interpolation
- * (same approach as cubrid-go and node-cubrid).
+ * - `'...'` is a string. `''` is a quote, and a backslash escapes the next
+ *   character only with `no_backslash_escapes=no`.
+ * - `"..."` is an identifier with `ansi_quotes=yes`, the default, and a string
+ *   with `ansi_quotes=no`. `""` is a quote either way; a backslash escapes only in
+ *   the string, and only with `no_backslash_escapes=no`.
+ * - `` `...` `` is an identifier: ` `` ` is a backtick and a backslash is ordinary.
+ * - `[...]` is an identifier that ends at the first `]`: `]]` is not an escape.
+ * - `--` and `//` start a comment that ends at the next CR or LF. `/* ... *\/`
+ *   does not nest, and an unterminated one runs to the end of the text.
+ *   `#` is not a comment.
+ */
+interface LexRules {
+  /** `no_backslash_escapes=no`: a backslash escapes the next character in a `'` string. */
+  readonly backslashEscapes: boolean;
+  /** The same in a `"` span, which is a string only with `ansi_quotes=no`. */
+  readonly doubleQuoteEscapes: boolean;
+}
+
+/** `no_backslash_escapes=yes`, the CUBRID default: `ansi_quotes` changes nothing here. */
+const LITERAL_BACKSLASH: LexRules = { backslashEscapes: false, doubleQuoteEscapes: false };
+/** `no_backslash_escapes=no` with either `ansi_quotes` setting, which the client cannot see. */
+const ESCAPE_RULES: readonly LexRules[] = [
+  { backslashEscapes: true, doubleQuoteEscapes: false },
+  { backslashEscapes: true, doubleQuoteEscapes: true },
+];
+const ALL_LEX_RULES: readonly LexRules[] = [LITERAL_BACKSLASH, ...ESCAPE_RULES];
+
+interface SqlScan {
+  /** Offsets of the `?` markers outside quoted spans and comments. */
+  readonly markers: number[];
+  /** Whether anything but a comment follows a top-level `;`. */
+  readonly secondStatement: boolean;
+}
+
+/** The one lexer of the SQL text, for every literal path and executeMany(). */
+function scanSql(sql: string, rules: LexRules): SqlScan {
+  const markers: number[] = [];
+  let separated = false;
+  let secondStatement = false;
+  let i = 0;
+
+  while (i < sql.length) {
+    const ch = sql[i]!;
+    const next = sql[i + 1] ?? "";
+
+    if ((ch === "-" && next === "-") || (ch === "/" && next === "/")) {
+      i = lineCommentEnd(sql, i + 2);
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      const end = sql.indexOf("*/", i + 2);
+      i = end === -1 ? sql.length : end + 2;
+      continue;
+    }
+    if (ch === ";") {
+      separated = true;
+      i++;
+      continue;
+    }
+    // Only ASCII whitespace: anything else after a ; is counted as a statement.
+    if (separated && !/[ \t\n\r\f\v]/.test(ch)) {
+      secondStatement = true;
+    }
+
+    if (ch === "'") {
+      i = quotedSpanEnd(sql, i, "'", rules.backslashEscapes);
+    } else if (ch === '"') {
+      i = quotedSpanEnd(sql, i, '"', rules.doubleQuoteEscapes);
+    } else if (ch === "`") {
+      i = quotedSpanEnd(sql, i, "`", false);
+    } else if (ch === "[") {
+      const end = sql.indexOf("]", i + 1);
+      i = end === -1 ? sql.length : end + 1;
+    } else {
+      if (ch === "?") {
+        markers.push(i);
+      }
+      i++;
+    }
+  }
+
+  return { markers, secondStatement };
+}
+
+/** The offset after a quoted span that starts at `start`, or the end of an unterminated one. */
+function quotedSpanEnd(sql: string, start: number, quote: string, backslash: boolean): number {
+  for (let i = start + 1; i < sql.length; i++) {
+    const ch = sql[i];
+    if (backslash && ch === "\\") {
+      i++;
+    } else if (ch === quote) {
+      if (sql[i + 1] !== quote) {
+        return i + 1;
+      }
+      i++;
+    }
+  }
+  return sql.length;
+}
+
+/** The offset of the CR or LF that ends a line comment, or the end of the text. */
+function lineCommentEnd(sql: string, from: number): number {
+  for (let i = from; i < sql.length; i++) {
+    if (sql[i] === "\n" || sql[i] === "\r") {
+      return i;
+    }
+  }
+  return sql.length;
+}
+
+/**
+ * The offsets of the `?` markers of `sql` under the server's backslash mode, or
+ * under every mode when it is not known. `undefined` when the possible lexings
+ * disagree: only a backslash inside a quoted span makes them differ.
+ */
+export function findPlaceholders(sql: string, noBackslashEscapes?: boolean): number[] | undefined {
+  let candidates: readonly LexRules[] = [LITERAL_BACKSLASH];
+  if (sql.includes("\\")) {
+    if (noBackslashEscapes === undefined) {
+      candidates = ALL_LEX_RULES;
+    } else if (!noBackslashEscapes) {
+      candidates = ESCAPE_RULES;
+    }
+  }
+
+  const [first, ...others] = candidates.map((rules) => scanSql(sql, rules).markers);
+  const agree = others.every(
+    (markers) => markers.length === first!.length && markers.every((at, k) => at === first![k]),
+  );
+  return agree ? first : undefined;
+}
+
+/** Every literal statement has exactly one value per marker; neither side is guessed. */
+export function assertParameterCount(markers: number, values: number): void {
+  if (markers !== values) {
+    throw new Error(
+      `Parameter count mismatch: the SQL has ${markers} ? markers, but ${values} values were given`,
+    );
+  }
+}
+
+/**
+ * Renders the values into the SQL text as literals, in place of its `?` markers,
+ * for `query()`, `queryResult()`, `execute()` and `stream()`. `queryPrepared()`,
+ * `queryResultPrepared()`, `executePrepared()` and `executeMany()` send the values
+ * as typed binds instead, so the server finds the markers and no value becomes
+ * SQL text.
+ *
+ * The markers are found by the server's lexing rules (see LexRules) under the
+ * negotiated backslash mode, and the number of values must equal them. In
+ * escape mode a `"` span holding a backslash is refused when its two possible
+ * lexings place the markers differently: whether it is an identifier depends on
+ * the server's `ansi_quotes`, which the client cannot see.
  */
 export function interpolateParams(
   sql: string,
   params: readonly unknown[],
   noBackslashEscapes: boolean,
 ): string {
-  let paramIndex = 0;
-  let result = "";
-  let inSingleQuotedString = false;
-  let inDoubleQuotedString = false;
-  let inBlockComment = false;
-  let inLineComment = false;
-
-  for (let i = 0; i < sql.length; i++) {
-    const ch = sql[i]!;
-    const next = i + 1 < sql.length ? sql[i + 1]! : "";
-
-    if (inSingleQuotedString) {
-      result += ch;
-
-      if (ch === "\\" && next !== "") {
-        result += next;
-        i++;
-        continue;
-      }
-
-      if (ch === "'") {
-        if (next === "'") {
-          result += next;
-          i++;
-          continue;
-        }
-        inSingleQuotedString = false;
-      }
-
-      continue;
-    }
-
-    if (inDoubleQuotedString) {
-      result += ch;
-
-      if (ch === "\\" && next !== "") {
-        result += next;
-        i++;
-        continue;
-      }
-
-      if (ch === '"') {
-        if (next === '"') {
-          result += next;
-          i++;
-          continue;
-        }
-        inDoubleQuotedString = false;
-      }
-
-      continue;
-    }
-
-    if (inBlockComment) {
-      result += ch;
-      if (ch === "*" && next === "/") {
-        result += next;
-        i++;
-        inBlockComment = false;
-      }
-      continue;
-    }
-
-    if (inLineComment) {
-      result += ch;
-      if (ch === "\n" || ch === "\r") {
-        inLineComment = false;
-      }
-      continue;
-    }
-
-    if (ch === "'") {
-      inSingleQuotedString = true;
-      result += ch;
-      continue;
-    }
-
-    if (ch === '"') {
-      inDoubleQuotedString = true;
-      result += ch;
-      continue;
-    }
-
-    if (ch === "/" && next === "*") {
-      inBlockComment = true;
-      result += ch;
-      result += next;
-      i++;
-      continue;
-    }
-
-    if (ch === "-" && next === "-") {
-      inLineComment = true;
-      result += ch;
-      result += next;
-      i++;
-      continue;
-    }
-
-    if (ch === "?") {
-      if (paramIndex >= params.length) {
-        throw new Error(
-          `Not enough parameters: expected at least ${paramIndex + 1}, got ${params.length}`,
-        );
-      }
-      result += formatValue(params[paramIndex]!, noBackslashEscapes);
-      paramIndex++;
-      continue;
-    }
-
-    result += ch;
+  const markers = findPlaceholders(sql, noBackslashEscapes);
+  if (markers === undefined) {
+    throw new Error(
+      "The ? markers of this SQL depend on the server's ansi_quotes setting: a double-quoted " +
+        "span holds a backslash. Use a single-quoted string, or the prepared methods.",
+    );
   }
+  assertParameterCount(markers.length, params.length);
 
-  return result;
+  let result = "";
+  let from = 0;
+  markers.forEach((at, index) => {
+    result += sql.slice(from, at) + formatValue(params[index], noBackslashEscapes);
+    from = at + 1;
+  });
+  return result + sql.slice(from);
 }
 
 /**

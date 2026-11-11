@@ -267,9 +267,10 @@ it.
 ### How parameters are escaped
 
 Parameters are rendered into the SQL text client-side, with escaping that is
-aware of the server's `no_backslash_escapes` setting. On first use, the client
-probes the server (`SELECT CHAR_LENGTH('\\')`) and pins the correct mode for
-the connection:
+aware of the server's `no_backslash_escapes` setting. The first time a value or
+the SQL text needs it, the client probes the session
+(`SELECT CHAR_LENGTH('\\')`) and keeps the mode until the session changes or a
+statement that may run `SET SYSTEM PARAMETERS` is sent:
 
 - **`no_backslash_escapes=yes`** (the CUBRID default): the backslash is an
   ordinary character. Only the single quote is doubled (`'` → `''`); backslashes,
@@ -278,6 +279,21 @@ the connection:
 - **`no_backslash_escapes=no`**: backslash-escape processing is active, so
   backslashes are doubled and `\r` / `\n` are backslash-escaped in addition to
   doubling the single quote.
+
+A `?` is a marker only where CUBRID's own lexer reads code: not inside a
+`'...'` string, a `"..."`, `` `...` `` or `[...]` identifier, a `/* */` comment or
+a `--` or `//` comment (which ends at CR or LF). The number of values must equal
+the number of markers; too few or too many reject with a `QueryError` before
+anything is sent. A backslash escapes a quote only when the server runs with
+`no_backslash_escapes=no`, so SQL whose markers depend on that is measured against
+the server first. In that mode a `"..."` span holding a backslash is refused when
+the server's `ansi_quotes` setting, which the client cannot see, would move a
+marker. A call without `params` sends the SQL as written.
+
+The values become SQL text. To keep them out of it, use the
+[prepared methods](#server-side-prepared-binding): the server finds the markers
+and receives typed values. `query()` and `execute()` keep the literal behavior in
+1.x.
 
 A negative `number` or `bigint` is rendered in parentheses, `(-1)`, so SQL such
 as `balance-?` can never become `balance--1`, where `--` would start a comment.
