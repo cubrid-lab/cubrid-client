@@ -587,6 +587,10 @@ export class CASConnection {
       return;
     }
 
+    // Nothing of the statement is sent yet: an abort now must not retire the
+    // session, which in a transaction would lose work that was never touched.
+    this.throwIfAborted();
+
     if (await this.probeCasUnlocked()) {
       this.casVerified = true;
       return;
@@ -876,9 +880,15 @@ export class CASConnection {
 
     let onTimeout = (): void => {};
     let onAbort = (): void => {};
+    // Once the reply is in, an abort is too late: the statement completed and
+    // the session is still in step, so it must not be reported as aborted.
+    let settled = false;
     const interrupted = new Promise<never>((_resolve, reject) => {
       onTimeout = () => reject(new ReadTimeoutError(readTimeout ?? 0));
       onAbort = () => {
+        if (settled) {
+          return;
+        }
         if (scope) {
           scope.aborted = true;
         }
@@ -897,7 +907,12 @@ export class CASConnection {
     }
 
     try {
-      return await Promise.race([operation, interrupted]);
+      return await Promise.race([
+        operation.finally(() => {
+          settled = true;
+        }),
+        interrupted,
+      ]);
     } finally {
       signal?.removeEventListener("abort", onAbort);
       if (readTimeout !== undefined) {
