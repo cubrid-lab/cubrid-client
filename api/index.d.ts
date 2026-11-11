@@ -171,6 +171,8 @@ interface ClientConfig {
     maxLobBytes?: number | undefined;
     /** See {@link ClientOptions.fetchSize}. */
     fetchSize?: number | undefined;
+    /** See {@link ClientOptions.timezone}. */
+    timezone?: "local" | "utc" | undefined;
     /** See {@link ClientOptions.isolationLevel}. */
     isolationLevel?: IsolationLevel | undefined;
     /** See {@link ClientOptions.lockTimeout}. */
@@ -224,6 +226,21 @@ interface ClientOptions {
      * to 2147483647. Default: 100.
      */
     fetchSize?: number;
+    /**
+     * The time zone DATE, TIME, TIMESTAMP and DATETIME values are decoded in. Those
+     * SQL types carry no zone, so their fields must be read in some zone to become a
+     * `Date` instant:
+     *
+     * - `"local"` (default, the 1.x behavior): the Node.js process's zone, so the
+     *   same stored value is a different instant under a different `TZ`.
+     * - `"utc"`: UTC, the zone `Date` parameters are already encoded in, so a `Date`
+     *   written and read back is the same instant on every host. Read the fields
+     *   with `getUTCFullYear()`, `getUTCHours()` and so on.
+     *
+     * The zone-aware types (TIMESTAMPTZ and the like) are not affected; they return
+     * `ZonedDateTime`. `"utc"` is a candidate default for 2.0.
+     */
+    timezone?: "local" | "utc";
     maxConnectionRetryCount?: number;
     ssl?: boolean | ClientSSLOptions;
     /**
@@ -745,6 +762,8 @@ declare class NativeCubridAdapter implements DriverAdapter {
     private heldBy;
     /** Timer of the next possible refusal. See watchHeldTurn(). */
     private refusalTimer;
+    /** See ClientOptions.timezone. */
+    private readonly utcDates;
     constructor(config: ClientConfig);
     connect(): Promise<void>;
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;

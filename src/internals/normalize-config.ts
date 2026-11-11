@@ -76,6 +76,16 @@ export function assertValidFetchSize(size: number | undefined): void {
   }
 }
 
+/**
+ * Any other value would silently decode in local time, so it is refused. The
+ * adapter, which is public and skips normalizeConfig(), checks this too.
+ */
+export function assertValidTimezone(timezone: unknown): void {
+  if (timezone !== undefined && timezone !== "local" && timezone !== "utc") {
+    throw new RangeError('timezone must be "local" or "utc".');
+  }
+}
+
 /** Disabling the limit is not offered: that is what would let a nested statement hang. */
 export function assertValidStreamOptions(options: StreamOptions | undefined): void {
   assertValidFetchSize(options?.fetchSize);
@@ -96,7 +106,7 @@ export function assertValidStreamOptions(options: StreamOptions | undefined): vo
 }
 
 export function normalizeConfig(options: ClientOptions): ClientConfig {
-  const { readTimeout, maxLobBytes, fetchSize } = options;
+  const { readTimeout, maxLobBytes, fetchSize, timezone } = options;
 
   // A value that quietly disabled the timeout would leave queries able to hang.
   if (
@@ -111,6 +121,7 @@ export function normalizeConfig(options: ClientOptions): ClientConfig {
   assertValidRetryCount(options.maxConnectionRetryCount);
   assertValidMaxLobBytes(maxLobBytes);
   assertValidFetchSize(fetchSize);
+  assertValidTimezone(timezone);
   assertValidTransactionOptions(options);
 
   return {
@@ -123,6 +134,7 @@ export function normalizeConfig(options: ClientOptions): ClientConfig {
     ...(readTimeout !== undefined && { readTimeout }),
     ...(maxLobBytes !== undefined && { maxLobBytes }),
     ...(fetchSize !== undefined && { fetchSize }),
+    ...(timezone !== undefined && { timezone }),
     ...pickTransactionOptions(options),
     maxConnectionRetryCount: options.maxConnectionRetryCount,
     ssl: options.ssl,

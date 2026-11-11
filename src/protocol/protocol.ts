@@ -264,9 +264,10 @@ export interface PrepareAndExecuteResult extends PrepareResult {
 export function parsePrepareAndExecute(
   data: Buffer,
   protoVersion: number,
+  utcDates = false,
 ): PrepareAndExecuteResult {
   assertReplySize(data);
-  const reader = new PacketReader(data);
+  const reader = new PacketReader(data, 0, utcDates);
   const responseCode = reader.parseInt();
 
   if (responseCode < 0) {
@@ -462,9 +463,10 @@ export function parseExecute(
   data: Buffer,
   statement: PrepareResult,
   protoVersion: number,
+  utcDates = false,
 ): PrepareAndExecuteResult {
   assertReplySize(data);
-  const reader = new PacketReader(data);
+  const reader = new PacketReader(data, 0, utcDates);
   const responseCode = reader.parseInt();
 
   if (responseCode < 0) {
@@ -517,9 +519,10 @@ export interface FetchResult {
 export function parseFetch(
   data: Buffer,
   columns: ColumnMeta[],
+  utcDates = false,
 ): FetchResult {
   assertReplySize(data);
-  const reader = new PacketReader(data);
+  const reader = new PacketReader(data, 0, utcDates);
   const responseCode = reader.parseInt();
 
   if (responseCode < 0) {

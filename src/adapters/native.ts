@@ -65,6 +65,7 @@ import {
   assertValidMaxLobBytes,
   assertValidRetryCount,
   assertValidStreamOptions,
+  assertValidTimezone,
   assertValidTransactionOptions,
   pickTransactionOptions,
 } from "../internals/normalize-config.js";
@@ -204,14 +205,17 @@ export class NativeCubridAdapter implements DriverAdapter {
   /** Timer of the next possible refusal. See watchHeldTurn(). */
   private refusalTimer: NodeJS.Timeout | null = null;
 
-
+  /** See ClientOptions.timezone. */
+  private readonly utcDates: boolean;
 
   constructor(private readonly config: ClientConfig) {
     assertValidRetryCount(config.maxConnectionRetryCount);
     assertValidMaxLobBytes(config.maxLobBytes);
     assertValidFetchSize(config.fetchSize);
+    assertValidTimezone(config.timezone);
     assertValidTransactionOptions(config);
     this.transactionOptions = pickTransactionOptions(config);
+    this.utcDates = config.timezone === "utc";
   }
 
   async connect(): Promise<void> {
@@ -936,7 +940,7 @@ export class NativeCubridAdapter implements DriverAdapter {
 
         const result: PrepareAndExecuteResult = binds
           ? await this.executeHandle(cas, responsePayload, binds, generation)
-          : parsePrepareAndExecute(responsePayload, cas.protoVersion);
+          : parsePrepareAndExecute(responsePayload, cas.protoVersion, this.utcDates);
 
         const value = await use(cas, result);
         if (deferCommit) {
@@ -983,7 +987,7 @@ export class NativeCubridAdapter implements DriverAdapter {
 
     const { header, payload } = writeExecute(statement, binds, cas.casInfo);
     const reply = await this.exchangeOnSession(cas, generation, header, payload);
-    return parseExecute(reply, statement, cas.protoVersion);
+    return parseExecute(reply, statement, cas.protoVersion, this.utcDates);
   }
 
   private async exchangeOnSession(
@@ -1289,6 +1293,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     const responsePayload = await cas.sendAndRecv(header, payload);
 
     return this.withQueryHandle(cas, responsePayload, async () => {
+      // Reads one INT: the timezone option has nothing to apply to.
       const result = parsePrepareAndExecute(responsePayload, cas.protoVersion);
       const firstRow = result.rows[0];
       const length = firstRow ? Number(Object.values(firstRow)[0]) : NaN;
@@ -1336,7 +1341,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     if (fetchPayload === null) {
       throw new ConnectionLostError("Connection lost during FETCH");
     }
-    const fetchResult = parseFetch(fetchPayload, result.columns);
+    const fetchResult = parseFetch(fetchPayload, result.columns, this.utcDates);
 
     // Returning a partial result as success silently corrupts the query
     // contract. The execute response still promises more rows here.

@@ -16,7 +16,7 @@ convert a runtime value.
 | BIGINT | `bigint` | Lossless signed 64-bit value; corrected by [#126](https://github.com/cubrid-lab/cubrid-client/pull/126); `JSON.stringify` needs explicit bigint conversion |
 | FLOAT, DOUBLE, MONETARY | `number` | IEEE-754 conversion may round decimal values |
 | NUMERIC | `string` | Decimal text retained without floating-point rounding; consumer chooses decimal library |
-| DATE, TIME, TIMESTAMP, DATETIME | `Date` | Parsed using the **local Node.js process timezone**; SQL DATETIME itself has no timezone, so this is not stable across zones ([#113](https://github.com/cubrid-lab/cubrid-client/issues/113)). The zero date `0000-00-00` of DATE, DATETIME and TIMESTAMP has no `Date`, so the query rejects; see [zero dates](#zero-dates) |
+| DATE, TIME, TIMESTAMP, DATETIME | `Date` | Fields read in the zone set by the [`timezone`](API_REFERENCE.md#clientoptions) option: the **local Node.js process zone** by default, or UTC with `timezone: "utc"`. See [date and time values](#date-and-time-values). The zero date `0000-00-00` of DATE, DATETIME and TIMESTAMP has no `Date`, so the query rejects; see [zero dates](#zero-dates) |
 | BIT, VARBIT | `Buffer` | Binary bytes; verify bit-length/bit-order semantics per server version. An empty `X''` returns an empty `Buffer`, distinct from SQL NULL |
 | BLOB | `Buffer` | Complete content, loaded by the query. See [BLOB and CLOB columns](#blob-and-clob-columns) |
 | CLOB | `string` | Complete content decoded as UTF-8, loaded by the query. See [BLOB and CLOB columns](#blob-and-clob-columns) |
@@ -92,6 +92,30 @@ same way, with the cause `Zero date 0000-00-00 cannot be represented as a
 ZonedDateTime`. OBJECT/OID decoding is not part of this contract; see the
 [independent protocol fixture plan](https://github.com/cubrid-lab/cubrid-client/issues/117).
 
+## Date and time values
+
+DATE, TIME, TIMESTAMP and DATETIME store wall-clock fields and no zone, while a
+JavaScript `Date` is an instant, so the client has to pick a zone to read the
+fields in. The [`timezone`](API_REFERENCE.md#clientoptions) client option picks it:
+
+| `timezone` | Decoded `Date` | Read the fields with |
+| --- | --- | --- |
+| `"local"` (default) | The fields in the Node.js process zone. The same stored value is a **different instant** under `TZ=UTC`, `TZ=Asia/Seoul` or `TZ=America/Los_Angeles` | `getFullYear()`, `getHours()`, ... |
+| `"utc"` | The fields as UTC, the zone `Date` parameters are sent in: a `Date` written and read back is the same instant on every host | `getUTCFullYear()`, `getUTCHours()`, ... |
+
+- DATE is midnight of that day; TIME is that time on 1970-01-01.
+- DATETIME keeps milliseconds; TIMESTAMP and TIME have none.
+- Years 1 to 99 stay as written in both modes.
+- A local time that does not exist in the process zone, inside a DST gap such as
+  `2026-03-08 02:30` in `America/Los_Angeles`, is moved forward by JavaScript in
+  `"local"` mode; `"utc"` has no gaps and keeps every field.
+- The server does not send impossible calendar fields such as February 30, and the
+  zero date rejects the query in both modes (see [zero dates](#zero-dates)).
+- The zone-aware types below are not affected by the option.
+
+`"local"` stays the default in 1.x so existing code reads the same values;
+`"utc"` is a candidate default for 2.0.
+
 ## Timezone-aware values
 
 TIMESTAMPTZ, TIMESTAMPLTZ, DATETIMETZ and DATETIMELTZ columns return a
@@ -134,8 +158,9 @@ int16, DATETIME seven) followed by the zone as NUL-terminated text.
 - Fields that are not a real date and time (year outside 1 to 9999, a day the month does not have, with leap years checked), a zone that is empty, not valid UTF-8
   or not one NUL-terminated string, and a value that does not fill its cell reject
   as a [malformed reply](#values-that-cannot-be-decoded), also for a zero date, so a damaged zero value is never reported as merely unsupported. The server itself refuses such dates (`Invalid utime`), so this only guards a damaged reply.
-- Plain DATE, TIME, TIMESTAMP and DATETIME are unchanged and still decode to a
-  local-time `Date` ([#113](https://github.com/cubrid-lab/cubrid-client/issues/113)).
+- Plain DATE, TIME, TIMESTAMP and DATETIME decode to a `Date` in the zone set by
+  the [`timezone`](API_REFERENCE.md#clientoptions) option, local by default; see
+  [date and time values](#date-and-time-values).
 
 ## JSON columns
 
@@ -239,8 +264,8 @@ These results were checked on CUBRID 10.2, 11.0, 11.2 and 11.4:
 Do not depend on SET or MULTISET order: CUBRID defines both as unordered.
 
 - **Elements** use the same JavaScript types as result columns of that type,
-  including `bigint` for BIGINT, decimal `string` for NUMERIC, local-time
-  `Date` values ([#113](https://github.com/cubrid-lab/cubrid-client/issues/113))
+  including `bigint` for BIGINT, decimal `string` for NUMERIC, `Date` values
+  decoded in the [`timezone`](#date-and-time-values) zone like columns,
   and `ZonedDateTime` for the [timezone-aware types](#timezone-aware-values).
   ENUM elements are strings, and a `SEQUENCE OF JSON` arrives as string elements.
 - **Empty** collections return `[]`. A NULL column returns `null`.
@@ -344,8 +369,9 @@ statement on both paths, and the markers of all the statements count together.
 
 - A TypeScript row type does not prove the database returned the declared
   type; explicitly validate results that cross trust boundaries.
-- Do not use local-time `Date` decoding as a canonical UTC conversion until
-  [#113](https://github.com/cubrid-lab/cubrid-client/issues/113) is resolved.
+- The default `timezone: "local"` decoding depends on the process `TZ`; use
+  `timezone: "utc"` when values must be the same instants on every host. The
+  default is a 2.0 decision ([#113](https://github.com/cubrid-lab/cubrid-client/issues/113)).
 - The required live broker/version and round-trip evidence is tracked in
   [#95](https://github.com/cubrid-lab/cubrid-client/issues/95).
 
