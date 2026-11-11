@@ -1,6 +1,7 @@
 import type {
   ClientConfig,
   ClientOptions,
+  QueryOptions,
   StreamOptions,
   TransactionOptions,
 } from "../types/client.js";
@@ -110,17 +111,45 @@ export function assertValidStreamOptions(options: StreamOptions | undefined): vo
   }
 }
 
-export function normalizeConfig(options: ClientOptions): ClientConfig {
-  const { readTimeout, maxLobBytes, fetchSize, timezone } = options;
-
-  // A value that quietly disabled the timeout would leave queries able to hang.
+/** A value that quietly disabled the timeout would leave queries able to hang. */
+function assertValidReadTimeout(readTimeout: unknown): void {
   if (
     readTimeout !== undefined &&
-    !(Number.isFinite(readTimeout) && readTimeout >= 0 && readTimeout <= MAX_READ_TIMEOUT)
+    !(
+      typeof readTimeout === "number" &&
+      Number.isFinite(readTimeout) &&
+      readTimeout >= 0 &&
+      readTimeout <= MAX_READ_TIMEOUT
+    )
   ) {
     throw new RangeError(`readTimeout must be between 0 and ${MAX_READ_TIMEOUT} milliseconds.`);
   }
+}
 
+/**
+ * Checked by the client, its transactions and the adapter before anything is
+ * queued or sent. A signal that is not an AbortSignal could never cancel.
+ */
+export function assertValidQueryOptions(options: QueryOptions | undefined): void {
+  if (options === undefined) {
+    return;
+  }
+
+  if (options === null || typeof options !== "object") {
+    throw new TypeError("Query options must be an object.");
+  }
+
+  if (options.signal !== undefined && !(options.signal instanceof AbortSignal)) {
+    throw new TypeError("signal must be an AbortSignal.");
+  }
+
+  assertValidReadTimeout(options.readTimeout);
+}
+
+export function normalizeConfig(options: ClientOptions): ClientConfig {
+  const { readTimeout, maxLobBytes, fetchSize, timezone } = options;
+
+  assertValidReadTimeout(readTimeout);
   assertValidRetryCount(options.maxConnectionRetryCount);
   assertValidMaxLobBytes(maxLobBytes);
   assertValidFetchSize(fetchSize);

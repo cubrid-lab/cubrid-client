@@ -5372,3 +5372,99 @@ describe("stream()", { skip: !available }, () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Per-query options: AbortSignal and readTimeout (#150)
+// ---------------------------------------------------------------------------
+
+describe("Integration: per-query AbortSignal and readTimeout (#150)", { skip: !available }, () => {
+  const SLOW = "SELECT SLEEP(3) AS slept FROM db_root";
+  const QUICK = "SELECT 1 AS one FROM db_root";
+
+  function abortAfter(ms: number, reason: unknown): AbortSignal {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(reason), ms);
+    return controller.signal;
+  }
+
+  test("an abort stops a slow statement quickly, and the next query on the client works", async () => {
+    const client = createClient(TEST_CONFIG);
+    const reason = new Error("stopped by the test");
+
+    try {
+      await client.query(QUICK);
+      const started = Date.now();
+      await assert.rejects(
+        client.query(SLOW, [], { signal: abortAfter(100, reason) }),
+        (error) => error === reason,
+      );
+      assert.ok(Date.now() - started < 1500, `took ${Date.now() - started}ms`);
+
+      assert.deepEqual(await client.query(QUICK), [{ one: 1 }]);
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("a per-query readTimeout stops a slow statement, and the next query works", async () => {
+    const client = createClient({ ...TEST_CONFIG, readTimeout: 10_000 });
+
+    try {
+      const started = Date.now();
+      await assert.rejects(
+        client.query(SLOW, [], { readTimeout: 300 }),
+        (error: unknown) => error instanceof ReadTimeoutError && error.timeoutMs === 300,
+      );
+      assert.ok(Date.now() - started < 1500, `took ${Date.now() - started}ms`);
+
+      assert.deepEqual(await client.query(QUICK), [{ one: 1 }]);
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("an abort while queued sends nothing and leaves the running statement alone", async () => {
+    const client = createClient(TEST_CONFIG);
+    const reason = new Error("not needed any more");
+    const controller = new AbortController();
+
+    try {
+      const running = client.query("SELECT SLEEP(1) AS slept FROM db_root");
+      const queued = client.query(QUICK, [], { signal: controller.signal });
+      controller.abort(reason);
+
+      await assert.rejects(queued, (error) => error === reason);
+      assert.deepEqual(await running, [{ slept: 0 }]);
+      assert.deepEqual(await client.query(QUICK), [{ one: 1 }]);
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("an abort inside a transaction scope loses the transaction's work", async () => {
+    const TABLE = "cc_query_abort";
+    const client = createClient(TEST_CONFIG);
+    const reason = new Error("stopped by the test");
+
+    try {
+      await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+      await client.query(`CREATE TABLE ${TABLE} (id INT)`);
+
+      const scope = await client.beginTransactionScope();
+      await scope.execute(`INSERT INTO ${TABLE} VALUES (1)`);
+      await assert.rejects(
+        scope.query(SLOW, [], { signal: abortAfter(100, reason) }),
+        (error) => error === reason,
+      );
+      await assert.rejects(scope.query(QUICK), TransactionError);
+      await scope.rollback().catch(() => undefined);
+
+      // COUNT(*) is a BIGINT on 11.x and an INT on 10.2.
+      const [row] = await client.query(`SELECT COUNT(*) AS n FROM ${TABLE}`);
+      assert.equal(Number(row?.n), 0);
+    } finally {
+      await client.query(`DROP TABLE IF EXISTS ${TABLE}`).catch(() => undefined);
+      await client.close();
+    }
+  });
+});

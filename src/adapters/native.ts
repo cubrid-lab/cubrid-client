@@ -17,6 +17,7 @@ import { type ErrorKind, mapError } from "../internals/map-error.js";
 import {
   assertValidFetchSize,
   assertValidMaxLobBytes,
+  assertValidQueryOptions,
   assertValidRetryCount,
   assertValidStreamOptions,
   assertValidTimezone,
@@ -26,6 +27,7 @@ import {
 import {
   CASConnection,
   type CASConnectionConfig,
+  type RequestScope,
   type SessionParameter,
 } from "../protocol/connection.js";
 import {
@@ -71,6 +73,7 @@ import {
 import type {
   ClientConfig,
   ExecuteResult,
+  QueryOptions,
   StreamOptions,
   TransactionOptions,
 } from "../types/client.js";
@@ -232,21 +235,31 @@ export class NativeCubridAdapter implements DriverAdapter {
     }
   }
 
+  /**
+   * See {@link QueryOptions} for `signal` and a per-statement `readTimeout`. An
+   * invalid option rejects before anything is queued or sent.
+   */
   async query<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
+    options?: QueryOptions,
   ): Promise<T[]> {
-    return (await this.queryResult<T>(sql, params)).rows;
+    return (await this.queryResult<T>(sql, params, options)).rows;
   }
 
   async queryResult<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
+    options?: QueryOptions,
   ): Promise<QueryResult<T>> {
+    assertValidQueryOptions(options);
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
-    return this.inTurn("query", QUERY_FAILED, () =>
-      this.queryNow<T>(sql, params, issued, undefined),
+    return this.inTurn(
+      "query",
+      QUERY_FAILED,
+      () => this.queryNow<T>(sql, params, issued, undefined),
+      options,
     );
   }
 
@@ -308,37 +321,57 @@ export class NativeCubridAdapter implements DriverAdapter {
     }
   }
 
-  async execute(sql: string, params?: QueryParams): Promise<ExecuteResult> {
+  async execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult> {
+    assertValidQueryOptions(options);
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
-    return this.inTurn("query", "Failed to execute CUBRID statement.", () =>
-      this.executeNow(sql, params, issued, undefined),
+    return this.inTurn(
+      "query",
+      "Failed to execute CUBRID statement.",
+      () => this.executeNow(sql, params, issued, undefined),
+      options,
     );
   }
 
   async queryPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
+    options?: QueryOptions,
   ): Promise<T[]> {
-    return (await this.queryResultPrepared<T>(sql, params)).rows;
+    return (await this.queryResultPrepared<T>(sql, params, options)).rows;
   }
 
   async queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
+    options?: QueryOptions,
   ): Promise<QueryResult<T>> {
+    assertValidQueryOptions(options);
     const binds = bindOrRefuse(sql, params, "Failed to execute CUBRID query.");
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
-    return this.inTurn("query", QUERY_FAILED, () => this.queryNow<T>(sql, params, issued, binds));
+    return this.inTurn(
+      "query",
+      QUERY_FAILED,
+      () => this.queryNow<T>(sql, params, issued, binds),
+      options,
+    );
   }
 
-  async executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult> {
+  async executePrepared(
+    sql: string,
+    params?: QueryParams,
+    options?: QueryOptions,
+  ): Promise<ExecuteResult> {
+    assertValidQueryOptions(options);
     const binds = bindOrRefuse(sql, params, "Failed to execute CUBRID statement.");
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
-    return this.inTurn("query", "Failed to execute CUBRID statement.", () =>
-      this.executeNow(sql, params, issued, binds),
+    return this.inTurn(
+      "query",
+      "Failed to execute CUBRID statement.",
+      () => this.executeNow(sql, params, issued, binds),
+      options,
     );
   }
 
@@ -607,32 +640,90 @@ export class NativeCubridAdapter implements DriverAdapter {
    *
    * Nothing runs here but this adapter's own statements, so a statement can
    * never wait on its own turn. Waiting does not count towards readTimeout.
+   *
+   * `options` belong to the statement (#150). A signal already aborted rejects
+   * at once, and one aborted while the statement waits takes it out of the
+   * queue; either way nothing is sent. Once its turn comes, see runScoped().
    */
   private inTurn<T>(
     kind: ErrorKind,
     failureMessage: string,
     statement: () => Promise<T>,
+    options?: QueryOptions,
   ): Promise<T> {
+    const signal = options?.signal;
+    if (signal?.aborted) {
+      return Promise.reject(signal.reason);
+    }
+
     let waiting!: WaitingStatement;
+    let leave = (_reason: unknown): void => {};
     const refused = new Promise<never>((_resolve, reject) => {
       waiting = {
         since: Date.now(),
         refuse: (reason) => reject(mapError(kind, reason, failureMessage)),
       };
+      leave = reject;
     });
+
+    const onQueuedAbort = (): void => {
+      if (this.waitingStatements.delete(waiting)) {
+        leave(signal?.reason);
+      }
+    };
+    signal?.addEventListener("abort", onQueuedAbort, { once: true });
 
     this.waitingStatements.add(waiting);
     this.watchHeldTurn();
 
     const turn = this.queueStatement(async () => {
+      signal?.removeEventListener("abort", onQueuedAbort);
       // A refused statement keeps its place in the queue but must not run.
-      if (this.waitingStatements.delete(waiting)) {
-        return statement();
+      if (!this.waitingStatements.delete(waiting)) {
+        return undefined as T;
       }
-      return undefined as T;
+      return options && (signal || options.readTimeout !== undefined)
+        ? this.runScoped(statement, { signal, readTimeout: options.readTimeout })
+        : statement();
     });
 
-    return Promise.race([turn, refused]);
+    const settled = Promise.race([turn, refused]);
+    if (!signal) {
+      return settled;
+    }
+    return settled.finally(() => signal.removeEventListener("abort", onQueuedAbort));
+  }
+
+  /**
+   * Runs a statement whose turn has come with its own limits on every request
+   * it sends, FETCH, LOB_READ and END_TRAN included. An abort once a request is
+   * written retires the socket, as a read timeout does: the reply may still
+   * come, and it must never answer another request. The statement then rejects
+   * with the signal's reason, whatever else failed, and is never sent again.
+   * Its outcome on the server is unknown; inside a transaction the transaction
+   * is lost, which the next statement reports.
+   */
+  private async runScoped<T>(
+    statement: () => Promise<T>,
+    limits: { signal: AbortSignal | undefined; readTimeout: number | undefined },
+  ): Promise<T> {
+    const { signal } = limits;
+    const scope: RequestScope = { ...limits, sent: false, aborted: false };
+    let result: T;
+
+    try {
+      result = await this.getOrCreateCAS().runScoped(scope, statement);
+    } catch (error) {
+      if (scope.aborted && signal) {
+        throw signal.reason;
+      }
+      throw error;
+    }
+
+    if (scope.aborted && signal) {
+      throw signal.reason;
+    }
+    return result;
   }
 
   private queueStatement<T>(statement: () => Promise<T>): Promise<T> {

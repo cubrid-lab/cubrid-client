@@ -253,12 +253,38 @@ interface ClientOptions {
     logger?: unknown;
     connectionFactory?: ConnectionFactory;
 }
+/**
+ * Options of one statement, the optional last argument of `query()`,
+ * `queryResult()`, `execute()` and their `Prepared` forms.
+ *
+ * After an abort or a timeout while the statement was on the wire, its outcome
+ * on the server is unknown: it may have run, and in autocommit mode it may be
+ * committed. Verify before running it again. See `docs/API_REFERENCE.md`.
+ */
+interface QueryOptions {
+    /**
+     * Cancels this statement. Already aborted: it rejects at once with
+     * `signal.reason` and nothing is sent. Aborted while it waits behind other
+     * statements: it leaves the queue, nothing is sent and the session is kept.
+     * Aborted once sent: the connection is discarded so a late reply can never
+     * answer another statement, it rejects with `signal.reason`, and it is never
+     * retried. Inside a transaction that loses the transaction.
+     */
+    signal?: AbortSignal;
+    /**
+     * {@link ClientOptions.readTimeout} for this statement only, including its
+     * FETCH, LOB and END_TRAN requests: the same inactivity limit and
+     * `ReadTimeoutError`. 0 means no timeout for this statement. Must be from 0 to
+     * 2147483647.
+     */
+    readTimeout?: number;
+}
 interface Queryable {
-    query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
+    query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
 }
 /** Runs a statement and reports its rows with their column metadata. */
 interface ResultQueryable {
-    queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
+    queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
 }
 /**
  * Options of `stream()`.
@@ -311,7 +337,7 @@ interface ExecuteResult {
 }
 /** Runs a statement and reports its {@link ExecuteResult} instead of rows. */
 interface Executable {
-    execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+    execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
 }
 /**
  * Runs statements with server-side prepared binding: the values travel as typed
@@ -321,9 +347,9 @@ interface Executable {
  * docs/TYPES.md. The methods without `Prepared` keep rendering SQL literals.
  */
 interface PreparedQueryable {
-    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
-    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
-    executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
+    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
+    executePrepared(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
 }
 interface TransactionClient extends Queryable {
     commit(): Promise<void>;
@@ -367,25 +393,25 @@ interface TransactionScope extends ResultTransactionClient, ExecutableTransactio
 }
 interface ConnectionLike {
     connect(): Promise<void>;
-    query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
+    query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
     /**
      * Optional so 1.x connection factories keep compiling. `queryResult()` on a
      * client or transaction fails when its connection does not provide it.
      */
-    queryResult?<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
+    queryResult?<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
     /**
      * Optional so 1.x connection factories keep compiling. `execute()` on a
      * client or transaction fails when its connection does not provide it.
      */
-    execute?(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+    execute?(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
     /**
      * Optional so 1.x connection factories keep compiling. The prepared methods
      * on a client or transaction fail when their connection does not provide
      * them, rather than falling back to SQL literals.
      */
-    queryPrepared?<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
-    queryResultPrepared?<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
-    executePrepared?(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+    queryPrepared?<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
+    queryResultPrepared?<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
+    executePrepared?(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
     beginTransaction(): Promise<void>;
     commit(): Promise<void>;
     rollback(): Promise<void>;
@@ -475,8 +501,12 @@ declare class NativeCubridAdapter implements DriverAdapter {
     private readonly utcDates;
     constructor(config: ClientConfig);
     connect(): Promise<void>;
-    query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
-    queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
+    /**
+     * See {@link QueryOptions} for `signal` and a per-statement `readTimeout`. An
+     * invalid option rejects before anything is queued or sent.
+     */
+    query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
+    queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
     /**
      * Reads a result one server reply at a time. See `CubridClient.stream()` for the
      * contract. The statement is issued by the first read, like any other statement
@@ -484,10 +514,10 @@ declare class NativeCubridAdapter implements DriverAdapter {
      */
     stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncGenerator<T, void, undefined>;
     private streamRows;
-    execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
-    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
-    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
-    executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+    execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
+    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
+    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
+    executePrepared(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
     private executeNow;
     private queryNow;
     private streamNow;
@@ -528,8 +558,22 @@ declare class NativeCubridAdapter implements DriverAdapter {
      *
      * Nothing runs here but this adapter's own statements, so a statement can
      * never wait on its own turn. Waiting does not count towards readTimeout.
+     *
+     * `options` belong to the statement (#150). A signal already aborted rejects
+     * at once, and one aborted while the statement waits takes it out of the
+     * queue; either way nothing is sent. Once its turn comes, see runScoped().
      */
     private inTurn;
+    /**
+     * Runs a statement whose turn has come with its own limits on every request
+     * it sends, FETCH, LOB_READ and END_TRAN included. An abort once a request is
+     * written retires the socket, as a read timeout does: the reply may still
+     * come, and it must never answer another request. The statement then rejects
+     * with the signal's reason, whatever else failed, and is never sent again.
+     * Its outcome on the server is unknown; inside a transaction the transaction
+     * is lost, which the next statement reports.
+     */
+    private runScoped;
     private queueStatement;
     /**
      * Arms the timer that refuses statements stuck behind a held stream, at the
@@ -771,12 +815,19 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
     /** beginTransactionScope() calls still opening a connection, so close() can wait for them. */
     private readonly beginningScopes;
     constructor(config: ClientConfig, connectionFactory: ConnectionFactory);
-    query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
-    queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
-    execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
-    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
-    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
-    executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+    /**
+     * Run a statement and return its rows. See {@link QueryOptions} for `signal`
+     * and a per-statement `readTimeout`.
+     *
+     * @throws RangeError or TypeError (as a rejection, before anything is sent)
+     * when an option is invalid.
+     */
+    query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
+    queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
+    execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
+    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
+    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
+    executePrepared(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
     /**
      * Run a statement and read its rows one at a time with `for await`, holding at
      * most one server reply of rows in memory. Nothing is sent before the first read.
@@ -867,12 +918,12 @@ declare function createClient(options: ClientOptions): CubridClient;
 declare class CubridTransaction implements ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient {
     private readonly connection;
     constructor(connection: ConnectionLike);
-    query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
-    queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
-    execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
-    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
-    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<QueryResult<T>>;
-    executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+    query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
+    queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
+    execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
+    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
+    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
+    executePrepared(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
     commit(): Promise<void>;
     rollback(): Promise<void>;
 }
@@ -1007,4 +1058,4 @@ declare function buildWhere(conditions: Record<string, unknown>): {
     params: unknown[];
 };
 
-export { type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteResult, type IsolationLevel, LockTimeoutError, NativeCubridAdapter, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type StreamOptions, type Streamable, type TransactionCallback, type TransactionClient, TransactionError, type TransactionOptions, type TransactionScope, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, buildWhere, createClient, escapeIdentifier, parseConnectionString };
+export { type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteResult, type IsolationLevel, LockTimeoutError, NativeCubridAdapter, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryOptions, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type StreamOptions, type Streamable, type TransactionCallback, type TransactionClient, TransactionError, type TransactionOptions, type TransactionScope, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, buildWhere, createClient, escapeIdentifier, parseConnectionString };

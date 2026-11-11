@@ -25,6 +25,7 @@ Complete reference for every public export of `cubrid-client`.
   - [ExecutableTransactionClient](#executabletransactionclient)
   - [Streamable](#streamable)
   - [StreamOptions](#streamoptions)
+  - [QueryOptions](#queryoptions)
   - [PreparedQueryable](#preparedqueryable)
   - [PreparedTransactionClient](#preparedtransactionclient)
   - [ExecuteResult](#executeresult)
@@ -111,6 +112,7 @@ Executes a SQL statement and returns typed result rows.
 async query<T extends QueryResultRow = QueryResultRow>(
   sql: string,
   params?: QueryParams,
+  options?: QueryOptions,
 ): Promise<T[]>
 ```
 
@@ -118,10 +120,11 @@ async query<T extends QueryResultRow = QueryResultRow>(
 |-----------|------|---------|-------------|
 | `sql` | `string` | — | SQL statement. Use `?` for parameter placeholders. |
 | `params` | [`QueryParams`](#queryparams) | `undefined` | Positional parameter values |
+| `options` | [`QueryOptions`](#queryoptions) | `undefined` | `signal` and a per-statement `readTimeout`. See [Cancelling one statement](#cancelling-one-statement) |
 
 **Returns:** `Promise<T[]>` — Array of result rows typed as `T`.
 
-**Throws:** [`QueryError`](#queryerror) if execution fails.
+**Throws:** [`QueryError`](#queryerror) if execution fails. A `RangeError` or `TypeError` for an invalid option, [`ReadTimeoutError`](#readtimeouterror) after `readTimeout`, and `signal.reason`, unchanged, after an abort.
 
 **Type Parameter:** `T` defaults to `QueryResultRow` (`Record<string, unknown>`). Pass a custom type for typed results.
 
@@ -165,6 +168,7 @@ Executes a SQL statement like `query()` and returns its rows together with the m
 async queryResult<T extends QueryResultRow = QueryResultRow>(
   sql: string,
   params?: QueryParams,
+  options?: QueryOptions,
 ): Promise<QueryResult<T>>
 ```
 
@@ -188,7 +192,7 @@ const { rows, columns } = await db.queryResult(
 Runs a statement and returns how many rows it changed and, after an `INSERT`, the generated `AUTO_INCREMENT` value, instead of rows. Use it for `INSERT`, `UPDATE`, `DELETE`, `MERGE` and DDL; use [`query()`](#queryt-sql-params) for `SELECT`. `query()` is unchanged and still returns `[]` for those statements.
 
 ```ts
-async execute(sql: string, params?: QueryParams): Promise<ExecuteResult>
+async execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>
 ```
 
 **Returns:** [`ExecuteResult`](#executeresult) `{ affectedRows, lastInsertId? }`.
@@ -220,14 +224,20 @@ Opt-in server-side binding: the same results as `query()`, `queryResult()` and `
 async queryPrepared<T extends QueryResultRow = QueryResultRow>(
   sql: string,
   params?: QueryParams,
+  options?: QueryOptions,
 ): Promise<T[]>
 
 async queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
   sql: string,
   params?: QueryParams,
+  options?: QueryOptions,
 ): Promise<QueryResult<T>>
 
-async executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>
+async executePrepared(
+  sql: string,
+  params?: QueryParams,
+  options?: QueryOptions,
+): Promise<ExecuteResult>
 ```
 
 **Throws:** [`QueryError`](#queryerror) if execution fails, if a value is refused, if the number of values differs from the statement's markers, or if a custom `connectionFactory` connection does not provide the method. They never fall back to SQL literals.
@@ -241,6 +251,39 @@ const { affectedRows } = await db.executePrepared("UPDATE users SET name = ? WHE
 - **Lifecycle.** Each call prepares, executes and releases its own handle, so a handle is never kept between calls or carried to another session. There is no reusable statement object.
 - **Autocommit.** The statement runs in a transaction of its own that ends with an explicit commit, or a rollback if anything failed.
 - **Cost.** A call takes more round trips than `query()`; see the [measurements](PERFORMANCE.md#prepared-binding). Do not expect it to be faster.
+
+#### Cancelling one statement
+
+Every statement method of the client, of the `transaction()` callback's `tx` and of a [`beginTransactionScope()`](#begintransactionscopeoptions) handle takes [`QueryOptions`](#queryoptions) as its optional last argument: `query`, `queryResult`, `execute`, `queryPrepared`, `queryResultPrepared` and `executePrepared`.
+
+```ts
+// Give up after 2 seconds, whatever the client's readTimeout.
+const rows = await db.query("SELECT * FROM big_report", [], {
+  signal: AbortSignal.timeout(2000),
+});
+
+// A tighter inactivity limit for this one statement, or 0 for none.
+await db.execute("UPDATE stats SET n = n + 1", [], { readTimeout: 500 });
+```
+
+What happens depends on where the statement is when the signal aborts:
+
+| When | Result | On the wire and the session |
+|------|--------|-----------------------------|
+| Already aborted when called | Rejects at once with `signal.reason` | Nothing is sent, and no connection is opened |
+| Waiting behind other statements on the connection | Leaves the queue and rejects with `signal.reason` | Nothing is sent. The session and the other statements are unaffected |
+| Sent: waiting for its reply, or for any FETCH, LOB_READ or END_TRAN of the same statement | Rejects with `signal.reason` as soon as the signal aborts | The CAS socket is discarded, so a late reply can never be read as another request's answer. The statement is never retried or replayed |
+| Already settled | Nothing | The abort is ignored |
+
+- **The outcome is unknown after an abort in flight.** The server may still run the statement to its end, and in autocommit mode it may be committed; nothing asks the server to stop it. Verify the outcome before running a statement that is not idempotent again, as after a [`ReadTimeoutError`](#readtimeouterror).
+- **Inside a transaction an abort in flight loses the transaction.** Its connection is gone and the server rolls back the uncommitted work. The next statement and `commit()` fail with the existing connection-lost errors (a [`TransactionError`](#transactionerror) on `tx`), and nothing reaches a new session until the transaction is ended. Statements queued behind an aborted one behave as they do after a read timeout: they fail without being sent, and the next statement issued reconnects.
+- **The reason is passed on unchanged.** The promise rejects with the exact `signal.reason` (an `AbortError` `DOMException` for `controller.abort()` without a reason, a `TimeoutError` for `AbortSignal.timeout()`), never wrapped in a `QueryError`. `transaction()` itself still wraps an error that its callback rethrows in a `TransactionError`, with the reason as `cause`.
+- **`readTimeout`** behaves exactly like [the client's](CONNECTION.md#read-timeout), for this statement and all of its follow-up requests only: an inactivity limit that rejects with `ReadTimeoutError` and discards the socket. `0` means no timeout for this statement, even when the client has one. Time spent waiting behind other statements does not count.
+- **Validation.** A `readTimeout` that the client option would refuse rejects with a `RangeError`, and a `signal` that is not an `AbortSignal` (or options that are not an object) with a `TypeError`, before anything is queued or sent.
+- The abort listener is removed when the statement settles, so one signal can be passed to any number of statements.
+- `stream()` has its own [`signal`](#streamoptions) and does not take `QueryOptions`. `commit()`, `rollback()` and `ping()` take no options.
+
+---
 
 #### `stream<T>(sql, params?, options?)`
 
@@ -591,6 +634,7 @@ Same signature and behavior as [`CubridClient.query()`](#queryt-sql-params), but
 async query<T extends QueryResultRow = QueryResultRow>(
   sql: string,
   params?: QueryParams,
+  options?: QueryOptions,
 ): Promise<T[]>
 ```
 
@@ -601,7 +645,7 @@ async query<T extends QueryResultRow = QueryResultRow>(
 Same signature and behavior as [`CubridClient.execute()`](#executesql-params), but runs within the transaction's isolated connection. Nothing is committed until the transaction commits, and the generated id is the one the server reports inside the open transaction.
 
 ```ts
-async execute(sql: string, params?: QueryParams): Promise<ExecuteResult>
+async execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>
 ```
 
 **Throws:** [`TransactionError`](#transactionerror) if execution fails.
@@ -1013,12 +1057,14 @@ interface ConnectionLike {
   query<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
+    options?: QueryOptions,
   ): Promise<T[]>;
   queryResult?<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
+    options?: QueryOptions,
   ): Promise<QueryResult<T>>;
-  execute?(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+  execute?(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
   setTransactionOptions?(options: TransactionOptions): Promise<void>;
   stream?<T extends QueryResultRow = QueryResultRow>(
     sql: string,
@@ -1034,7 +1080,7 @@ interface ConnectionLike {
 
 `setTransactionOptions` is optional too, but it decides whether settings work. The client calls it on a new connection before anything else when `isolationLevel` or `lockTimeout` is in effect, and only then. Without it such a client or transaction fails rather than running without the setting. An implementation must keep the setting on every session it opens, and `NativeCubridAdapter` does. Options it is not given keep their value. The built-in adapter rejects the call inside a transaction, because changing the level there would change the running transaction.
 
-`queryResult`, `execute` and `stream` are optional so existing custom adapters keep compiling. Calling `queryResult()` or `execute()` on a client or transaction fails when its connection does not provide it, and so does the first read of `stream()`.
+`queryResult`, `execute` and `stream` are optional so existing custom adapters keep compiling. The client passes [`QueryOptions`](#queryoptions) as the last argument of each statement method; an implementation that declares fewer parameters still compiles, and then ignores them. Calling `queryResult()` or `execute()` on a client or transaction fails when its connection does not provide it, and so does the first read of `stream()`.
 
 ### Queryable
 
@@ -1045,6 +1091,7 @@ interface Queryable {
   query<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
+    options?: QueryOptions,
   ): Promise<T[]>;
 }
 ```
@@ -1072,6 +1119,7 @@ interface ResultQueryable {
   queryResult<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
+    options?: QueryOptions,
   ): Promise<QueryResult<T>>;
 }
 ```
@@ -1082,7 +1130,7 @@ Interface for any object that can run a statement and report its [`ExecuteResult
 
 ```ts
 interface Executable {
-  execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+  execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
 }
 ```
 
@@ -1117,6 +1165,22 @@ interface StreamOptions {
 | `fetchSize` | `number` | The client's [`fetchSize`](#clientoptions) | Rows requested in each FETCH, ignored by CUBRID 10.2 to 11.4 |
 | `signal` | `AbortSignal` | `undefined` | Stops the stream. The next read rejects with `signal.reason` |
 | `consumerTimeout` | `number` | `5000` | Milliseconds a statement issued on this connection waits while the consumer asks for no row, before it rejects with `kind: "stream-busy"`. A consumer that keeps reading is never timed out, however long the stream takes. `0` refuses such statements at once. An integer from 0 to 2147483647; this limit cannot be disabled |
+
+### QueryOptions
+
+The optional last argument of `query()`, `queryResult()`, `execute()`, `queryPrepared()`, `queryResultPrepared()` and `executePrepared()`, on the client, `tx` and a transaction scope. See [Cancelling one statement](#cancelling-one-statement).
+
+```ts
+interface QueryOptions {
+  signal?: AbortSignal;
+  readTimeout?: number;
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `signal` | `AbortSignal` | `undefined` | Cancels the statement. Rejects with `signal.reason`; once the statement was sent its connection is discarded and its outcome is unknown |
+| `readTimeout` | `number` | The client's [`readTimeout`](#clientoptions) | Inactivity limit for this statement and its follow-up requests, with the client option's semantics. `0` means none for this statement. From 0 to 2147483647 |
 
 ### ExecuteResult
 
@@ -1162,12 +1226,18 @@ interface PreparedQueryable {
   queryPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
+    options?: QueryOptions,
   ): Promise<T[]>;
   queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
+    options?: QueryOptions,
   ): Promise<QueryResult<T>>;
-  executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+  executePrepared(
+  sql: string,
+  params?: QueryParams,
+  options?: QueryOptions,
+): Promise<ExecuteResult>;
 }
 ```
 

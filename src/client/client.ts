@@ -1,6 +1,7 @@
 import { TransactionError } from "../errors/transaction-error.js";
-import { mapError, toError } from "../internals/map-error.js";
+import { isAbortReason, mapError, toError } from "../internals/map-error.js";
 import {
+  assertValidQueryOptions,
   assertValidStreamOptions,
   assertValidTimezone,
   assertValidTransactionOptions,
@@ -16,6 +17,7 @@ import type {
   PreparedQueryable,
   PreparedTransactionClient,
   Queryable,
+  QueryOptions,
   ResultQueryable,
   ResultTransactionClient,
   Streamable,
@@ -54,85 +56,110 @@ export class CubridClient
     assertValidTimezone(config.timezone);
   }
 
-  async query<T extends QueryResultRow = QueryResultRow>(
+  /**
+   * Run a statement and return its rows. See {@link QueryOptions} for `signal`
+   * and a per-statement `readTimeout`.
+   *
+   * @throws RangeError or TypeError (as a rejection, before anything is sent)
+   * when an option is invalid.
+   */
+  query<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
+    options?: QueryOptions,
   ): Promise<T[]> {
-    try {
-      const connection = await this.getSharedConnection();
-      return await connection.query<T>(sql, params);
-    } catch (error) {
-      throw mapError("query", error, "Query failed.");
-    }
+    return runStatement(
+      options,
+      "Query failed.",
+      () => this.getSharedConnection(),
+      (connection) => connection.query<T>(sql, params, options),
+    );
   }
 
-  async queryResult<T extends QueryResultRow = QueryResultRow>(
+  queryResult<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
+    options?: QueryOptions,
   ): Promise<QueryResult<T>> {
-    try {
-      const connection = await this.getSharedConnection();
-      if (!connection.queryResult) {
-        throw new Error("Underlying connection does not support queryResult.");
-      }
-      return await connection.queryResult<T>(sql, params);
-    } catch (error) {
-      throw mapError("query", error, "Query failed.");
-    }
+    return runStatement(
+      options,
+      "Query failed.",
+      () => this.getSharedConnection(),
+      (connection) => {
+        if (!connection.queryResult) {
+          throw new Error("Underlying connection does not support queryResult.");
+        }
+        return connection.queryResult<T>(sql, params, options);
+      },
+    );
   }
 
-  async execute(sql: string, params?: QueryParams): Promise<ExecuteResult> {
-    try {
-      const connection = await this.getSharedConnection();
-      if (!connection.execute) {
-        throw new Error("Underlying connection does not support execute.");
-      }
-      return await connection.execute(sql, params);
-    } catch (error) {
-      throw mapError("query", error, "Statement failed.");
-    }
+  execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult> {
+    return runStatement(
+      options,
+      "Statement failed.",
+      () => this.getSharedConnection(),
+      (connection) => {
+        if (!connection.execute) {
+          throw new Error("Underlying connection does not support execute.");
+        }
+        return connection.execute(sql, params, options);
+      },
+    );
   }
 
-  async queryPrepared<T extends QueryResultRow = QueryResultRow>(
+  queryPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
+    options?: QueryOptions,
   ): Promise<T[]> {
-    try {
-      const connection = await this.getSharedConnection();
-      if (!connection.queryPrepared) {
-        throw new Error("Underlying connection does not support queryPrepared.");
-      }
-      return await connection.queryPrepared<T>(sql, params);
-    } catch (error) {
-      throw mapError("query", error, "Query failed.");
-    }
+    return runStatement(
+      options,
+      "Query failed.",
+      () => this.getSharedConnection(),
+      (connection) => {
+        if (!connection.queryPrepared) {
+          throw new Error("Underlying connection does not support queryPrepared.");
+        }
+        return connection.queryPrepared<T>(sql, params, options);
+      },
+    );
   }
 
-  async queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
+  queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
+    options?: QueryOptions,
   ): Promise<QueryResult<T>> {
-    try {
-      const connection = await this.getSharedConnection();
-      if (!connection.queryResultPrepared) {
-        throw new Error("Underlying connection does not support queryResultPrepared.");
-      }
-      return await connection.queryResultPrepared<T>(sql, params);
-    } catch (error) {
-      throw mapError("query", error, "Query failed.");
-    }
+    return runStatement(
+      options,
+      "Query failed.",
+      () => this.getSharedConnection(),
+      (connection) => {
+        if (!connection.queryResultPrepared) {
+          throw new Error("Underlying connection does not support queryResultPrepared.");
+        }
+        return connection.queryResultPrepared<T>(sql, params, options);
+      },
+    );
   }
 
-  async executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult> {
-    try {
-      const connection = await this.getSharedConnection();
-      if (!connection.executePrepared) {
-        throw new Error("Underlying connection does not support executePrepared.");
-      }
-      return await connection.executePrepared(sql, params);
-    } catch (error) {
-      throw mapError("query", error, "Statement failed.");
-    }
+  executePrepared(
+    sql: string,
+    params?: QueryParams,
+    options?: QueryOptions,
+  ): Promise<ExecuteResult> {
+    return runStatement(
+      options,
+      "Statement failed.",
+      () => this.getSharedConnection(),
+      (connection) => {
+        if (!connection.executePrepared) {
+          throw new Error("Underlying connection does not support executePrepared.");
+        }
+        return connection.executePrepared(sql, params, options);
+      },
+    );
   }
 
   /**
@@ -538,5 +565,29 @@ export class CubridClient
     }
 
     await connection.setTransactionOptions(options);
+  }
+}
+
+/**
+ * Runs one statement on the shared connection. Invalid options and a signal
+ * already aborted reject before a connection is opened, and the reason of the
+ * caller's own abort is passed on unchanged.
+ */
+async function runStatement<R>(
+  options: QueryOptions | undefined,
+  failureMessage: string,
+  connect: () => Promise<ConnectionLike>,
+  run: (connection: ConnectionLike) => Promise<R>,
+): Promise<R> {
+  assertValidQueryOptions(options);
+  options?.signal?.throwIfAborted();
+
+  try {
+    return await run(await connect());
+  } catch (error) {
+    if (isAbortReason(error, options?.signal)) {
+      throw error;
+    }
+    throw mapError("query", error, failureMessage);
   }
 }

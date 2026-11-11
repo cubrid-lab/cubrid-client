@@ -104,6 +104,20 @@ export interface CASConnectionConfig {
 }
 
 /**
+ * Limits of the requests one statement makes. See CASConnection.runScoped().
+ */
+export interface RequestScope {
+  /** Stops the statement's requests. A request already written retires the socket. */
+  readonly signal?: AbortSignal | undefined;
+  /** Replaces `CASConnectionConfig.readTimeout` for these requests; 0 disables it. */
+  readonly readTimeout?: number | undefined;
+  /** Set once a request of this scope has been written, so the socket may be out of step. */
+  sent: boolean;
+  /** Set when `signal` stopped a request of this scope. */
+  aborted: boolean;
+}
+
+/**
  * Low-level TCP connection to a CUBRID CAS broker.
  *
  * Manages socket lifecycle, the two-step handshake, and framed binary I/O.
@@ -140,6 +154,12 @@ export class CASConnection {
 
   private readonly config: CASConnectionConfig;
 
+  /** Given to each operation queued while it is set. See runScoped(). */
+  private scope: RequestScope | null = null;
+
+  /** The scope of the queued operation running now. */
+  private activeScope: RequestScope | null = null;
+
   private sessionParameters: readonly SessionParameter[];
 
   constructor(config: CASConnectionConfig | string) {
@@ -169,6 +189,22 @@ export class CASConnection {
     });
   }
 
+  /**
+   * Run `run` with every operation it queues on this connection limited by
+   * `scope`: its signal and its readTimeout apply to those requests and to no
+   * other. The caller must be the only one queuing operations meanwhile, which
+   * the adapter's statement queue ensures.
+   */
+  async runScoped<T>(scope: RequestScope, run: () => Promise<T>): Promise<T> {
+    const previous = this.scope;
+    this.scope = scope;
+    try {
+      return await run();
+    } finally {
+      this.scope = previous;
+    }
+  }
+
   /** Unlocked connect body. MUST only be called from within the queue. */
   private async connectUnlocked(): Promise<void> {
     const retries = this.config.maxConnectionRetryCount ?? 0;
@@ -192,6 +228,9 @@ export class CASConnection {
     if (this.connected) {
       return;
     }
+
+    // An aborted statement opens no connection.
+    this.throwIfAborted();
 
     this.socketDead = false;
     this.inHandshake = true;
@@ -300,8 +339,8 @@ export class CASConnection {
       response.copy(this._casInfo, 0, 0, SIZE_CAS_INFO);
       parseCheckCas(response.subarray(SIZE_CAS_INFO));
     } catch (error) {
-      // mapError() must still see a read timeout at the top.
-      if (error instanceof ReadTimeoutError) {
+      // mapError() must still see a read timeout at the top, and an abort is the caller's own.
+      if (error instanceof ReadTimeoutError || this.isAbortReason(error)) {
         throw error;
       }
       throw new Error("The session settings could not be applied, so nothing was sent", {
@@ -432,8 +471,24 @@ export class CASConnection {
     payload: Buffer,
     outcomeUnknownOnFailure = true,
   ): Promise<Buffer> {
+    const scope = this.activeScope;
+    if (scope?.signal?.aborted) {
+      // Nothing of this request is written. A statement that already wrote one
+      // may have a reply on its way, so its socket cannot be used again.
+      if (scope.sent) {
+        if (outcomeUnknownOnFailure) {
+          this._failedExchanges += 1;
+        }
+        this.retireSocket();
+      }
+      this.throwIfAborted();
+    }
+
     let response: Buffer;
     try {
+      if (scope) {
+        scope.sent = true;
+      }
       await this.send(header, payload);
       response = await this.recv();
     } catch (error) {
@@ -538,6 +593,8 @@ export class CASConnection {
     }
 
     this.retireSocket();
+    // An abort of the probe is no sign that the CAS has gone.
+    this.throwIfAborted();
     await this.connectUnlocked();
   }
 
@@ -636,10 +693,16 @@ export class CASConnection {
    * operation cannot deadlock or poison the queue.
    */
   private enqueue<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.queue.then(
-      () => fn(),
-      () => fn(),
-    );
+    const scope = this.scope;
+    const step = async (): Promise<T> => {
+      this.activeScope = scope;
+      try {
+        return await fn();
+      } finally {
+        this.activeScope = null;
+      }
+    };
+    const run = this.queue.then(step, step);
     this.queue = run.then(
       () => undefined,
       () => undefined,
@@ -793,34 +856,69 @@ export class CASConnection {
 
   /**
    * Settle with `operation`, or reject with ReadTimeoutError if `socket` goes
-   * quiet for `readTimeout` ms first. Node.js restarts this socket timer on
+   * quiet for `readTimeout` ms first, or with the reason of the running
+   * scope's signal once it aborts. Node.js restarts this socket timer on
    * every chunk read and on write progress, which is what makes the limit one
-   * of inactivity. The timer is cleared on the way out so an idle connection
-   * is never timed out. The caller must discard the socket on rejection: the
-   * abandoned operation is only released when the socket closes.
+   * of inactivity. The timer and the abort listener are removed on the way out
+   * so an idle connection is never timed out. The caller must discard the
+   * socket on rejection: the abandoned operation is only released when the
+   * socket closes.
    */
   private async withReadTimeout<T>(socket: Socket, operation: Promise<T>): Promise<T> {
-    const readTimeout =
-      this.config.readTimeout || (this.inHandshake ? DEFAULT_HANDSHAKE_TIMEOUT_MS : undefined);
+    const scope = this.activeScope;
+    const limit = scope?.readTimeout !== undefined ? scope.readTimeout : this.config.readTimeout;
+    const readTimeout = limit || (this.inHandshake ? DEFAULT_HANDSHAKE_TIMEOUT_MS : undefined);
+    const signal = scope?.signal;
 
-    if (readTimeout === undefined) {
+    if (readTimeout === undefined && !signal) {
       return operation;
     }
 
     let onTimeout = (): void => {};
-    const timedOut = new Promise<never>((_resolve, reject) => {
-      onTimeout = () => reject(new ReadTimeoutError(readTimeout));
+    let onAbort = (): void => {};
+    const interrupted = new Promise<never>((_resolve, reject) => {
+      onTimeout = () => reject(new ReadTimeoutError(readTimeout ?? 0));
+      onAbort = () => {
+        if (scope) {
+          scope.aborted = true;
+        }
+        reject(signal?.reason);
+      };
     });
 
-    socket.setTimeout(readTimeout);
-    socket.once("timeout", onTimeout);
+    if (readTimeout !== undefined) {
+      socket.setTimeout(readTimeout);
+      socket.once("timeout", onTimeout);
+    }
+    if (signal?.aborted) {
+      onAbort();
+    } else {
+      signal?.addEventListener("abort", onAbort, { once: true });
+    }
 
     try {
-      return await Promise.race([operation, timedOut]);
+      return await Promise.race([operation, interrupted]);
     } finally {
-      socket.removeListener("timeout", onTimeout);
-      socket.setTimeout(0);
+      signal?.removeEventListener("abort", onAbort);
+      if (readTimeout !== undefined) {
+        socket.removeListener("timeout", onTimeout);
+        socket.setTimeout(0);
+      }
     }
+  }
+
+  /** Rejects with the running scope's abort reason, if its signal has aborted. */
+  private throwIfAborted(): void {
+    const scope = this.activeScope;
+    if (scope?.signal?.aborted) {
+      scope.aborted = true;
+      throw scope.signal.reason;
+    }
+  }
+
+  private isAbortReason(error: unknown): boolean {
+    const signal = this.activeScope?.signal;
+    return signal?.aborted === true && error === signal.reason;
   }
 
   private socketWrite(socket: Socket, data: Buffer): Promise<void> {

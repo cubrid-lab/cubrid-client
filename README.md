@@ -439,9 +439,11 @@ Creates a client instance. Connection is established lazily on first query.
 
 Reads a result row by row with `for await`, with bounded memory. See [Streaming Large Results](#streaming-large-results).
 
-### `client.query<T>(sql, params?): Promise<T[]>`
+### `client.query<T>(sql, params?, options?): Promise<T[]>`
 
 Executes SQL and returns typed row objects. DDL/DML statements return `[]`. BLOB columns return a complete `Buffer` and CLOB columns a complete `string`.
+
+`options` is a `QueryOptions` `{ signal?: AbortSignal; readTimeout?: number }`, also accepted by `queryResult`, `execute` and the `Prepared` methods on the client, `tx` and a transaction scope. An abort rejects with `signal.reason`: a statement still queued is never sent, and one already sent has its connection discarded and an unknown outcome on the server, so verify before retrying. `readTimeout` overrides the client's for that statement (`0` = none). See [Cancelling one statement](docs/API_REFERENCE.md#cancelling-one-statement).
 
 ### `client.transaction<T>(callback, options?): Promise<T>`
 

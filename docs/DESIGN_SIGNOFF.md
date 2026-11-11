@@ -59,7 +59,7 @@ The Node package's public Promise API and emitted declarations are already subje
 
 ## Decisions still blocking full sign-off
 
-#118 JDBC comparison, #150 query cancellation, #189 npm release completeness. #214 autocommit partial FETCH is resolved: `query()` now ends the read transaction when a FETCH fails partway. #112 manual transaction ownership is resolved by `beginTransactionScope()` (ADR 0007, accepted); the shared-connection manual methods are deprecated. #113 date/time zone is resolved by the opt-in `timezone: "utc"` option; the default stays local in 1.x. Existing 1.x does not imply every issue is complete.
+#118 JDBC comparison, #189 npm release completeness. #150 query cancellation is resolved by the optional `QueryOptions` argument (`signal`, per-statement `readTimeout`): an abort after a request was written discards the socket and is never replayed, and its outcome is reported as unknown. #214 autocommit partial FETCH is resolved: `query()` now ends the read transaction when a FETCH fails partway. #112 manual transaction ownership is resolved by `beginTransactionScope()` (ADR 0007, accepted); the shared-connection manual methods are deprecated. #113 date/time zone is resolved by the opt-in `timezone: "utc"` option; the default stays local in 1.x. Existing 1.x does not imply every issue is complete.
 
 These are outstanding verifications, not proof of failure. Existing code and currently declared support are not silently reclassified as unsupported merely because a test is absent.
 
