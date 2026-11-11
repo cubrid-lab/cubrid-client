@@ -82,6 +82,10 @@ const client = createClient({ host: "localhost", database: "demodb", user: "dba"
 | `error` | The same operations failed | `operation`, `durationMs`, `errorName`; `paramCount` for `query` |
 | `error` | A connection could not be created (`operation: "connection"`; the original error is rethrown unchanged) | `operation`, `host`, `port`, `database`, `durationMs`, `errorName` |
 
+A pool (`createPool()`) also reports `pool.create` and `pool.destroy` at `info`,
+with `reason` on `pool.destroy`, and `pool.acquire-timeout` at `error`; see
+[CubridPool logging](API_REFERENCE.md#logging).
+
 Fields never contain SQL text, bound parameter values, row data, passwords or
 error messages (servers can echo SQL in them). `errorName` is the error's class
 (one of this library's errors or a standard `Error` subclass, otherwise

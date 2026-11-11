@@ -26,6 +26,7 @@ import {
   assertValidTransactionOptions,
   pickTransactionOptions,
 } from "../internals/normalize-config.js";
+import { SESSION_STATE, type SessionState } from "../internals/session-state.js";
 import {
   CASConnection,
   type CASConnectionConfig,
@@ -797,6 +798,21 @@ export class NativeCubridAdapter implements DriverAdapter {
 
   async ping(): Promise<string> {
     return this.inTurn("connection", "Health check failed.", () => this.pingNow());
+  }
+
+  /**
+   * For the pool: whether this session may go to another caller. Read
+   * synchronously when a lease ends, so nothing queued can change it meanwhile.
+   * See docs/adr/0008-pool-reuse-invariant.md.
+   */
+  private [SESSION_STATE](): SessionState {
+    return {
+      inTransaction:
+        !this.autoCommit || this.transactionGeneration !== null || this.transactionAbort !== null,
+      busy: this.openCursors.size > 0 || this.heldBy !== null || this.waitingStatements.size > 0,
+      failedExchanges: this.cas?.failedExchanges ?? 0,
+      connected: this.cas?.isConnected ?? false,
+    };
   }
 
   private async pingNow(): Promise<string> {

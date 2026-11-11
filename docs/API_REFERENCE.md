@@ -8,6 +8,8 @@ Complete reference for every public export of `cubrid-client`.
 
 - [createClient()](#createclient)
 - [CubridClient](#cubridclient)
+- [createPool()](#createpool)
+- [CubridPool](#cubridpool)
 - [CubridTransaction](#cubridtransaction)
 - [Error Classes](#error-classes)
   - [ConnectionError](#connectionerror)
@@ -44,6 +46,7 @@ Complete reference for every public export of `cubrid-client`.
   - [QueryResult](#queryresult)
   - [ColumnInfo](#columninfo)
   - [Schema introspection types](#schema-introspection-types)
+  - [PoolOptions, PoolStats and PoolConnection](#pooloptions-poolstats-and-poolconnection)
 
 ---
 
@@ -694,6 +697,172 @@ try {
 
 ---
 
+## createPool()
+
+Creates a [`CubridPool`](#cubridpool): several connections to one database, each
+lent to one caller at a time.
+
+```ts
+function createPool(options: PoolOptions): CubridPool;
+```
+
+`new CubridPool(options)` does the same.
+
+`options` takes every [`ClientOptions`](#clientoptions) field, applied to each
+connection the pool opens, and these limits. An invalid value throws a
+`RangeError` from `createPool()`; nothing is opened before that.
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `max` | `10` | Most connections at once, counting those still being opened. An integer of at least 1 |
+| `min` | `0` | Connections kept open even when idle, opened in the background after `createPool()` and after one is closed. A failure to open one is only logged. An integer from 0 to `max` |
+| `acquireTimeoutMs` | `30000` | Longest a caller waits for a connection, then it rejects with a [`ConnectionError`](#connectionerror) of `kind: "pool-timeout"` and nothing is sent. It includes the time to open a connection. The wait does not count towards `readTimeout`. An integer from 1 to 2147483647 |
+| `maxWaitingClients` | `Infinity` | Most callers waiting at once. One more rejects at once with `kind: "pool-full"`. A non-negative integer or `Infinity` |
+| `idleTimeoutMs` | `30000` | An idle connection is closed after this many milliseconds, never going below `min`. `0` keeps idle connections. An integer from 0 to 2147483647 |
+| `maxLifetimeMs` | none | A connection older than this is closed when its lease ends or while it is idle, never during a lease. Each connection's limit is up to 10% shorter, so connections opened together do not all close at once. An integer from 1 to 2147483647 |
+| `validateAfterIdleMs` | none | A connection idle at least this long is checked with `ping()` before it is lent; one that fails is closed and the caller gets another. `0` checks before every lease. An integer from 0 to 2147483647 |
+
+```ts
+import { createPool } from "cubrid-client";
+
+const pool = createPool({ host: "localhost", database: "demodb", user: "dba", max: 5 });
+const rows = await pool.query("SELECT name FROM athlete WHERE code = ?", [10999]);
+await pool.close();
+```
+
+---
+
+## CubridPool
+
+```ts
+class CubridPool
+  implements Queryable, ResultQueryable, Executable, PreparedQueryable, BatchExecutable, Streamable
+```
+
+### Leases
+
+Every method borrows a connection (a *lease*) and gives it back:
+
+| Method | Holds its connection |
+|--------|----------------------|
+| `query()`, `queryResult()`, `execute()`, the `Prepared` methods, `executeMany()`, `ping()`, `getServerVersion()` | For that statement |
+| `getTables()`, `getColumns()`, `getPrimaryKey()`, `getIndexes()` | For every catalog query of that call |
+| `stream()` | From its first read until it ends, breaks or fails |
+| `connection(fn, options?)` | Until `fn` settles |
+| `transaction(callback, options?)` | Until it commits or rolls back |
+| `beginTransactionScope(options?)` | Until `commit()` or `rollback()` |
+
+These methods have the signatures, options and errors of the
+[`CubridClient`](#cubridclient) methods of the same name, with three differences:
+
+- A statement waits for a free connection first. `QueryOptions.signal` also
+  cancels that wait, which then rejects with `signal.reason`. A failure to lease
+  rejects with a [`ConnectionError`](#connectionerror) of `kind` `pool-timeout`,
+  `pool-full` or `pool-closed`, or with the failure to open the connection opened
+  for that caller; `beginTransactionScope()` wraps it in a `TransactionError` that
+  keeps the `kind`, as it does every failure to begin.
+- A query awaited inside a `stream()` loop runs on another connection, or waits
+  for one, instead of being refused with `stream-busy`. With `max: 1` it waits
+  until `acquireTimeoutMs`.
+- `executeMany()` runs in autocommit mode on its connection, so a failed batch is
+  rolled back, as on the client.
+
+The `Prepared` methods take `blob()` and `clob()` values, as on the client, and
+`query()`, `queryResult()`, `execute()` and `stream()` refuse them with a
+`TypeError` before leasing a connection.
+
+The deprecated `beginTransaction()`, `commit()` and `rollback()` of the client do
+not exist on the pool.
+
+Callers are served in arrival order. A connection released while callers wait goes
+straight to the first of them, so a caller arriving later cannot take it first. A
+failed open rejects only the caller it was opened for.
+
+### Reuse
+
+A connection goes back to the pool only when its session is clean. It is closed,
+never rolled back for reuse, when:
+
+| Reason (`pool.destroy`) | When |
+|-------------------------|------|
+| `in-transaction` | A transaction is still open on the session, the server ended one the caller did not acknowledge, a rollback failed, or a scope was discarded by `close()` |
+| `error` | The session is closed, `transaction()` or `beginTransactionScope()` failed before its transaction began, or a custom `ConnectionLike` (which cannot report its state) had a call fail during the lease |
+| `busy` | A statement or stream of the lease is still running, for example one the `connection()` callback did not await |
+| `failed-exchange` | A request of the lease has an unknown outcome: a read timeout or an abort while it was on the wire |
+| `options` | The `transaction()` or `beginTransactionScope()` options differ from the pool's own `isolationLevel` or `lockTimeout`. They cannot be undone, so set them on the pool instead |
+| `lifetime` | The connection is older than `maxLifetimeMs` |
+
+Idle connections are also closed for `idle` (`idleTimeoutMs`), `validation`
+(`validateAfterIdleMs`) and `closed` (`close()`). Session variables and other
+session state set in autocommit mode stay on a reused connection, **including an
+isolation level or lock timeout changed with SQL** such as `SET TRANSACTION
+ISOLATION LEVEL`: the pool cannot see it, and the next caller inherits it. Use the
+pool's `isolationLevel` and `lockTimeout` options instead. The rule and
+its reasons are in [ADR 0008](adr/0008-pool-reuse-invariant.md).
+
+### `connection(fn, options?)`
+
+```ts
+connection<T>(fn: (connection: PoolConnection) => Promise<T>, options?: PoolConnectionOptions): Promise<T>
+```
+
+Runs `fn` with one connection, in autocommit mode, and releases it when `fn`
+settles. The [`PoolConnection`](#pooloptions-poolstats-and-poolconnection) has the
+statement methods and `stream()`, but no transaction methods: use
+`pool.transaction()`. Every call on it after `fn` settled rejects with a
+`ConnectionError` and sends nothing. `options.signal` cancels the wait for the
+connection, not the statements of `fn`. As on a client, a statement awaited
+inside a `stream()` loop of the same `PoolConnection` waits for the stream and is
+refused with `stream-busy`.
+
+```ts
+const count = await pool.connection(async (conn) => {
+  await conn.execute("INSERT INTO logs (msg) VALUES (?)", ["imported"]);
+  return conn.query("SELECT COUNT(*) AS n FROM logs");
+});
+```
+
+### `stats()`
+
+```ts
+stats(): PoolStats // { total, idle, active, pending, waiting }
+```
+
+`total` is `idle + active + pending`: open connections nobody holds, connections
+held or being checked, and connections being opened. `waiting` is the number of
+callers in line. A connection being closed is not counted.
+
+### `close()`
+
+```ts
+close(): Promise<void>
+```
+
+Stops the pool. In the same tick, every later call and every waiting caller
+rejects with `kind: "pool-closed"`. Idle connections are closed. An open stream's
+connection is closed, so its next read rejects. Statements, `connection()`
+callbacks and `transaction()` callbacks already running finish, and then their
+connections are closed. A `beginTransactionScope()` handle nobody ended is
+discarded meanwhile, as `CubridClient.close()` does: its connection is closed and
+the server rolls its work back. `close()` resolves when every connection is
+closed, including one still being opened. Calling it again returns the same
+promise. Awaiting `close()` inside a `connection()` or `transaction()` callback
+does not wait for that callback's own lease; its connection closes when the
+callback ends.
+
+### Logging
+
+With the `logger` option the pool also reports, besides every connection's own
+events:
+
+| Level | `operation` | Fields |
+|-------|-------------|--------|
+| `info` | `pool.create`: a connection was opened and set up | `host`, `port`, `database` |
+| `info` | `pool.destroy`: a connection was closed | `host`, `port`, `database`, `reason` (see [Reuse](#reuse)) |
+| `error` | `pool.acquire-timeout`: a caller waited `acquireTimeoutMs` | `host`, `port`, `database`, `durationMs` |
+
+---
+
 ## CubridTransaction
 
 A transaction-scoped client that delegates queries to the isolated transactional connection. You do **not** create this class directly — it is provided to you inside the `transaction()` callback, where it follows the [transaction lifecycle](#transaction-lifecycle).
@@ -985,6 +1154,9 @@ Failures detected by the client have a `kind` but no `code` or `origin`:
 | `connection-lost` | The socket closed, or the session that held the transaction is gone. The outcome of a request that was in flight is unknown |
 | `read-timeout` | [`ReadTimeoutError`](#readtimeouterror): the client stopped waiting for a response. A server lock wait that expires is `lock-timeout` instead |
 | `stream-busy` | A statement waited behind a [`stream()`](#streamtsql-params-options) whose consumer asked for no row for `consumerTimeout`. Nothing was sent. Often the statement was awaited inside the loop that reads the stream |
+| `pool-timeout` | A [`CubridPool`](#cubridpool) caller waited `acquireTimeoutMs` for a connection. Nothing was sent |
+| `pool-full` | A pool already had `maxWaitingClients` callers waiting. Nothing was sent |
+| `pool-closed` | The pool was closed before a connection could be lent. Nothing was sent |
 
 After any `deadlock`, roll back and retry the transaction from its start.
 
@@ -1669,3 +1841,43 @@ interface SchemaIndex {
 | `SchemaIndexColumn.prefixLength` | Set only for a prefix index such as `c(5)`. |
 | `SchemaIndex.filter` | The condition of a filtered index as the catalog prints it, or `null`. |
 | `SchemaIndex.primaryKey`, `foreignKey` | The primary key and each foreign key are listed by `getIndexes()` as indexes of their own. |
+
+### PoolOptions, PoolStats and PoolConnection
+
+```ts
+interface PoolOptions extends ClientOptions {
+  max?: number;
+  min?: number;
+  acquireTimeoutMs?: number;
+  maxWaitingClients?: number;
+  idleTimeoutMs?: number;
+  maxLifetimeMs?: number;
+  validateAfterIdleMs?: number;
+}
+
+interface PoolStats {
+  total: number;
+  idle: number;
+  active: number;
+  pending: number;
+  waiting: number;
+}
+
+interface PoolConnection
+  extends Queryable,
+    ResultQueryable,
+    Executable,
+    PreparedQueryable,
+    BatchExecutable,
+    Streamable {}
+
+interface PoolConnectionOptions {
+  signal?: AbortSignal;
+}
+```
+
+See [`createPool()`](#createpool) for the options and [`CubridPool`](#cubridpool)
+for the rest. `PoolConnection` describes a value the pool passes to
+`connection()`; members may be added to it in a minor release, so do not implement
+it in your own classes. `ClientLogFields.reason` carries the `pool.destroy`
+reason.

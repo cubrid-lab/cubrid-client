@@ -151,7 +151,7 @@ type ClientLogLevel = "debug" | "info" | "error";
  * parameter values, row data, credentials or error messages.
  */
 interface ClientLogFields {
-    /** `connection`, `connect`, `query`, `queryResult`, `execute`, `queryPrepared`, `queryResultPrepared`, `executePrepared`, `executeMany`, `stream`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`. */
+    /** `connection`, `connect`, `query`, `queryResult`, `execute`, `queryPrepared`, `queryResultPrepared`, `executePrepared`, `executeMany`, `stream`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`, and for a pool `pool.create`, `pool.destroy` or `pool.acquire-timeout`. */
     operation?: string;
     host?: string;
     port?: number;
@@ -165,6 +165,12 @@ interface ClientLogFields {
     paramCount?: number;
     /** Number of rows a successful `query` returned, or a `stream` handed to its consumer. */
     rowCount?: number;
+    /**
+     * Why a pool closed a connection (`pool.destroy`): `in-transaction`, `busy`,
+     * `failed-exchange`, `options`, `lifetime`, `idle`, `validation`, `error` or
+     * `closed`. See `docs/API_REFERENCE.md`.
+     */
+    reason?: string;
     /**
      * Class of the error of a failed operation: one of this library's error
      * classes or a standard `Error` subclass, otherwise `Error`. A custom
@@ -503,6 +509,15 @@ interface ConnectionLike {
 }
 type ConnectionFactory = (config: ClientConfig) => ConnectionLike | Promise<ConnectionLike>;
 
+/**
+ * Key of the internal method through which a connection tells the pool whether
+ * its session may be handed to another caller. It is a symbol, not a member of
+ * `ConnectionLike`, so it adds nothing to the public interface; a custom
+ * connection without it is reused only after a lease in which every call
+ * succeeded.
+ */
+declare const SESSION_STATE: unique symbol;
+
 interface DriverAdapter extends ConnectionLike {
 }
 
@@ -633,6 +648,12 @@ declare class NativeCubridAdapter implements DriverAdapter {
     close(): Promise<void>;
     private closeNow;
     ping(): Promise<string>;
+    /**
+     * For the pool: whether this session may go to another caller. Read
+     * synchronously when a lease ends, so nothing queued can change it meanwhile.
+     * See docs/adr/0008-pool-reuse-invariant.md.
+     */
+    private [SESSION_STATE];
     private pingNow;
     /**
      * Run `statement` after every statement issued before it has settled.
@@ -921,6 +942,8 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
     private readonly config;
     private readonly connectionFactory;
     private sharedConnectionPromise;
+    /** Where transaction() and beginTransactionScope() open their own connections. */
+    private readonly source;
     private closed;
     private readonly schemaOperations;
     private readonly openScopes;
@@ -970,7 +993,6 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
      * @throws RangeError at once when an option is invalid.
      */
     stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncGenerator<T, void, undefined>;
-    private streamRows;
     transaction<T>(callback: TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient & BatchTransactionClient>, options?: TransactionOptions): Promise<T>;
     /**
      * Start a manual transaction on its own connection and return the handle that
@@ -1038,15 +1060,242 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
     private literalConnection;
     private getSharedConnection;
     private prepareSharedConnection;
-    /**
-     * Hands `options` to a new connection before anything runs on it. A connection
-     * that cannot take them fails here: the statements would otherwise run, with no
-     * sign of it, under the server's defaults.
-     */
-    private applyTransactionOptions;
 }
 
 declare function createClient(options: ClientOptions): CubridClient;
+
+/**
+ * Options of `createPool()`: every {@link ClientOptions} setting, applied to
+ * each connection the pool opens, and the pool's own limits. An invalid value
+ * throws a `RangeError` from `createPool()`.
+ */
+interface PoolOptions extends ClientOptions {
+    /**
+     * Most connections open at once, counting those still being opened. An
+     * integer of at least 1. Default: 10.
+     */
+    max?: number;
+    /**
+     * Connections the pool keeps open even when idle, opened in the background
+     * after `createPool()` and after a connection is closed. A failure to open one
+     * is only logged. An integer from 0 to `max`. Default: 0.
+     */
+    min?: number;
+    /**
+     * Longest a caller waits for a connection, in milliseconds, before it rejects
+     * with a `ConnectionError` of kind `pool-timeout`. The wait does not count
+     * towards `readTimeout`. An integer from 1 to 2147483647. Default: 30000.
+     */
+    acquireTimeoutMs?: number;
+    /**
+     * Most callers waiting for a connection at once. One more rejects at once with
+     * kind `pool-full`. A non-negative integer or `Infinity`. Default: `Infinity`.
+     */
+    maxWaitingClients?: number;
+    /**
+     * Milliseconds a connection may stay idle before the pool closes it, never
+     * going below `min`. `0` keeps idle connections open. An integer from 0 to
+     * 2147483647. Default: 30000.
+     */
+    idleTimeoutMs?: number;
+    /**
+     * Age, in milliseconds, after which a connection is closed instead of being
+     * reused. Checked when a lease ends and while the connection is idle, never
+     * during a lease; each connection's limit is up to 10% shorter, so connections
+     * opened together do not all close together. An integer from 1 to 2147483647.
+     * Default: no limit.
+     */
+    maxLifetimeMs?: number;
+    /**
+     * A connection idle for at least this many milliseconds is checked with
+     * `ping()` before it is leased; one that fails is closed and the caller gets
+     * another. `0` checks before every lease. An integer from 0 to 2147483647.
+     * Default: no check.
+     */
+    validateAfterIdleMs?: number;
+}
+/** A snapshot of the pool, from `CubridPool.stats()`. */
+interface PoolStats {
+    /** Connections open or being opened: `idle + active + pending`. */
+    total: number;
+    /** Open connections nobody holds. */
+    idle: number;
+    /** Connections held by a statement, stream, transaction or `connection()` callback. */
+    active: number;
+    /** Connections being opened. */
+    pending: number;
+    /** Callers waiting for a connection. */
+    waiting: number;
+}
+/**
+ * The connection `CubridPool.connection()` lends its callback. It runs in
+ * autocommit mode, so it has no transaction methods: use `pool.transaction()`.
+ * It is valid only while the callback runs; afterwards every call rejects
+ * without reaching the server.
+ *
+ * This describes a value the pool passes in. Members may be added to it in a
+ * minor release, so do not implement it in your own classes.
+ */
+interface PoolConnection extends Queryable, ResultQueryable, Executable, PreparedQueryable, BatchExecutable, Streamable {
+}
+/** Options of `CubridPool.connection()`. */
+interface PoolConnectionOptions {
+    /** Cancels the wait for a connection. It does not apply to the callback's statements. */
+    signal?: AbortSignal;
+}
+
+/**
+ * Create a pool of connections to one database. Nothing waits here: `min`
+ * connections are opened in the background, and every other one when a caller
+ * needs it.
+ *
+ * @throws RangeError or TypeError when an option is invalid.
+ */
+declare function createPool(options: PoolOptions): CubridPool;
+/**
+ * A pool of connections to one database. Each statement method leases a
+ * connection for that statement only; `stream()` holds its lease until the
+ * stream ends; `transaction()`, `beginTransactionScope()` and `connection()`
+ * hold one until they end. A connection goes back to the pool only when its
+ * session is clean: no open transaction, nothing still running, no request
+ * with an unknown outcome and no transaction settings other than the pool's.
+ * Otherwise it is closed. See `docs/API_REFERENCE.md` and ADR 0008.
+ */
+declare class CubridPool implements Queryable, ResultQueryable, Executable, PreparedQueryable, BatchExecutable, Streamable {
+    private closed;
+    private closing;
+    private readonly idle;
+    private readonly active;
+    private pending;
+    /** Callers waiting in line, in arrival order. */
+    private readonly waiting;
+    /** Every caller that has not been given a connection or an error yet. */
+    private readonly unsettled;
+    private readonly leases;
+    private readonly opening;
+    private readonly closings;
+    private readonly openScopes;
+    private readonly beginningScopes;
+    private readonly statements;
+    /** The callback lease running in this async context, so close() never waits for itself. */
+    private readonly callbackLease;
+    private readonly emit;
+    private readonly config;
+    private readonly connectionFactory;
+    private readonly settings;
+    /** Same as {@link createPool}. */
+    constructor(options: PoolOptions);
+    /** Run a statement on a leased connection and return its rows. See {@link QueryOptions}. */
+    query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
+    queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
+    execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
+    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<T[]>;
+    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<QueryResult<T>>;
+    executePrepared(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<ExecuteResult>;
+    /** `executeMany()` of the client, on one leased connection, in autocommit mode. */
+    executeMany(sql: string, paramSets: readonly QueryParams[], options?: QueryOptions): Promise<ExecuteManyResult>;
+    /**
+     * Read a statement's rows one at a time with `for await`. The stream holds its
+     * connection from the first read until it ends, so a statement awaited inside
+     * the loop runs on another connection of the pool, or waits for one.
+     *
+     * @throws RangeError at once when an option is invalid.
+     */
+    stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncGenerator<T, void, undefined>;
+    /**
+     * Run `fn` with one connection of the pool, in autocommit mode, and release it
+     * when `fn` settles. The connection rejects every call made after that.
+     * `options.signal` cancels the wait for the connection.
+     */
+    connection<T>(fn: (connection: PoolConnection) => Promise<T>, options?: PoolConnectionOptions): Promise<T>;
+    /**
+     * `transaction()` of the client, on a leased connection. The connection goes
+     * back to the pool only when the transaction ended cleanly.
+     */
+    transaction<T>(callback: TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient & BatchTransactionClient>, options?: TransactionOptions): Promise<T>;
+    /**
+     * `beginTransactionScope()` of the client, on a leased connection held until
+     * `commit()` or `rollback()`. `close()` discards a scope nobody ended.
+     *
+     * @throws RangeError at once when an option is invalid.
+     */
+    beginTransactionScope(options?: TransactionOptions): Promise<TransactionScope>;
+    /** Check one leased connection, as `CubridClient.ping()` does. */
+    ping(): Promise<string>;
+    /** Return the CUBRID server version, for example `11.4.6.1963`. */
+    getServerVersion(): Promise<string>;
+    /** See `CubridClient.getTables()`. */
+    getTables(options?: SchemaOptions): Promise<SchemaTable[]>;
+    /** See `CubridClient.getColumns()`. */
+    getColumns(table: string, options?: SchemaOptions): Promise<SchemaColumn[]>;
+    /** See `CubridClient.getPrimaryKey()`. */
+    getPrimaryKey(table: string, options?: SchemaOptions): Promise<SchemaPrimaryKey | null>;
+    /** See `CubridClient.getIndexes()`. */
+    getIndexes(table: string, options?: SchemaOptions): Promise<SchemaIndex[]>;
+    /** Counts of connections and waiting callers at this moment. */
+    stats(): PoolStats;
+    /**
+     * Stop leasing and close every connection. In order: new calls and waiting
+     * callers reject with kind `pool-closed`; idle connections close; open streams
+     * end, as their connections close; statements, `connection()` callbacks and
+     * `transaction()` callbacks run to their end and their connections close.
+     * Scopes nobody ended are discarded meanwhile, not after: a statement may be
+     * waiting for a lock that only such a scope holds. Calling it again returns the
+     * same promise.
+     */
+    close(): Promise<void>;
+    private drain;
+    private total;
+    /** Connections open now, leaving out those still opening. */
+    private open;
+    private canServe;
+    private sourceFor;
+    private runStatement;
+    private streamOnLease;
+    private pingLeased;
+    /** A catalog inspection runs all its queries on one lease. */
+    private runSchemaOperation;
+    /**
+     * Lease a connection: an idle one, a new one while fewer than `max` exist, or
+     * the next one released, in the order callers arrived. Rejects with the
+     * signal's reason when it aborts, and with a ConnectionError of kind
+     * `pool-closed`, `pool-full` or `pool-timeout`, or the failure to open the
+     * connection opened for this caller.
+     */
+    private acquire;
+    /** Serves `waiter` now; only call it when canServe(). */
+    private serve;
+    private takeIdle;
+    /** Gives `pooled`, already counted as active, to `waiter`, or back if it gave up. */
+    private deliver;
+    /** `waiter` was being served when its connection had to be closed. */
+    private retry;
+    /** Serves waiting callers while there is a connection or room for one. */
+    private dispatch;
+    /** An unused connection: to the first waiting caller, else idle. */
+    private putBack;
+    private lease;
+    /**
+     * Ends a lease: the connection goes back to the pool, or is closed when its
+     * session is not clean (ADR 0008). Never throws.
+     */
+    private release;
+    /** Why the connection of an ended lease must not be reused, if it must not. */
+    private evictionReason;
+    /** Closes a connection counted as active that no lease holds. */
+    private discard;
+    private destroy;
+    /** Opens connections in the background until `min` exist. Failures are only logged. */
+    private fillMin;
+    /** Opens and sets up one connection: connected, with the pool's transaction settings. */
+    private create;
+    /** close() waits for connections being opened or validated. */
+    private track;
+    /** Arms the timer that closes an idle connection when it expires or idles too long. */
+    private armIdleTimer;
+    private onIdleTimer;
+    private endpoint;
+}
 
 declare class CubridTransaction implements ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient, BatchTransactionClient {
     private readonly connection;
@@ -1086,8 +1335,14 @@ declare class CubridTransaction implements ResultTransactionClient, ExecutableTr
  * - `read-timeout`: the client gave up waiting, see `ReadTimeoutError`.
  * - `stream-busy`: the client refused a statement that waited behind a `stream()`
  *   whose consumer stopped asking for rows. Nothing was sent.
+ * - `pool-timeout`: a pool had no connection to lease within `acquireTimeoutMs`.
+ *   Nothing was sent.
+ * - `pool-full`: a pool already had `maxWaitingClients` callers waiting for a
+ *   connection. Nothing was sent.
+ * - `pool-closed`: the pool was closed before a connection could be leased.
+ *   Nothing was sent.
  */
-type CubridErrorKind = "unique-violation" | "not-null-violation" | "foreign-key-violation" | "syntax" | "semantic" | "deadlock" | "lock-timeout" | "interrupted" | "authentication" | "connection-lost" | "read-timeout" | "stream-busy";
+type CubridErrorKind = "unique-violation" | "not-null-violation" | "foreign-key-violation" | "syntax" | "semantic" | "deadlock" | "lock-timeout" | "interrupted" | "authentication" | "connection-lost" | "read-timeout" | "stream-busy" | "pool-timeout" | "pool-full" | "pool-closed";
 /** One parameter set of an `executeMany()` call that the server reported as failed. */
 interface ExecuteManySetFailure {
     /** Position of the set in `paramSets`. */
@@ -1237,4 +1492,4 @@ declare function buildWhere(conditions: Record<string, unknown>): {
     params: unknown[];
 };
 
-export { type BatchExecutable, type BatchTransactionClient, type BlobSource, type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type ClobSource, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteManyFailure, type ExecuteManyResult, type ExecuteManySetFailure, type ExecuteResult, type IsolationLevel, type LobParam, LockTimeoutError, NativeCubridAdapter, type PreparedQueryParam, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryOptions, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type StreamOptions, type Streamable, type TransactionCallback, type TransactionClient, TransactionError, type TransactionOptions, type TransactionScope, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, blob, buildWhere, clob, createClient, escapeIdentifier, parseConnectionString };
+export { type BatchExecutable, type BatchTransactionClient, type BlobSource, type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type ClobSource, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridPool, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteManyFailure, type ExecuteManyResult, type ExecuteManySetFailure, type ExecuteResult, type IsolationLevel, type LobParam, LockTimeoutError, NativeCubridAdapter, type PoolConnection, type PoolConnectionOptions, type PoolOptions, type PoolStats, type PreparedQueryParam, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryOptions, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type StreamOptions, type Streamable, type TransactionCallback, type TransactionClient, TransactionError, type TransactionOptions, type TransactionScope, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, blob, buildWhere, clob, createClient, createPool, escapeIdentifier, parseConnectionString };

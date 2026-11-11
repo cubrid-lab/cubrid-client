@@ -107,6 +107,16 @@ and the refusal on the literal path
 LOB_WRITE frames were captured from 10.2 and 11.4 and differ only in the locator
 text.
 
+The connection pool (`createPool()`) is asserted against local `cubrid/cubrid`
+10.2 and 11.4 containers: concurrency bounded by `max`, a clean session reused, a
+session lost inside a transaction never reused (its session variable undefined and
+its uncommitted row gone on the next lease), a scope discarded by `close()`, a
+stream holding its session while a query in the loop uses another, and `close()`
+waiting for a running statement, and a `blob()` written through the pool's
+`executePrepared()` (11.4)
+([#92](https://github.com/cubrid-lab/cubrid-client/issues/92)). 11.0 and 11.2 were
+not run.
+
 The `isolationLevel` and `lockTimeout` options are asserted the same way against
 local `cubrid/cubrid` 10.2, 11.0, 11.2 and 11.4 containers: the level read back from
 the server, what each level shows of a concurrent commit, the `-1158` conflict, write

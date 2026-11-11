@@ -17,6 +17,7 @@ import { setFlagsFromString } from "node:v8";
 import { runInNewContext } from "node:vm";
 import { NativeCubridAdapter } from "../src/adapters/native.js";
 import { createClient } from "../src/client/create-client.js";
+import { createPool } from "../src/client/pool.js";
 import { ConnectionError } from "../src/errors/connection-error.js";
 import {
   ConstraintError,
@@ -37,7 +38,7 @@ import {
   writeFetch,
   writePrepareAndExecute,
 } from "../src/protocol/protocol.js";
-import type { TransactionClient } from "../src/types/client.js";
+import type { ClientLogFields, TransactionClient } from "../src/types/client.js";
 import { blob, clob } from "../src/types/lob.js";
 import type { QueryParam, QueryParams } from "../src/types/query.js";
 import { ZonedDateTime } from "../src/types/zoned-date-time.js";
@@ -6318,5 +6319,202 @@ describe("Integration: where a ? is a marker (#243)", { skip: !available }, () =
       );
       assert.equal(result.affectedRows, 1);
     });
+  });
+});
+
+describe("Integration: connection pool (#92)", { skip: !available }, () => {
+  const TABLE = "cc92_pool";
+  const SLOW = "SELECT SLEEP(1) AS slept FROM db_root";
+
+  function poolWithEvents(options: Parameters<typeof createPool>[0]) {
+    const events: ClientLogFields[] = [];
+    const record = (_message: string, fields: ClientLogFields): void => {
+      if (fields.operation?.startsWith("pool.")) {
+        events.push(fields);
+      }
+    };
+    const pool = createPool({ ...options, logger: { info: record, error: record } });
+    const count = (operation: string): number =>
+      events.filter((event) => event.operation === operation).length;
+    return { pool, events, count };
+  }
+
+  before(async () => {
+    const client = createClient(TEST_CONFIG);
+    await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+    await client.query(`CREATE TABLE ${TABLE} (id INT PRIMARY KEY, pad VARCHAR(400))`);
+    await client.query(
+      `INSERT INTO ${TABLE} (id, pad) SELECT ROWNUM, '${"p".repeat(300)}' ` +
+        "FROM db_attribute a, db_attribute b LIMIT 1500",
+    );
+    await client.close();
+  });
+
+  after(async () => {
+    const client = createClient(TEST_CONFIG);
+    await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+    await client.close();
+  });
+
+  test("concurrent statements never use more sessions than max", async () => {
+    const { pool, count } = poolWithEvents({ ...TEST_CONFIG, max: 3 });
+    let peak = 0;
+    try {
+      const started = Date.now();
+      await Promise.all(
+        Array.from({ length: 9 }, async () => {
+          const rows = await pool.query(SLOW);
+          peak = Math.max(peak, pool.stats().total);
+          return rows;
+        }),
+      );
+      // Nine one-second statements on three sessions take three rounds.
+      assert.ok(Date.now() - started >= 2900, `took ${Date.now() - started}ms`);
+      assert.ok(peak <= 3, `peak ${peak}`);
+      assert.equal(count("pool.create"), 3);
+    } finally {
+      await pool.close();
+    }
+  });
+
+  test("a clean session is reused, session variables included", async () => {
+    const { pool, count } = poolWithEvents({ ...TEST_CONFIG, max: 1 });
+    try {
+      await pool.query("SET @cc92_reused = 7");
+      assert.deepEqual(await pool.query("SELECT @cc92_reused AS v FROM db_root"), [{ v: 7 }]);
+      assert.equal(count("pool.create"), 1);
+      assert.equal(count("pool.destroy"), 0);
+    } finally {
+      await pool.close();
+    }
+  });
+
+  test("a session left in a transaction is never reused", async () => {
+    const { pool, events, count } = poolWithEvents({ ...TEST_CONFIG, max: 1 });
+    const reason = new Error("stopped by the test");
+    const controller = new AbortController();
+    try {
+      await pool.execute(`DELETE FROM ${TABLE} WHERE id = 99999`);
+      await assert.rejects(
+        pool.transaction(async (tx) => {
+          await tx.query(`INSERT INTO ${TABLE} (id, pad) VALUES (99999, 'uncommitted')`);
+          await tx.query("SET @cc92_marker = 42");
+          setTimeout(() => controller.abort(reason), 200);
+          // Aborted on the wire: the outcome is unknown and the transaction is lost.
+          await tx.query(SLOW, [], { signal: controller.signal });
+        }),
+      );
+
+      const destroyed = events.filter((event) => event.operation === "pool.destroy");
+      assert.equal(destroyed.length, 1);
+      assert.ok(
+        ["failed-exchange", "in-transaction"].includes(destroyed[0]?.reason ?? ""),
+        `reason ${destroyed[0]?.reason}`,
+      );
+
+      // The next lease is a new session: the session variable is not defined
+      // there (-1070), and the uncommitted row is gone.
+      await assert.rejects(
+        pool.query("SELECT @cc92_marker AS v FROM db_root"),
+        (error: unknown) => error instanceof QueryError && error.code === -1070,
+      );
+      assert.deepEqual(await pool.query(`SELECT id FROM ${TABLE} WHERE id = 99999`), []);
+      assert.equal(count("pool.create"), 2);
+    } finally {
+      await pool.close();
+    }
+  });
+
+  test("a scope the pool discards on close() leaves nothing behind", async () => {
+    const { pool } = poolWithEvents({ ...TEST_CONFIG, max: 2 });
+    const scope = await pool.beginTransactionScope();
+    await scope.execute(`INSERT INTO ${TABLE} (id, pad) VALUES (99998, 'discarded')`);
+    await pool.close();
+
+    const client = createClient(TEST_CONFIG);
+    try {
+      assert.deepEqual(await client.query(`SELECT id FROM ${TABLE} WHERE id = 99998`), []);
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("a stream holds its session while queries inside the loop use another", async () => {
+    const { pool, count } = poolWithEvents({ ...TEST_CONFIG, max: 2 });
+    try {
+      let rows = 0;
+      for await (const row of pool.stream<{ id: number }>(
+        `SELECT id, pad FROM ${TABLE} WHERE id <= 1500 ORDER BY id`,
+      )) {
+        rows += 1;
+        if (row.id % 500 === 0) {
+          const [found] = await pool.query<{ id: number }>(`SELECT id FROM ${TABLE} WHERE id = ?`, [
+            row.id,
+          ]);
+          assert.equal(found?.id, row.id);
+          assert.equal(pool.stats().active, 1);
+        }
+      }
+      assert.equal(rows, 1500);
+      assert.equal(count("pool.create"), 2);
+      assert.deepEqual(pool.stats(), { total: 2, idle: 2, active: 0, pending: 0, waiting: 0 });
+    } finally {
+      await pool.close();
+    }
+  });
+
+  test("executePrepared() with blob() writes through a leased session that is then reused", async () => {
+    const { pool, count } = poolWithEvents({ ...TEST_CONFIG, max: 1 });
+    const table = "cc92_pool_lob";
+    const content = Buffer.alloc(300 * 1024, 0x5a);
+    try {
+      await pool.execute(`DROP TABLE IF EXISTS ${table}`);
+      await pool.execute(`CREATE TABLE ${table} (id INT PRIMARY KEY, b BLOB)`);
+      assert.deepEqual(
+        await pool.executePrepared(`INSERT INTO ${table} (id, b) VALUES (?, ?)`, [
+          1,
+          blob(content),
+        ]),
+        { affectedRows: 1 },
+      );
+      await pool.transaction(async (tx) => {
+        await tx.executePrepared(`INSERT INTO ${table} (id, b) VALUES (?, ?)`, [
+          2,
+          blob(content.subarray(0, 10)),
+        ]);
+      });
+
+      const rows = await pool.query<{ id: number; b: Buffer }>(
+        `SELECT id, b FROM ${table} ORDER BY id`,
+      );
+      assert.equal(rows.length, 2);
+      assert.ok(rows[0]?.b.equals(content));
+      assert.ok(rows[1]?.b.equals(content.subarray(0, 10)));
+      await assert.rejects(
+        pool.execute(`INSERT INTO ${table} (id, b) VALUES (?, ?)`, [3, blob(content) as never]),
+        (error: unknown) => error instanceof TypeError,
+      );
+      assert.equal(count("pool.create"), 1);
+      assert.equal(count("pool.destroy"), 0);
+    } finally {
+      await pool.execute(`DROP TABLE IF EXISTS ${table}`).catch(() => undefined);
+      await pool.close();
+    }
+  });
+
+  test("close() waits for running statements, then closes every session", async () => {
+    const { pool, count } = poolWithEvents({ ...TEST_CONFIG, max: 2 });
+    await pool.query(`SELECT 1 FROM db_root`);
+    const running = pool.query(SLOW);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const closing = pool.close();
+    await assert.rejects(pool.query("SELECT 1 FROM db_root"), (error: unknown) => {
+      return error instanceof ConnectionError && error.kind === "pool-closed";
+    });
+    assert.deepEqual(await running, [{ slept: 0 }]);
+    await closing;
+    assert.equal(count("pool.destroy"), count("pool.create"));
+    assert.deepEqual(pool.stats(), { total: 0, idle: 0, active: 0, pending: 0, waiting: 0 });
   });
 });

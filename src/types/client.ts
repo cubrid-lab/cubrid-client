@@ -26,7 +26,7 @@ export type ClientLogLevel = "debug" | "info" | "error";
  * parameter values, row data, credentials or error messages.
  */
 export interface ClientLogFields {
-  /** `connection`, `connect`, `query`, `queryResult`, `execute`, `queryPrepared`, `queryResultPrepared`, `executePrepared`, `executeMany`, `stream`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`. */
+  /** `connection`, `connect`, `query`, `queryResult`, `execute`, `queryPrepared`, `queryResultPrepared`, `executePrepared`, `executeMany`, `stream`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`, and for a pool `pool.create`, `pool.destroy` or `pool.acquire-timeout`. */
   operation?: string;
   host?: string;
   port?: number;
@@ -40,6 +40,12 @@ export interface ClientLogFields {
   paramCount?: number;
   /** Number of rows a successful `query` returned, or a `stream` handed to its consumer. */
   rowCount?: number;
+  /**
+   * Why a pool closed a connection (`pool.destroy`): `in-transaction`, `busy`,
+   * `failed-exchange`, `options`, `lifetime`, `idle`, `validation`, `error` or
+   * `closed`. See `docs/API_REFERENCE.md`.
+   */
+  reason?: string;
   /**
    * Class of the error of a failed operation: one of this library's error
    * classes or a standard `Error` subclass, otherwise `Error`. A custom
