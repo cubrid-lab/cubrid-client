@@ -68,7 +68,11 @@ jobs:
           set -euo pipefail
           ready=false
           for attempt in $(seq 1 36); do
-            if docker exec cubrid-live csql -u dba testdb -c "SELECT 1" >/dev/null 2>&1; then
+            # Run csql as the service user, never as root. A root csql that wins
+            # the race with the entrypoint's createdb creates $CUBRID/log owned
+            # by root; the server then cannot write its logs and reports lock
+            # timeouts as -2 instead of -74/-75/-968 (issue #203).
+            if docker exec --user cubrid cubrid-live csql -u dba testdb -c "SELECT 1" >/dev/null 2>&1; then
               ready=true
               break
             fi

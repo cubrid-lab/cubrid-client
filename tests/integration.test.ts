@@ -2973,7 +2973,8 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
     const rejections = (results: PromiseSettledResult<unknown>[]): QueryError[] =>
       results.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
 
-    test("create the tables", async () => {
+    // Hooks rather than tests, so a run filtered by --test-name-pattern still has the tables.
+    before(async () => {
       const adapter = new NativeCubridAdapter(TEST_CONFIG);
 
       try {
@@ -3424,7 +3425,7 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       });
     });
 
-    test("drop the tables", async () => {
+    after(async () => {
       const adapter = new NativeCubridAdapter(TEST_CONFIG);
 
       try {
