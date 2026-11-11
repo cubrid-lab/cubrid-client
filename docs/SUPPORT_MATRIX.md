@@ -19,8 +19,9 @@ Node.js 18 and 20 have reached end-of-life upstream but remain in the
 declared 1.x contract; see the
 [Node.js support schedule](API_STABILITY.md#nodejs-support-schedule). The
 `@types/node` development dependency stays on `^18.19.0` to match the lowest
-declared version. The packed-package consumer smoke
-(`release-validation.yml`) still runs on Node 18/20/22 only.
+declared version. CI, the release preflight (`publish.yml`) and the
+packed-package CJS/ESM consumer smoke (`release-validation.yml`) all run on
+Node 18, 20, 22, 24 and 26 ([#96](https://github.com/cubrid-lab/cubrid-client/issues/96)).
 
 The `tsup` build-tool Node.js requirement is **not** the runtime floor for
 users importing the emitted npm package. A change to `engines` in 1.x is

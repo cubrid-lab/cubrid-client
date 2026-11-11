@@ -26,7 +26,7 @@ Python release strategy. The GitHub Release and npm publish steps are separate.
 A release PR that modifies `.release-please-manifest.json` or `CHANGELOG.md`
 automatically runs the **full Reviewed release validation gate**. It uses the
 four CUBRID 10.2/11.0/11.2/11.4 broker images rather than only the routine
-11.4 PR lane, plus real SSL=ON and Node 18/20/22 packaged consumer
+11.4 PR lane, plus real SSL=ON and Node 18/20/22/24/26 packaged consumer
 verification. Do not confuse the PR's proposed merge SHA with the final
 post-merge commit: the manual publish workflow revalidates that exact commit
 before tagging. Ordinary source PRs retain the existing faster 11.4 smoke
@@ -63,7 +63,7 @@ retained and no Release is created for it.
    A version is **not published** merely because the PR exists.
 2. Review the candidate notes and supported/unsupported behavior. The release
    PR automatically runs the **full four-version CUBRID matrix**, real
-   CUBRID 11.4 SSL=ON certificate checks, Node 18/20/22 packed ESM/CJS
+   CUBRID 11.4 SSL=ON certificate checks, Node 18/20/22/24/26 packed ESM/CJS
    smoke, API declaration verification, offline tests and security scans.
    Never merge while a required check has failed, been skipped or is absent.
 3. **Merging the reviewed Release Please PR into `main` automatically
@@ -72,7 +72,7 @@ retained and no Release is created for it.
    a matching Release Please PR was merged, and no version tag or npm
    artifact already exists. It is idempotent: an existing GitHub Release
    is not generated twice.
-4. The same automatic job repeats Node 18/20/22 preflight checks, high
+4. The same automatic job repeats Node 18/20/22/24/26 preflight checks, high
    severity dependency audit and the complete four-version live database,
    TLS and packed npm consumer validation on the **exact main commit**.
    Any failure blocks tag creation and npm publication.

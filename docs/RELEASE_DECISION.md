@@ -29,7 +29,7 @@ SemVer commitments.
 | Actual TLS security | [main SSL=ON broker run](https://github.com/cubrid-lab/cubrid-client/actions/runs/42217503095) | CUBRID 11.4: trusted CA/hostname round trip and rejection of untrusted/wrong-host certificates; not SSL testing of every version |
 | Independent protocol oracle | [PR #147](https://github.com/cubrid-lab/cubrid-client/pull/147) and [source table](PROTOCOL_ORACLES.md) | Literal code and packet tests include a BIGINT 21->26 mutation that must fail; does not cover every wire extension |
 | No silent live-test bypass | [PR #149](https://github.com/cubrid-lab/cubrid-client/pull/149) | Required live mode fails with an unreachable broker instead of self-skipping |
-| Package/API/security gate | [PR #146](https://github.com/cubrid-lab/cubrid-client/pull/146), [validation workflow](../.github/workflows/release-validation.yml) | Automated pre-tag dependency, Node 18/20/22 packed ESM/CJS smoke, live DB/TLS; final **candidate SHA** must still pass an explicit full dry run |
+| Package/API/security gate | [PR #146](https://github.com/cubrid-lab/cubrid-client/pull/146), [validation workflow](../.github/workflows/release-validation.yml) | Automated pre-tag dependency, Node 18/20/22/24/26 packed ESM/CJS smoke, live DB/TLS; final **candidate SHA** must still pass an explicit full dry run |
 
 A successful earlier branch/main run **does not** prove the final release
 candidate passes after subsequent changes. Copy the final immutable commit
@@ -81,7 +81,7 @@ from an earlier commit.
 - [ ] **Final candidate SHA** is validated with the no-publish
       [Reviewed release validation workflow](../.github/workflows/release-validation.yml):
       all four live database versions, real SSL=ON, negative gate behavior,
-      no skipped jobs, Node 18/20/22 package ESM/CJS smoke, API diff, audit.
+      no skipped jobs, Node 18/20/22/24/26 package ESM/CJS smoke, API diff, audit.
 - [ ] Reviewer examines the exact npm tarball file list and included
       TypeScript declarations/ESM and CommonJS exports; no undeclared runtime
       dependencies or wrong Node.js minimum.
