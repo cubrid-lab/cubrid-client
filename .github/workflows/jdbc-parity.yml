@@ -1,0 +1,131 @@
+name: JDBC semantic parity
+
+# Opt-in comparison of cubrid-client with the official CUBRID JDBC driver
+# (#118, docs/LEGACY_PARITY.md#official-jdbc-comparison). It is not part of
+# ordinary PR validation: it runs on CUBRID 11.4 only when a pull request
+# changes the protocol, adapter or the comparison itself, and on all four
+# versions when dispatched by hand or called by another workflow.
+#
+# Cost per version: one disposable CUBRID container, the pinned 285 KB JDBC
+# JAR from Maven Central (hash checked), JDK 17, and about 3 to 5 minutes,
+# mostly the server's DDL. Both runners took about 2.5 minutes together per
+# version locally.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/protocol/**"
+      - "src/adapters/**"
+      - "tests/jdbc-parity/**"
+      - "tests/jdbc-parity-compare.test.ts"
+      - ".github/workflows/jdbc-parity.yml"
+  workflow_dispatch:
+    inputs:
+      checkout_ref:
+        description: "Git commit SHA or tag to compare; blank uses the selected branch head"
+        type: string
+        required: false
+        default: ""
+  workflow_call:
+    inputs:
+      checkout_ref:
+        type: string
+        required: false
+        default: ""
+      full_matrix:
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  jdbc-parity:
+    name: CUBRID ${{ matrix.cubrid }} JDBC parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # A caller passes full_matrix; a pull request without it runs 11.4 only.
+        cubrid: ${{ fromJSON((inputs.full_matrix == false || (github.event_name == 'pull_request' && inputs.full_matrix != true)) && '["11.4"]' || '["10.2","11.0","11.2","11.4"]') }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - run: npm ci
+      - name: Download the pinned CUBRID JDBC driver and check its SHA-256
+        id: jar
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "path=$(node tests/jdbc-parity/fetch-jdbc.mjs "$RUNNER_TEMP/cubrid-jdbc")" >> "$GITHUB_OUTPUT"
+      - name: Start disposable CUBRID broker and database
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name cubrid-jdbc-parity \
+            -e CUBRID_DB=testdb \
+            -p 127.0.0.1:33000:33000 \
+            "cubrid/cubrid:${{ matrix.cubrid }}"
+      - name: Wait until a client can connect
+        env:
+          PORT: "33000"
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Probe with a client instead of `docker exec csql`, which runs as
+          # root inside the container and leaves root-owned logs (#203).
+          for attempt in $(seq 1 36); do
+            if node --import tsx -e '
+              import("./src/index.ts").then(async ({ createClient }) => {
+                const db = createClient({ host: "127.0.0.1", port: Number(process.env.PORT), database: "testdb", user: "dba", password: "", connectionTimeout: 3000 });
+                try { console.log(await db.getServerVersion()); } finally { await db.close(); }
+              });
+            ' 2>/dev/null; then
+              exit 0
+            fi
+            sleep 5
+          done
+          docker logs cubrid-jdbc-parity
+          echo "::error::CUBRID ${{ matrix.cubrid }} did not start; this is not a skipped comparison"
+          exit 1
+      - name: Compare JDBC and cubrid-client on the same broker
+        env:
+          CUBRID_TEST_PORT: "33000"
+          CUBRID_JDBC_JAR: ${{ steps.jar.outputs.path }}
+          JDBC_PARITY_OUT: ${{ runner.temp }}/jdbc-parity-results
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run test:jdbc-parity 2>&1 | tee "$RUNNER_TEMP/jdbc-parity.log"
+          # run.ts already fails on zero executed cases; also refuse a silently shrunken corpus.
+          executed=$(sed -n 's/.* executed=\([0-9]*\) .*/\1/p' "$RUNNER_TEMP/jdbc-parity.log" | tail -1)
+          if [ -z "$executed" ] || [ "$executed" -lt 30 ]; then
+            echo "::error::Expected at least 30 executed JDBC parity cases; got ${executed:-none}"
+            exit 1
+          fi
+          grep -E '^total=' "$RUNNER_TEMP/jdbc-parity.log" >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the normalized outputs and report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: jdbc-parity-cubrid-${{ matrix.cubrid }}
+          path: ${{ runner.temp }}/jdbc-parity-results
+          if-no-files-found: ignore
+      - name: Print failed container logs
+        if: failure()
+        run: docker logs cubrid-jdbc-parity || true
+      - name: Remove disposable database
+        if: always()
+        run: docker rm -f cubrid-jdbc-parity >/dev/null 2>&1 || true

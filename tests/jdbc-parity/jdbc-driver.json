@@ -1,0 +1,9 @@
+{
+  "groupId": "org.cubrid",
+  "artifactId": "cubrid-jdbc",
+  "version": "11.3.2.0053",
+  "url": "https://repo1.maven.org/maven2/org/cubrid/cubrid-jdbc/11.3.2.0053/cubrid-jdbc-11.3.2.0053.jar",
+  "sha256": "ab8ab5632382a3042c0f354dd903d53b4f15c67b462afbeddb4edcf0bf43ad1f",
+  "source": "https://github.com/CUBRID/cubrid-jdbc",
+  "note": "The only org.cubrid:cubrid-jdbc release on Maven Central on 2026-11-11 (maven-metadata.xml lastUpdated 20250904055331). Maven Central's published .sha256 matches."
+}

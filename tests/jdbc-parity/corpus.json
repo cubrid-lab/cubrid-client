@@ -1,0 +1,494 @@
+{
+  "description": "Bounded SQL/behavior corpus executed by both the official CUBRID JDBC driver (JdbcRunner.java) and the public cubrid-client API (ts-runner.ts) against the same live broker. See docs/LEGACY_PARITY.md#official-jdbc-comparison.",
+  "representations": {
+    "equivalent": [
+      ["null", "null"],
+      ["Short", "number"],
+      ["Integer", "number"],
+      ["Float", "number"],
+      ["Double", "number"],
+      ["String", "string"],
+      ["byte[]", "Buffer"],
+      ["Object[]", "Array"]
+    ],
+    "intentional": [
+      {
+        "jdbc": "Long",
+        "ts": "bigint",
+        "reason": "BIGINT is a JavaScript bigint so all 64 bits stay exact; JDBC uses java.lang.Long. Same value. docs/TYPES.md#reading-result-columns"
+      },
+      {
+        "jdbc": "BigDecimal",
+        "ts": "string",
+        "reason": "NUMERIC is returned as decimal text, because JavaScript has no decimal type; JDBC uses BigDecimal. Same digits and scale."
+      },
+      {
+        "jdbc": "Date",
+        "ts": "Date",
+        "reason": "DATE is a JavaScript Date (an instant) read in the client's timezone option; JDBC uses java.sql.Date. Compared as wall-clock fields. #113"
+      },
+      {
+        "jdbc": "Time",
+        "ts": "Date",
+        "reason": "TIME is a JavaScript Date on 1970-01-01; JDBC uses java.sql.Time. Compared as wall-clock fields. #113"
+      },
+      {
+        "jdbc": "CUBRIDTimestamp",
+        "ts": "Date",
+        "reason": "DATETIME and TIMESTAMP are JavaScript Date values; JDBC uses java.sql.Timestamp (driver subclass CUBRIDTimestamp). Compared as wall-clock fields. #113"
+      },
+      {
+        "jdbc": "CUBRIDBlob",
+        "ts": "Buffer",
+        "reason": "query() loads complete BLOB content into a Buffer; JDBC returns a locator-backed java.sql.Blob that the runner reads. Same bytes. docs/TYPES.md#blob-and-clob-columns"
+      },
+      {
+        "jdbc": "CUBRIDClob",
+        "ts": "string",
+        "reason": "query() loads complete CLOB content as a string; JDBC returns a locator-backed java.sql.Clob that the runner reads. Same text. docs/TYPES.md#blob-and-clob-columns"
+      }
+    ]
+  },
+  "cases": [
+    {
+      "id": "connect-server-version",
+      "area": "connection",
+      "steps": [{ "op": "version" }]
+    },
+    {
+      "id": "select-literals",
+      "area": "select",
+      "steps": [{ "op": "query", "sql": "SELECT 1 AS a, 'text' AS b, NULL AS c" }]
+    },
+    {
+      "id": "select-empty-result",
+      "area": "select",
+      "steps": [{ "op": "query", "sql": "SELECT 1 AS a FROM db_root WHERE 1 = 0" }]
+    },
+    {
+      "id": "dml-row-counts",
+      "area": "dml",
+      "setup": ["CREATE TABLE jp_dml (id INT PRIMARY KEY, v VARCHAR(20))"],
+      "cleanup": ["DROP TABLE IF EXISTS jp_dml"],
+      "steps": [
+        { "op": "exec", "sql": "INSERT INTO jp_dml VALUES (1, 'a'), (2, 'b'), (3, 'c')" },
+        { "op": "exec", "sql": "UPDATE jp_dml SET v = 'x' WHERE id > 1" },
+        { "op": "exec", "sql": "UPDATE jp_dml SET v = 'y' WHERE id > 99" },
+        { "op": "exec", "sql": "DELETE FROM jp_dml WHERE id = 3" },
+        { "op": "exec", "sql": "INSERT INTO jp_dml SELECT id + 10, v FROM jp_dml" },
+        { "op": "query", "sql": "SELECT id, v FROM jp_dml ORDER BY id" }
+      ]
+    },
+    {
+      "id": "ddl-row-count",
+      "area": "dml",
+      "cleanup": ["DROP TABLE IF EXISTS jp_ddl"],
+      "steps": [
+        { "op": "exec", "sql": "CREATE TABLE jp_ddl (id INT)" },
+        { "op": "exec", "sql": "DROP TABLE jp_ddl" }
+      ]
+    },
+    {
+      "id": "integer-ranges",
+      "area": "numeric",
+      "steps": [
+        {
+          "op": "query",
+          "sql": "SELECT CAST(-32768 AS SHORT) AS s_min, CAST(32767 AS SHORT) AS s_max, CAST(-2147483648 AS INT) AS i_min, CAST(2147483647 AS INT) AS i_max, CAST(0 AS INT) AS zero"
+        }
+      ]
+    },
+    {
+      "id": "bigint-ranges",
+      "area": "numeric",
+      "steps": [
+        {
+          "op": "query",
+          "sql": "SELECT CAST(9223372036854775807 AS BIGINT) AS b_max, CAST(-9223372036854775808 AS BIGINT) AS b_min, CAST(9007199254740993 AS BIGINT) AS b_unsafe, CAST(1 AS BIGINT) AS b_one"
+        }
+      ]
+    },
+    {
+      "id": "numeric-scale",
+      "area": "numeric",
+      "steps": [
+        {
+          "op": "query",
+          "sql": "SELECT CAST(12345678901234567890.123456789 AS NUMERIC(38,9)) AS n_big, CAST(-0.5 AS NUMERIC(5,2)) AS n_neg, CAST(0 AS NUMERIC(10,3)) AS n_zero, CAST(99999999999999999999999999999999999999 AS NUMERIC(38,0)) AS n_max, CAST(0.001 AS NUMERIC(4,3)) AS n_small"
+        }
+      ]
+    },
+    {
+      "id": "double-float-monetary",
+      "area": "numeric",
+      "steps": [
+        {
+          "op": "query",
+          "sql": "SELECT CAST(0.1 AS DOUBLE) AS d_tenth, CAST(1e308 AS DOUBLE) AS d_huge, CAST(-2.5 AS DOUBLE) AS d_neg, CAST(3 AS DOUBLE) AS d_int, CAST(0.1 AS FLOAT) AS f_tenth, CAST(12.34 AS MONETARY) AS m"
+        }
+      ]
+    },
+    {
+      "id": "stored-numeric-columns",
+      "area": "numeric",
+      "setup": [
+        "CREATE TABLE jp_num (i INT, b BIGINT, n NUMERIC(20,4), d DOUBLE, f FLOAT)",
+        "INSERT INTO jp_num VALUES (-7, -9007199254740993, 1234567890123456.7890, 6.02214076e23, 1.5)",
+        "INSERT INTO jp_num VALUES (NULL, NULL, NULL, NULL, NULL)"
+      ],
+      "cleanup": ["DROP TABLE IF EXISTS jp_num"],
+      "steps": [{ "op": "query", "sql": "SELECT i, b, n, d, f FROM jp_num ORDER BY i" }]
+    },
+    {
+      "id": "null-and-empty-literals",
+      "area": "null-empty",
+      "steps": [
+        {
+          "op": "query",
+          "sql": "SELECT '' AS e, NULL AS n, X'' AS eb, CAST('' AS CHAR(3)) AS ec, CAST(NULL AS INT) AS ni, CAST(NULL AS VARCHAR(5)) AS nv"
+        }
+      ]
+    },
+    {
+      "id": "null-and-empty-stored",
+      "area": "null-empty",
+      "setup": [
+        "CREATE TABLE jp_empty (id INT PRIMARY KEY, v VARCHAR(10), c CHAR(3), vb BIT VARYING(16))",
+        "INSERT INTO jp_empty VALUES (1, '', '', X'')",
+        "INSERT INTO jp_empty VALUES (2, NULL, NULL, NULL)",
+        "INSERT INTO jp_empty VALUES (3, ' ', 'a', X'0f')"
+      ],
+      "cleanup": ["DROP TABLE IF EXISTS jp_empty"],
+      "steps": [
+        { "op": "query", "sql": "SELECT id, v, c, vb FROM jp_empty ORDER BY id" },
+        {
+          "op": "query",
+          "sql": "SELECT COUNT(*) AS empty_not_null FROM jp_empty WHERE v = '' AND v IS NOT NULL"
+        }
+      ]
+    },
+    {
+      "id": "bit-strings",
+      "area": "null-empty",
+      "steps": [
+        {
+          "op": "query",
+          "sql": "SELECT X'0f' AS x1, B'1010' AS b4, CAST(X'ff' AS BIT(16)) AS bit16, CAST(X'00ff10' AS BIT VARYING(64)) AS vb"
+        }
+      ]
+    },
+    {
+      "id": "text-non-ascii-iso88591-database",
+      "area": "select",
+      "expectedDefect": {
+        "issue": "#238",
+        "steps": [1, 3, 5],
+        "reason": "cubrid-client always decodes CHAR/VARCHAR bytes as UTF-8. The CUBRID Docker images create testdb with charset iso88591, so the server stores the UTF-8 bytes that both drivers send (steps 2 and 4 agree on HEX and LENGTH) as iso88591 characters, and JDBC decodes them in that column charset. A byte that is not UTF-8, such as CHR(233), becomes U+FFFD in cubrid-client. Recorded, not fixed, by #118."
+      },
+      "setup": ["CREATE TABLE jp_text (id INT PRIMARY KEY, s VARCHAR(40))"],
+      "cleanup": ["DROP TABLE IF EXISTS jp_text"],
+      "steps": [
+        {
+          "op": "query",
+          "sql": "SELECT 'caf\u00e9 \ud55c\uae00 \u2603' AS u, 'quote''s \\ back' AS q"
+        },
+        {
+          "op": "query",
+          "sql": "SELECT HEX('caf\u00e9') AS h, LENGTH('caf\u00e9') AS l, CHARSET('x') AS cs"
+        },
+        { "op": "query", "sql": "SELECT CHR(233) AS latin1_e9, HEX(CHR(233)) AS h" },
+        {
+          "op": "execPrepared",
+          "sql": "INSERT INTO jp_text VALUES (?, ?)",
+          "params": [{ "t": "int", "v": 1 }, { "t": "string", "v": "caf\u00e9" }]
+        },
+        { "op": "query", "sql": "SELECT s, HEX(s) AS h FROM jp_text" }
+      ]
+    },
+    {
+      "id": "temporal-literals",
+      "area": "temporal",
+      "steps": [
+        {
+          "op": "query",
+          "sql": "SELECT DATE'2024-02-29' AS d, TIME'23:59:58' AS t, DATETIME'2024-02-29 13:45:59.123' AS dt, TIMESTAMP'2024-02-29 13:45:59' AS ts"
+        }
+      ]
+    },
+    {
+      "id": "temporal-boundaries",
+      "area": "temporal",
+      "setup": [
+        "CREATE TABLE jp_dates (id INT PRIMARY KEY, d DATE, t TIME, dt DATETIME, ts TIMESTAMP)",
+        "INSERT INTO jp_dates VALUES (1, DATE'0001-01-01', TIME'00:00:00', DATETIME'0001-01-01 00:00:00.000', TIMESTAMP'1970-01-01 09:00:01')",
+        "INSERT INTO jp_dates VALUES (2, DATE'9999-12-31', TIME'23:59:59', DATETIME'9999-12-31 23:59:59.999', TIMESTAMP'2038-01-19 03:14:07')",
+        "INSERT INTO jp_dates VALUES (3, DATE'1582-10-04', TIME'12:00:00', DATETIME'1582-10-04 12:00:00.000', TIMESTAMP'2000-02-29 00:00:00')",
+        "INSERT INTO jp_dates VALUES (4, DATE'1582-10-15', TIME'12:34:56', DATETIME'1582-10-15 12:00:00.001', TIMESTAMP'2026-03-08 02:30:00')",
+        "INSERT INTO jp_dates VALUES (5, NULL, NULL, NULL, NULL)"
+      ],
+      "cleanup": ["DROP TABLE IF EXISTS jp_dates"],
+      "steps": [{ "op": "query", "sql": "SELECT id, d, t, dt, ts FROM jp_dates ORDER BY id" }]
+    },
+    {
+      "id": "collections-literal",
+      "area": "collection",
+      "steps": [
+        {
+          "op": "query",
+          "sql": "SELECT CAST({3,1,2,2} AS SET OF INT) AS s, CAST({3,1,2,2} AS MULTISET OF INT) AS ms, CAST({3,1,2,2} AS SEQUENCE OF INT) AS sq, CAST({'b','a'} AS SET OF VARCHAR(5)) AS sv"
+        }
+      ]
+    },
+    {
+      "id": "collections-stored",
+      "area": "collection",
+      "setup": [
+        "CREATE TABLE jp_coll (id INT PRIMARY KEY, s SET OF VARCHAR(10), m MULTISET OF BIGINT, q SEQUENCE OF NUMERIC(6,2), dq SEQUENCE OF DATE)",
+        "INSERT INTO jp_coll VALUES (1, {'x','', 'y'}, {9007199254740993, 1, 1}, {1.50, -2.25}, {DATE'2024-01-02', DATE'1999-12-31'})",
+        "INSERT INTO jp_coll VALUES (2, {}, {}, {}, {})",
+        "INSERT INTO jp_coll VALUES (3, NULL, NULL, NULL, NULL)",
+        "INSERT INTO jp_coll VALUES (4, {NULL, 'z'}, {NULL, 5}, {NULL}, {NULL})"
+      ],
+      "cleanup": ["DROP TABLE IF EXISTS jp_coll"],
+      "steps": [{ "op": "query", "sql": "SELECT id, s, m, q, dq FROM jp_coll ORDER BY id" }]
+    },
+    {
+      "id": "lob-read",
+      "area": "lob",
+      "setup": [
+        "CREATE TABLE jp_lob (id INT PRIMARY KEY, b BLOB, c CLOB)",
+        "INSERT INTO jp_lob VALUES (1, BIT_TO_BLOB(X'00ff1080'), CHAR_TO_CLOB('hello clob'))",
+        "INSERT INTO jp_lob VALUES (2, BIT_TO_BLOB(X''), CHAR_TO_CLOB(''))",
+        "INSERT INTO jp_lob VALUES (3, NULL, NULL)"
+      ],
+      "cleanup": ["DROP TABLE IF EXISTS jp_lob"],
+      "steps": [{ "op": "query", "sql": "SELECT id, b, c FROM jp_lob ORDER BY id" }]
+    },
+    {
+      "id": "prepared-bind-roundtrip",
+      "area": "prepared",
+      "setup": [
+        "CREATE TABLE jp_bind (id INT PRIMARY KEY, i INT, b BIGINT, d DOUBLE, s VARCHAR(40), n VARCHAR(10), dt DATETIME, vb BIT VARYING(64))"
+      ],
+      "cleanup": ["DROP TABLE IF EXISTS jp_bind"],
+      "steps": [
+        {
+          "op": "execPrepared",
+          "sql": "INSERT INTO jp_bind VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          "params": [
+            { "t": "int", "v": 1 },
+            { "t": "int", "v": -2147483648 },
+            { "t": "bigint", "v": "-9223372036854775808" },
+            { "t": "double", "v": 0.1 },
+            { "t": "string", "v": "plain ' ? \\" },
+            { "t": "null" },
+            { "t": "datetime", "v": "2024-02-29 13:45:59.000" },
+            { "t": "bytes", "v": "00ff10" }
+          ]
+        },
+        { "op": "query", "sql": "SELECT id, i, b, d, s, n, dt, vb FROM jp_bind ORDER BY id" },
+        {
+          "op": "queryPrepared",
+          "sql": "SELECT id, s FROM jp_bind WHERE b = ? AND s = ?",
+          "params": [
+            { "t": "bigint", "v": "-9223372036854775808" },
+            { "t": "string", "v": "plain ' ? \\" }
+          ]
+        },
+        {
+          "op": "execPrepared",
+          "sql": "UPDATE jp_bind SET d = ? WHERE id = ?",
+          "params": [{ "t": "double", "v": -1.5e-300 }, { "t": "int", "v": 1 }]
+        },
+        { "op": "query", "sql": "SELECT d FROM jp_bind" }
+      ]
+    },
+    {
+      "id": "prepared-datetime-millis",
+      "area": "prepared",
+      "setup": ["CREATE TABLE jp_bind_ms (id INT PRIMARY KEY, dt DATETIME)"],
+      "cleanup": ["DROP TABLE IF EXISTS jp_bind_ms"],
+      "steps": [
+        {
+          "op": "execPrepared",
+          "sql": "INSERT INTO jp_bind_ms VALUES (?, ?)",
+          "params": [{ "t": "int", "v": 1 }, { "t": "datetime", "v": "2024-02-29 13:45:59.678" }]
+        },
+        { "op": "query", "sql": "SELECT dt FROM jp_bind_ms" }
+      ]
+    },
+    {
+      "id": "prepared-row-counts",
+      "area": "prepared",
+      "setup": [
+        "CREATE TABLE jp_bind_cnt (id INT PRIMARY KEY)",
+        "INSERT INTO jp_bind_cnt VALUES (1), (2), (3), (4), (5)"
+      ],
+      "cleanup": ["DROP TABLE IF EXISTS jp_bind_cnt"],
+      "steps": [
+        {
+          "op": "execPrepared",
+          "sql": "DELETE FROM jp_bind_cnt WHERE id > ?",
+          "params": [{ "t": "int", "v": 2 }]
+        },
+        {
+          "op": "execPrepared",
+          "sql": "DELETE FROM jp_bind_cnt WHERE id > ?",
+          "params": [{ "t": "int", "v": 2 }]
+        },
+        {
+          "op": "queryPrepared",
+          "sql": "SELECT COUNT(*) AS c FROM jp_bind_cnt WHERE id <= ?",
+          "params": [{ "t": "int", "v": 100 }]
+        }
+      ]
+    },
+    {
+      "id": "prepared-type-mismatch-error",
+      "area": "error",
+      "setup": ["CREATE TABLE jp_bind_err (i INT)"],
+      "cleanup": ["DROP TABLE IF EXISTS jp_bind_err"],
+      "steps": [
+        {
+          "op": "execPrepared",
+          "sql": "INSERT INTO jp_bind_err VALUES (?)",
+          "params": [{ "t": "string", "v": "not a number" }]
+        },
+        { "op": "query", "sql": "SELECT COUNT(*) AS c FROM jp_bind_err" }
+      ]
+    },
+    {
+      "id": "multi-fetch-8192-rows",
+      "area": "fetch",
+      "setup": [
+        "CREATE TABLE jp_big (id INT PRIMARY KEY, label VARCHAR(40), amount DOUBLE, stamp DATETIME)",
+        "INSERT INTO jp_big VALUES (1, 'row-1', 0.125, DATETIME'2024-01-01 00:00:00.000')",
+        "INSERT INTO jp_big SELECT id + 1, 'row-' || CAST(id + 1 AS VARCHAR), (id + 1) / 8.0, stamp + 1001 FROM jp_big",
+        "INSERT INTO jp_big SELECT id + 2, 'row-' || CAST(id + 2 AS VARCHAR), (id + 2) / 8.0, stamp + 2002 FROM jp_big",
+        "INSERT INTO jp_big SELECT id + 4, 'row-' || CAST(id + 4 AS VARCHAR), (id + 4) / 8.0, stamp + 4004 FROM jp_big",
+        "INSERT INTO jp_big SELECT id + 8, 'row-' || CAST(id + 8 AS VARCHAR), (id + 8) / 8.0, stamp + 8008 FROM jp_big",
+        "INSERT INTO jp_big SELECT id + 16, 'row-' || CAST(id + 16 AS VARCHAR), (id + 16) / 8.0, stamp + 16016 FROM jp_big",
+        "INSERT INTO jp_big SELECT id + 32, 'row-' || CAST(id + 32 AS VARCHAR), (id + 32) / 8.0, stamp + 32032 FROM jp_big",
+        "INSERT INTO jp_big SELECT id + 64, 'row-' || CAST(id + 64 AS VARCHAR), (id + 64) / 8.0, stamp + 64064 FROM jp_big",
+        "INSERT INTO jp_big SELECT id + 128, 'row-' || CAST(id + 128 AS VARCHAR), (id + 128) / 8.0, stamp + 128128 FROM jp_big",
+        "INSERT INTO jp_big SELECT id + 256, 'row-' || CAST(id + 256 AS VARCHAR), (id + 256) / 8.0, stamp + 256256 FROM jp_big",
+        "INSERT INTO jp_big SELECT id + 512, 'row-' || CAST(id + 512 AS VARCHAR), (id + 512) / 8.0, stamp + 512512 FROM jp_big",
+        "INSERT INTO jp_big SELECT id + 1024, 'row-' || CAST(id + 1024 AS VARCHAR), (id + 1024) / 8.0, stamp + 1025024 FROM jp_big",
+        "INSERT INTO jp_big SELECT id + 2048, 'row-' || CAST(id + 2048 AS VARCHAR), (id + 2048) / 8.0, stamp + 2050048 FROM jp_big",
+        "INSERT INTO jp_big SELECT id + 4096, 'row-' || CAST(id + 4096 AS VARCHAR), (id + 4096) / 8.0, stamp + 4100096 FROM jp_big"
+      ],
+      "cleanup": ["DROP TABLE IF EXISTS jp_big"],
+      "steps": [
+        {
+          "op": "query",
+          "sql": "SELECT id, label, amount, stamp FROM jp_big ORDER BY id",
+          "digest": true
+        },
+        { "op": "query", "sql": "SELECT COUNT(*) AS c, SUM(id) AS s FROM jp_big" }
+      ]
+    },
+    {
+      "id": "autocommit-visibility",
+      "area": "transaction",
+      "setup": ["CREATE TABLE jp_tx_auto (id INT PRIMARY KEY)"],
+      "cleanup": ["DROP TABLE IF EXISTS jp_tx_auto"],
+      "steps": [
+        { "op": "exec", "conn": "a", "sql": "INSERT INTO jp_tx_auto VALUES (1)" },
+        { "op": "query", "conn": "b", "sql": "SELECT id FROM jp_tx_auto" }
+      ]
+    },
+    {
+      "id": "explicit-rollback-visibility",
+      "area": "transaction",
+      "setup": ["CREATE TABLE jp_tx_rb (id INT PRIMARY KEY)"],
+      "cleanup": ["DROP TABLE IF EXISTS jp_tx_rb"],
+      "steps": [
+        { "op": "begin", "conn": "a" },
+        { "op": "exec", "conn": "a", "sql": "INSERT INTO jp_tx_rb VALUES (1)" },
+        { "op": "query", "conn": "a", "sql": "SELECT id FROM jp_tx_rb" },
+        { "op": "query", "conn": "b", "sql": "SELECT id FROM jp_tx_rb" },
+        { "op": "rollback", "conn": "a" },
+        { "op": "query", "conn": "a", "sql": "SELECT id FROM jp_tx_rb" },
+        { "op": "query", "conn": "b", "sql": "SELECT id FROM jp_tx_rb" }
+      ]
+    },
+    {
+      "id": "explicit-commit-visibility",
+      "area": "transaction",
+      "setup": ["CREATE TABLE jp_tx_cm (id INT PRIMARY KEY)"],
+      "cleanup": ["DROP TABLE IF EXISTS jp_tx_cm"],
+      "steps": [
+        { "op": "begin", "conn": "a" },
+        { "op": "exec", "conn": "a", "sql": "INSERT INTO jp_tx_cm VALUES (1)" },
+        { "op": "query", "conn": "b", "sql": "SELECT id FROM jp_tx_cm" },
+        { "op": "commit", "conn": "a" },
+        { "op": "query", "conn": "b", "sql": "SELECT id FROM jp_tx_cm" }
+      ]
+    },
+    {
+      "id": "failed-statement-inside-transaction",
+      "area": "transaction",
+      "setup": ["CREATE TABLE jp_tx_err (id INT PRIMARY KEY)"],
+      "cleanup": ["DROP TABLE IF EXISTS jp_tx_err"],
+      "steps": [
+        { "op": "begin", "conn": "a" },
+        { "op": "exec", "conn": "a", "sql": "INSERT INTO jp_tx_err VALUES (1)" },
+        { "op": "exec", "conn": "a", "sql": "INSERT INTO jp_tx_err VALUES (1)" },
+        { "op": "exec", "conn": "a", "sql": "INSERT INTO jp_tx_err VALUES (2)" },
+        { "op": "commit", "conn": "a" },
+        { "op": "query", "conn": "b", "sql": "SELECT id FROM jp_tx_err ORDER BY id" }
+      ]
+    },
+    {
+      "id": "error-syntax",
+      "area": "error",
+      "steps": [
+        { "op": "query", "sql": "SELEC 1" },
+        { "op": "query", "sql": "SELECT 2 AS after_error" }
+      ]
+    },
+    {
+      "id": "error-unknown-table",
+      "area": "error",
+      "steps": [
+        { "op": "query", "sql": "SELECT * FROM jp_definitely_missing_table" },
+        { "op": "exec", "sql": "DELETE FROM jp_definitely_missing_table" },
+        { "op": "query", "sql": "SELECT 3 AS after_error" }
+      ]
+    },
+    {
+      "id": "error-unique-violation",
+      "area": "error",
+      "setup": [
+        "CREATE TABLE jp_uniq (id INT PRIMARY KEY, u VARCHAR(10) UNIQUE)",
+        "INSERT INTO jp_uniq VALUES (1, 'a')"
+      ],
+      "cleanup": ["DROP TABLE IF EXISTS jp_uniq"],
+      "steps": [
+        { "op": "exec", "sql": "INSERT INTO jp_uniq VALUES (1, 'b')" },
+        { "op": "exec", "sql": "INSERT INTO jp_uniq VALUES (2, 'a')" },
+        {
+          "op": "execPrepared",
+          "sql": "INSERT INTO jp_uniq VALUES (?, ?)",
+          "params": [{ "t": "int", "v": 1 }, { "t": "string", "v": "c" }]
+        },
+        { "op": "query", "sql": "SELECT id, u FROM jp_uniq ORDER BY id" }
+      ]
+    },
+    {
+      "id": "error-semantic-unknown-column",
+      "area": "error",
+      "steps": [{ "op": "query", "sql": "SELECT jp_no_such_column FROM db_root" }]
+    },
+    {
+      "id": "session-replacement-stale-handle",
+      "area": "failure-path",
+      "unverified": "Needs a broker restart or CAS kill between statements; not part of this bounded lane. Covered only by the native integration suite, not compared with JDBC."
+    },
+    {
+      "id": "uncertain-outcome-no-replay",
+      "area": "failure-path",
+      "unverified": "Needs fault injection after a statement reaches the server; JDBC and cubrid-client cannot be compared without a proxy. Native behavior is documented in docs/TYPES.md#values-that-cannot-be-decoded and API_REFERENCE error details."
+    }
+  ]
+}

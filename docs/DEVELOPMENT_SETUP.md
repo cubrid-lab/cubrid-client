@@ -41,6 +41,14 @@ CUBRID_LIVE_REQUIRED=1 npm run test:integration
 
 The integration fixture documents `CUBRID_TEST_PORT` (default 33000) and other `CUBRID_TEST_*` overrides; inspect the fixture before adjusting credentials/endpoint. **Never** pass production credentials into a test suite or leak passwords in CI logs. A release candidate requires an explicit tested CUBRID matrix and a nonzero count of executed SQL assertions, beyond this workstation smoke.
 
+### Official JDBC comparison
+
+For a protocol or value-decoding change, `npm run test:jdbc-parity` runs the same
+SQL corpus through the official CUBRID JDBC driver and this client against one
+broker and fails on an unexpected difference. It needs Java 11 or later, the
+pinned JAR from `npm run -s jdbc-parity:fetch`, `CUBRID_JDBC_JAR` and
+`CUBRID_TEST_PORT`. See [the official JDBC comparison](LEGACY_PARITY.md#official-jdbc-comparison).
+
 ## Consumer and release checks
 
 ```sh
