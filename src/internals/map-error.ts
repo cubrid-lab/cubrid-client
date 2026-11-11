@@ -97,6 +97,14 @@ function isInstance<T>(value: unknown, type: abstract new (...args: never[]) => 
   }
 }
 
+/**
+ * Whether `error` is the reason of the caller's own abort, which every layer
+ * passes on as it is, the way `fetch()` does.
+ */
+export function isAbortReason(error: unknown, signal: AbortSignal | undefined): boolean {
+  return signal?.aborted === true && error === signal.reason;
+}
+
 export function toError(error: unknown): Error {
   if (isInstance(error, Error)) {
     return error;

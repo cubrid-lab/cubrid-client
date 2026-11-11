@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import { createServer, type Socket as NetSocket, type Server } from "node:net";
 import test from "node:test";
 import { inspect } from "node:util";
@@ -187,6 +188,11 @@ class FakeCASConnection {
     payload: Buffer,
   ): Promise<Buffer | null> {
     return this.sendAndRecvOnSession(generation, header, payload);
+  }
+
+  /** The real connection limits the requests `run` makes; this one only runs it. */
+  async runScoped<T>(_scope: unknown, run: () => Promise<T>): Promise<T> {
+    return run();
   }
 
   async close(beforeClose?: () => Promise<void>): Promise<void> {
@@ -2006,12 +2012,18 @@ function openDatabaseFrame(): Buffer {
   return frame(Buffer.alloc(16));
 }
 
+/** A reply sent `delay` milliseconds after its request arrived. */
+interface Delayed {
+  delay: number;
+  reply: Buffer;
+}
+
 /**
  * Stub CAS. `scripts[n]` answers the requests of the nth connection in order;
  * STALL leaves that request unanswered and a missing entry answers success.
  */
 async function createScriptedCas(
-  scripts: Array<Array<Buffer | typeof STALL>>,
+  scripts: Array<Array<Buffer | typeof STALL | Delayed>>,
 ): Promise<{ server: Server; port: number; requests: number[] }> {
   const requests: number[] = [];
   const server = createServer((socket: NetSocket) => {
@@ -2025,8 +2037,12 @@ async function createScriptedCas(
           const index = requests[connection]!;
           requests[connection] = index + 1;
           const reply = scripts[connection]?.[index] ?? CLOSE_OK;
-          if (reply !== STALL) {
+          if (Buffer.isBuffer(reply)) {
             socket.write(frame(reply));
+          } else if (reply !== STALL) {
+            setTimeout(() => {
+              if (!socket.destroyed) socket.write(frame(reply.reply));
+            }, reply.delay);
           }
         });
       });
@@ -4264,4 +4280,356 @@ test("stream: the adapter checks its options and fetchSize config like the clien
   const { adapter } = createAdapterWithFakeCAS();
   assert.throws(() => adapter.stream("SELECT 1", undefined, { fetchSize: 0 }), RangeError);
   assert.throws(() => adapter.stream("SELECT 1", undefined, { consumerTimeout: -1 }), RangeError);
+});
+
+// ---------------------------------------------------------------------------
+// Per-query options: AbortSignal and readTimeout (#150)
+// ---------------------------------------------------------------------------
+
+const ADAPTER_METHODS = [
+  "query",
+  "queryResult",
+  "execute",
+  "queryPrepared",
+  "queryResultPrepared",
+  "executePrepared",
+] as const;
+
+function callAdapter(
+  adapter: NativeCubridAdapter,
+  method: (typeof ADAPTER_METHODS)[number],
+  sql: string,
+  options: unknown,
+): Promise<unknown> {
+  return (
+    adapter as unknown as Record<
+      (typeof ADAPTER_METHODS)[number],
+      (sql: string, params: unknown[], options: unknown) => Promise<unknown>
+    >
+  )[method](sql, [], options);
+}
+
+/** A client with no readTimeout of its own, unless one is given. */
+function optionsClient(port: number, readTimeout?: number) {
+  return createClient({
+    host: "127.0.0.1",
+    port,
+    database: "testdb",
+    user: "dba",
+    ...(readTimeout !== undefined && { readTimeout }),
+  });
+}
+
+function abortAfter(ms: number, reason: unknown): AbortSignal {
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(reason), ms);
+  return controller.signal;
+}
+
+function selectReply(value: string): Buffer {
+  return buildSelectResponse([{ name: "v", type: 2 }], [[value]]);
+}
+
+function sentSql(fakeCAS: FakeCASConnection): string[] {
+  return fakeCAS.sentPayloads
+    .filter((payload) => payload[0] === CASFunctionCode.PREPARE_AND_EXECUTE)
+    .map((payload) => payload.toString("latin1"));
+}
+
+test("an already aborted signal sends nothing and opens no session", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS._isConnected = false;
+  const reason = new Error("cancelled before it started");
+  const controller = new AbortController();
+  controller.abort(reason);
+
+  for (const method of ADAPTER_METHODS) {
+    await assert.rejects(
+      callAdapter(adapter, method, "SELECT 1", { signal: controller.signal }),
+      (error) => error === reason,
+    );
+  }
+
+  assert.equal(fakeCAS.sendAndRecvCalls, 0);
+  assert.equal(fakeCAS.connectCalls, 0);
+});
+
+test("the adapter refuses invalid query options at once and sends nothing", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+
+  for (const method of ADAPTER_METHODS) {
+    await assert.rejects(callAdapter(adapter, method, "SELECT 1", { readTimeout: -1 }), RangeError);
+    await assert.rejects(callAdapter(adapter, method, "SELECT 1", { signal: {} }), TypeError);
+  }
+
+  assert.equal(fakeCAS.sendAndRecvCalls, 0);
+});
+
+test("an abort while queued removes the statement: nothing is sent and the session stays", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(INSERT_OK);
+  fakeCAS.queueResponse(CLOSE_OK);
+  fakeCAS.queueResponse(INSERT_OK);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const send = fakeCAS.sendAndRecv.bind(fakeCAS);
+  let first = true;
+  fakeCAS.sendAndRecv = async (header: Buffer, payload: Buffer) => {
+    if (first) {
+      first = false;
+      await gate;
+    }
+    return send(header, payload);
+  };
+
+  const running = adapter.query("INSERT INTO t VALUES (1)");
+  const controller = new AbortController();
+  const reason = new Error("not needed any more");
+  const queued = adapter.query("INSERT INTO t VALUES (2)", [], { signal: controller.signal });
+  const behind = adapter.query("INSERT INTO t VALUES (3)");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  controller.abort(reason);
+  await assert.rejects(queued, (error) => error === reason);
+
+  release();
+  await running;
+  await behind;
+
+  const sent = sentSql(fakeCAS);
+  assert.equal(sent.length, 2);
+  assert.ok(sent[0]?.includes("VALUES (1)"));
+  assert.ok(sent[1]?.includes("VALUES (3)"));
+  assert.equal(fakeCAS.discardCalls, 0);
+  assert.equal(fakeCAS.isConnected, true);
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+});
+
+test("an abort in flight rejects at once with its reason, retires the socket and is not replayed", {
+  timeout: 5000,
+}, async () => {
+  const { server, port, requests } = await createScriptedCas([[STALL], [INSERT_OK, CLOSE_OK]]);
+  const client = optionsClient(port);
+  const reason = new Error("stopped by the caller");
+
+  try {
+    const started = Date.now();
+    await assert.rejects(
+      client.query("INSERT INTO t VALUES (1)", [], { signal: abortAfter(50, reason) }),
+      (error) => error === reason,
+    );
+    assert.ok(Date.now() - started < 1000);
+
+    assert.deepEqual(await client.query("INSERT INTO t VALUES (2)"), []);
+    assert.deepEqual(requests, [1, 2]);
+  } finally {
+    await client.close();
+    await closeStub(server);
+  }
+});
+
+test("a late reply to an aborted statement never answers the next one", {
+  timeout: 5000,
+}, async () => {
+  const { server, port, requests } = await createScriptedCas([
+    [{ delay: 150, reply: selectReply("late") }],
+    [selectReply("fresh"), CLOSE_OK, selectReply("fresh")],
+  ]);
+  const client = optionsClient(port);
+  const reason = new Error("stopped by the caller");
+
+  try {
+    await assert.rejects(
+      client.query("SELECT v FROM t", [], { signal: abortAfter(30, reason) }),
+      (error) => error === reason,
+    );
+
+    assert.deepEqual(await client.query("SELECT v FROM t"), [{ v: "fresh" }]);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.deepEqual(await client.query("SELECT v FROM t"), [{ v: "fresh" }]);
+    assert.equal(requests[0], 1);
+  } finally {
+    await client.close();
+    await closeStub(server);
+  }
+});
+
+test("an abort during a FETCH of a multi-window result retires the socket", {
+  timeout: 5000,
+}, async () => {
+  const { server, port, requests } = await createScriptedCas([
+    [buildPartialSelectResponse(3), STALL],
+    [INSERT_OK, CLOSE_OK],
+  ]);
+  const client = optionsClient(port);
+  const reason = new Error("stopped by the caller");
+
+  try {
+    await assert.rejects(
+      client.query("SELECT id FROM t", [], { signal: abortAfter(50, reason) }),
+      (error) => error === reason,
+    );
+
+    // Neither the handle release nor an END_TRAN followed on the retired socket.
+    assert.deepEqual(requests, [2]);
+    assert.deepEqual(await client.query("INSERT INTO t VALUES (2)"), []);
+    assert.deepEqual(requests, [2, 2]);
+  } finally {
+    await client.close();
+    await closeStub(server);
+  }
+});
+
+test("an abort inside a transaction loses it: later statements and commit fail", {
+  timeout: 5000,
+}, async () => {
+  const { server, port, requests } = await createScriptedCas([[INSERT_OK, CLOSE_OK, STALL]]);
+  const client = optionsClient(port);
+  const reason = new Error("stopped by the caller");
+
+  try {
+    const scope = await client.beginTransactionScope();
+    await scope.query("INSERT INTO t VALUES (1)");
+    await assert.rejects(
+      scope.execute("INSERT INTO t VALUES (2)", [], { signal: abortAfter(50, reason) }),
+      (error) => error === reason,
+    );
+
+    await assert.rejects(scope.query("INSERT INTO t VALUES (3)"), (error: unknown) => {
+      assert.ok(error instanceof TransactionError);
+      assert.match(
+        String(((error.cause as Error).cause as Error).message),
+        /Connection lost during transaction/,
+      );
+      return true;
+    });
+    await assert.rejects(scope.commit(), TransactionError);
+
+    // Nothing reached a new session while the transaction was unresolved.
+    assert.deepEqual(requests, [3]);
+  } finally {
+    await client.close();
+    await closeStub(server);
+  }
+});
+
+test("statements queued behind an aborted one behave as after a timeout", {
+  timeout: 5000,
+}, async () => {
+  const { server, port, requests } = await createScriptedCas([
+    [INSERT_OK, CLOSE_OK, STALL],
+    [INSERT_OK, CLOSE_OK],
+  ]);
+  const client = optionsClient(port);
+  const reason = new Error("stopped by the caller");
+
+  try {
+    await client.query("INSERT INTO t VALUES (1)");
+    const aborted = client.query("INSERT INTO t VALUES (2)", [], {
+      signal: abortAfter(50, reason),
+    });
+    const queued = client.query("INSERT INTO t VALUES (3)");
+
+    await assert.rejects(aborted, (error) => error === reason);
+    await assert.rejects(queued, (error: unknown) => {
+      assert.ok(error instanceof QueryError);
+      assert.match(((error.cause as Error).cause as Error).message, /not connected/);
+      return true;
+    });
+
+    await client.query("INSERT INTO t VALUES (4)");
+    assert.deepEqual(requests, [3, 2]);
+  } finally {
+    await client.close();
+    await closeStub(server);
+  }
+});
+
+test("a per-query readTimeout applies where the client has none, and retires the socket", {
+  timeout: 5000,
+}, async () => {
+  const { server, port, requests } = await createScriptedCas([[STALL], [INSERT_OK, CLOSE_OK]]);
+  const client = optionsClient(port);
+
+  try {
+    await assert.rejects(
+      client.query("INSERT INTO t VALUES (1)", [], { readTimeout: 100 }),
+      (error: unknown) => error instanceof ReadTimeoutError && error.timeoutMs === 100,
+    );
+
+    assert.deepEqual(await client.query("INSERT INTO t VALUES (2)"), []);
+    assert.deepEqual(requests, [1, 2]);
+  } finally {
+    await client.close();
+    await closeStub(server);
+  }
+});
+
+test("a per-query readTimeout overrides the client's for that request only", {
+  timeout: 5000,
+}, async () => {
+  const { server, port } = await createScriptedCas([
+    [{ delay: 300, reply: INSERT_OK }, CLOSE_OK, { delay: 300, reply: INSERT_OK }, CLOSE_OK, STALL],
+  ]);
+  const client = optionsClient(port, 100);
+
+  try {
+    assert.deepEqual(await client.query("INSERT INTO t VALUES (1)", [], { readTimeout: 1000 }), []);
+    assert.deepEqual(await client.query("INSERT INTO t VALUES (2)", [], { readTimeout: 0 }), []);
+
+    await assert.rejects(
+      client.query("INSERT INTO t VALUES (3)"),
+      (error: unknown) => error instanceof ReadTimeoutError && error.timeoutMs === 100,
+    );
+  } finally {
+    await client.close();
+    await closeStub(server);
+  }
+});
+
+test("a per-query readTimeout also limits the statement's FETCH", { timeout: 5000 }, async () => {
+  const { server, port, requests } = await createScriptedCas([
+    [buildPartialSelectResponse(3), STALL],
+    [INSERT_OK, CLOSE_OK],
+  ]);
+  const client = optionsClient(port);
+
+  try {
+    await assert.rejects(
+      client.query("SELECT id FROM t", [], { readTimeout: 100 }),
+      (error: unknown) => error instanceof ReadTimeoutError && error.timeoutMs === 100,
+    );
+    assert.deepEqual(await client.query("INSERT INTO t VALUES (2)"), []);
+    assert.deepEqual(requests, [2, 2]);
+  } finally {
+    await client.close();
+    await closeStub(server);
+  }
+});
+
+test("abort listeners are removed when statements settle", { timeout: 10000 }, async () => {
+  const CALLS = 50;
+  const script = Array.from({ length: CALLS * 4 }, (_, index) =>
+    index % 2 === 0 ? INSERT_OK : CLOSE_OK,
+  );
+  const { server, port } = await createScriptedCas([script]);
+  const client = optionsClient(port);
+  const signal = new AbortController().signal;
+
+  try {
+    for (let index = 0; index < CALLS; index += 1) {
+      await client.query("INSERT INTO t VALUES (1)", [], { signal, readTimeout: 1000 });
+    }
+    assert.equal(getEventListeners(signal, "abort").length, 0);
+
+    await Promise.all(
+      Array.from({ length: CALLS }, () => client.query("INSERT INTO t VALUES (1)", [], { signal })),
+    );
+    assert.equal(getEventListeners(signal, "abort").length, 0);
+  } finally {
+    await client.close();
+    await closeStub(server);
+  }
 });

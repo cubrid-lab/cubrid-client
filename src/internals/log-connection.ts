@@ -14,6 +14,7 @@ import type {
   ConnectionFactory,
   ConnectionLike,
   ExecuteResult,
+  QueryOptions,
   StreamOptions,
 } from "../types/client.js";
 import type { QueryParams } from "../types/query.js";
@@ -134,11 +135,15 @@ export function withLogging(factory: ConnectionFactory, logger: unknown): Connec
 
     const wrapped: ConnectionLike = {
       connect: () => timed("connect", {}, () => inner.connect()),
-      query: <T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams) =>
+      query: <T extends QueryResultRow = QueryResultRow>(
+        sql: string,
+        params?: QueryParams,
+        options?: QueryOptions,
+      ) =>
         timed(
           "query",
           { paramCount: params?.length ?? 0 },
-          () => inner.query<T>(sql, params),
+          () => inner.query<T>(sql, params, options),
           (rows) => rows.length,
         ),
       beginTransaction: () => timed("beginTransaction", {}, () => inner.beginTransaction()),
@@ -151,29 +156,35 @@ export function withLogging(factory: ConnectionFactory, logger: unknown): Connec
       wrapped.queryResult = <T extends QueryResultRow = QueryResultRow>(
         sql: string,
         params?: QueryParams,
+        options?: QueryOptions,
       ): Promise<QueryResult<T>> =>
         timed(
           "queryResult",
           { paramCount: params?.length ?? 0 },
-          () => queryResult<T>(sql, params),
+          () => queryResult<T>(sql, params, options),
           (result) => result.rows.length,
         );
     }
     const execute = inner.execute?.bind(inner);
     if (execute) {
-      wrapped.execute = (sql: string, params?: QueryParams): Promise<ExecuteResult> =>
-        timed("execute", { paramCount: params?.length ?? 0 }, () => execute(sql, params));
+      wrapped.execute = (
+        sql: string,
+        params?: QueryParams,
+        options?: QueryOptions,
+      ): Promise<ExecuteResult> =>
+        timed("execute", { paramCount: params?.length ?? 0 }, () => execute(sql, params, options));
     }
     const queryPrepared = inner.queryPrepared?.bind(inner);
     if (queryPrepared) {
       wrapped.queryPrepared = <T extends QueryResultRow = QueryResultRow>(
         sql: string,
         params?: QueryParams,
+        options?: QueryOptions,
       ): Promise<T[]> =>
         timed(
           "queryPrepared",
           { paramCount: params?.length ?? 0 },
-          () => queryPrepared<T>(sql, params),
+          () => queryPrepared<T>(sql, params, options),
           (rows) => rows.length,
         );
     }
@@ -182,19 +193,24 @@ export function withLogging(factory: ConnectionFactory, logger: unknown): Connec
       wrapped.queryResultPrepared = <T extends QueryResultRow = QueryResultRow>(
         sql: string,
         params?: QueryParams,
+        options?: QueryOptions,
       ): Promise<QueryResult<T>> =>
         timed(
           "queryResultPrepared",
           { paramCount: params?.length ?? 0 },
-          () => queryResultPrepared<T>(sql, params),
+          () => queryResultPrepared<T>(sql, params, options),
           (result) => result.rows.length,
         );
     }
     const executePrepared = inner.executePrepared?.bind(inner);
     if (executePrepared) {
-      wrapped.executePrepared = (sql: string, params?: QueryParams): Promise<ExecuteResult> =>
+      wrapped.executePrepared = (
+        sql: string,
+        params?: QueryParams,
+        options?: QueryOptions,
+      ): Promise<ExecuteResult> =>
         timed("executePrepared", { paramCount: params?.length ?? 0 }, () =>
-          executePrepared(sql, params),
+          executePrepared(sql, params, options),
         );
     }
     const setTransactionOptions = inner.setTransactionOptions?.bind(inner);

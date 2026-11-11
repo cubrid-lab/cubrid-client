@@ -148,6 +148,18 @@ It does not run while the connection is idle, or while a request waits its turn 
 
 The timeout is per client and applies to the built-in native driver. A custom `connectionFactory` receives the value in its `ClientConfig` and decides what to do with it.
 
+### Per-statement timeout and cancellation
+
+One statement can override the client's limit, or be cancelled with an `AbortSignal`, without changing the client (#150):
+
+```ts
+await db.query("SELECT * FROM big_report", [], { readTimeout: 120000 }); // longer for this one
+await db.query("SELECT 1 FROM db_root", [], { readTimeout: 0 }); // no limit for this one
+await db.query("SELECT * FROM t", [], { signal: AbortSignal.timeout(2000) }); // total-time limit
+```
+
+A per-statement `readTimeout` has the same inactivity semantics and the same consequences as the client option above, for that statement and its FETCH, LOB_READ and END_TRAN requests only. A `signal` that aborts after the statement was sent discards the socket in the same way and rejects with `signal.reason`, so everything above about queued requests, transactions and the unknown outcome applies too. A statement aborted while still waiting for its turn is simply removed: nothing is sent and the session is kept. See [Cancelling one statement](API_REFERENCE.md#cancelling-one-statement). The built-in driver honors these options; a custom `connectionFactory` receives them as the last argument of each statement method.
+
 ## Lazy Connection
 
 `cubrid-client` uses **lazy connection** — the TCP connection to CUBRID is not established when you call `createClient()`. The actual connection is created on the **first query**.

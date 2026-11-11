@@ -32,6 +32,7 @@ export type {
   PreparedQueryable,
   PreparedTransactionClient,
   Queryable,
+  QueryOptions,
   ResultQueryable,
   ResultTransactionClient,
   Streamable,

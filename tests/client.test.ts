@@ -22,6 +22,7 @@ import type {
   ConnectionLike,
   ExecuteResult,
   PreparedTransactionClient,
+  QueryOptions,
   TransactionClient,
   TransactionOptions,
 } from "../src/types/client.js";
@@ -2879,4 +2880,289 @@ test("stream after close() rejects on its first read and opens no connection", a
 
   await assert.rejects(() => client.stream("SELECT 1").next(), QueryError);
   assert.equal(opened, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Per-query options: AbortSignal and readTimeout (#150)
+// ---------------------------------------------------------------------------
+
+const QUERY_METHODS = [
+  "query",
+  "queryResult",
+  "execute",
+  "queryPrepared",
+  "queryResultPrepared",
+  "executePrepared",
+] as const;
+
+type QueryMethod = (typeof QUERY_METHODS)[number];
+type QueryRunner = (
+  method: QueryMethod,
+  sql: string,
+  params?: QueryParams,
+  options?: QueryOptions,
+) => Promise<unknown>;
+
+/** Calls `method` on anything that has the six statement methods. */
+function runner(target: unknown): QueryRunner {
+  return (method, sql, params, options) =>
+    (
+      target as Record<
+        QueryMethod,
+        (sql: string, params?: QueryParams, options?: QueryOptions) => Promise<unknown>
+      >
+    )[method](sql, params, options);
+}
+
+/** A connection whose six statement methods record their arguments. */
+class OptionsConnection extends FakeConnection {
+  calls: Array<[string, string, QueryParams | undefined, QueryOptions | undefined]> = [];
+  failure?: unknown;
+
+  private run(
+    method: string,
+    sql: string,
+    params: QueryParams | undefined,
+    options: QueryOptions | undefined,
+    result: unknown,
+  ): Promise<never> {
+    this.calls.push([method, sql, params, options]);
+    return this.failure === undefined
+      ? Promise.resolve(result as never)
+      : Promise.reject(this.failure);
+  }
+
+  override query<T extends Record<string, unknown>>(
+    sql: string,
+    params?: QueryParams,
+    options?: QueryOptions,
+  ): Promise<T[]> {
+    return this.run("query", sql, params, options, []);
+  }
+
+  queryResult<T extends Record<string, unknown>>(
+    sql: string,
+    params?: QueryParams,
+    options?: QueryOptions,
+  ): Promise<QueryResult<T>> {
+    return this.run("queryResult", sql, params, options, { rows: [], columns: [] });
+  }
+
+  execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult> {
+    return this.run("execute", sql, params, options, { affectedRows: 0 });
+  }
+
+  queryPrepared<T extends Record<string, unknown>>(
+    sql: string,
+    params?: QueryParams,
+    options?: QueryOptions,
+  ): Promise<T[]> {
+    return this.run("queryPrepared", sql, params, options, []);
+  }
+
+  queryResultPrepared<T extends Record<string, unknown>>(
+    sql: string,
+    params?: QueryParams,
+    options?: QueryOptions,
+  ): Promise<QueryResult<T>> {
+    return this.run("queryResultPrepared", sql, params, options, { rows: [], columns: [] });
+  }
+
+  executePrepared(
+    sql: string,
+    params?: QueryParams,
+    options?: QueryOptions,
+  ): Promise<ExecuteResult> {
+    return this.run("executePrepared", sql, params, options, { affectedRows: 0 });
+  }
+}
+
+/** Runs `use` on the client, on a transaction() `tx` and on a scope handle. */
+async function onEveryQueryable(
+  connection: OptionsConnection,
+  use: (run: QueryRunner, where: string) => Promise<void>,
+): Promise<void> {
+  const client = createClient(baseOptions({ connectionFactory: () => connection }));
+
+  await use(runner(client), "client");
+  await client
+    .transaction(async (tx) => {
+      await use(runner(tx), "transaction");
+    })
+    .catch((error: unknown) => {
+      // A rejected statement fails the transaction; `use` already checked it.
+      assert.ok(error instanceof TransactionError);
+    });
+  const scope = await client.beginTransactionScope();
+  await use(runner(scope), "scope");
+  await scope.rollback();
+  await client.close();
+}
+
+test("every statement method forwards its QueryOptions to the connection", async () => {
+  const connection = new OptionsConnection();
+  const options: QueryOptions = { signal: new AbortController().signal, readTimeout: 250 };
+
+  await onEveryQueryable(connection, async (run) => {
+    for (const method of QUERY_METHODS) {
+      await run(method, "SELECT 1", [1], options);
+    }
+  });
+
+  assert.equal(connection.calls.length, QUERY_METHODS.length * 3);
+  for (const [index, [method, sql, params, forwarded]] of connection.calls.entries()) {
+    assert.equal(method, QUERY_METHODS[index % QUERY_METHODS.length]);
+    assert.equal(sql, "SELECT 1");
+    assert.deepEqual(params, [1]);
+    assert.equal(forwarded, options);
+  }
+});
+
+test("an already aborted signal rejects with its reason and reaches no connection", async () => {
+  const controller = new AbortController();
+  const reason = new Error("cancelled before it started");
+  controller.abort(reason);
+  let opened = 0;
+  const client = createClient(
+    baseOptions({
+      connectionFactory: () => {
+        opened += 1;
+        return new OptionsConnection();
+      },
+    }),
+  );
+
+  for (const method of QUERY_METHODS) {
+    await assert.rejects(
+      runner(client)(method, "SELECT 1", [], { signal: controller.signal }),
+      (error) => error === reason,
+    );
+  }
+  assert.equal(opened, 0);
+
+  const connection = new OptionsConnection();
+  await onEveryQueryable(connection, async (run, where) => {
+    if (where === "client") return;
+    for (const method of QUERY_METHODS) {
+      await assert.rejects(
+        run(method, "SELECT 1", [], { signal: controller.signal }),
+        (error) => error === reason,
+      );
+    }
+  });
+  assert.deepEqual(connection.calls, []);
+});
+
+test("an abort reason from the connection is passed through unchanged", async () => {
+  const controller = new AbortController();
+  const reason = new DOMException("stopped", "AbortError");
+  const connection = new OptionsConnection();
+  connection.failure = reason;
+
+  await onEveryQueryable(connection, async (run) => {
+    // The connection fails with the reason while the signal is not aborted yet:
+    // only the caller's own abort keeps its identity.
+    for (const method of QUERY_METHODS) {
+      await assert.rejects(
+        run(method, "SELECT 1", [], { signal: controller.signal }),
+        (error) => error !== reason && (error as Error).cause === reason,
+      );
+    }
+  });
+
+  const live = new AbortController();
+  const aborting = new OptionsConnection();
+  aborting.failure = reason;
+  aborting.query = (async () => {
+    live.abort(reason);
+    throw reason;
+  }) as OptionsConnection["query"];
+  const client = createClient(baseOptions({ connectionFactory: () => aborting }));
+  await assert.rejects(
+    client.query("SELECT 1", [], { signal: live.signal }),
+    (error) => error === reason,
+  );
+});
+
+test("an abort reason from a transaction's connection is passed through unchanged", async () => {
+  const live = new AbortController();
+  const reason = new Error("stopped by the caller");
+  const connection = new OptionsConnection();
+  connection.query = (async () => {
+    live.abort(reason);
+    throw reason;
+  }) as OptionsConnection["query"];
+  const client = createClient(baseOptions({ connectionFactory: () => connection }));
+
+  let seen: unknown;
+  await client
+    .transaction(async (tx) => {
+      seen = await tx.query("SELECT 1", [], { signal: live.signal }).catch((error) => error);
+    })
+    .catch(() => undefined);
+  assert.equal(seen, reason);
+
+  const second = new AbortController();
+  connection.query = (async () => {
+    second.abort(reason);
+    throw reason;
+  }) as OptionsConnection["query"];
+  const scope = await client.beginTransactionScope();
+  await assert.rejects(
+    scope.query("SELECT 1", [], { signal: second.signal }),
+    (error) => error === reason,
+  );
+  await scope.rollback();
+  await client.close();
+});
+
+for (const [name, options, type] of [
+  ["a negative readTimeout", { readTimeout: -1 }, RangeError],
+  ["a NaN readTimeout", { readTimeout: Number.NaN }, RangeError],
+  ["an infinite readTimeout", { readTimeout: Number.POSITIVE_INFINITY }, RangeError],
+  ["a readTimeout over 2^31-1", { readTimeout: 2 ** 31 }, RangeError],
+  ["a string readTimeout", { readTimeout: "100" }, RangeError],
+  ["a signal that is not an AbortSignal", { signal: { aborted: false } }, TypeError],
+  ["options that are not an object", "fast", TypeError],
+  ["null options", null, TypeError],
+] as const) {
+  test(`every statement method refuses ${name} at once and sends nothing`, async () => {
+    const connection = new OptionsConnection();
+
+    await onEveryQueryable(connection, async (run) => {
+      for (const method of QUERY_METHODS) {
+        await assert.rejects(run(method, "SELECT 1", [], options as unknown as QueryOptions), type);
+      }
+    });
+
+    assert.deepEqual(connection.calls, []);
+  });
+}
+
+test("readTimeout 0 and an unaborted signal are valid query options", async () => {
+  const connection = new OptionsConnection();
+  const client = createClient(baseOptions({ connectionFactory: () => connection }));
+
+  await client.query("SELECT 1", [], { readTimeout: 0 });
+  await client.query("SELECT 1", [], { signal: new AbortController().signal });
+  await client.query("SELECT 1", [], {});
+
+  assert.equal(connection.calls.length, 3);
+});
+
+test("the logging wrapper forwards QueryOptions", async () => {
+  const connection = new OptionsConnection();
+  const client = createClient(
+    baseOptions({ connectionFactory: () => connection, logger: { debug: () => undefined } }),
+  );
+  const options: QueryOptions = { readTimeout: 10 };
+
+  for (const method of QUERY_METHODS) {
+    await runner(client)(method, "SELECT 1", [], options);
+  }
+
+  assert.deepEqual(
+    connection.calls.map(([method, , , forwarded]) => [method, forwarded]),
+    QUERY_METHODS.map((method) => [method, options]),
+  );
 });

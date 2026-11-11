@@ -168,8 +168,39 @@ export interface ClientOptions {
   connectionFactory?: ConnectionFactory;
 }
 
+/**
+ * Options of one statement, the optional last argument of `query()`,
+ * `queryResult()`, `execute()` and their `Prepared` forms.
+ *
+ * After an abort or a timeout while the statement was on the wire, its outcome
+ * on the server is unknown: it may have run, and in autocommit mode it may be
+ * committed. Verify before running it again. See `docs/API_REFERENCE.md`.
+ */
+export interface QueryOptions {
+  /**
+   * Cancels this statement. Already aborted: it rejects at once with
+   * `signal.reason` and nothing is sent. Aborted while it waits behind other
+   * statements: it leaves the queue, nothing is sent and the session is kept.
+   * Aborted once sent: the connection is discarded so a late reply can never
+   * answer another statement, it rejects with `signal.reason`, and it is never
+   * retried. Inside a transaction that loses the transaction.
+   */
+  signal?: AbortSignal;
+  /**
+   * {@link ClientOptions.readTimeout} for this statement only, including its
+   * FETCH, LOB and END_TRAN requests: the same inactivity limit and
+   * `ReadTimeoutError`. 0 means no timeout for this statement. Must be from 0 to
+   * 2147483647.
+   */
+  readTimeout?: number;
+}
+
 export interface Queryable {
-  query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
+  query<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+    options?: QueryOptions,
+  ): Promise<T[]>;
 }
 
 /** Runs a statement and reports its rows with their column metadata. */
@@ -177,6 +208,7 @@ export interface ResultQueryable {
   queryResult<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
+    options?: QueryOptions,
   ): Promise<QueryResult<T>>;
 }
 
@@ -238,7 +270,7 @@ export interface ExecuteResult {
 
 /** Runs a statement and reports its {@link ExecuteResult} instead of rows. */
 export interface Executable {
-  execute(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+  execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
 }
 
 /**
@@ -252,12 +284,18 @@ export interface PreparedQueryable {
   queryPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
+    options?: QueryOptions,
   ): Promise<T[]>;
   queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
+    options?: QueryOptions,
   ): Promise<QueryResult<T>>;
-  executePrepared(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+  executePrepared(
+    sql: string,
+    params?: QueryParams,
+    options?: QueryOptions,
+  ): Promise<ExecuteResult>;
 }
 
 export interface TransactionClient extends Queryable {
@@ -309,7 +347,11 @@ export interface TransactionScope
 
 export interface ConnectionLike {
   connect(): Promise<void>;
-  query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams): Promise<T[]>;
+  query<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+    options?: QueryOptions,
+  ): Promise<T[]>;
   /**
    * Optional so 1.x connection factories keep compiling. `queryResult()` on a
    * client or transaction fails when its connection does not provide it.
@@ -317,12 +359,13 @@ export interface ConnectionLike {
   queryResult?<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
+    options?: QueryOptions,
   ): Promise<QueryResult<T>>;
   /**
    * Optional so 1.x connection factories keep compiling. `execute()` on a
    * client or transaction fails when its connection does not provide it.
    */
-  execute?(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+  execute?(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
   /**
    * Optional so 1.x connection factories keep compiling. The prepared methods
    * on a client or transaction fail when their connection does not provide
@@ -331,12 +374,18 @@ export interface ConnectionLike {
   queryPrepared?<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
+    options?: QueryOptions,
   ): Promise<T[]>;
   queryResultPrepared?<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
+    options?: QueryOptions,
   ): Promise<QueryResult<T>>;
-  executePrepared?(sql: string, params?: QueryParams): Promise<ExecuteResult>;
+  executePrepared?(
+    sql: string,
+    params?: QueryParams,
+    options?: QueryOptions,
+  ): Promise<ExecuteResult>;
   beginTransaction(): Promise<void>;
   commit(): Promise<void>;
   rollback(): Promise<void>;
