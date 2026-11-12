@@ -84,10 +84,22 @@ jobs:
             exit 1
           fi
           docker inspect --format '{{.Config.Image}}' cubrid-live
+      - name: Create a utf8 database for the charset tests (#238)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # testdb is iso88591 in these images; the charset tests also need a
+          # database created with en_US.utf8. Run as the service user (#203).
+          docker exec --user cubrid cubrid-live bash -lc \
+            'mkdir -p "$CUBRID_DATABASES/testu8" && cd "$CUBRID_DATABASES/testu8" &&
+             cubrid createdb --db-volume-size=20M --log-volume-size=20M testu8 en_US.utf8 &&
+             cubrid server start testu8'
+          docker exec --user cubrid cubrid-live csql -u dba testu8 -c "SELECT 1" >/dev/null
       - name: Execute non-skippable live integration tests
         env:
           CUBRID_LIVE_REQUIRED: "1"
           CUBRID_TEST_PORT: "33000"
+          CUBRID_TEST_UTF8_DATABASE: testu8
         shell: bash
         run: |
           set -euo pipefail
