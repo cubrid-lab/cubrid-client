@@ -349,10 +349,14 @@ Once the transaction is complete, `tx.query()`, `tx.queryResult()`, `tx.execute(
 to the server. If the rollback or
 the connection close also fails, `error.cause` stays the original failure and the
 later ones are on `error.rollbackError` and `error.closeError`. Await every
-statement: one that is still running when the commit starts and then fails
-rolls the transaction back. See the
+statement. A failure you awaited and caught is your decision, so the rest still
+commits. A statement nobody awaited or attached a handler to, such as
+`void tx.query(sql)`, rolls the transaction back if it fails, whether it fails
+before the callback returns or after. Any handler counts, including
+`.finally()` and a `Promise.all()` you never await: then the rest commits and
+Node.js reports the unhandled rejection. See the
 [transaction lifecycle](docs/API_REFERENCE.md#transaction-lifecycle) for every
-outcome and the [compatibility notes](docs/API_STABILITY.md#transaction-callback-guards).
+outcome and the [compatibility notes](docs/API_STABILITY.md#unobserved-statement-failures).
 
 ### Isolation level and lock timeout
 

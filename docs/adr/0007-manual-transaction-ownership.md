@@ -76,6 +76,9 @@ Adopt the explicit ownership capability, additively, in 1.x:
   rolled back) when a statement of the scope still running at `commit()` fails,
   rollback after a refused COMMIT. A failure that settled before `commit()` was
   called is the caller's to handle. Either outcome closes the connection.
+  *Amended by [ADR 0009](0009-unobserved-statement-failures-roll-back.md):* a
+  failure refuses the commit if and only if nothing observed the statement's
+  promise, whenever it settled.
 - Deliberate difference from `transaction()`: a close failure after a successful
   commit does **not** reject, because the commit stands and a rejection would
   invite a retry; `transaction()` keeps rethrowing it for 1.x compatibility.

@@ -165,7 +165,7 @@ test("scope: a commit racing a second commit sends COMMIT once and closes once",
   assert.deepEqual(connections[0]!.calls, ["begin", "commit", "close"]);
 });
 
-test("scope: commit waits for a statement still running, then refuses if it failed", async () => {
+test("scope: commit waits for a statement still running, then refuses if nothing observed its failure", async () => {
   const { client, connections } = setup();
   const tx = await client.beginTransactionScope();
   const own = connections[0]!;
@@ -175,8 +175,8 @@ test("scope: commit waits for a statement still running, then refuses if it fail
   });
   own.queryError = new Error("constraint violated");
 
-  const pending = tx.query("INSERT dup");
-  pending.catch(() => undefined);
+  // Not observed (ADR 0009): no handler was ever attached to it.
+  void tx.query("INSERT dup");
   const committing = tx.commit();
   release();
 
@@ -187,6 +187,26 @@ test("scope: commit waits for a statement still running, then refuses if it fail
   });
   // Never committed: the work is rolled back and the connection closed.
   assert.deepEqual(own.calls, ["begin", "query:INSERT dup", "rollback", "close"]);
+});
+
+test("scope: commit waits for a statement still running and commits past a failure the caller observed", async () => {
+  const { client, connections } = setup();
+  const tx = await client.beginTransactionScope();
+  const [own] = connections;
+  assert.ok(own);
+  let release!: () => void;
+  own.gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  own.queryError = new Error("constraint violated");
+
+  const handled = tx.query("INSERT dup").catch(() => "handled");
+  const committing = tx.commit();
+  release();
+  await committing;
+
+  assert.equal(await handled, "handled");
+  assert.deepEqual(own.calls, ["begin", "query:INSERT dup", "commit", "close"]);
 });
 
 test("scope: a refused COMMIT rolls back, closes, and reports both failures", async () => {

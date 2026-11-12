@@ -168,11 +168,71 @@ const COMPLETED_MESSAGES: Record<Exclude<CallbackTransactionState, "open">, stri
 };
 
 /**
+ * The promise a statement of a `CallbackTransaction` returns. Attaching a
+ * rejection handler to it, directly or further down a chain of `then(onFulfilled)`
+ * calls, marks the statement observed (ADR 0009). `await`, `.catch()`,
+ * `.finally()`, `.then(f, g)`, `Promise.all()`, `Promise.allSettled()` and
+ * returning it from an async function all call `then()` with a rejection
+ * handler: a native `await` assimilates it through `then()` because its
+ * constructor is not `Promise`.
+ *
+ * What counts is whether a handler was attached, not when the statement settles.
+ */
+class StatementPromise<T> extends Promise<T> {
+  /** Marks the statement observed; derived promises without a rejection handler share it. */
+  observe: () => void = () => undefined;
+
+  // biome-ignore lint/suspicious/noThenProperty: overriding Promise.prototype.then is the point
+  override then<TResult1 = T, TResult2 = never>(
+    onfulfilled?: ((value: T) => TResult1 | PromiseLike<TResult1>) | null,
+    // biome-ignore lint/suspicious/noExplicitAny: the signature of Promise.prototype.then
+    onrejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | null,
+  ): Promise<TResult1 | TResult2> {
+    if (typeof onrejected === "function") {
+      this.observe();
+    }
+
+    const derived = super.then(onfulfilled, onrejected);
+
+    // A rejection passes through to the derived promise, so a handler attached
+    // there observes this statement's failure too.
+    if (typeof onrejected !== "function" && derived instanceof StatementPromise) {
+      derived.observe = this.observe;
+    }
+    return derived;
+  }
+}
+
+/** One statement issued through a `CallbackTransaction`, kept until the outcome is decided. */
+interface StatementRecord {
+  /** Resolves once the statement settled. Never rejects. */
+  readonly settled: Promise<void>;
+  failed: boolean;
+  reason: unknown;
+  observed: boolean;
+}
+
+/**
+ * Marks a promise handled without observing it, so Node.js does not report it.
+ * The base `then()` bypasses the override; the promise it derives is a
+ * `StatementPromise` whose `observe` does nothing.
+ */
+function markHandled(promise: Promise<unknown>): void {
+  Promise.prototype.then.call(promise, undefined, () => {
+    // Reported by the transaction instead.
+  });
+}
+
+/**
  * The `tx` handed to a `CubridClient.transaction()` callback. It allows exactly
  * one terminal outcome, whether the callback asks for it through `commit()` or
  * `rollback()` or the client decides when the callback settles. Everything
  * after that outcome rejects without reaching the connection: the adapter is
  * back in autocommit by then, so a late statement would persist on its own.
+ *
+ * A statement that failed stops the commit only if nothing observed its promise
+ * (ADR 0009): `void tx.query()` and a promise left untouched. Whether a handler
+ * was attached is a property of the code, not of when the failure arrived.
  *
  * `CubridTransaction` stays an unguarded forwarder because its constructor is
  * public 1.x API and a caller may reuse one across several transactions.
@@ -180,9 +240,16 @@ const COMPLETED_MESSAGES: Record<Exclude<CallbackTransactionState, "open">, stri
 export class CallbackTransaction extends CubridTransaction {
   protected state: CallbackTransactionState = "open";
   private completion: Promise<void> | undefined;
-  private readonly runningQueries = new Set<Promise<unknown>>();
-  private readonly justRejectedQueries = new Set<Promise<unknown>>();
-  private readonly rejectedQueries = new Set<Promise<unknown>>();
+  /**
+   * Statements in the order they were issued, so the failure reported is the same
+   * whichever settled first. A statement leaves once it settled and either
+   * succeeded or was observed, since it can no longer stop the commit.
+   */
+  private readonly statements = new Set<StatementRecord>();
+  /** The callback returned without completing, so the client commits on its behalf. */
+  private committingForCallback = false;
+  /** Set once every statement settled and the outcome is decided. */
+  private decided = false;
 
   /** Why the rollback failed, once one was attempted and rejected. */
   rollbackFailure: Error | undefined;
@@ -257,10 +324,9 @@ export class CallbackTransaction extends CubridTransaction {
    * because returning normally must not report work that was not committed.
    */
   async finish(): Promise<void> {
-    for (const query of this.justRejectedQueries) {
-      this.runningQueries.add(query);
+    if (!this.completion) {
+      this.committingForCallback = true;
     }
-
     await (this.completion ?? this.commit());
   }
 
@@ -269,14 +335,6 @@ export class CallbackTransaction extends CubridTransaction {
    * rejects, so the caller keeps its original failure; see `rollbackFailure`.
    */
   async abort(): Promise<void> {
-    // Nobody may ever look at these now, and the callback's failure is the one reported.
-    // A rejection left alone until the event loop moved on was already reported by Node.js.
-    for (const query of this.rejectedQueries) {
-      query.catch(() => {
-        // The transaction failed for another reason.
-      });
-    }
-
     await (this.completion ?? this.rollback()).catch(() => {
       // Recorded in rollbackFailure when it matters; the original error wins.
     });
@@ -285,44 +343,59 @@ export class CallbackTransaction extends CubridTransaction {
   /** Runs one statement of this transaction, unless the transaction is over. */
   private track<R>(statement: () => Promise<R>): Promise<R> {
     if (this.state !== "open") {
-      return Promise.reject(new TransactionError(COMPLETED_MESSAGES[this.state]));
+      const refused = new TransactionError(COMPLETED_MESSAGES[this.state]);
+
+      // Work the callback left running is still issuing statements while the client
+      // commits for it. This one is never sent, so committing would persist the
+      // rest of the work without it. An explicit commit() keeps the 1.x rule: the
+      // late statement is refused and the commit stands.
+      if (this.committingForCallback && this.state === "completing" && !this.decided) {
+        this.statements.add({
+          settled: Promise.resolve(),
+          failed: true,
+          reason: refused,
+          observed: false,
+        });
+      }
+      return Promise.reject(refused);
     }
 
     const pending = statement();
-
-    // Tracks the promise the caller holds, so settling it later also marks it handled.
-    // It leaves the set in the same step that settles it, so it is never untracked
-    // while still pending.
-    const settle = async (): Promise<R> => {
-      try {
-        return await pending;
-      } catch (error) {
-        this.rememberRejection(running);
-        throw error;
-      } finally {
-        this.runningQueries.delete(running);
+    // Settled from the internal promise before the record below is, so a handler
+    // the caller attached directly to `result` runs before the outcome is decided.
+    const result = new StatementPromise<R>((resolve, reject) => {
+      pending.then(resolve, reject);
+    });
+    const record: StatementRecord = {
+      // Attached to the internal promise, never to the one the caller holds.
+      settled: pending.then(
+        () => {
+          this.statements.delete(record);
+        },
+        (error: unknown) => {
+          record.failed = true;
+          record.reason = error;
+          if (record.observed) {
+            this.statements.delete(record);
+          }
+        },
+      ),
+      failed: false,
+      reason: undefined,
+      observed: false,
+    };
+    result.observe = () => {
+      record.observed = true;
+      if (record.failed) {
+        this.statements.delete(record);
       }
     };
-    const running = settle();
+    // A failure nobody observed is reported by the commit it refuses, or is
+    // irrelevant to a rollback, so Node.js should not report it as well.
+    markHandled(result);
 
-    this.runningQueries.add(running);
-    return running;
-  }
-
-  /**
-   * Keeps a rejected query visible to finish() for two microtask turns. A callback
-   * that awaited it resumes one turn after the rejection, and transaction() resumes
-   * one turn after the callback returns, so by then this entry is gone. A query still
-   * here when the callback settles rejected too late for the callback to have seen it.
-   */
-  protected rememberRejection(query: Promise<unknown>): void {
-    this.rejectedQueries.add(query);
-    this.justRejectedQueries.add(query);
-    queueMicrotask(() => {
-      queueMicrotask(() => {
-        this.justRejectedQueries.delete(query);
-      });
-    });
+    this.statements.add(record);
+    return result;
   }
 
   private complete(outcome: "commit" | "rollback"): Promise<void> {
@@ -344,24 +417,24 @@ export class CallbackTransaction extends CubridTransaction {
    * A query the callback did not await may not have sent its statement yet: the
    * first bound query on a connection waits for the backslash-mode probe. END_TRAN
    * must follow it, or the statement lands outside the transaction it was issued in.
-   * Settling them also marks their promises handled: this is where a failure is reported.
+   * Nothing new can be issued meanwhile: the state is no longer "open".
    */
-  private settleRunningQueries(): Promise<PromiseSettledResult<unknown>[]> {
-    return Promise.allSettled(this.runningQueries);
+  private async settleStatements(): Promise<void> {
+    await Promise.all([...this.statements].map((record) => record.settled));
+    this.decided = true;
   }
 
   private async runCommit(): Promise<void> {
     try {
-      // Nobody awaited a query still running here, so nobody decided its failure was
-      // acceptable. Committing would persist the rest of the work without it. A query
-      // that rejected before the callback's last step cannot be told apart from a handled one.
-      const results = await this.settleRunningQueries();
-      const failed = results.find(
-        (result): result is PromiseRejectedResult => result.status === "rejected",
-      );
+      await this.settleStatements();
 
-      if (failed) {
-        throw failed.reason;
+      // Nobody observed this failure, so nobody decided it was acceptable, and
+      // committing would persist the rest of the work without it. In issue order,
+      // so the cause does not depend on which statement settled first.
+      for (const record of this.statements) {
+        if (record.failed && !record.observed) {
+          throw record.reason;
+        }
       }
 
       await super.commit();
@@ -381,7 +454,7 @@ export class CallbackTransaction extends CubridTransaction {
   }
 
   private async runRollback(): Promise<void> {
-    await this.settleRunningQueries();
+    await this.settleStatements();
 
     try {
       await super.rollback();
@@ -398,8 +471,8 @@ export class CallbackTransaction extends CubridTransaction {
  * The handle `beginTransactionScope()` returns (#112). It owns a dedicated
  * connection, so statements sent on the client meanwhile cannot join its
  * transaction. It keeps the guarantees of the `transaction()` callback's `tx`:
- * one terminal outcome, a commit refused while one of its statements is still
- * failing, and a rollback after a failed commit. Whichever way it ends, its
+ * one terminal outcome, a commit refused (and rolled back) while a statement
+ * failed that nothing observed, and a rollback after a failed commit. Whichever way it ends, its
  * connection goes back to `source` (closed by a client, released or destroyed
  * by a pool) and its owner stops tracking it.
  */
@@ -439,12 +512,6 @@ export class ScopedTransaction extends CallbackTransaction {
       // Nothing to report: close() is not about this transaction's outcome.
     });
   }
-
-  /**
-   * A handle may live long and run many statements whose failures its caller
-   * handled; only finish() and abort() of the transaction() callback read these.
-   */
-  protected override rememberRejection(): void {}
 
   private end(run: () => Promise<void>, message: string, committing: boolean): Promise<void> {
     if (this.ending) {

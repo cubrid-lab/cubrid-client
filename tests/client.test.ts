@@ -3367,3 +3367,393 @@ test("a failed set keeps its per-set detail through a transaction and its rollba
   assert.equal(connection.rollbackCalls, 2);
   assert.equal(connection.commitCalls, 0);
 });
+
+// ---------------------------------------------------------------------------
+// Observed and unobserved statement failures (#244, ADR 0009): the outcome
+// depends on whether a handler was attached, never on when a failure arrives
+// ---------------------------------------------------------------------------
+
+type Schedule = "early" | "late";
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Fails every statement whose SQL starts with BAD. In the early schedule it
+ * fails at once, well before a callback that waits 10 ms returns; in the late
+ * schedule 30 ms after it was issued, after such a callback returned.
+ */
+class ScheduledConnection extends RecordingConnection {
+  readonly failure = new Error("statement failed");
+
+  constructor(private readonly schedule: Schedule) {
+    super();
+  }
+
+  override async query<T extends Record<string, unknown> = Record<string, unknown>>(
+    sql: string,
+    params?: QueryParams,
+  ): Promise<T[]> {
+    if (!sql.startsWith("BAD")) {
+      return super.query<T>(sql, params);
+    }
+
+    this.calls.push(`query:${sql}`);
+    if (this.schedule === "late") {
+      await delay(30);
+    }
+    this.calls.push(`failed:${sql}`);
+    throw this.failure;
+  }
+}
+
+/** Runs `body` in a transaction() callback that returns 10 ms after it, under one schedule. */
+async function runScheduled(
+  schedule: Schedule,
+  body: (tx: StatementTransaction) => Promise<void>,
+): Promise<{
+  connection: ScheduledConnection;
+  outcome: PromiseSettledResult<string>;
+  unhandled: unknown[];
+}> {
+  const connection = new ScheduledConnection(schedule);
+  let outcome: PromiseSettledResult<string> | undefined;
+
+  const { unhandled } = await collectUnhandledRejections(async () => {
+    [outcome] = await Promise.allSettled([
+      transactionClient(connection).transaction(async (tx) => {
+        await body(tx);
+        await delay(10);
+        connection.calls.push("returned");
+        return "value";
+      }),
+    ]);
+  });
+
+  assert.ok(outcome);
+  return { connection, outcome, unhandled };
+}
+
+/** Which of the two happened first, so each schedule is shown to be the one it claims. */
+function failedBeforeReturn(connection: ScheduledConnection): boolean {
+  const failed = connection.calls.indexOf("failed:BAD INSERT");
+  const returned = connection.calls.indexOf("returned");
+  assert.ok(failed >= 0 && returned >= 0);
+  return failed < returned;
+}
+
+/** transaction() rolled back because a statement failed with `raw` and nothing observed it. */
+function rejectsUnobserved(raw: unknown) {
+  return (error: unknown) =>
+    error instanceof TransactionError &&
+    error.message === "Transaction failed." &&
+    error.cause instanceof TransactionError &&
+    error.cause.cause === raw;
+}
+
+const COMMITTED = "committed";
+const ROLLED_BACK = "rolled back";
+
+const SCHEDULED_CASES: Array<{
+  name: string;
+  body: (tx: StatementTransaction) => Promise<void>;
+  /** Whether the late schedule's failure arrives after the callback returned. */
+  detached: boolean;
+  expected: typeof COMMITTED | typeof ROLLED_BACK;
+}> = [
+  {
+    name: "awaited and caught, then continued",
+    detached: false,
+    expected: COMMITTED,
+    body: async (tx) => {
+      try {
+        await tx.query("BAD INSERT");
+      } catch {
+        await tx.query("UPDATE");
+      }
+    },
+  },
+  {
+    name: "awaited with .catch()",
+    detached: false,
+    expected: COMMITTED,
+    body: async (tx) => {
+      await tx.query("BAD INSERT").catch(() => undefined);
+    },
+  },
+  {
+    name: "Promise.allSettled",
+    detached: false,
+    expected: COMMITTED,
+    body: async (tx) => {
+      await Promise.allSettled([tx.query("BAD INSERT"), tx.query("OK")]);
+    },
+  },
+  {
+    name: "Promise.all, caught",
+    detached: false,
+    expected: COMMITTED,
+    body: async (tx) => {
+      await Promise.all([tx.query("BAD INSERT"), tx.query("OK")]).catch(() => undefined);
+    },
+  },
+  {
+    name: "a detached .catch()",
+    detached: true,
+    expected: COMMITTED,
+    body: async (tx) => {
+      tx.query("BAD INSERT").catch(() => undefined);
+    },
+  },
+  {
+    name: "a detached .then(f, g)",
+    detached: true,
+    expected: COMMITTED,
+    body: async (tx) => {
+      tx.query("BAD INSERT").then(
+        () => undefined,
+        () => undefined,
+      );
+    },
+  },
+  {
+    name: "a detached .then(f).catch(g)",
+    detached: true,
+    expected: COMMITTED,
+    body: async (tx) => {
+      tx.query("BAD INSERT")
+        .then(() => undefined)
+        .catch(() => undefined);
+    },
+  },
+  {
+    name: "void tx.query()",
+    detached: true,
+    expected: ROLLED_BACK,
+    body: async (tx) => {
+      void tx.query("BAD INSERT");
+    },
+  },
+  {
+    name: "a promise kept but never touched",
+    detached: true,
+    expected: ROLLED_BACK,
+    body: async (tx) => {
+      const kept = [tx.query("BAD INSERT")];
+      assert.equal(kept.length, 1);
+    },
+  },
+];
+
+for (const { name, body, detached, expected } of SCHEDULED_CASES) {
+  for (const schedule of ["early", "late"] as const) {
+    test(`statement failure ${name}, failing ${schedule}: ${expected}`, async () => {
+      const { connection, outcome, unhandled } = await runScheduled(schedule, body);
+
+      if (detached) {
+        assert.equal(failedBeforeReturn(connection), schedule === "early");
+      }
+      assert.deepEqual(unhandled, []);
+
+      if (expected === COMMITTED) {
+        assert.deepEqual(outcome, { status: "fulfilled", value: "value" });
+        assert.equal(connection.commitCalls, 1);
+        assert.equal(connection.rollbackCalls, 0);
+      } else {
+        assert.equal(outcome.status, "rejected");
+        assert.ok(rejectsUnobserved(connection.failure)(outcome.reason));
+        assert.equal(connection.commitCalls, 0);
+        assert.equal(connection.rollbackCalls, 1);
+      }
+      // END_TRAN is always the last thing sent, after every statement settled.
+      assert.deepEqual(connection.calls.slice(-2), [
+        expected === COMMITTED ? "commit" : "rollback",
+        "close",
+      ]);
+      assert.ok(connection.calls.indexOf("failed:BAD INSERT") < connection.calls.length - 2);
+    });
+  }
+}
+
+for (const schedule of ["early", "late"] as const) {
+  test(`a detached .then(f) without a rejection handler is not observation (${schedule})`, async () => {
+    const { connection, outcome, unhandled } = await runScheduled(schedule, async (tx) => {
+      // The derived promise carries the rejection. Nothing attaches a handler to it;
+      // the base then() below only keeps this test free of an unhandled rejection,
+      // and it bypasses the statement promise's own then(), as no caller code would.
+      const derived = tx.query("BAD INSERT").then(() => undefined);
+      Promise.prototype.then.call(derived, undefined, () => undefined);
+    });
+
+    assert.equal(outcome.status, "rejected");
+    assert.ok(rejectsUnobserved(connection.failure)(outcome.reason));
+    assert.equal(connection.commitCalls, 0);
+    assert.deepEqual(unhandled, []);
+  });
+
+  test(`.finally() counts as observation, as await does (${schedule})`, async () => {
+    const { connection, outcome, unhandled } = await runScheduled(schedule, async (tx) => {
+      tx.query("BAD INSERT")
+        .finally(() => undefined)
+        .catch(() => undefined);
+    });
+
+    assert.deepEqual(outcome, { status: "fulfilled", value: "value" });
+    assert.equal(connection.commitCalls, 1);
+    assert.deepEqual(unhandled, []);
+  });
+
+  test(`a statement returned by the callback is observed and its failure rolls back (${schedule})`, async () => {
+    const connection = new ScheduledConnection(schedule);
+
+    await assert.rejects(
+      transactionClient(connection).transaction((tx) => tx.query("BAD INSERT")),
+      (error: unknown) =>
+        error instanceof TransactionError &&
+        error.cause instanceof TransactionError &&
+        error.cause.cause === connection.failure,
+    );
+    assert.equal(connection.rollbackCalls, 1);
+    assert.equal(connection.commitCalls, 0);
+  });
+
+  test(`an unobserved failure, failing ${schedule}, leaves the callback's own error as cause`, async () => {
+    const failure = new Error("callback");
+    const connection = new ScheduledConnection(schedule);
+
+    const { unhandled } = await collectUnhandledRejections(() =>
+      assert.rejects(
+        transactionClient(connection).transaction(async (tx) => {
+          void tx.query("BAD INSERT");
+          await delay(10);
+          throw failure;
+        }),
+        (error: unknown) => error instanceof TransactionError && error.cause === failure,
+      ),
+    );
+
+    assert.deepEqual(unhandled, []);
+    assert.equal(connection.commitCalls, 0);
+    assert.equal(connection.rollbackCalls, 1);
+  });
+
+  test(`tx.commit() refuses an unobserved failure, failing ${schedule}`, async () => {
+    const connection = new ScheduledConnection(schedule);
+    let refused: unknown;
+
+    const { unhandled } = await collectUnhandledRejections(() =>
+      assert.rejects(
+        transactionClient(connection).transaction(async (tx) => {
+          void tx.query("BAD INSERT");
+          await delay(10);
+          refused = await tx.commit().catch((error: unknown) => error);
+        }),
+        TransactionError,
+      ),
+    );
+
+    assert.ok(refused instanceof TransactionError);
+    assert.equal(refused.cause, connection.failure);
+    assert.deepEqual(unhandled, []);
+    assert.equal(connection.commitCalls, 0);
+    assert.equal(connection.rollbackCalls, 1);
+  });
+
+  test(`a statement after an unawaited tx.commit() is refused and the commit stands (${schedule})`, async () => {
+    // As in 1.3.0: the caller chose the moment to commit. Slow or fast, the outcome is the same.
+    const connection = new ScheduledConnection(schedule);
+    connection.holdQueries();
+    if (schedule === "early") {
+      connection.releaseQuery?.();
+    } else {
+      setTimeout(() => connection.releaseQuery?.(), 30);
+    }
+    let late: unknown;
+
+    await transactionClient(connection).transaction(async (tx) => {
+      void tx.query("OK").catch(() => undefined);
+      const commit = tx.commit();
+      await delay(10);
+      late = await tx.query("AFTER").catch((error: unknown) => error);
+      await commit;
+    });
+
+    assert.ok(late instanceof TransactionError);
+    // Refused either way; only the message says how far the commit had got.
+    assert.match(
+      late.message,
+      /^Transaction (is already completing|has already been committed)\.$/,
+    );
+    assert.deepEqual(connection.calls.slice(-2), ["commit", "close"]);
+    assert.ok(!connection.calls.includes("query:AFTER"));
+  });
+
+  test(`a detached handler sending a fallback after the callback returned never commits without it (${schedule})`, async () => {
+    const { connection, outcome, unhandled } = await runScheduled(schedule, async (tx) => {
+      tx.query("BAD INSERT")
+        .catch(() => tx.query("UPDATE"))
+        .catch(() => undefined);
+    });
+
+    assert.equal(failedBeforeReturn(connection), schedule === "early");
+    assert.deepEqual(unhandled, []);
+
+    if (schedule === "early") {
+      // The fallback ran inside the callback, so it is part of the commit.
+      assert.deepEqual(outcome, { status: "fulfilled", value: "value" });
+      assert.ok(connection.calls.includes("queried:UPDATE"));
+      assert.deepEqual(connection.calls.slice(-2), ["commit", "close"]);
+    } else {
+      // Refused while the client committed for the callback: rolled back, as in 1.3.0.
+      assert.equal(outcome.status, "rejected");
+      assert.ok(!connection.calls.includes("query:UPDATE"));
+      assert.deepEqual(connection.calls.slice(-2), ["rollback", "close"]);
+    }
+  });
+}
+
+test("the cause is the first unobserved failure in issue order, not in settle order", async () => {
+  const slow = new Error("issued first, fails last");
+  const fast = new Error("issued second, fails first");
+  const connection = new FakeConnection();
+  connection.query = async (sql: string) => {
+    if (sql === "SLOW") {
+      await delay(20);
+      throw slow;
+    }
+    throw fast;
+  };
+
+  await assert.rejects(
+    transactionClient(connection).transaction(async (tx) => {
+      void tx.query("SLOW");
+      void tx.query("FAST");
+    }),
+    rejectsUnobserved(slow),
+  );
+
+  await assert.rejects(
+    transactionClient(connection).transaction(async (tx) => {
+      tx.query("SLOW").catch(() => undefined);
+      void tx.query("FAST");
+    }),
+    rejectsUnobserved(fast),
+  );
+  assert.equal(connection.commitCalls, 0);
+});
+
+test("a statement promise behaves as a promise: instanceof, await, Promise.resolve", async () => {
+  const connection = new FakeConnection();
+  connection.nextRows = [{ id: 1 }];
+
+  await transactionClient(connection).transaction(async (tx) => {
+    const statement = tx.query("SELECT");
+    assert.ok(statement instanceof Promise);
+    assert.deepEqual(await Promise.resolve(statement), [{ id: 1 }]);
+    assert.deepEqual(await statement, [{ id: 1 }]);
+    // A derived promise is still a promise.
+    assert.ok(statement.then((rows) => rows.length) instanceof Promise);
+  });
+  assert.equal(connection.commitCalls, 1);
+});

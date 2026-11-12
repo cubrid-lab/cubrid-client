@@ -255,7 +255,7 @@ A `tx` was used after its transaction ended. The same applies to `Transaction ha
 
 ### A transaction failed because of a query the callback did not await
 
-If a `tx.query()`, `tx.queryResult()` or `tx.execute()` is still running when the commit starts and then fails, nothing is committed and `transaction()` rejects with that failure as `cause`. Await every statement, and catch the error at that point if the transaction may continue. The client cannot see a query that was not awaited and rejected before the callback's last `await` resumed, so the commit goes ahead in that case. See the [transaction lifecycle](API_REFERENCE.md#transaction-lifecycle).
+If a statement of `tx` fails and nothing observed its promise (nothing awaited it or attached a handler with `.catch()`, `.then(f, g)`, `.finally()` or a combinator such as `Promise.all()`; for example `void tx.query(sql)`), nothing is committed and `transaction()` rejects with that failure as `cause`. This holds whether the statement failed before the callback returned or after. Await every statement, and catch the error at that point if the transaction may continue. See [observed and unobserved statement failures](API_REFERENCE.md#observed-and-unobserved-statement-failures).
 
 ### The rollback or close failed as well
 

@@ -876,6 +876,123 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       });
     });
 
+    describe("observed and unobserved statement failures (#244)", () => {
+      const missingTable = "INSERT INTO tx_lifecycle_no_such_table (val) VALUES ('x')";
+
+      test("a duplicate key awaited and caught, then an UPDATE, commits both", async () => {
+        await withObservedClient(async (client, observed, insertedValues) => {
+          await client.query(`INSERT INTO ${table} (id, val) VALUES (1000, 'original')`);
+
+          const result = await client.transaction(async (tx) => {
+            await tx.query(insert("kept"));
+            try {
+              await tx.query(`INSERT INTO ${table} (id, val) VALUES (1000, 'duplicate')`);
+            } catch (error) {
+              assert.equal((error as TransactionError).kind, "unique-violation");
+              await tx.query(`UPDATE ${table} SET val = 'updated' WHERE id = 1000`);
+            }
+            return "upserted";
+          });
+
+          assert.equal(result, "upserted");
+          assert.equal(observed.commits, 1);
+          assert.equal(observed.rollbacks, 0);
+          assert.deepEqual(await insertedValues(), ["kept", "updated"]);
+        });
+      });
+
+      // Early: a later awaited statement cannot finish before the failed one, which
+      // the connection ran first. Late: the callback returns before any reply arrives.
+      for (const schedule of ["early", "late"] as const) {
+        test(`void tx.query() that fails rolls back the rest (${schedule})`, async () => {
+          await withObservedClient(async (client, observed, insertedValues) => {
+            let failedBeforeReturn: boolean | undefined;
+            let failed = false;
+
+            await assert.rejects(
+              client.transaction(async (tx) => {
+                await tx.query(insert("not kept"));
+                const statement = tx.query(missingTable);
+                // Records when it failed without observing it: Promise.prototype.then
+                // bypasses the statement promise's own then().
+                Promise.prototype.then.call(statement, undefined, () => {
+                  failed = true;
+                });
+                if (schedule === "early") {
+                  await tx.query("SELECT 1 FROM db_root");
+                }
+                failedBeforeReturn = failed;
+              }),
+              TransactionError,
+            );
+
+            assert.equal(failedBeforeReturn, schedule === "early");
+            assert.equal(observed.commits, 0);
+            assert.equal(observed.rollbacks, 1);
+            assert.deepEqual(await insertedValues(), []);
+          });
+        });
+
+        test(`a detached .catch() observes the failure and the rest commits (${schedule})`, async () => {
+          await withObservedClient(async (client, observed, insertedValues) => {
+            let failedBeforeReturn: boolean | undefined;
+            let failed = false;
+
+            await client.transaction(async (tx) => {
+              await tx.query(insert("kept"));
+              tx.query(missingTable).catch(() => {
+                failed = true;
+              });
+              if (schedule === "early") {
+                await tx.query("SELECT 1 FROM db_root");
+              }
+              failedBeforeReturn = failed;
+            });
+
+            assert.equal(failedBeforeReturn, schedule === "early");
+            assert.equal(observed.commits, 1);
+            assert.equal(observed.rollbacks, 0);
+            assert.deepEqual(await insertedValues(), ["kept"]);
+          });
+        });
+      }
+
+      test("Promise.allSettled observes a failure and commits the statements that succeeded", async () => {
+        await withObservedClient(async (client, observed, insertedValues) => {
+          const results = await client.transaction((tx) =>
+            Promise.allSettled([
+              tx.query(insert("one")),
+              tx.query(missingTable),
+              tx.query(insert("two")),
+            ]),
+          );
+
+          assert.deepEqual(
+            results.map((result) => result.status),
+            ["fulfilled", "rejected", "fulfilled"],
+          );
+          assert.equal(observed.commits, 1);
+          assert.deepEqual(await insertedValues(), ["one", "two"]);
+        });
+      });
+
+      test("a scope commits past an observed failure and refuses an unobserved one", async () => {
+        await withObservedClient(async (client, _observed, insertedValues) => {
+          const observedScope = await client.beginTransactionScope();
+          await observedScope.query(insert("scope kept"));
+          await observedScope.query(missingTable).catch(() => undefined);
+          await observedScope.commit();
+
+          const unobserved = await client.beginTransactionScope();
+          await unobserved.query(insert("scope not kept"));
+          void unobserved.query(missingTable);
+          await assert.rejects(unobserved.commit(), TransactionError);
+
+          assert.deepEqual(await insertedValues(), ["scope kept"]);
+        });
+      });
+    });
+
     test("Promise.all of bound statements commits all of them through the queue", async () => {
       await withObservedClient(async (client, observed, insertedValues) => {
         const values = ["one", "two", "three", "four", "five"];
