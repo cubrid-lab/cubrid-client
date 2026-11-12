@@ -164,6 +164,17 @@ required property, wrapped abort reasons or a richer outcome than a boolean are 
 to a 2.0 decision. The mapping from each failure to its value is public behavior;
 see [Unknown outcomes](API_REFERENCE.md#unknown-outcomes).
 
+### Binding methods and the driver interface in 2.0
+
+The `*Prepared` methods, the capability interfaces such as `PreparedQueryable`,
+and the driver interface (`ConnectionLike` and the types around it) exported from
+the root are unchanged for every 1.x release. A 2.0 plan replaces the method
+variants with one `binding: "literal" | "prepared"` option and moves the driver
+interface to a `cubrid-client/driver` entry point, after additive 1.x MINOR
+releases that let callers migrate first. It is proposed in
+[ADR 0011](adr/0011-v2-binding-option-and-driver-subpath.md), with the
+migration matrix and release plan in the [v2 API design](design/v2-api.md).
+
 For the complete 1.x line, Node.js 18 and 20 are retained even though they are upstream EOL. [ADR 0006](adr/0006-node-18-support-through-1x.md) records the explicit Node 18 release commitment and independent Node 18 **packed-package** test requirement. A higher Node minimum is reserved for a possible, separately reviewed 2.0 MAJOR, not a 1.x development-tooling update.
 
 ## Node.js, TypeScript and distribution

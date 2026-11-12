@@ -566,6 +566,10 @@ How the result differs from the literal path for the same statement:
 An NCHAR column accepts text on neither path. Multi-statement strings run every
 statement on both paths, and the markers of all the statements count together.
 
+A 2.0 proposal replaces these method names with a `binding` option on the
+existing methods and refuses `undefined` on both paths; see
+[the v2 API design](design/v2-api.md#value-behavior-by-binding). Nothing changes in 1.x.
+
 `executeMany()` binds every parameter set with these same rules, and refuses the
 whole call, before anything is sent, when one value of any set is refused. Every
 set must have the statement's marker count. It differs in one way: it runs a

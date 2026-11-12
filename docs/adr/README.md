@@ -16,6 +16,7 @@ ADRs preserve **why** a consequential technical or release decision was made, th
 | [0008](0008-pool-reuse-invariant.md) | A pooled connection is reused only when its session is clean | Proposed |
 | [0009](0009-unobserved-statement-failures-roll-back.md) | A failed statement nothing observed rolls a transaction back, whenever it failed | Proposed |
 | [0010](0010-utc-temporal-default-in-2-0.md) | Read plain date and time values as UTC by default in 2.0; keep `"local"` for all of 1.x | Proposed (2.0 planning; no 1.x change) |
+| [0011](0011-v2-binding-option-and-driver-subpath.md) | Choose literal or prepared binding with one `binding` option instead of `*Prepared` methods, offer prepared streaming through it, and move the driver SPI to `cubrid-client/driver` in 2.0 | Proposed (2.0 planning; no 1.x change) |
 
 The Node.js driver already has an established release process; these proposals record the rules without changing it.
 
