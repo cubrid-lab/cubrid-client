@@ -66,11 +66,12 @@ try {
     }
     const [looped, batched] = times.map(median) as [number, number];
     const ms = (value: number): string => `${value.toFixed(1)} ms`;
+    // Each call on a reused session starts with the CHECK_CAS probe. Then
     // execute() of an INSERT, per row: PREPARE_AND_EXECUTE, GET_LAST_INSERT_ID,
     // END_TRAN (one commit per row) and the handle release. executeMany(): PREPARE,
     // EXECUTE_ARRAY (these rows are far below the 1 MiB request limit), END_TRAN
-    // and the handle release.
-    console.log(`| ${size} | ${size * 4} | 4 | ${ms(looped)} | ${ms(batched)} |`);
+    // and the handle release. scripts/bench-round-trips.ts counts them on the wire.
+    console.log(`| ${size} | ${size * 5} | 5 | ${ms(looped)} | ${ms(batched)} |`);
   }
 } finally {
   await client.query(`DROP TABLE IF EXISTS ${table}`).catch(() => undefined);
