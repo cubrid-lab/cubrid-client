@@ -6,6 +6,7 @@ import type {
   ConnectionLike,
   ExecutableTransactionClient,
   ExecuteManyResult,
+  ExecuteOptions,
   ExecuteResult,
   PreparedTransactionClient,
   QueryOptions,
@@ -50,7 +51,7 @@ export class CubridTransaction
     });
   }
 
-  execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult> {
+  execute(sql: string, params?: QueryParams, options?: ExecuteOptions): Promise<ExecuteResult> {
     return runStatement(options, "Transaction statement failed.", () => {
       refuseLobParams(params);
       if (!this.connection.execute) {
@@ -89,7 +90,7 @@ export class CubridTransaction
   executePrepared(
     sql: string,
     params?: readonly PreparedQueryParam[],
-    options?: QueryOptions,
+    options?: ExecuteOptions,
   ): Promise<ExecuteResult> {
     return runStatement(options, "Transaction statement failed.", () => {
       if (!this.connection.executePrepared) {
@@ -273,7 +274,7 @@ export class CallbackTransaction extends CubridTransaction {
   override execute(
     sql: string,
     params?: QueryParams,
-    options?: QueryOptions,
+    options?: ExecuteOptions,
   ): Promise<ExecuteResult> {
     return this.track(() => super.execute(sql, params, options));
   }
@@ -297,7 +298,7 @@ export class CallbackTransaction extends CubridTransaction {
   override executePrepared(
     sql: string,
     params?: readonly PreparedQueryParam[],
-    options?: QueryOptions,
+    options?: ExecuteOptions,
   ): Promise<ExecuteResult> {
     return this.track(() => super.executePrepared(sql, params, options));
   }

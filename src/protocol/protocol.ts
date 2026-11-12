@@ -37,6 +37,7 @@ import {
   CLIENT_JDBC,
   CUBRIDDataType,
   EXECUTE_QUERY_ALL,
+  EXECUTE_RETURN_GENERATED_KEYS,
   OPEN_DB_FIELD_SIZE,
   OPEN_DB_FILLER_SIZE,
   OPEN_DB_MAX_VALUE_BYTES,
@@ -273,13 +274,15 @@ export function parseOpenDatabase(data: Buffer): OpenDatabaseResult {
 // ---------------------------------------------------------------------------
 
 /**
- * Build PREPARE_AND_EXECUTE request payload.
+ * Build PREPARE_AND_EXECUTE request payload. `generatedKeys` adds
+ * EXECUTE_RETURN_GENERATED_KEYS; see writeGetGeneratedKeys().
  */
 export function writePrepareAndExecute(
   sql: string,
   autoCommit: boolean,
   casInfo: Buffer,
   charset: TextCharset = "utf-8",
+  generatedKeys = false,
 ): { header: Buffer; payload: Buffer } {
   const w = new PacketWriter(512);
   w.writeByte(CASFunctionCode.PREPARE_AND_EXECUTE);
@@ -287,7 +290,7 @@ export function writePrepareAndExecute(
   w.writeNullTermString(sql, charset, "SQL text");
   w.addByte(PREPARE_NORMAL);
   w.addByte(autoCommit ? 1 : 0);
-  w.addByte(EXECUTE_QUERY_ALL);
+  w.addByte(executeFlag(generatedKeys));
   w.addInt(0); // max_col_size
   w.addInt(0); // max_row_size
   w.writeInt(0); // NULL bind params
@@ -511,11 +514,12 @@ export function writeExecute(
   statement: PrepareResult,
   binds: PreparedBinds,
   casInfo: Buffer,
+  generatedKeys = false,
 ): { header: Buffer; payload: Buffer } {
   const w = new PacketWriter(512 + binds.bytes.length);
   w.writeByte(CASFunctionCode.EXECUTE);
   w.addInt(statement.queryHandle);
-  w.addByte(EXECUTE_QUERY_ALL);
+  w.addByte(executeFlag(generatedKeys));
   w.addInt(0); // max_col_size
   w.addInt(0); // max_row_size
   w.writeInt(0); // empty CALL-mode argument
@@ -531,6 +535,10 @@ export function writeExecute(
   const payload = w.toBuffer();
   const header = PacketWriter.buildHeader(payload.length, casInfo);
   return { header, payload };
+}
+
+function executeFlag(generatedKeys: boolean): number {
+  return generatedKeys ? EXECUTE_QUERY_ALL | EXECUTE_RETURN_GENERATED_KEYS : EXECUTE_QUERY_ALL;
 }
 
 /**
@@ -906,6 +914,143 @@ export function parseGetLastInsertId(data: Buffer): string | undefined {
     const text = cell.parseNullTermString(size - headerSize);
     return text === "" ? undefined : text;
   });
+}
+
+// ---------------------------------------------------------------------------
+// GetGeneratedKeys (FC=34)
+// ---------------------------------------------------------------------------
+
+/**
+ * Asks for the AUTO_INCREMENT values the statement on `queryHandle` generated
+ * (CAS `fn_get_generated_keys`, JDBC `UStatement.getGeneratedKeys`). The CAS
+ * answers only for a statement executed with EXECUTE_RETURN_GENERATED_KEYS,
+ * while its handle is open and before its transaction ends, and only for the
+ * first statement of an `a; b` string.
+ */
+export function writeGetGeneratedKeys(
+  queryHandle: number,
+  casInfo: Buffer,
+): { header: Buffer; payload: Buffer } {
+  const w = new PacketWriter(16);
+  w.writeByte(CASFunctionCode.GET_GENERATED_KEYS);
+  w.addInt(queryHandle);
+
+  const payload = w.toBuffer();
+  const header = PacketWriter.buildHeader(payload.length, casInfo);
+  return { header, payload };
+}
+
+/**
+ * The AUTO_INCREMENT value the statement generated for its first row, as
+ * decimal text, or undefined when it generated none or more than one column of
+ * them. Layout (CAS `ux_get_generated_keys_server_insert` and `_client_insert`,
+ * the same in 10.2 to 11.4): result code 0, statement type byte, row count int,
+ * updatable byte, column count int, per column a type, scale short, precision
+ * int and name, then the row count again and per row an index int, an 8-byte
+ * OID and one cell per column. A row only lists the values the server
+ * generated: a key the INSERT supplied itself is not there. A server error
+ * throws; a body that does not decode is undefined, see below.
+ */
+export function parseGetGeneratedKeys(data: Buffer): string | undefined {
+  assertReplySize(data);
+  const reader = new PacketReader(data);
+  const code = reader.parseInt();
+
+  if (code < 0) {
+    const err = reader.readError(data.length - SIZE_INT);
+    throw new CasReplyError(
+      `CUBRID getGeneratedKeys failed (${err.code}): ${err.message}`,
+      code,
+      err.code,
+    );
+  }
+
+  // The frame was read whole, so a body that does not decode leaves the session
+  // aligned. CUBRID 11.0 to 11.4 send such bodies: the column descriptions come
+  // only with the first row, while the column count is the one of the last row,
+  // so when the server could not read the first row's keys (seen after DDL on
+  // the table) a later row's count arrives without its descriptions. Such a
+  // reply says nothing reliable, so it reports no key rather than failing an
+  // INSERT that succeeded.
+  try {
+    return readGeneratedKeys(reader);
+  } catch (error) {
+    if (error instanceof MalformedReplyError || error instanceof RangeError) {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+function readGeneratedKeys(reader: PacketReader): string | undefined {
+  return decodeReply(() => {
+    reader.parseByte(); // statement type
+    const totalRows = reader.parseInt();
+    reader.parseByte(); // updatable
+    const columnCount = reader.parseInt();
+    if (columnCount < 0) {
+      throw new MalformedReplyError(`Malformed CAS packet: ${columnCount} generated key columns`);
+    }
+    const types: CUBRIDDataType[] = [];
+    for (let c = 0; c < columnCount; c++) {
+      types.push(parseColumnType(reader).type);
+      reader.parseShort(); // scale
+      reader.parseInt(); // precision
+      reader.parseNullTermString(reader.parseInt()); // column name
+    }
+
+    const rowCount = reader.parseInt();
+    if (rowCount < 0 || rowCount !== totalRows) {
+      throw new MalformedReplyError(
+        `Malformed CAS packet: ${rowCount} generated key rows of ${totalRows}`,
+      );
+    }
+    const firstRow: Array<string | undefined> = [];
+    for (let r = 0; r < rowCount; r++) {
+      reader.parseInt(); // row index
+      reader.skip(SIZE_OID);
+      for (const type of types) {
+        const value = readGeneratedKey(reader, type);
+        if (r === 0) {
+          firstRow.push(value);
+        }
+      }
+    }
+    if (reader.remaining !== 0) {
+      throw new MalformedReplyError(
+        `Malformed CAS packet: ${reader.remaining} bytes after the generated keys`,
+      );
+    }
+
+    // Two AUTO_INCREMENT columns leave no one value to report.
+    return firstRow.length === 1 ? firstRow[0] : undefined;
+  });
+}
+
+/** One generated-key cell. AUTO_INCREMENT columns are SMALLINT, INT, BIGINT or NUMERIC(p,0). */
+function readGeneratedKey(reader: PacketReader, type: CUBRIDDataType): string | undefined {
+  const size = reader.parseInt();
+  if (size === -1) {
+    return undefined;
+  }
+  let text: string;
+  if (type === CUBRIDDataType.SHORT && size === SIZE_SHORT) {
+    text = String(reader.parseShort());
+  } else if (type === CUBRIDDataType.INT && size === SIZE_INT) {
+    text = String(reader.parseInt());
+  } else if (type === CUBRIDDataType.BIGINT && size === SIZE_LONG) {
+    text = String(reader.parseLong());
+  } else if (type === CUBRIDDataType.NUMERIC && size > 0) {
+    text = reader.parseNullTermString(size);
+  } else {
+    throw new MalformedReplyError(
+      `Malformed CAS packet: generated key of type ${type} and ${size} bytes`,
+    );
+  }
+  if (!/^-?\d+$/.test(text)) {
+    throw new MalformedReplyError(`Malformed CAS packet: generated key "${text}"`);
+  }
+  return text;
 }
 
 // ---------------------------------------------------------------------------
@@ -1541,6 +1686,112 @@ function scanSql(sql: string, rules: LexRules): SqlScan {
   }
 
   return { markers, secondStatement };
+}
+
+/**
+ * Whether `sql` is one `INSERT` or `REPLACE` whose text cannot run a stored
+ * routine: no `SELECT` and no `name(` other than its column list and `VALUES (`.
+ * A function in the statement can insert into another AUTO_INCREMENT table and
+ * leave its value as the session's last insert id (seen with PL/CSQL on CUBRID
+ * 11.4), so only such a statement may report that value. Built-in functions are
+ * refused too: telling them from a stored function by name is not certain. Every
+ * lexing the server could use must agree, as for assertSingleStatement().
+ */
+export function isPlainInsert(sql: string): boolean {
+  return ALL_LEX_RULES.every((rules) => {
+    const { code, secondStatement } = codeOnly(sql, rules);
+    if (secondStatement || /\bselect\b/i.test(code)) {
+      return false;
+    }
+    const head = INSERT_HEAD.exec(code);
+    if (!head) {
+      return false;
+    }
+    // The column list, if the table name is followed by one.
+    const columnList = head[0].endsWith("(") ? head[0].length - 1 : -1;
+    for (const call of code.matchAll(CALL)) {
+      const paren = call.index + call[0].length - 1;
+      if (paren !== columnList && !/^values?$/i.test(call[1] ?? "")) {
+        return false;
+      }
+    }
+    return true;
+  });
+}
+
+/**
+ * Whether `sql` is one statement that starts with INSERT or REPLACE under every
+ * lexing: the only statements EXECUTE_RETURN_GENERATED_KEYS is sent with, since
+ * on 11.x the flag can make an INSERT the server runs on the client side fail.
+ */
+export function isSingleInsert(sql: string): boolean {
+  return ALL_LEX_RULES.every((rules) => {
+    const { code, secondStatement } = codeOnly(sql, rules);
+    return !secondStatement && INSERT_HEAD.test(code);
+  });
+}
+
+/** A name, or a quoted identifier as codeOnly() leaves it. */
+const SQL_NAME = String.raw`(?:[\p{L}_][\p{L}\p{N}_$#]*|_q_)`;
+const INSERT_HEAD = new RegExp(
+  String.raw`^\s*(?:insert|replace)\s+(?:into\s+)?${SQL_NAME}(?:\s*\.\s*${SQL_NAME})?\s*\(?`,
+  "iu",
+);
+const CALL = new RegExp(String.raw`(${SQL_NAME})\s*\(`, "gu");
+
+/**
+ * `sql` with comments blanked, string literals as `0` and quoted identifiers as
+ * `_q_`, so what is left is the code of the statement.
+ */
+function codeOnly(sql: string, rules: LexRules): { code: string; secondStatement: boolean } {
+  let code = "";
+  let separated = false;
+  let secondStatement = false;
+  let i = 0;
+
+  while (i < sql.length) {
+    const ch = sql.charAt(i);
+    const next = sql[i + 1] ?? "";
+    let end: number;
+    let replacement: string;
+
+    if ((ch === "-" && next === "-") || (ch === "/" && next === "/")) {
+      end = lineCommentEnd(sql, i + 2);
+      replacement = " ";
+    } else if (ch === "/" && next === "*") {
+      const close = sql.indexOf("*/", i + 2);
+      end = close === -1 ? sql.length : close + 2;
+      replacement = " ";
+    } else {
+      if (separated && !/[ \t\n\r\f\v;]/.test(ch)) {
+        secondStatement = true;
+      }
+      if (ch === ";") {
+        separated = true;
+      }
+      if (ch === "'") {
+        end = quotedSpanEnd(sql, i, "'", rules.backslashEscapes);
+        replacement = " 0 ";
+      } else if (ch === '"') {
+        end = quotedSpanEnd(sql, i, '"', rules.doubleQuoteEscapes);
+        replacement = " _q_ ";
+      } else if (ch === "`") {
+        end = quotedSpanEnd(sql, i, "`", false);
+        replacement = " _q_ ";
+      } else if (ch === "[") {
+        const close = sql.indexOf("]", i + 1);
+        end = close === -1 ? sql.length : close + 1;
+        replacement = " _q_ ";
+      } else {
+        end = i + 1;
+        replacement = ch;
+      }
+    }
+    code += replacement;
+    i = end;
+  }
+
+  return { code, secondStatement };
 }
 
 /** The offset after a quoted span that starts at `start`, or the end of an unterminated one. */

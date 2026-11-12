@@ -18,6 +18,7 @@ import type {
   Executable,
   ExecutableTransactionClient,
   ExecuteManyResult,
+  ExecuteOptions,
   ExecuteResult,
   PreparedQueryable,
   PreparedTransactionClient,
@@ -174,7 +175,7 @@ export class CubridClient
     );
   }
 
-  execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult> {
+  execute(sql: string, params?: QueryParams, options?: ExecuteOptions): Promise<ExecuteResult> {
     return runStatement(
       options,
       "Statement failed.",
@@ -227,7 +228,7 @@ export class CubridClient
   executePrepared(
     sql: string,
     params?: readonly PreparedQueryParam[],
-    options?: QueryOptions,
+    options?: ExecuteOptions,
   ): Promise<ExecuteResult> {
     return runStatement(
       options,

@@ -29,6 +29,7 @@ Complete reference for every public export of `cubrid-client`.
   - [Streamable](#streamable)
   - [StreamOptions](#streamoptions)
   - [QueryOptions](#queryoptions)
+  - [ExecuteOptions](#executeoptions)
   - [PreparedQueryable](#preparedqueryable)
   - [PreparedTransactionClient](#preparedtransactionclient)
   - [BatchExecutable](#batchexecutable)
@@ -202,8 +203,10 @@ const { rows, columns } = await db.queryResult(
 Runs a statement and returns how many rows it changed and, after an `INSERT`, the generated `AUTO_INCREMENT` value, instead of rows. Use it for `INSERT`, `UPDATE`, `DELETE`, `MERGE` and DDL; use [`query()`](#queryt-sql-params) for `SELECT`. `query()` is unchanged and still returns `[]` for those statements.
 
 ```ts
-async execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>
+async execute(sql: string, params?: QueryParams, options?: ExecuteOptions): Promise<ExecuteResult>
 ```
+
+`options` is a [`QueryOptions`](#queryoptions) with one more field, `generatedKeys`: see [Generated ids](#generated-ids).
 
 **Returns:** [`ExecuteResult`](#executeresult) `{ affectedRows, lastInsertId? }`.
 
@@ -220,9 +223,47 @@ console.log(updated.affectedRows); // 1, or 0 when no row matched
 What the server reports, checked on CUBRID 10.2, 11.0, 11.2 and 11.4 (the replies are byte for byte identical):
 
 - `affectedRows` is the server's count for `INSERT`, `UPDATE`, `DELETE` and `MERGE`, and 0 for DDL and `SELECT`. A multi-statement string (`"INSERT ...; INSERT ..."`) reports the sum over its statements. `REPLACE` over an existing row counts the deleted row and the inserted one (2).
-- `lastInsertId` is present only when the string contained an `INSERT` and the session then holds a generated value that is new. An `INSERT` into a table with no `AUTO_INCREMENT` column, or one that supplies the key itself, has none. The server keeps the last generated value for the whole [session](CONNECTION.md#session-reuse), through `COMMIT`, `ROLLBACK` and failed statements, and answers with the same bytes whether or not this statement generated one, so `execute()` reports an id only when the server's value differs from the one seen before the statement. A value that happens to repeat is therefore reported as no id, because a wrong id is worse than none: two fresh tables that both generate `1`, one straight after the other, report an id for the first and none for the second, so read the key back when you need both. After a statement that may have changed the value unseen, such as a `query()` INSERT or a failed statement, `execute()` reads the server's value once before its next `INSERT` to have that comparison, at the cost of one more round trip. A multi-row `INSERT` reports the **first** id it generated, not the last. The value is a `number` while it is a safe integer and a `bigint` beyond `Number.MAX_SAFE_INTEGER`, so no precision is lost. In a multi-statement string it is the one of the last `INSERT`.
+- `lastInsertId`: see [Generated ids](#generated-ids) below.
 - In autocommit mode `execute()` sends the statement without the autocommit flag, reads the value, then commits with a separate `END_TRAN` request (rolling back if anything failed), because the CAS may go to another client once the statement commits and the value stays with the session. The statement is committed before `execute()` resolves, as with `query()`, at the cost of one more round trip. Inside a transaction nothing is committed until you commit.
 - Statements issued at the same time still run one at a time, in the order issued, whether they use `query()` or `execute()`.
+
+##### Generated ids
+
+`lastInsertId` is optional. It is never guessed: when `execute()` cannot be sure the value belongs to the statement, it leaves it out, and you read the key back yourself. There are two ways to get it, checked on CUBRID 10.2, 11.0, 11.2 and 11.4.
+
+**Default: the session's last insert id.** After an `INSERT` the server keeps its last generated `AUTO_INCREMENT` value for the whole [session](CONNECTION.md#session-reuse), through `COMMIT`, `ROLLBACK` and failed statements, and reports it again after an `INSERT` into a table without `AUTO_INCREMENT`. So `execute()` reads that value (`GET_LAST_INSERT_ID`) before and after the statement and reports it only when it changed. `lastInsertId` is set only when all of these hold:
+
+- The SQL is one `INSERT` or `REPLACE` with `VALUES`, `SET` or `DEFAULT VALUES`, and its text calls nothing: no `SELECT` and no `name(...)` apart from the column list and `VALUES (...)`. A stored function can insert into another table and leave that table's id as the session's value, and built-in functions such as `NOW()` are refused too, because a name alone cannot tell them apart. `?` markers are fine.
+- The value after the statement differs from the one just before it.
+
+So `lastInsertId` is **undefined** for:
+
+- an `INSERT` into a table without `AUTO_INCREMENT`, or one that supplies the key itself;
+- an `INSERT` that generates the same number the session already held, such as tables `A` and `B` that both generate `1`, one after the other: `A` reports `1`, `B` none;
+- `INSERT ... SELECT`, an `INSERT` whose values call any function, and a multi-statement string;
+- `UPDATE`, `DELETE`, `MERGE`, `CALL` and DDL.
+
+A multi-row `INSERT` reports the **first** id it generated. One case the client cannot see: a trigger on the table that calls a stored procedure or function which itself inserts into an `AUTO_INCREMENT` table can leave **that** id as the session's value (seen with PL/CSQL on 11.4). The same can happen through a view whose `WITH CHECK OPTION` condition calls such a function. Do not rely on the default `lastInsertId` for such a table or view.
+
+Cost: one `GET_LAST_INSERT_ID` request after the statement, and one more before it unless the previous statement on the session was an `execute()` `INSERT` of this kind. An `INSERT` that cannot report an id costs nothing extra.
+
+**`{ generatedKeys: true }`: the statement's own keys.** The statement is sent with the `RETURN_GENERATED_KEYS` execute flag and `execute()` then asks its handle for the keys it generated (`GET_GENERATED_KEYS`, what JDBC's `RETURN_GENERATED_KEYS` uses), before the handle is released and before `COMMIT`. These belong to the statement alone, so tables that generate the same number, `INSERT ... SELECT` and functions in the values all report the right key, and a supplied key or a table without `AUTO_INCREMENT` reports none. A multi-row `INSERT` or `INSERT ... SELECT` reports the first generated key. `lastInsertId` is undefined for a table with two `AUTO_INCREMENT` columns. The option applies only to SQL that is one `INSERT` or `REPLACE`: for anything else, a multi-statement string included (the server would answer only for its first statement), the flag is not sent and `execute()` behaves as without the option.
+
+```ts
+const a = await db.execute("INSERT INTO a (v) VALUES (?)", [1], { generatedKeys: true });
+const b = await db.execute("INSERT INTO b (v) VALUES (?)", [1], { generatedKeys: true });
+// a.lastInsertId === 1 and b.lastInsertId === 1
+```
+
+Cost: one `GET_GENERATED_KEYS` request after the statement, never a request before it. It works with `execute()` and `executePrepared()`, in autocommit mode and in a transaction. If that request fails, `execute()` rejects: in autocommit mode the `INSERT` is rolled back, but inside a transaction its row stays in the transaction, as for any statement whose follow-up request fails, so roll back. The same holds for the default's `GET_LAST_INSERT_ID` request.
+
+On CUBRID 11.0, 11.2 and 11.4 the server can also leave a generated key out: it answers with the inserted row but without its key, or, for a multi-row `INSERT`, with a reply whose column descriptions are missing, and `lastInsertId` is then absent. Live tests saw it mostly on the first `INSERT`s into a table just created or recreated, by another session or by the same one, often enough to matter in tests that recreate tables, and never with a wrong key; 10.2 did not do it. Asking again does not help, so it is not retried.
+
+> **Warning:** on CUBRID 11.0, 11.2 and 11.4 the server rejects an `INSERT` that generates a key when it runs the insert itself on the client side, which it does for a table with an `INSERT` trigger (and for `REPLACE` or `ON DUPLICATE KEY UPDATE` on a table with `DELETE` or `UPDATE` triggers). The statement fails with "Instances of a reusable OID class are non-referable" and changes nothing; it is not retried. 10.2 runs it. JDBC's `RETURN_GENERATED_KEYS` fails the same way. Leave `generatedKeys` off for such tables.
+
+The value is a `number` while it is a safe integer and a `bigint` beyond `Number.MAX_SAFE_INTEGER`, in both modes, so no precision is lost.
+
+**Changed in this release** (both are 1.x behaviour changes in what is reported, not in the types): the default no longer reports an id for a multi-statement string, an `INSERT ... SELECT` or an `INSERT` whose values call a function, and it now reads the session's value again after any other statement, a `SELECT` included, which costs that one request. Before, a `CREATE TABLE ... AS SELECT` into an `AUTO_INCREMENT` column or a `SELECT` of a function that inserts could leave its id to be reported by the next `INSERT` into a table without `AUTO_INCREMENT`, and a function in the values could have its own insert's id reported.
 
 ---
 
@@ -246,7 +287,7 @@ async queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
 async executePrepared(
   sql: string,
   params?: readonly PreparedQueryParam[],
-  options?: QueryOptions,
+  options?: ExecuteOptions,
 ): Promise<ExecuteResult>
 ```
 
@@ -999,7 +1040,7 @@ async query<T extends QueryResultRow = QueryResultRow>(
 Same signature and behavior as [`CubridClient.execute()`](#executesql-params), but runs within the transaction's isolated connection. Nothing is committed until the transaction commits, and the generated id is the one the server reports inside the open transaction.
 
 ```ts
-async execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>
+async execute(sql: string, params?: QueryParams, options?: ExecuteOptions): Promise<ExecuteResult>
 ```
 
 **Throws:** [`TransactionError`](#transactionerror) if execution fails.
@@ -1577,7 +1618,7 @@ Interface for any object that can run a statement and report its [`ExecuteResult
 
 ```ts
 interface Executable {
-  execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
+  execute(sql: string, params?: QueryParams, options?: ExecuteOptions): Promise<ExecuteResult>;
 }
 ```
 
@@ -1629,6 +1670,14 @@ interface QueryOptions {
 | `signal` | `AbortSignal` | `undefined` | Cancels the statement. Rejects with `signal.reason`; once the statement was sent its connection is discarded and its outcome is unknown |
 | `readTimeout` | `number` | The client's [`readTimeout`](#clientoptions) | Inactivity limit for this statement and its follow-up requests, with the client option's semantics. `0` means none for this statement. From 0 to 2147483647 |
 
+### ExecuteOptions
+
+The options of [`execute()`](#executesql-params) and [`executePrepared()`](#querypreparedtsql-params-queryresultpreparedtsql-params-executepreparedsql-params): every [`QueryOptions`](#queryoptions) field, and:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `generatedKeys` | `boolean` | `false` | Report `lastInsertId` from the keys this `INSERT` generated instead of from the session's last insert id. One more request after the statement. Fails an `INSERT` into a table with an `INSERT` trigger on CUBRID 11.0 to 11.4. See [Generated ids](#generated-ids) |
+
 ### ExecuteResult
 
 The outcome of [`execute()`](#executesql-params).
@@ -1643,7 +1692,7 @@ interface ExecuteResult {
 | Field | Description |
 |-------|-------------|
 | `affectedRows` | Rows changed by `INSERT`, `UPDATE`, `DELETE` or `MERGE`, summed over a multi-statement string; 0 for DDL, `SELECT` and a statement that matched nothing. |
-| `lastInsertId` | The generated `AUTO_INCREMENT` value after an `INSERT`: a `number` if it is a safe integer, otherwise a `bigint`. Absent when no value was generated. For a multi-row `INSERT` it is the first generated id. |
+| `lastInsertId` | The generated `AUTO_INCREMENT` value of the `INSERT`: a `number` if it is a safe integer, otherwise a `bigint`. For a multi-row `INSERT` it is the first generated id. Absent whenever it cannot be attributed to the statement; see [Generated ids](#generated-ids) for exactly when. |
 
 ### ExecuteManyResult
 
@@ -1699,7 +1748,7 @@ interface PreparedQueryable {
   executePrepared(
     sql: string,
     params?: readonly PreparedQueryParam[],
-    options?: QueryOptions,
+    options?: ExecuteOptions,
   ): Promise<ExecuteResult>;
 }
 ```

@@ -79,6 +79,7 @@ export enum CASFunctionCode {
   EXECUTE_ARRAY = 21,
   CON_CLOSE = 31,
   CHECK_CAS = 32,
+  GET_GENERATED_KEYS = 34,
   LOB_NEW = 35,
   LOB_WRITE = 36,
   LOB_READ = 37,
@@ -120,6 +121,12 @@ export const ISOLATION_LEVEL_CODES = {
 export const PREPARE_NORMAL = 0x00;
 export const EXECUTE_NORMAL = 0x00;
 export const EXECUTE_QUERY_ALL = 0x02;
+/**
+ * CCI_EXEC_RETURN_GENERATED_KEYS: makes an INSERT keep the rows it generated an
+ * AUTO_INCREMENT value for, so GET_GENERATED_KEYS can return them. Same value
+ * in the CUBRID 10.2 to 11.4 headers (src/cci/cas_cci.h, src/broker/broker_cas_cci.h).
+ */
+export const EXECUTE_RETURN_GENERATED_KEYS = 0x40;
 
 // ---------------------------------------------------------------------------
 // CUBRID data types (wire type codes)

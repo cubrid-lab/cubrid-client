@@ -14,6 +14,7 @@ import type {
   ConnectionFactory,
   ConnectionLike,
   ExecuteManyResult,
+  ExecuteOptions,
   ExecuteResult,
   QueryOptions,
   StreamOptions,
@@ -184,7 +185,7 @@ export function withLogging(factory: ConnectionFactory, logger: unknown): Connec
       wrapped.execute = (
         sql: string,
         params?: QueryParams,
-        options?: QueryOptions,
+        options?: ExecuteOptions,
       ): Promise<ExecuteResult> =>
         timed("execute", { paramCount: params?.length ?? 0 }, () => execute(sql, params, options));
     }
@@ -221,7 +222,7 @@ export function withLogging(factory: ConnectionFactory, logger: unknown): Connec
       wrapped.executePrepared = (
         sql: string,
         params?: readonly PreparedQueryParam[],
-        options?: QueryOptions,
+        options?: ExecuteOptions,
       ): Promise<ExecuteResult> =>
         timed("executePrepared", { paramCount: params?.length ?? 0 }, () =>
           executePrepared(sql, params, options),

@@ -134,6 +134,8 @@ test("literal CAS function codes are not CCI values or SQL statement IDs", () =>
   assert.equal(CASFunctionCode.CLOSE_REQ_HANDLE, 6);
   assert.equal(CASFunctionCode.FETCH, 8);
   assert.equal(CASFunctionCode.GET_LAST_INSERT_ID, 40);
+  // CAS_FC_GET_GENERATED_KEYS in cas_protocol.h of 10.2 to 11.4; JDBC UFunctionCode.GET_GENERATED_KEYS.
+  assert.equal(CASFunctionCode.GET_GENERATED_KEYS, 34);
   assert.equal(CASFunctionCode.PREPARE_AND_EXECUTE, 41);
   // CAS_FC_EXECUTE_ARRAY in cas_protocol.h; JDBC's EXECUTE_BATCH_PREPAREDSTATEMENT.
   assert.equal(CASFunctionCode.EXECUTE_ARRAY, 21);

@@ -25,15 +25,20 @@ import {
   assertSingleStatement,
   type ColumnMeta,
   encodeBindParams,
+  encodePreparedParams,
   findPlaceholders,
   formatValue,
   interpolateParams,
+  isPlainInsert,
+  isSingleInsert,
   MalformedReplyError,
   parseClientInfoExchange,
   parseFetch,
   parseGetDbVersion,
+  parseGetGeneratedKeys,
   parseGetLastInsertId,
   parseOpenDatabase,
+  parsePrepare,
   parsePrepareAndExecute,
   parseSimpleResponse,
   readQueryHandle,
@@ -41,14 +46,21 @@ import {
   writeCloseReqHandle,
   writeConClose,
   writeEndTran,
+  writeExecute,
   writeFetch,
   writeGetDbVersion,
+  writeGetGeneratedKeys,
   writeGetLastInsertId,
   writeOpenDatabase,
   writePrepareAndExecute,
   writeSetDbParameter,
 } from "../src/protocol/protocol.js";
-import { DML_FRAMES, LAST_INSERT_ID_FRAMES } from "./fixtures/dml-frames.js";
+import {
+  DML_FRAMES,
+  GENERATED_KEYS_FRAMES,
+  LAST_INSERT_ID_FRAMES,
+  PREPARED_GENERATED_KEYS_FRAMES,
+} from "./fixtures/dml-frames.js";
 
 // ---------------------------------------------------------------------------
 // PacketWriter tests
@@ -2407,6 +2419,125 @@ test("parseGetLastInsertId rejects a reply that overruns its declared size", () 
     () => parseGetLastInsertId(Buffer.from("000000000000000983073100", "hex")),
     MalformedReplyError,
   );
+});
+
+// ---------------------------------------------------------------------------
+// GET_GENERATED_KEYS (replies captured from live brokers, see the fixture)
+// ---------------------------------------------------------------------------
+
+test("writeGetGeneratedKeys sends function code 34 and the query handle", () => {
+  const { payload, header } = writeGetGeneratedKeys(7, Buffer.from([1, 2, 3, 4]));
+
+  // FC 34, then the handle as a length-prefixed int (CAS fn_get_generated_keys argv[0]).
+  assert.equal(payload.toString("hex"), "22" + "00000004" + "00000007");
+  assert.equal(header.readInt32BE(0), payload.length);
+});
+
+test("the generated-keys execute flag is 0x40 on top of EXECUTE_QUERY_ALL", () => {
+  const sql = "INSERT INTO t VALUES (1)";
+  const plain = writePrepareAndExecute(sql, false, Buffer.alloc(4)).payload.toString("hex");
+  const keyed = writePrepareAndExecute(sql, false, Buffer.alloc(4), "utf-8", true).payload.toString(
+    "hex",
+  );
+  // After the SQL: prepare flag 0, autocommit 0, then the execute flag, each a
+  // one-byte argument (CAS fn_prepare_and_execute, then fn_execute_internal).
+  const args = (flag: string) => `0000000100000000010000000001${flag}`;
+  assert.ok(plain.includes(args("02")));
+  assert.equal(keyed, plain.replace(args("02"), args("42")));
+
+  const statement = parsePrepare(Buffer.from(PREPARED_GENERATED_KEYS_FRAMES.prepare, "hex"));
+  const binds = encodePreparedParams([30]);
+  const execute = writeExecute(statement, binds, Buffer.alloc(4), true).payload;
+  // FC 3, handle 1 as an argument, then the flag as a one-byte argument.
+  assert.equal(execute.subarray(0, 14).toString("hex"), "03" + "0000000400000001" + "0000000142");
+  assert.equal(writeExecute(statement, binds, Buffer.alloc(4)).payload[13], 0x02);
+});
+
+test("parseGetGeneratedKeys reads the first generated value of each captured reply", () => {
+  const parse = (hex: string) => parseGetGeneratedKeys(Buffer.from(hex, "hex"));
+
+  assert.equal(parse(GENERATED_KEYS_FRAMES.insertOneRow), "1");
+  assert.equal(parse(GENERATED_KEYS_FRAMES.insertOneRow102), "1");
+  assert.equal(parse(GENERATED_KEYS_FRAMES.insertThreeRows), "2");
+  assert.equal(parse(GENERATED_KEYS_FRAMES.bigintMaxSafe), "9007199254740991");
+  assert.equal(parse(GENERATED_KEYS_FRAMES.bigintBeyondSafe), "9007199254740992");
+  assert.equal(parse(GENERATED_KEYS_FRAMES.smallint), "-32768");
+  assert.equal(parse(GENERATED_KEYS_FRAMES.numeric), "12345678901234567890");
+  assert.equal(parse(PREPARED_GENERATED_KEYS_FRAMES.keys), "6");
+});
+
+test("parseGetGeneratedKeys reports no value when the INSERT generated none or two", () => {
+  const parse = (hex: string) => parseGetGeneratedKeys(Buffer.from(hex, "hex"));
+
+  assert.equal(parse(GENERATED_KEYS_FRAMES.noAutoIncrement), undefined);
+  assert.equal(parse(GENERATED_KEYS_FRAMES.explicitKey), undefined);
+  assert.equal(parse(GENERATED_KEYS_FRAMES.twoColumns), undefined);
+});
+
+test("parseGetGeneratedKeys raises the server's refusal", () => {
+  for (const hex of [GENERATED_KEYS_FRAMES.afterUpdate, GENERATED_KEYS_FRAMES.closedHandle]) {
+    assert.throws(() => parseGetGeneratedKeys(Buffer.from(hex, "hex")), CasReplyError);
+  }
+  assert.throws(
+    () => parseGetGeneratedKeys(Buffer.from(GENERATED_KEYS_FRAMES.closedHandle, "hex")),
+    (error: CasReplyError) => error.code === -1006,
+  );
+});
+
+test("parseGetGeneratedKeys reports no key for a body that does not decode", () => {
+  const one = GENERATED_KEYS_FRAMES.insertOneRow;
+  const bad = [
+    one.slice(0, -2), // the value cut short
+    `${one}00`, // a byte after the last row
+    one.replace("0000000101000000010800", "0000000101000000010300"), // a DOUBLE key column
+    `${one.slice(0, -10)}0000000300000001`, // an INT cell of 3 bytes
+    "000000001500000000" + "01" + "ffffffff", // a negative column count
+    one.replace("0000000015000000010100", "0000000015000000020100"), // 2 rows announced, 1 sent
+  ];
+  for (const hex of bad) {
+    assert.equal(parseGetGeneratedKeys(Buffer.from(hex, "hex")), undefined, hex);
+  }
+});
+
+test("isSingleInsert accepts one INSERT or REPLACE of any shape and nothing else", () => {
+  for (const sql of ["INSERT INTO t (v) SELECT f(v) FROM s", "replace into t values (1)"]) {
+    assert.equal(isSingleInsert(sql), true, sql);
+  }
+  for (const sql of ["UPDATE t SET v = 1", "INSERT INTO t VALUES (1); INSERT INTO u VALUES (2)"]) {
+    assert.equal(isSingleInsert(sql), false, sql);
+  }
+});
+
+test("isPlainInsert accepts only one INSERT whose text cannot call a routine", () => {
+  for (const sql of [
+    "INSERT INTO t (a, b) VALUES (?, ?)",
+    "insert into t values (1), (2)",
+    "INSERT INTO dba.t(a) VALUES(1)",
+    `INSERT INTO "t" ("a") VALUES ('f(x)')`,
+    "INSERT INTO t SET a = 1",
+    "INSERT INTO t DEFAULT VALUES",
+    "REPLACE INTO t (id, v) VALUES (1, 2)",
+    "INSERT INTO t (v) VALUES (1) ON DUPLICATE KEY UPDATE v = v + 1",
+    "INSERT INTO t (v) VALUES (1); -- trailing comment",
+    "INSERT INTO t /* x( */ (v) VALUES ((1 + 2) * 3)",
+  ]) {
+    assert.equal(isPlainInsert(sql), true, sql);
+  }
+  for (const sql of [
+    "INSERT INTO t (v) VALUES (f())",
+    "INSERT INTO t (v) VALUES (NOW())",
+    `INSERT INTO t (v) VALUES ("f"(1))`,
+    "INSERT INTO t (v) SELECT v FROM s",
+    "INSERT INTO t (v) VALUES ((SELECT 1))",
+    "INSERT INTO t (v) VALUES (1); INSERT INTO u (v) VALUES (2)",
+    "INSERT INTO t (v) VALUES (1) ON DUPLICATE KEY UPDATE v = f(v)",
+    "UPDATE t SET v = 1",
+    "CALL p()",
+    // With no_backslash_escapes=no the quote ends early and f(1) is code.
+    "INSERT INTO t (v) VALUES ('a\\'); SELECT f(1); --')",
+  ]) {
+    assert.equal(isPlainInsert(sql), false, sql);
+  }
 });
 
 test("parseGetLastInsertId rejects every nonpositive size except -1", () => {
