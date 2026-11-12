@@ -152,6 +152,16 @@ change. It is proposed for 2.0 in
 [ADR 0010](adr/0010-utc-temporal-default-in-2-0.md), with `"local"` kept as an
 explicit setting; set `timezone` explicitly now to be unaffected.
 
+### Zoned parameters
+
+`zoned()` and its `ZonedParam` type are a backward-compatible MINOR feature
+([#281](https://github.com/cubrid-lab/cubrid-client/issues/281)). A plain `Date`
+parameter keeps its DATETIME encoding on every path. `QueryParam` gains
+`ZonedParam`, so `PreparedQueryParam` does too; code that passes parameters
+compiles as before, but a `switch` or type guard over `QueryParam` that checks for
+exhaustiveness at compile time needs a case for it, and a custom `ConnectionLike`
+may now receive one.
+
 ### Unknown outcomes
 
 `outcomeUnknown` on `CubridErrorDetails`, and so on `ConnectionError`, `QueryError`,

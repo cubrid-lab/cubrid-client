@@ -120,6 +120,14 @@ and the refusal on the literal path
 LOB_WRITE frames were captured from 10.2 and 11.4 and differ only in the locator
 text.
 
+`zoned()` parameters ([#281](https://github.com/cubrid-lab/cubrid-client/issues/281))
+are asserted against local `cubrid/cubrid` 10.2 and 11.4 containers, on the
+literal path, the prepared path and `executeMany()`, in `Asia/Seoul` and
+`America/Los_Angeles` sessions: the instant is kept in TIMESTAMPTZ, TIMESTAMPLTZ,
+DATETIMETZ and DATETIMELTZ, DATE, TIME and DATETIME get the UTC fields, TIMESTAMP
+gets the instant in the session zone, and a TIMESTAMPTZ past 2038 is refused. Both
+versions answered the same. 11.0 and 11.2 were not measured.
+
 Identifier quoting by `escapeIdentifier()` and `buildWhere()` is asserted against
 local `cubrid/cubrid` 10.2 and 11.4 containers in both `no_backslash_escapes`
 modes ([#259](https://github.com/cubrid-lab/cubrid-client/issues/259)). Names with a

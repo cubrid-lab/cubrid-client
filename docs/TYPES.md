@@ -210,7 +210,8 @@ fields in. The [`timezone`](API_REFERENCE.md#clientoptions) client option picks 
   same fields, and a time in a skipped hour is refused (`Invalid utime`).
 - A `Date` written to a TIMESTAMPTZ, DATETIMETZ or `*LTZ` column gets the
   **session** zone attached to its UTC fields, so it is the same instant only
-  while the session zone is UTC. Wrap the marker in `FROM_TZ(?, '+00:00')`; see
+  while the session zone is UTC. Send it as [`zoned(date)`](#sending-the-instant-zoned),
+  or wrap the marker in `FROM_TZ(?, '+00:00')`; see
   [a `Date` in a zone-aware column](#a-date-in-a-zone-aware-column).
 
 `"local"` stays the default in 1.x so existing code reads the same values;
@@ -227,8 +228,56 @@ zone (the `timezone` server parameter, by default the zone of the server host)
 and `SET TIME ZONE` changes it. Under `Asia/Seoul` the stored instant is nine
 hours before the `Date`; under `America/Los_Angeles` in summer, seven hours after.
 
-To keep the instant, label the fields as UTC in the SQL. This was measured on
-both paths, on CUBRID 10.2 and 11.4, in `Asia/Seoul` and `America/Los_Angeles`
+To keep the instant, send the `Date` as [`zoned(date)`](#sending-the-instant-zoned),
+or label the fields as UTC in the SQL with `FROM_TZ`.
+
+#### Sending the instant: `zoned()`
+
+`zoned(date)`, exported by the package, sends a `Date` as the instant it is: a
+DATETIMETZ of its UTC fields with the zone `+00:00`. Every method that takes
+parameters accepts it: the literal methods (`query()`, `queryResult()`,
+`execute()`, `stream()`), the prepared methods and `executeMany()`, on a client,
+a transaction, a transaction scope and a pool. A plain `Date` is unchanged.
+
+```ts
+import { zoned } from "cubrid-client";
+
+await db.execute("INSERT INTO events (at) VALUES (?)", [zoned(new Date())]);
+await db.executePrepared("INSERT INTO events (at) VALUES (?)", [zoned(new Date())]);
+await db.executeMany("INSERT INTO events (at) VALUES (?)", [[zoned(a)], [zoned(b)]]);
+```
+
+| Path | Sent as |
+| --- | --- |
+| Literal methods | `DATETIMETZ'2025-06-14 23:30:45.678 +00:00'` |
+| Prepared methods, `executeMany()` | A DATETIMETZ bind: the seven DATETIME fields in UTC, then the zone text `+00:00` with no NUL, as JDBC's `setTimestamptz` sends a `CUBRIDTimestamptz`. The CAS takes the zone length from the value length and refuses a zone that ends in a NUL |
+
+What it stores, measured on CUBRID 10.2 and 11.4 (11.0 and 11.2 were not
+measured) on the literal path, the
+prepared path and `executeMany()`, in `Asia/Seoul` and `America/Los_Angeles`
+sessions, for `zoned(new Date("2025-06-14T23:30:45.678Z"))`:
+
+| Column | Reads back |
+| --- | --- |
+| DATETIMETZ | `ZonedDateTime` `2025-06-14 23:30:45.678 +00:00` |
+| TIMESTAMPTZ | `2025-06-14 23:30:45 +00:00`: the milliseconds are dropped, not rounded |
+| DATETIMELTZ, TIMESTAMPLTZ | The same instant in the session zone: `2025-06-15 08:30:45.678 Asia/Seoul KST` |
+| DATETIME, DATE, TIME | The UTC fields, as from a plain `Date` |
+| TIMESTAMP | **The instant in the session zone**: `2025-06-15 08:30:45` under `Asia/Seoul`, where a plain `Date` stores `2025-06-14 23:30:45`. Do not use `zoned()` for a TIMESTAMP column |
+| `?` in an expression, such as `SELECT ?` | A DATETIMETZ, read back as a `ZonedDateTime` |
+
+`WHERE dttz = ?` with `zoned(date)` finds the rows written with `zoned(date)`.
+`zoned()` reads the time when it is called, so changing the `Date` afterwards
+changes nothing. It throws a `TypeError` for a value that is not a `Date`, an
+invalid `Date`, or a `Date` whose UTC year is outside 0001 to 9999. A
+TIMESTAMPTZ or TIMESTAMPLTZ column holds only 1970 to 2038, and the server
+refuses a value outside that range with a `QueryError`. It always sends
+`+00:00`; a `ZonedDateTime` cannot be sent as a parameter.
+
+#### `FROM_TZ` in the SQL
+
+Labelling the fields as UTC in the SQL also keeps the instant. This was measured
+on both paths, on CUBRID 10.2 and 11.4, in `Asia/Seoul` and `America/Los_Angeles`
 sessions; a `null` parameter stays NULL:
 
 ```ts
@@ -241,26 +290,27 @@ A DATETIMETZ or TIMESTAMPTZ column then reads back as the `+00:00` fields of the
 in the session zone. `FROM_TZ(?, 'UTC')` keeps the same instant with the zone text
 `UTC UTC`.
 
+#### Why a plain `Date` is not zoned
+
 The client does not add the zone itself, because it does not know the column:
 the literal path sends no PREPARE, and a PREPARE reply describes result columns,
 not markers. Measured on 10.2 and 11.4 under `Asia/Seoul` and
 `America/Los_Angeles` sessions, every zoned form (a `DATETIMETZ'... +00:00'`
-literal, `FROM_TZ`, or a DATETIMETZ bind with zone `+00:00`, which is what JDBC
-sends for a `CUBRIDTimestamptz`; the bind was measured by hand, the literal is in
-the live tests) keeps the instant in the zone-aware columns and
-the fields of DATE, TIME and DATETIME columns, but changes TIMESTAMP:
+literal, `FROM_TZ`, or a DATETIMETZ bind with zone `+00:00`, which is what
+`zoned()` and JDBC send) keeps the instant in the zone-aware columns and the
+fields of DATE, TIME and DATETIME columns, but changes TIMESTAMP:
 
 | With a zoned `Date` instead of today's DATETIME | Effect in a non-UTC session |
 | --- | --- |
 | A TIMESTAMP column | Stores the instant and shows it in the session zone: `2025-06-15 08:30:45` under `Asia/Seoul` instead of `2025-06-14 23:30:45`, so the `Date` read back moves by the session offset |
 | `WHERE ts = DATETIMETZ'... +00:00'` on a TIMESTAMP written from the same `Date` today | Finds no row |
-| `?` in an expression, such as `TO_CHAR(?)` (measured with a DATETIMETZ bind) | Is a DATETIMETZ, so the result carries a zone |
+| `?` in an expression, such as `TO_CHAR(?)` | Is a DATETIMETZ, so the result carries a zone |
 
 The server converts a zoned value to the same instant for a TIMESTAMP as for the
 zone-aware types, so no single encoding can fix those columns without changing
 TIMESTAMP. A plain JavaScript `Date` (or JDBC `Timestamp`) is therefore always a
-DATETIME, and the zone is added where the SQL knows the column type. Sending a
-zoned parameter type, such as a `ZonedDateTime`, is not implemented.
+DATETIME, and the caller opts in with `zoned()` or `FROM_TZ` where the column is
+zone-aware.
 
 ## Timezone-aware values
 
@@ -296,8 +346,9 @@ int16, DATETIME seven) followed by the zone as NUL-terminated text.
   (milliseconds for DATETIMETZ and DATETIMELTZ only). Writing that text back as
   `TIMESTAMPTZ'...'`, `DATETIMETZ'...'` and so on reads back the same fields and
   zone on all four versions. `JSON.stringify` uses the same text.
-- A `ZonedDateTime` is frozen. It cannot be sent as a `query()` parameter; write
-  it as a SQL literal from `toString()`. Sending one is not implemented.
+- A `ZonedDateTime` is frozen. It cannot be sent as a parameter; write it as a
+  SQL literal from `toString()`. To send a `Date` with its zone, use
+  [`zoned()`](#sending-the-instant-zoned).
 - `ColumnInfo.type` is the name of the type (`TIMESTAMPTZ`, `DATETIMELTZ`, ...).
 - SQL NULL is `null`. Elements of SET, MULTISET and SEQUENCE columns are
   `ZonedDateTime` values too.
@@ -554,6 +605,7 @@ Other parameters render the same in both modes and are sent without that probe.
 | `bigint` | Decimal integer text, preserving JavaScript bigint precision. A negative value is parenthesized, `(-1)` |
 | `boolean` | `1` or `0` |
 | `Date` | `DATETIME'YYYY-MM-DD HH:MM:SS.mmm'` using **UTC components**; it has no timezone offset embedded, so a zone-aware column attaches the session zone (see [a `Date` in a zone-aware column](#a-date-in-a-zone-aware-column)). An invalid `Date` is refused |
+| `zoned(date)` | `DATETIMETZ'YYYY-MM-DD HH:MM:SS.mmm +00:00'` of the UTC fields: the instant, which a zone-aware column keeps (see [`zoned()`](#sending-the-instant-zoned)) |
 | `Buffer` | Hexadecimal binary literal `X'...'`. For BLOB or CLOB content use [`blob()` or `clob()`](#writing-blob-and-clob) with a prepared method |
 | `null`, `undefined` | SQL `NULL` |
 | `blob()`, `clob()` | Refused with a `TypeError`: use a prepared method |
@@ -607,6 +659,7 @@ rendering SQL literals.
 | `bigint` | BIGINT, or NUMERIC past 64 bits | Plain digits; more than 38 digits is refused |
 | `string` | CHAR | UTF-8, or ISO-8859-1 with `charset: "iso-8859-1"`; NUL and Ctrl-Z are refused, as on the literal path |
 | `Date` | DATETIME | **UTC components**, as on the literal path, with no zone: a zone-aware column attaches the session zone (see [a `Date` in a zone-aware column](#a-date-in-a-zone-aware-column)). Years outside 0001 to 9999 and an invalid `Date` are refused |
+| `zoned(date)` | DATETIMETZ | The UTC fields, then the zone text `+00:00` without a NUL. See [`zoned()`](#sending-the-instant-zoned) |
 | `Buffer` | VARBIT | An empty `Buffer` is refused: the broker reads it as SQL NULL |
 | `blob()`, `clob()` | BLOB, CLOB handle | Uploaded first. See [writing BLOB and CLOB](#writing-blob-and-clob) |
 | Anything else | Refused | As on the literal path |

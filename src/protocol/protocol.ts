@@ -21,6 +21,7 @@ import {
   STREAM_REUSED,
 } from "../types/lob.js";
 import { ZonedDateTime } from "../types/zoned-date-time.js";
+import { isZonedParam } from "../types/zoned-param.js";
 import {
   assertEncodable,
   CAS_CHARSET_EUC_KR,
@@ -1581,6 +1582,11 @@ function writePreparedParam(w: PacketWriter, value: unknown, charset: TextCharse
     return;
   }
 
+  if (isZonedParam(value)) {
+    writePreparedZoned(w, value.time);
+    return;
+  }
+
   if (Buffer.isBuffer(value)) {
     // X'' is valid SQL, but the CAS reads a zero-length bind as SQL NULL.
     if (value.length === 0) {
@@ -1639,7 +1645,8 @@ function writePreparedBigint(w: PacketWriter, value: bigint): void {
  *
  * It carries no zone, so a zone-aware column attaches the session zone (#273).
  * A DATETIMETZ bind would fix those columns but move TIMESTAMP ones, which the
- * server converts to the same instant; callers write FROM_TZ(?, '+00:00').
+ * server converts to the same instant; callers opt in with zoned() (#281) or
+ * FROM_TZ(?, '+00:00').
  */
 function writePreparedDate(w: PacketWriter, value: Date): void {
   const year = value.getUTCFullYear();
@@ -1659,6 +1666,45 @@ function writePreparedDate(w: PacketWriter, value: Date): void {
   w.writeShort(value.getUTCMinutes());
   w.writeShort(value.getUTCSeconds());
   w.writeShort(value.getUTCMilliseconds());
+}
+
+/** The zone of a zoned() parameter: an offset, so it never depends on zone rules. */
+const ZONED_PARAM_ZONE = "+00:00";
+
+/**
+ * A zoned() parameter as a DATETIMETZ bind, as JDBC's setTimestamptz sends it
+ * (UOutputBuffer.addDatetimetz): the length 14 plus the zone, the seven DATETIME
+ * fields in UTC, then the zone text without a NUL. The CAS (net_arg_get_datetimetz)
+ * takes the zone length as the value length less 14, and refuses a zone with a
+ * NUL, so none is sent (#281). zoned() has already checked the year.
+ */
+function writePreparedZoned(w: PacketWriter, time: number): void {
+  const value = zonedDate(time);
+  const zone = Buffer.from(ZONED_PARAM_ZONE, "latin1");
+  w.addByte(CUBRIDDataType.DATETIMETZ);
+  w.writeInt(SIZE_DATETIME + zone.length);
+  w.writeShort(value.getUTCFullYear());
+  w.writeShort(value.getUTCMonth() + 1);
+  w.writeShort(value.getUTCDate());
+  w.writeShort(value.getUTCHours());
+  w.writeShort(value.getUTCMinutes());
+  w.writeShort(value.getUTCSeconds());
+  w.writeShort(value.getUTCMilliseconds());
+  w.writeBytes(zone);
+}
+
+/**
+ * The Date of a zoned() parameter. zoned() checked it, but the brand is shared
+ * by every build through the symbol registry, so the range is checked again
+ * rather than trusting a value another version made.
+ */
+function zonedDate(time: number): Date {
+  const value = new Date(time);
+  const year = value.getUTCFullYear();
+  if (Number.isNaN(year) || year < MIN_DATETIME_YEAR || year > MAX_DATETIME_YEAR) {
+    throw new Error("zoned() parameter is not a Date in the DATETIMETZ years 0001 to 9999");
+  }
+  return value;
 }
 
 // ---------------------------------------------------------------------------
@@ -1991,6 +2037,10 @@ export function formatValue(value: unknown, noBackslashEscapes: boolean): string
     return formatDatetime(value);
   }
 
+  if (isZonedParam(value)) {
+    return formatZoned(value.time);
+  }
+
   if (Buffer.isBuffer(value)) {
     return `X'${value.toString("hex")}'`;
   }
@@ -2086,6 +2136,16 @@ function assertStorableText(value: string): void {
 
 /** A zone-less DATETIME of the UTC fields, like writePreparedDate() (#273). */
 function formatDatetime(date: Date): string {
+  return `DATETIME'${utcDatetimeText(date)}'`;
+}
+
+/** A zoned() parameter: the UTC fields labelled `+00:00`, like writePreparedZoned() (#281). */
+function formatZoned(time: number): string {
+  return `DATETIMETZ'${utcDatetimeText(zonedDate(time))} ${ZONED_PARAM_ZONE}'`;
+}
+
+/** `YYYY-MM-DD HH:MM:SS.mmm` of the UTC fields. */
+function utcDatetimeText(date: Date): string {
   const y = date.getUTCFullYear();
   const mo = String(date.getUTCMonth() + 1).padStart(2, "0");
   const d = String(date.getUTCDate()).padStart(2, "0");
@@ -2093,7 +2153,7 @@ function formatDatetime(date: Date): string {
   const mi = String(date.getUTCMinutes()).padStart(2, "0");
   const s = String(date.getUTCSeconds()).padStart(2, "0");
   const ms = String(date.getUTCMilliseconds()).padStart(3, "0");
-  return `DATETIME'${y}-${mo}-${d} ${h}:${mi}:${s}.${ms}'`;
+  return `${y}-${mo}-${d} ${h}:${mi}:${s}.${ms}`;
 }
 
 // ---------------------------------------------------------------------------

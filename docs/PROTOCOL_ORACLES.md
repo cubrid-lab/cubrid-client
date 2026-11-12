@@ -245,6 +245,12 @@ for a SET of it and `83 01` for a CHAR literal (#238).
   to `32`: the fields of TIMESTAMP (six int16) or DATETIME (seven int16), then the
   zone as NUL-terminated text (`+09:00`, `America/New_York EDT`, `UTC UTC`). The
   zero date is all-zero fields with a zone. Captured in `tests/fixtures/zoned-frames.ts`.
+- **A DATETIMETZ bind** (`zoned()`, #281) is the other way round: the value
+  length is 14 plus the zone length, then the seven DATETIME fields in UTC, then
+  the zone text `+00:00` **without** a NUL, as JDBC's `UOutputBuffer.addDatetimetz`
+  sends it. The CAS (`net_arg_get_datetimetz`) takes the zone length from the
+  value length and refuses a zone that ends in a NUL (`UTC` plus NUL: -1162).
+  Pinned in `tests/timezone.test.ts`.
 
 ## Required regression checks
 
