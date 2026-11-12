@@ -77,6 +77,24 @@ const cases = [
       return rows();
     },
   ],
+  // Safe: "1:10/0 2:11/1 3:10/0". Affected: no error, bal stays 10 on row 2.
+  [
+    "C1d negative number after minus, WHERE on next line",
+    async () => {
+      await reset();
+      await client.query(`UPDATE ${T} SET flag = 1, bal = bal-?\nWHERE id = ?`, [-1, 2]);
+      return rows();
+    },
+  ],
+  // Safe: {"id":2,"adj":11}. Affected: wrong value under another column name.
+  [
+    "C1e negative number after minus in SELECT list",
+    async () => {
+      await reset();
+      const [row] = await client.query(`SELECT id, bal-? AS adj\nFROM ${T} WHERE id = ?`, [-1, 2]);
+      return JSON.stringify(row);
+    },
+  ],
   // Safe: no row changes.
   [
     "C2 quote payload in a string",

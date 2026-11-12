@@ -1,9 +1,9 @@
 # Upgrade advisory: literal parameters before 1.4.0
 
-**Upgrade to `cubrid-client@1.4.0` or later.** Versions 0.2.0 through 1.3.0
-can turn a scoped `UPDATE` into one that changes every row when a negative
-number is passed as a parameter right after a minus sign. Version 1.4.0 fixes
-this ([#242](https://github.com/cubrid-lab/cubrid-client/issues/242),
+**Upgrade to `cubrid-client@1.4.0` or later.** In versions 0.2.0 through
+1.3.0, a negative number passed as a parameter right after a minus sign can make
+a scoped `UPDATE` change every row, or silently write and return wrong values.
+Version 1.4.0 fixes this ([#242](https://github.com/cubrid-lab/cubrid-client/issues/242),
 [#243](https://github.com/cubrid-lab/cubrid-client/issues/243), PR
 [#258](https://github.com/cubrid-lab/cubrid-client/pull/258)).
 
@@ -11,22 +11,31 @@ Tracking issue: [#290](https://github.com/cubrid-lab/cubrid-client/issues/290).
 
 ## Who is affected
 
-The problems are in how `query()` and `execute()` write parameter values into
-the SQL text. They only matter when your SQL has a pattern like the ones below.
+The problems are in how the client writes parameter values into the SQL text.
+That is `query()` in every version before 1.4.0, and in 1.3.0 also
+`execute()`, `queryResult()` and `stream()`, including their transaction and
+pool forms. They only matter when your SQL has one of the patterns below.
 
 - **Negative number after a minus sign.** In `bal-?` with the value `-1`, older
   versions wrote `bal--1`. CUBRID reads `--` as the start of a comment, so the
-  rest of the line, including a `WHERE` clause, was dropped. In the test below
-  `UPDATE t SET flag = 1, bal = bal-? WHERE id = ?` changed all three rows
-  instead of one. Writing `bal - ?` with a space, or passing a positive number,
-  avoids it.
-- **A `?` inside a `//` comment.** Versions 1.2.0 and 1.3.0 filled in a `?`
-  that sat inside a `//` comment. A string value containing a newline then
-  ended the comment, and the rest of the value ran as SQL. This needs a `?`
-  inside a comment in your own SQL text.
+  rest of that line is ignored, with no error.
+  - If the `WHERE` clause is on the same line, it is dropped:
+    `UPDATE t SET flag = 1, bal = bal-? WHERE id = ?` changed all three rows
+    instead of one.
+  - If the rest of the statement is on the next line, the right rows are
+    changed but the subtraction is lost: `bal` was written back unchanged.
+    `SELECT bal-? AS adj` likewise returned the unadjusted value, under the
+    column name `bal` instead of `adj`.
+  - Writing `bal - ?` with a space between the `-` and the `?`, or passing a
+    positive number, avoids it. `bal -?` is still affected.
+- **A `?` inside a `//` comment.** Versions up to 1.3.0 treat a `?` inside a
+  `//` comment as a placeholder and fill it in. From 1.2.0, string values keep
+  their newlines (the fix for C3 below), so a value containing a newline ends
+  the comment and the rest of the value is read as SQL. 1.1.0 and earlier
+  rewrote newlines as the two characters `\n` on a default server, so they did
+  not reach this case. This needs a `?` inside a comment in your own SQL text.
 
-String values containing quotes (`x' OR 1=1 --`) were escaped correctly in
-every tested version.
+String values containing quotes were escaped correctly in every tested version.
 
 `queryPrepared()`, `queryResultPrepared()` and `executePrepared()` (added in
 1.3.0) send values as typed binds and never write them into the SQL text, so
@@ -46,7 +55,10 @@ rather than inspecting the generated SQL. Versions 0.x and 1.0.0 hand values to
 | C1 `bal-?` with `-1` in `UPDATE ... WHERE id = ?` | n/a¹ | **all rows** | **all rows** | **all rows** | **all rows** | **all rows** | 1 row |
 | C1b same with `-1n` | n/a¹ | error | error | **all rows** | **all rows** | **all rows** | 1 row |
 | C1c `DELETE ... WHERE bal-? > 0 AND id = ?` | n/a¹ | error | error | error | error | error | 1 row |
-| C2 `x' OR 1=1 --` as a string | n/a¹ | safe | safe | safe | safe | safe | safe |
+| C1d C1 with `WHERE` on the next line | n/a¹ | *value lost* | *value lost* | *value lost* | *value lost* | *value lost* | correct |
+| C1e `SELECT bal-? AS adj` with `-1` | n/a¹ | *wrong value* | *wrong value* | *wrong value* | *wrong value* | *wrong value* | correct |
+| C2 string containing a quote and `--` | n/a¹ | safe | safe | safe | safe | safe | safe |
+| C2b string containing a backslash, a quote and `--` | n/a¹ | safe | safe | safe | safe | safe | safe |
 | C3 string with `\` and a newline stored unchanged | n/a¹ | altered | altered | altered | yes | yes | yes |
 | C4 `'a\'` followed by `?` | works | works | works | error | error | error | works |
 | C5 `?` inside `//` comment, value with a newline | n/a¹ | 1 row | 1 row | 1 row | **all rows** | **all rows** | refused |
@@ -57,7 +69,10 @@ rather than inspecting the generated SQL. Versions 0.x and 1.0.0 hand values to
 all, so these cases could not run. Its `SELECT` path behaved like 0.2.0.
 
 **Bold** marks a statement that changed rows its `WHERE` clause should have
-excluded. "Refused" means 1.4.0 raised a `QueryError` before sending any SQL:
+excluded. *Italics* mark a statement that succeeded with a wrong result and no
+error. "Altered" (C3) means 0.2.0 to 1.1.0 stored a backslash as two backslashes
+and a newline as the characters `\n` on a default server; data written through
+those versions may need checking. "Refused" means 1.4.0 raised a `QueryError` before sending any SQL:
 it does not count a `?` inside a comment or a quoted identifier as a
 placeholder, so the value count no longer matches.
 
@@ -71,7 +86,7 @@ Summary:
 | 1.4.0 | Fixed. Tested from the published npm artifact. |
 
 No CVE has been assigned. These results show that SQL written in the patterns
-above can change more rows than intended. They do not show that a particular
+above can change more rows than intended or produce wrong values. They do not show that a particular
 application is exploitable; that depends on its SQL and on where the values
 come from.
 
@@ -83,10 +98,16 @@ come from.
 2. If you cannot upgrade yet, search your SQL for a `-` directly before `?`, and
    for `?` inside comments, or switch those statements to `executePrepared()` /
    `queryPrepared()` (1.3.0).
-3. 1.4.0 refuses some calls that older versions accepted: a value count that
-   does not match the placeholders (a `?` inside a comment, string or quoted
-   identifier is not a placeholder), and values that are not a supported
-   parameter type. Fix the call rather than working around the error.
+3. 1.4.0 refuses, before sending any SQL, some calls that older versions
+   accepted. Fix the call rather than working around the error:
+   - a value count that does not match the placeholders (a `?` inside a
+     comment, string or quoted identifier is not a placeholder);
+   - `NaN` and `Infinity`, which older versions sent as bare words;
+   - an invalid `Date`;
+   - objects, arrays and other values that are not a supported parameter type,
+     which older versions sent as text such as `'[object Object]'`;
+   - a double-quoted span containing a backslash, when it makes the placeholder
+     positions ambiguous.
 
 ## Verifying 1.4.0
 
@@ -101,12 +122,16 @@ come from.
 
 ## npm deprecation (proposed, needs maintainer approval)
 
-No older version is deprecated on npm yet. Proposed command, to be run by a
-maintainer only after review:
+No older version is deprecated on npm yet. Proposed commands, to be run by a
+maintainer with publish rights only after review (add `--otp=<code>` if the
+account uses two-factor authentication):
 
 ```sh
-npm deprecate 'cubrid-client@<1.4.0' 'Upgrade to >=1.4.0: older versions can drop a WHERE clause when a negative number follows a minus sign in query()/execute() parameters. See https://github.com/cubrid-lab/cubrid-client/blob/main/docs/advisories/literal-parameters-1.4.0.md'
+npm deprecate 'cubrid-client@>=0.2.0 <1.4.0' 'Upgrade to >=1.4.0: a negative number after a minus sign in a parameter can drop a WHERE clause or give wrong values. See https://github.com/cubrid-lab/cubrid-client/blob/main/docs/advisories/literal-parameters-1.4.0.md'
+npm deprecate 'cubrid-client@0.1.0' 'Unsupported; upgrade to >=1.4.0. See https://github.com/cubrid-lab/cubrid-client/blob/main/docs/advisories/literal-parameters-1.4.0.md'
 ```
 
-Deprecation makes `npm install` print a warning. It does not remove or change
-the published packages.
+0.1.0 gets its own message because the defect could not be confirmed there.
+Check the result with `npm view cubrid-client@1.3.0 deprecated`. Deprecation
+makes `npm install` print a warning. It does not remove or change the published
+packages.

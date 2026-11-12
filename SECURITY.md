@@ -10,8 +10,9 @@
 ## Advisories
 
 - [Literal parameters before 1.4.0](docs/advisories/literal-parameters-1.4.0.md):
-  0.2.0 to 1.3.0 can drop a `WHERE` clause when a negative number follows a
-  minus sign in `query()`/`execute()` parameters. Fixed in 1.4.0.
+  in 0.2.0 to 1.3.0 a negative number right after a minus sign in a parameter
+  can drop a `WHERE` clause or give wrong values, and 1.2.0 to 1.3.0 also fill
+  in a `?` inside a `//` comment. Fixed in 1.4.0.
 
 ## Reporting a Vulnerability
 
