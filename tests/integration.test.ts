@@ -6951,34 +6951,56 @@ describe("Integration: pool close() inside transaction() callbacks (#268)", {
 
   test("two callbacks that each await close() both commit, and close() from outside waits", async () => {
     const setup = createClient(TEST_CONFIG);
-    await setup.query(`DROP TABLE IF EXISTS ${table}`);
-    await setup.query(`CREATE TABLE ${table} (val VARCHAR(20))`);
+    const pool = createPool({ ...TEST_CONFIG, max: 2 });
+    // Holds "b" after its close(), so the outside close() has a callback to wait for.
+    let releaseB!: () => void;
+    const gateB = new Promise<void>((resolve) => {
+      releaseB = resolve;
+    });
     try {
-      const pool = createPool({ ...TEST_CONFIG, max: 2 });
+      await setup.query(`DROP TABLE IF EXISTS ${table}`);
+      await setup.query(`CREATE TABLE ${table} (val VARCHAR(20))`);
+      const order: string[] = [];
       let running = 0;
       let bothRunning!: () => void;
       const together = new Promise<void>((resolve) => {
         bothRunning = resolve;
       });
       const run = (val: string) =>
-        pool.transaction(async (tx) => {
-          await tx.execute(`INSERT INTO ${table} (val) VALUES (?)`, [val]);
-          running += 1;
-          if (running === 2) {
-            bothRunning();
-          }
-          await together;
-          await pool.close();
-          // The session is still this callback's after close() resolved.
-          await tx.execute(`INSERT INTO ${table} (val) VALUES (?)`, [`${val} after`]);
-          return val;
-        });
-      const transactions = Promise.all([run("a"), run("b")]);
+        pool
+          .transaction(async (tx) => {
+            await tx.execute(`INSERT INTO ${table} (val) VALUES (?)`, [val]);
+            running += 1;
+            if (running === 2) {
+              bothRunning();
+            }
+            await together;
+            await pool.close();
+            if (val === "b") {
+              await gateB;
+            }
+            // The session is still this callback's after close() resolved.
+            await tx.execute(`INSERT INTO ${table} (val) VALUES (?)`, [`${val} after`]);
+            return val;
+          })
+          .then((result) => {
+            order.push(result);
+            return result;
+          });
+      const a = run("a");
+      const b = run("b");
       await together;
-      const outside = pool.close();
+      const outside = pool.close().then(() => {
+        order.push("close");
+      });
 
-      assert.deepEqual(await transactions, ["a", "b"]);
+      assert.equal(await a, "a");
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      assert.deepEqual(order, ["a"], "the outside close() waits for the held callback");
+      releaseB();
+      assert.equal(await b, "b");
       await outside;
+      assert.deepEqual(order, ["a", "b", "close"]);
       assert.deepEqual(pool.stats(), { total: 0, idle: 0, active: 0, pending: 0, waiting: 0 });
       const rows = await setup.query<{ val: string }>(`SELECT val FROM ${table} ORDER BY val`);
       assert.deepEqual(
@@ -6986,6 +7008,8 @@ describe("Integration: pool close() inside transaction() callbacks (#268)", {
         ["a", "a after", "b", "b after"],
       );
     } finally {
+      releaseB();
+      await pool.close();
       await setup.query(`DROP TABLE IF EXISTS ${table}`);
       await setup.close();
     }

@@ -642,7 +642,15 @@ export class CubridPool
     const slot: LeaseSlot = {};
     return runTransaction(
       this.sourceFor("transaction", slot),
-      (tx) => this.runCallback(slot.lease, () => callback(tx)),
+      async (tx) => {
+        // close() ran while the transaction options were applied or BEGIN was sent:
+        // the callback never starts, and the transaction is rolled back and its
+        // connection closed, as CubridClient.transaction() does.
+        if (this.closed) {
+          throw poolError("pool-closed", "Pool is closed.");
+        }
+        return this.runCallback(slot.lease, () => callback(tx));
+      },
       options,
     );
   }
@@ -721,9 +729,11 @@ export class CubridPool
    * end, as their connections close; statements, `connection()` callbacks and
    * `transaction()` callbacks run to their end and their connections close.
    * Scopes nobody ended are discarded meanwhile, not after: a statement may be
-   * waiting for a lock that only such a scope holds. Calling it again returns the
-   * same promise. Awaited inside a running `connection()` or `transaction()`
-   * callback, it waits for no callback, since it would wait for itself (#268).
+   * waiting for a lock that only such a scope holds. A `transaction()` whose
+   * callback has not started yet is rolled back without running it. Calling it
+   * again outside every callback returns the same promise. Awaited inside a
+   * running `connection()` or `transaction()` callback, it waits for no callback,
+   * since it would wait for itself (#268).
    */
   close(): Promise<void> {
     if (!this.draining) {

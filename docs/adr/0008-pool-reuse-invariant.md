@@ -102,7 +102,11 @@ with that wait.
   lease but its own was not enough: two callbacks that each awaited `close()`
   waited for each other forever (#268). It still waits for statements and
   discards scopes; a `close()` from outside every callback waits for all the
-  callbacks running when `close()` was first called.
+  callbacks running when `close()` was first called. A `transaction()` whose
+  callback has not started when the pool closes is rolled back without running
+  it, as in the client. An inside `close()` that waits for a statement blocked
+  on the closing callback's own lock waits until the statement's `readTimeout`
+  or `signal` ends it.
 - The method is internal and not part of the 1.x contract; a custom connection
   cannot opt in.
 
