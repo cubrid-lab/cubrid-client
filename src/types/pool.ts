@@ -1,12 +1,19 @@
 import type {
+  ArrayRowOptions,
+  ArrayStreamOptions,
   BatchExecutable,
   ClientOptions,
   Executable,
   PreparedQueryable,
   Queryable,
+  QueryOptions,
   ResultQueryable,
   Streamable,
+  StreamOptions,
 } from "./client.js";
+import type { PreparedQueryParam } from "./lob.js";
+import type { QueryParams } from "./query.js";
+import type { ArrayQueryResult, QueryResult, QueryResultRow } from "./result.js";
 
 /**
  * Options of `createPool()`: every {@link ClientOptions} setting, applied to
@@ -88,7 +95,58 @@ export interface PoolConnection
     Executable,
     PreparedQueryable,
     BatchExecutable,
-    Streamable {}
+    Streamable {
+  query<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayRowOptions,
+  ): Promise<T[]>;
+  query<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+    options?: QueryOptions,
+  ): Promise<T[]>;
+  queryResult<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayRowOptions,
+  ): Promise<ArrayQueryResult<T>>;
+  queryResult<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+    options?: QueryOptions,
+  ): Promise<QueryResult<T>>;
+  queryPrepared<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: readonly PreparedQueryParam[] | undefined,
+    options: ArrayRowOptions,
+  ): Promise<T[]>;
+  queryPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: readonly PreparedQueryParam[],
+    options?: QueryOptions,
+  ): Promise<T[]>;
+  queryResultPrepared<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: readonly PreparedQueryParam[] | undefined,
+    options: ArrayRowOptions,
+  ): Promise<ArrayQueryResult<T>>;
+  queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: readonly PreparedQueryParam[],
+    options?: QueryOptions,
+  ): Promise<QueryResult<T>>;
+  stream<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayStreamOptions,
+  ): AsyncIterable<T>;
+  stream<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+    options?: StreamOptions,
+  ): AsyncIterable<T>;
+}
 
 /** Options of `CubridPool.connection()`. */
 export interface PoolConnectionOptions {

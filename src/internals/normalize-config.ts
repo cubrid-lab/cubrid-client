@@ -122,6 +122,7 @@ export function assertValidTimezone(timezone: unknown): void {
 /** Disabling the limit is not offered: that is what would let a nested statement hang. */
 export function assertValidStreamOptions(options: StreamOptions | undefined): void {
   assertValidFetchSize(options?.fetchSize);
+  assertValidRowMode(options);
   const consumerTimeout = options?.consumerTimeout;
 
   if (
@@ -171,7 +172,48 @@ export function assertValidQueryOptions(options: QueryOptions | undefined): void
   }
 
   assertValidReadTimeout(options.readTimeout);
+  assertValidRowMode(options);
 }
+
+/**
+ * `rowMode` is declared only by the options of the methods that return rows, but
+ * any statement's options are checked, so a mistyped value never passes silently.
+ */
+function assertValidRowMode(options: object | undefined): void {
+  const rowMode = (options as { rowMode?: unknown } | undefined)?.rowMode;
+  if (rowMode !== undefined && rowMode !== "object" && rowMode !== "array") {
+    throw new TypeError('rowMode must be "object" or "array".');
+  }
+}
+
+/** True when the options ask for rows as arrays. */
+export function wantsArrayRows(options: object | undefined): boolean {
+  return (options as { rowMode?: unknown } | undefined)?.rowMode === "array";
+}
+
+/**
+ * Returns `rows`, refused when the options ask for arrays and they are not: a
+ * custom connection that does not know `rowMode` returns objects, which the
+ * caller's types would misdescribe. No rows cannot be wrong.
+ */
+export function checkedRows<R extends readonly unknown[]>(options: object | undefined, rows: R): R {
+  if (wantsArrayRows(options) && !rows.every((row) => Array.isArray(row))) {
+    throw new Error(ARRAY_ROWS_UNSUPPORTED);
+  }
+  return rows;
+}
+
+/** {@link checkedRows} for the result of a `queryResult()`. */
+export function checkedResult<R extends { rows: readonly unknown[] }>(
+  options: object | undefined,
+  result: R,
+): R {
+  checkedRows(options, result.rows);
+  return result;
+}
+
+/** Why rows in array mode were refused. */
+export const ARRAY_ROWS_UNSUPPORTED = 'Underlying connection does not support rowMode "array".';
 
 /** assertValidQueryOptions() for execute() and executePrepared(). */
 export function assertValidExecuteOptions(options: ExecuteOptions | undefined): void {

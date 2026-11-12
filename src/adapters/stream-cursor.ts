@@ -1,4 +1,4 @@
-import type { QueryResultRow } from "../types/result.js";
+import type { DecodedRow } from "../protocol/protocol.js";
 
 /**
  * The hand-over between a statement that holds its turn on the connection (the
@@ -11,7 +11,7 @@ export class StreamCursor {
   /** When the consumer last showed it is still reading. */
   activityAt = Date.now();
 
-  private window: QueryResultRow[] | null = null;
+  private window: DecodedRow[] | null = null;
   private stopped = false;
   private cancellation: { reason: unknown } | null = null;
   private running = false;
@@ -55,7 +55,7 @@ export class StreamCursor {
    * next window or stops. Without it the server has nothing left to send, so the
    * statement can release its turn while the consumer reads these rows.
    */
-  offer(rows: QueryResultRow[], more: boolean): Promise<void> {
+  offer(rows: DecodedRow[], more: boolean): Promise<void> {
     this.window = rows;
     this.activityAt = Date.now();
     this.wakeConsumer();
@@ -70,7 +70,7 @@ export class StreamCursor {
   }
 
   /** The next window, or null after the last one. Rejects if the statement failed. */
-  async take(): Promise<QueryResultRow[] | null> {
+  async take(): Promise<DecodedRow[] | null> {
     this.wakeProducer();
 
     for (;;) {

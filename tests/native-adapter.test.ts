@@ -16,7 +16,9 @@ import { writePrepareAndExecute } from "../src/protocol/protocol.js";
 import type {
   ClientConfig,
   ExecutableTransactionClient,
+  QueryOptions,
   ResultTransactionClient,
+  StreamOptions,
 } from "../src/types/client.js";
 import { blob, clob } from "../src/types/lob.js";
 import type { QueryParam } from "../src/types/query.js";
@@ -6063,4 +6065,318 @@ test("charset iso-8859-1: a CLOB is read and written as Latin-1", async () => {
     (error: Error) => error instanceof TypeError && /above U\+00FF/.test(error.message),
   );
   assert.deepEqual(refused.fakeCAS.sentPayloads, []);
+});
+
+// ---------------------------------------------------------------------------
+// rowMode: "array" (#255)
+// ---------------------------------------------------------------------------
+
+/** `SELECT t1.id, t2.id, t1.name`: two columns named `id`. */
+const DUPLICATE_ID_REPLY = (): Buffer =>
+  buildSelectResponse(
+    [
+      { name: "id", type: 2 },
+      { name: "id", type: 2, notNull: false },
+      { name: "name", type: 2 },
+    ],
+    [
+      ["1", "10", "a"],
+      ["2", null, "b"],
+    ],
+  );
+
+test("rowMode array: query keeps both values of a repeated name, in select-list order", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(DUPLICATE_ID_REPLY());
+  fakeCAS.queueResponse(buildSimpleResponse(0)); // CloseReqHandle
+  fakeCAS.queueResponse(DUPLICATE_ID_REPLY());
+  fakeCAS.queueResponse(buildSimpleResponse(0)); // CloseReqHandle
+
+  const arrays = await adapter.query<[string, string | null, string]>(
+    "SELECT t1.id, t2.id, t1.name FROM t1 LEFT JOIN t2 ON t1.id = t2.ref",
+    undefined,
+    { rowMode: "array" },
+  );
+  const objects = await adapter.query(
+    "SELECT t1.id, t2.id, t1.name FROM t1 LEFT JOIN t2 ON t1.id = t2.ref",
+  );
+
+  assert.deepEqual(arrays, [
+    ["1", "10", "a"],
+    ["2", null, "b"],
+  ]);
+  // Object mode is unchanged: the last `id` wins.
+  assert.deepEqual(objects, [
+    { id: "10", name: "a" },
+    { id: null, name: "b" },
+  ]);
+});
+
+test("rowMode array: queryResult pairs each value with its column", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(DUPLICATE_ID_REPLY());
+
+  const result = await adapter.queryResult("SELECT t1.id, t2.id, t1.name", undefined, {
+    rowMode: "array",
+  });
+
+  assert.deepEqual(
+    result.columns.map((column) => [column.name, column.nullable]),
+    [
+      ["id", false],
+      ["id", true],
+      ["name", false],
+    ],
+  );
+  assert.deepEqual(result.rows, [
+    ["1", "10", "a"],
+    ["2", null, "b"],
+  ]);
+});
+
+test('rowMode "object" is the default and anything else is refused before sending', async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(DUPLICATE_ID_REPLY());
+  fakeCAS.queueResponse(buildSimpleResponse(0)); // CloseReqHandle
+
+  const explicit = await adapter.query("SELECT 1", undefined, {
+    rowMode: "object",
+  } as QueryOptions);
+  assert.deepEqual(explicit[0], { id: "10", name: "a" });
+
+  for (const rowMode of ["arrays", "ARRAY", null, 1]) {
+    await assert.rejects(
+      adapter.query("SELECT 1", undefined, { rowMode } as unknown as QueryOptions),
+      (error: Error) =>
+        error instanceof TypeError && error.message === 'rowMode must be "object" or "array".',
+    );
+    assert.throws(
+      () => adapter.stream("SELECT 1", undefined, { rowMode } as unknown as StreamOptions),
+      TypeError,
+    );
+  }
+  assert.equal(functionsSent(fakeCAS).filter((code) => code === FC_PREPARE_AND_EXECUTE).length, 1);
+});
+
+test("rowMode array: a statement without a result set has no rows and no columns", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(buildDMLResponse(20, 1));
+
+  assert.deepEqual(
+    await adapter.queryResult("INSERT INTO t VALUES (1)", undefined, { rowMode: "array" }),
+    { rows: [], columns: [] },
+  );
+});
+
+test("rowMode array: queryPrepared and queryResultPrepared return arrays", async () => {
+  const first = createPreparedAdapter();
+  queuePreparedSelect(first.fakeCAS);
+  assert.deepEqual(await first.adapter.queryPrepared("SELECT ? AS v", [7], { rowMode: "array" }), [
+    [7],
+  ]);
+
+  const second = createPreparedAdapter();
+  queuePreparedSelect(second.fakeCAS);
+  const result = await second.adapter.queryResultPrepared("SELECT ? AS v", [7], {
+    rowMode: "array",
+  });
+  assert.deepEqual(result.rows, [[7]]);
+  assert.deepEqual(
+    result.columns.map((column) => column.name),
+    ["v"],
+  );
+});
+
+test("rowMode array: stream yields arrays", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(DUPLICATE_ID_REPLY());
+
+  const rows: unknown[][] = [];
+  for await (const row of adapter.stream("SELECT t1.id, t2.id, t1.name", undefined, {
+    rowMode: "array",
+  })) {
+    rows.push(row);
+  }
+
+  assert.deepEqual(rows, [
+    ["1", "10", "a"],
+    ["2", null, "b"],
+  ]);
+});
+
+test("rowMode array: LOBs of same-named columns are each read; object mode reads only the kept one", async () => {
+  // Columns id, c (BLOB), c (CLOB).
+  const objects = lobAdapter();
+  objects.fakeCAS.queueResponse(lobSelectReplyWithBlobAlias("c"));
+  objects.fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readClobReply, "hex"));
+
+  assert.deepEqual(await objects.adapter.query(SELECT_LOBS), [
+    { id: 1, c: "hi" },
+    { id: 2, c: "" },
+    { id: 3, c: null },
+  ]);
+  // The BLOB a later `c` replaced is never read.
+  assert.deepEqual(lobReads(objects.fakeCAS), [[0, 2]]);
+
+  const arrays = lobAdapter();
+  arrays.fakeCAS.queueResponse(lobSelectReplyWithBlobAlias("c"));
+  arrays.fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readBlobReply, "hex"));
+  arrays.fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readClobReply, "hex"));
+
+  const result = await arrays.adapter.queryResult(SELECT_LOBS, undefined, { rowMode: "array" });
+
+  assert.deepEqual(result.rows, [
+    [1, Buffer.from([1, 2, 3]), "hi"],
+    [2, Buffer.alloc(0), ""],
+    [3, null, null],
+  ]);
+  assert.deepEqual(
+    result.columns.map((column) => [column.name, column.type]),
+    [
+      ["id", "INT"],
+      ["c", "BLOB"],
+      ["c", "CLOB"],
+    ],
+  );
+  assert.ok(!inspect(result.rows, { depth: null }).includes("file:"));
+  assert.deepEqual(functionsSent(arrays.fakeCAS), [
+    FC_PREPARE_AND_EXECUTE,
+    FC_LOB_READ,
+    FC_LOB_READ,
+    FC_END_TRAN,
+    FC_CLOSE_REQ_HANDLE,
+  ]);
+});
+
+test("rowMode array: every LOB counts against maxLobBytes and is named in the refusal", async () => {
+  const objects = lobAdapter({ maxLobBytes: 2 });
+  objects.fakeCAS.queueResponse(lobSelectReplyWithBlobAlias("c"));
+  objects.fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readClobReply, "hex"));
+  // Object mode loads only the CLOB, which fits.
+  assert.equal((await objects.adapter.query(SELECT_LOBS)).length, 3);
+
+  const arrays = lobAdapter({ maxLobBytes: 2 });
+  arrays.fakeCAS.queueResponse(lobSelectReplyWithBlobAlias("c"));
+  await assert.rejects(
+    arrays.adapter.query(SELECT_LOBS, undefined, { rowMode: "array" }),
+    (error: Error) => {
+      assert.match(
+        String((error.cause as Error)?.message),
+        /column "c" takes this query's LOB content to 3 bytes/,
+      );
+      return true;
+    },
+  );
+  assert.deepEqual(lobReads(arrays.fakeCAS), []);
+});
+
+test("rowMode array: a column aliased __proto__ is an ordinary element", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  fakeCAS.queueResponse(lobSelectReplyWithBlobAlias("__proto__"));
+  fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readBlobReply, "hex"));
+  fakeCAS.queueResponse(Buffer.from(LOB_FRAMES.readClobReply, "hex"));
+
+  const result = await adapter.queryResult(SELECT_LOBS, undefined, { rowMode: "array" });
+
+  assert.deepEqual(result.rows[0], [1, Buffer.from([1, 2, 3]), "hi"]);
+  assert.equal(result.columns[1]?.name, "__proto__");
+  assert.equal(Object.getPrototypeOf(result.rows[0]), Array.prototype);
+});
+
+test("rowMode array: stream reads each row's LOBs when its row is reached", async () => {
+  const { adapter, fakeCAS } = lobAdapter();
+  fakeCAS.queueResponse(lobReplyWithSizes([1n, 0n], [1n, 0n]));
+  fakeCAS.queueResponse(lobReadReply(Buffer.from([7])));
+  fakeCAS.queueResponse(lobReadReply(Buffer.from([8])));
+
+  const rows = adapter.stream(SELECT_LOBS, undefined, { rowMode: "array" });
+  const first = await rows.next();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.deepEqual(first.value, [1, Buffer.from([7]), ""]);
+  assert.deepEqual(lobReads(fakeCAS), [[0, 1]]);
+  assert.deepEqual((await rows.next()).value, [2, Buffer.from([8]), ""]);
+  assert.deepEqual((await rows.next()).value, [3, null, null]);
+  assert.equal((await rows.next()).done, true);
+  assert.deepEqual(functionsSent(fakeCAS), [
+    FC_PREPARE_AND_EXECUTE,
+    FC_LOB_READ,
+    FC_LOB_READ,
+    FC_END_TRAN,
+    FC_CLOSE_REQ_HANDLE,
+  ]);
+});
+
+/** `SELECT t1.id, t2.id` with one inline row of `total`, the rest left to FETCH. */
+function duplicateIdPartialReply(total: number): Buffer {
+  const response = buildSelectResponse(
+    [
+      { name: "id", type: 2 },
+      { name: "id", type: 2 },
+    ],
+    [["1", "10"]],
+  );
+  const colMetaSize = 1 + 2 + 4 + 4 + 3 + 4 + 3 + 4 + 1 + 1 + 4 + 1 + 7;
+  response.writeInt32BE(QUERY_HANDLE, 0);
+  response.writeInt32BE(total, 4 + 4 + 1 + 4 + 1 + 4 + 2 * colMetaSize);
+  return response;
+}
+
+/** A FETCH reply holding `rows` of text cells, numbered from `first`. */
+function textFetchReply(first: number, rows: string[][]): Buffer {
+  const parts: Buffer[] = [];
+  const int = (value: number): Buffer => {
+    const buffer = Buffer.alloc(4);
+    buffer.writeInt32BE(value, 0);
+    return buffer;
+  };
+  parts.push(int(0), int(rows.length));
+  rows.forEach((row, index) => {
+    parts.push(int(first + index), Buffer.alloc(8));
+    for (const cell of row) {
+      const text = Buffer.from(`${cell}\0`, "utf-8");
+      parts.push(int(text.length), text);
+    }
+  });
+  return Buffer.concat(parts);
+}
+
+test("rowMode array: rows that arrive by FETCH are arrays too", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(duplicateIdPartialReply(3));
+  fakeCAS.queueResponse(
+    textFetchReply(2, [
+      ["2", "20"],
+      ["3", "30"],
+    ]),
+  );
+  fakeCAS.queueResponse(buildSimpleResponse(0)); // CloseReqHandle
+
+  const result = await adapter.queryResult("SELECT t1.id, t2.id", undefined, { rowMode: "array" });
+
+  assert.deepEqual(result.rows, [
+    ["1", "10"],
+    ["2", "20"],
+    ["3", "30"],
+  ]);
+  assert.ok(sentCodes(fakeCAS).includes(CASFunctionCode.FETCH));
+});
+
+test("rowMode array: a stream's FETCH windows are arrays too", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  fakeCAS.queueResponse(duplicateIdPartialReply(2));
+  fakeCAS.queueResponse(textFetchReply(2, [["2", "20"]]));
+  fakeCAS.queueResponse(buildSimpleResponse(0)); // END_TRAN
+  fakeCAS.queueResponse(buildSimpleResponse(0)); // CloseReqHandle
+
+  const rows: unknown[][] = [];
+  for await (const row of adapter.stream("SELECT t1.id, t2.id", undefined, { rowMode: "array" })) {
+    rows.push(row);
+  }
+
+  assert.deepEqual(rows, [
+    ["1", "10"],
+    ["2", "20"],
+  ]);
+  assert.ok(sentCodes(fakeCAS).includes(CASFunctionCode.FETCH));
 });

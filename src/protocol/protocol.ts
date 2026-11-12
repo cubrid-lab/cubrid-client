@@ -313,11 +313,21 @@ export interface PrepareResult {
   columns: ColumnMeta[];
 }
 
-export interface PrepareAndExecuteResult extends PrepareResult {
+/**
+ * How a decoded row holds its cells: an object keyed by column name, where the
+ * last of several same-named columns wins, or an array in select-list order.
+ */
+export type RowShape = "object" | "array";
+
+/** A decoded row of either {@link RowShape}. */
+export type DecodedRow = Record<string, unknown> | unknown[];
+
+export interface PrepareAndExecuteResult<R extends DecodedRow = Record<string, unknown>>
+  extends PrepareResult {
   totalTupleCount: number;
   /** One entry per statement the request ran; more than one for `a; b`. */
   resultInfos: ResultInfo[];
-  rows: Record<string, unknown>[];
+  rows: R[];
 }
 
 /**
@@ -326,9 +336,24 @@ export interface PrepareAndExecuteResult extends PrepareResult {
 export function parsePrepareAndExecute(
   data: Buffer,
   protoVersion: number,
+  utcDates?: boolean,
+  charset?: TextCharset,
+  shape?: "object",
+): PrepareAndExecuteResult;
+export function parsePrepareAndExecute(
+  data: Buffer,
+  protoVersion: number,
+  utcDates: boolean,
+  charset: TextCharset,
+  shape: RowShape,
+): PrepareAndExecuteResult<DecodedRow>;
+export function parsePrepareAndExecute(
+  data: Buffer,
+  protoVersion: number,
   utcDates = false,
   charset: TextCharset = "utf-8",
-): PrepareAndExecuteResult {
+  shape: RowShape = "object",
+): PrepareAndExecuteResult<DecodedRow> {
   assertReplySize(data);
   const reader = new PacketReader(data, 0, utcDates, charset);
   const responseCode = reader.parseInt();
@@ -343,16 +368,17 @@ export function parsePrepareAndExecute(
     );
   }
 
-  return decodeReply(() => readExecuteReply(reader, responseCode, protoVersion));
+  return decodeReply(() => readExecuteReply(reader, responseCode, protoVersion, shape));
 }
 
 function readExecuteReply(
   reader: PacketReader,
   queryHandle: number,
   protoVersion: number,
-): PrepareAndExecuteResult {
+  shape: RowShape,
+): PrepareAndExecuteResult<DecodedRow> {
   const statement = readPrepareInfo(reader, queryHandle);
-  return readExecution(reader, statement, reader.parseInt(), protoVersion, false);
+  return readExecution(reader, statement, reader.parseInt(), protoVersion, false, shape);
 }
 
 /** The statement description shared by PREPARE, PREPARE_AND_EXECUTE and a refreshed EXECUTE. */
@@ -380,7 +406,8 @@ function readExecution(
   totalTupleCount: number,
   protoVersion: number,
   prepared: boolean,
-): PrepareAndExecuteResult {
+  shape: RowShape,
+): PrepareAndExecuteResult<DecodedRow> {
   reader.parseByte(); // cache_reusable
   const resultCount = reader.parseInt();
   const resultInfos = parseResultInfos(reader, resultCount, prepared);
@@ -407,13 +434,13 @@ function readExecution(
 
   // Inline fetch (for SELECT statements)
   const { columns, statementType } = current;
-  const rows: Record<string, unknown>[] = [];
+  const rows: DecodedRow[] = [];
   if (statementType === StatementType.SELECT && reader.remaining > 0) {
     const fetchCode = reader.parseInt();
     if (fetchCode >= 0) {
       const tupleCount = reader.parseInt();
       if (tupleCount > 0) {
-        parseRowData(reader, columns, tupleCount, rows, false);
+        parseRowData(reader, columns, tupleCount, rows, false, shape);
       }
     }
   }
@@ -549,9 +576,26 @@ export function parseExecute(
   data: Buffer,
   statement: PrepareResult,
   protoVersion: number,
+  utcDates?: boolean,
+  charset?: TextCharset,
+  shape?: "object",
+): PrepareAndExecuteResult;
+export function parseExecute(
+  data: Buffer,
+  statement: PrepareResult,
+  protoVersion: number,
+  utcDates: boolean,
+  charset: TextCharset,
+  shape: RowShape,
+): PrepareAndExecuteResult<DecodedRow>;
+export function parseExecute(
+  data: Buffer,
+  statement: PrepareResult,
+  protoVersion: number,
   utcDates = false,
   charset: TextCharset = "utf-8",
-): PrepareAndExecuteResult {
+  shape: RowShape = "object",
+): PrepareAndExecuteResult<DecodedRow> {
   assertReplySize(data);
   const reader = new PacketReader(data, 0, utcDates, charset);
   const responseCode = reader.parseInt();
@@ -566,7 +610,9 @@ export function parseExecute(
     );
   }
 
-  return decodeReply(() => readExecution(reader, statement, responseCode, protoVersion, true));
+  return decodeReply(() =>
+    readExecution(reader, statement, responseCode, protoVersion, true, shape),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -702,9 +748,9 @@ export function writeFetch(
   return { header, payload };
 }
 
-export interface FetchResult {
+export interface FetchResult<R extends DecodedRow = Record<string, unknown>> {
   tupleCount: number;
-  rows: Record<string, unknown>[];
+  rows: R[];
 }
 
 /**
@@ -713,9 +759,24 @@ export interface FetchResult {
 export function parseFetch(
   data: Buffer,
   columns: ColumnMeta[],
+  utcDates?: boolean,
+  charset?: TextCharset,
+  shape?: "object",
+): FetchResult;
+export function parseFetch(
+  data: Buffer,
+  columns: ColumnMeta[],
+  utcDates: boolean,
+  charset: TextCharset,
+  shape: RowShape,
+): FetchResult<DecodedRow>;
+export function parseFetch(
+  data: Buffer,
+  columns: ColumnMeta[],
   utcDates = false,
   charset: TextCharset = "utf-8",
-): FetchResult {
+  shape: RowShape = "object",
+): FetchResult<DecodedRow> {
   assertReplySize(data);
   const reader = new PacketReader(data, 0, utcDates, charset);
   const responseCode = reader.parseInt();
@@ -736,9 +797,9 @@ export function parseFetch(
 
   return decodeReply(() => {
     const tupleCount = reader.parseInt();
-    const rows: Record<string, unknown>[] = [];
+    const rows: DecodedRow[] = [];
     if (tupleCount > 0) {
-      parseRowData(reader, columns, tupleCount, rows, false);
+      parseRowData(reader, columns, tupleCount, rows, false, shape);
     }
 
     return { tupleCount, rows };
@@ -2136,12 +2197,25 @@ export function setColumn(row: Record<string, unknown>, name: string, value: unk
   row[name] = value;
 }
 
+/**
+ * Store a decoded cell: an array row at the column's position, so a repeated or
+ * empty name keeps its own value, and an object row by name through setColumn().
+ */
+export function setCell(row: DecodedRow, index: number, name: string, value: unknown): void {
+  if (Array.isArray(row)) {
+    row[index] = value;
+  } else {
+    setColumn(row, name, value);
+  }
+}
+
 function parseRowData(
   reader: PacketReader,
   columns: ColumnMeta[],
   tupleCount: number,
-  rows: Record<string, unknown>[],
+  rows: DecodedRow[],
   isCallType: boolean,
+  shape: RowShape,
 ): void {
   let unsupported: UnsupportedValueError | undefined;
 
@@ -2151,7 +2225,7 @@ function parseRowData(
     reader.parseInt(); // row index
     reader.skip(SIZE_OID); // OID
 
-    const row: Record<string, unknown> = {};
+    const row: DecodedRow = shape === "array" ? new Array(columns.length) : {};
 
     for (let c = 0; c < columns.length; c++) {
       let size = reader.parseInt();
@@ -2167,7 +2241,7 @@ function parseRowData(
         );
       }
       if (size === -1) {
-        setColumn(row, column.name, null);
+        setCell(row, c, column.name, null);
         continue;
       }
 
@@ -2186,7 +2260,7 @@ function parseRowData(
 
       // An empty bit string is not SQL NULL: it is an empty Buffer (#173).
       if (size === 0 && isBitType(colType)) {
-        setColumn(row, column.name, Buffer.alloc(0));
+        setCell(row, c, column.name, Buffer.alloc(0));
         continue;
       }
 
@@ -2201,7 +2275,7 @@ function parseRowData(
         if (size === 0) {
           throw new Error(`Malformed CAS packet: type ${colType} cannot be empty`);
         }
-        setColumn(row, column.name, value);
+        setCell(row, c, column.name, value);
       } catch (error) {
         const message = `Failed to decode CUBRID column "${column.name}" (wire type ${colType}, ${size} bytes)`;
         if (!(error instanceof UnsupportedValueError)) {

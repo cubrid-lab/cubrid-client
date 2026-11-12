@@ -125,10 +125,28 @@ interface ColumnInfo {
  * only NULL still has its type, and a name that appears twice (for example
  * `SELECT a.id, b.id`) appears twice. Each row object is keyed by column name,
  * exactly as `query()` returns it, so for a repeated name the value of the last
- * such column is the one in the row. A statement that returns no result set
- * has no rows and no columns.
+ * such column is the one in the row, at the position of the first. Give such
+ * columns distinct aliases, or use `rowMode: "array"` ({@link ArrayQueryResult}),
+ * to keep every value. A statement that returns no result set has no rows and
+ * no columns.
  */
 interface QueryResult<T extends QueryResultRow = QueryResultRow> {
+    rows: T[];
+    columns: ColumnInfo[];
+}
+/**
+ * Rows as arrays, together with the columns that produced them: what
+ * `queryResult()` and `queryResultPrepared()` return with `rowMode: "array"`.
+ *
+ * Every row holds one value per select-list column, in select-list order, and
+ * `columns[i]` describes the value at index `i` of each row. Columns with the
+ * same name, an empty name or names that differ only in case each keep their
+ * own value. A statement that returns no result set has no rows and no columns.
+ *
+ * `T` describes each row at compile time, for example `[number, string | null]`;
+ * as with object rows, it is not checked at runtime.
+ */
+interface ArrayQueryResult<T extends readonly unknown[] = unknown[]> {
     rows: T[];
     columns: ColumnInfo[];
 }
@@ -378,6 +396,25 @@ interface QueryOptions {
      */
     readTimeout?: number;
 }
+/**
+ * {@link QueryOptions} of a statement whose rows are arrays: `query()`,
+ * `queryResult()` and their `Prepared` forms then return each row as an array
+ * of its values in select-list order, so `SELECT t1.id, t2.id` keeps both `id`
+ * values. `queryResult()` reports the names in `columns`, one per value. See
+ * {@link ArrayQueryResult}.
+ *
+ * The overloads that accept it exist on the client, the pool, a pool
+ * connection, a transaction and a transaction scope. A custom
+ * `connectionFactory` connection receives `rowMode` in its options; when its
+ * rows are not arrays, the query rejects with a `QueryError`.
+ */
+interface ArrayRowOptions extends QueryOptions {
+    rowMode: "array";
+}
+/** {@link StreamOptions} of a `stream()` that yields each row as an array, as {@link ArrayRowOptions}. */
+interface ArrayStreamOptions extends StreamOptions {
+    rowMode: "array";
+}
 /** Options of `execute()` and `executePrepared()`. */
 interface ExecuteOptions extends QueryOptions {
     /**
@@ -430,6 +467,17 @@ interface StreamOptions {
  */
 interface Streamable {
     stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncIterable<T>;
+}
+/**
+ * The array-row overloads of the statement methods (see {@link ArrayRowOptions}),
+ * on the transaction client `transaction()` passes in. This describes values the
+ * client hands out; do not implement it in your own classes.
+ */
+interface ArrayRowQueryable {
+    query<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayRowOptions): Promise<T[]>;
+    queryResult<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayRowOptions): Promise<ArrayQueryResult<T>>;
+    queryPrepared<T extends readonly unknown[] = unknown[]>(sql: string, params: readonly PreparedQueryParam[] | undefined, options: ArrayRowOptions): Promise<T[]>;
+    queryResultPrepared<T extends readonly unknown[] = unknown[]>(sql: string, params: readonly PreparedQueryParam[] | undefined, options: ArrayRowOptions): Promise<ArrayQueryResult<T>>;
 }
 /**
  * Outcome of a statement run with `execute()`.
@@ -529,6 +577,14 @@ interface BatchTransactionClient extends TransactionClient, BatchExecutable {
  * minor release, so do not implement it in your own classes.
  */
 interface TransactionScope extends ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient, BatchTransactionClient {
+    query<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayRowOptions): Promise<T[]>;
+    query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
+    queryResult<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayRowOptions): Promise<ArrayQueryResult<T>>;
+    queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
+    queryPrepared<T extends readonly unknown[] = unknown[]>(sql: string, params: readonly PreparedQueryParam[] | undefined, options: ArrayRowOptions): Promise<T[]>;
+    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<T[]>;
+    queryResultPrepared<T extends readonly unknown[] = unknown[]>(sql: string, params: readonly PreparedQueryParam[] | undefined, options: ArrayRowOptions): Promise<ArrayQueryResult<T>>;
+    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<QueryResult<T>>;
 }
 interface ConnectionLike {
     connect(): Promise<void>;
@@ -682,20 +738,31 @@ declare class NativeCubridAdapter implements DriverAdapter {
     constructor(config: ClientConfig);
     connect(): Promise<void>;
     /**
-     * See {@link QueryOptions} for `signal` and a per-statement `readTimeout`. An
-     * invalid option rejects before anything is queued or sent.
+     * See {@link QueryOptions} for `signal` and a per-statement `readTimeout`, and
+     * {@link ArrayRowOptions} for `rowMode`. An invalid option rejects before
+     * anything is queued or sent.
      */
+    query<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayRowOptions): Promise<T[]>;
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
+    queryResult<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayRowOptions): Promise<ArrayQueryResult<T>>;
     queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
     /**
      * Reads a result one server reply at a time. See `CubridClient.stream()` for the
      * contract. The statement is issued by the first read, like any other statement
      * in the queue, and keeps its turn until it has released its query handle.
      */
+    stream<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayStreamOptions): AsyncGenerator<T, void, undefined>;
     stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncGenerator<T, void, undefined>;
+    /**
+     * The signature of {@link Streamable.stream}, so a union of this type with
+     * `Streamable` or `ConnectionLike` stays callable. Never chosen by a direct call.
+     */
+    stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncIterable<T>;
     private streamRows;
     execute(sql: string, params?: QueryParams, options?: ExecuteOptions): Promise<ExecuteResult>;
+    queryPrepared<T extends readonly unknown[] = unknown[]>(sql: string, params: readonly PreparedQueryParam[] | undefined, options: ArrayRowOptions): Promise<T[]>;
     queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<T[]>;
+    queryResultPrepared<T extends readonly unknown[] = unknown[]>(sql: string, params: readonly PreparedQueryParam[] | undefined, options: ArrayRowOptions): Promise<ArrayQueryResult<T>>;
     queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<QueryResult<T>>;
     executePrepared(sql: string, params?: readonly PreparedQueryParam[], options?: ExecuteOptions): Promise<ExecuteResult>;
     /**
@@ -1093,15 +1160,21 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
     constructor(config: ClientConfig, connectionFactory: ConnectionFactory);
     /**
      * Run a statement and return its rows. See {@link QueryOptions} for `signal`
-     * and a per-statement `readTimeout`.
+     * and a per-statement `readTimeout`. With `rowMode: "array"` each row is an
+     * array of its values in select-list order; see {@link ArrayRowOptions}.
      *
      * @throws RangeError or TypeError (as a rejection, before anything is sent)
      * when an option is invalid.
      */
+    query<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayRowOptions): Promise<T[]>;
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
+    /** {@link query} with the columns of the result. See {@link QueryResult}. */
+    queryResult<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayRowOptions): Promise<ArrayQueryResult<T>>;
     queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
     execute(sql: string, params?: QueryParams, options?: ExecuteOptions): Promise<ExecuteResult>;
+    queryPrepared<T extends readonly unknown[] = unknown[]>(sql: string, params: readonly PreparedQueryParam[] | undefined, options: ArrayRowOptions): Promise<T[]>;
     queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<T[]>;
+    queryResultPrepared<T extends readonly unknown[] = unknown[]>(sql: string, params: readonly PreparedQueryParam[] | undefined, options: ArrayRowOptions): Promise<ArrayQueryResult<T>>;
     queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<QueryResult<T>>;
     executePrepared(sql: string, params?: readonly PreparedQueryParam[], options?: ExecuteOptions): Promise<ExecuteResult>;
     /**
@@ -1129,12 +1202,19 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
      * Statements issued on this client meanwhile wait, so one awaited inside the loop
      * can never run: it rejects with `kind: "stream-busy"` after
      * {@link StreamOptions.consumerTimeout}. Use `transaction()`, which has its own
-     * connection, or another client. See `docs/API_REFERENCE.md`.
+     * connection, or another client. With `rowMode: "array"` each row is an array
+     * of its values in select-list order. See `docs/API_REFERENCE.md`.
      *
-     * @throws RangeError at once when an option is invalid.
+     * @throws RangeError or TypeError at once when an option is invalid.
      */
+    stream<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayStreamOptions): AsyncGenerator<T, void, undefined>;
     stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncGenerator<T, void, undefined>;
-    transaction<T>(callback: TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient & BatchTransactionClient>, options?: TransactionOptions): Promise<T>;
+    /**
+     * The signature of {@link Streamable.stream}, so a union of this type with
+     * `Streamable` or `ConnectionLike` stays callable. Never chosen by a direct call.
+     */
+    stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncIterable<T>;
+    transaction<T>(callback: TransactionCallback<T, ArrayRowQueryable & ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient & BatchTransactionClient>, options?: TransactionOptions): Promise<T>;
     /**
      * Start a manual transaction on its own connection and return the handle that
      * owns it. Statements belong to the transaction only when sent through the
@@ -1317,6 +1397,16 @@ interface PoolStats {
  * minor release, so do not implement it in your own classes.
  */
 interface PoolConnection extends Queryable, ResultQueryable, Executable, PreparedQueryable, BatchExecutable, Streamable {
+    query<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayRowOptions): Promise<T[]>;
+    query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
+    queryResult<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayRowOptions): Promise<ArrayQueryResult<T>>;
+    queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
+    queryPrepared<T extends readonly unknown[] = unknown[]>(sql: string, params: readonly PreparedQueryParam[] | undefined, options: ArrayRowOptions): Promise<T[]>;
+    queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<T[]>;
+    queryResultPrepared<T extends readonly unknown[] = unknown[]>(sql: string, params: readonly PreparedQueryParam[] | undefined, options: ArrayRowOptions): Promise<ArrayQueryResult<T>>;
+    queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<QueryResult<T>>;
+    stream<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayStreamOptions): AsyncIterable<T>;
+    stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncIterable<T>;
 }
 /** Options of `CubridPool.connection()`. */
 interface PoolConnectionOptions {
@@ -1372,11 +1462,18 @@ declare class CubridPool implements Queryable, ResultQueryable, Executable, Prep
     private readonly settings;
     /** Same as {@link createPool}. */
     constructor(options: PoolOptions);
-    /** Run a statement on a leased connection and return its rows. See {@link QueryOptions}. */
+    /**
+     * Run a statement on a leased connection and return its rows. See
+     * {@link QueryOptions}, and {@link ArrayRowOptions} for `rowMode: "array"`.
+     */
+    query<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayRowOptions): Promise<T[]>;
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
+    queryResult<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayRowOptions): Promise<ArrayQueryResult<T>>;
     queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
     execute(sql: string, params?: QueryParams, options?: ExecuteOptions): Promise<ExecuteResult>;
+    queryPrepared<T extends readonly unknown[] = unknown[]>(sql: string, params: readonly PreparedQueryParam[] | undefined, options: ArrayRowOptions): Promise<T[]>;
     queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<T[]>;
+    queryResultPrepared<T extends readonly unknown[] = unknown[]>(sql: string, params: readonly PreparedQueryParam[] | undefined, options: ArrayRowOptions): Promise<ArrayQueryResult<T>>;
     queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<QueryResult<T>>;
     executePrepared(sql: string, params?: readonly PreparedQueryParam[], options?: ExecuteOptions): Promise<ExecuteResult>;
     /** `executeMany()` of the client, on one leased connection, in autocommit mode. */
@@ -1386,9 +1483,15 @@ declare class CubridPool implements Queryable, ResultQueryable, Executable, Prep
      * connection from the first read until it ends, so a statement awaited inside
      * the loop runs on another connection of the pool, or waits for one.
      *
-     * @throws RangeError at once when an option is invalid.
+     * @throws RangeError or TypeError at once when an option is invalid.
      */
+    stream<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayStreamOptions): AsyncGenerator<T, void, undefined>;
     stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncGenerator<T, void, undefined>;
+    /**
+     * The signature of {@link Streamable.stream}, so a union of this type with
+     * `Streamable` or `ConnectionLike` stays callable. Never chosen by a direct call.
+     */
+    stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncIterable<T>;
     /**
      * Run `fn` with one connection of the pool, in autocommit mode, and release it
      * when `fn` settles. The connection rejects every call made after that.
@@ -1399,7 +1502,7 @@ declare class CubridPool implements Queryable, ResultQueryable, Executable, Prep
      * `transaction()` of the client, on a leased connection. The connection goes
      * back to the pool only when the transaction ended cleanly.
      */
-    transaction<T>(callback: TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient & BatchTransactionClient>, options?: TransactionOptions): Promise<T>;
+    transaction<T>(callback: TransactionCallback<T, ArrayRowQueryable & ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient & BatchTransactionClient>, options?: TransactionOptions): Promise<T>;
     /**
      * `beginTransactionScope()` of the client, on a leased connection held until
      * `commit()` or `rollback()`. `close()` discards a scope nobody ended.
@@ -1494,13 +1597,17 @@ declare class CubridPool implements Queryable, ResultQueryable, Executable, Prep
     private endpoint;
 }
 
-declare class CubridTransaction implements ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient, BatchTransactionClient {
+declare class CubridTransaction implements ArrayRowQueryable, ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient, BatchTransactionClient {
     private readonly connection;
     constructor(connection: ConnectionLike);
+    query<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayRowOptions): Promise<T[]>;
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
+    queryResult<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayRowOptions): Promise<ArrayQueryResult<T>>;
     queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
     execute(sql: string, params?: QueryParams, options?: ExecuteOptions): Promise<ExecuteResult>;
+    queryPrepared<T extends readonly unknown[] = unknown[]>(sql: string, params: readonly PreparedQueryParam[] | undefined, options: ArrayRowOptions): Promise<T[]>;
     queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<T[]>;
+    queryResultPrepared<T extends readonly unknown[] = unknown[]>(sql: string, params: readonly PreparedQueryParam[] | undefined, options: ArrayRowOptions): Promise<ArrayQueryResult<T>>;
     queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<QueryResult<T>>;
     executePrepared(sql: string, params?: readonly PreparedQueryParam[], options?: ExecuteOptions): Promise<ExecuteResult>;
     /**
@@ -1727,4 +1834,4 @@ declare function buildWhere(conditions: Record<string, unknown>): {
     params: unknown[];
 };
 
-export { type BatchExecutable, type BatchTransactionClient, type BlobSource, type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type ClobSource, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridPool, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteManyFailure, type ExecuteManyResult, type ExecuteManySetFailure, type ExecuteOptions, type ExecuteResult, type IsolationLevel, type LobParam, LockTimeoutError, NativeCubridAdapter, type PoolConnection, type PoolConnectionOptions, type PoolOptions, type PoolStats, type PreparedQueryParam, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryOptions, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type StreamOptions, type Streamable, type TransactionCallback, type TransactionClient, TransactionError, type TransactionOptions, type TransactionScope, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, blob, buildWhere, clob, createClient, createPool, escapeIdentifier, parseConnectionString };
+export { type ArrayQueryResult, type ArrayRowOptions, type ArrayRowQueryable, type ArrayStreamOptions, type BatchExecutable, type BatchTransactionClient, type BlobSource, type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type ClobSource, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridPool, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteManyFailure, type ExecuteManyResult, type ExecuteManySetFailure, type ExecuteOptions, type ExecuteResult, type IsolationLevel, type LobParam, LockTimeoutError, NativeCubridAdapter, type PoolConnection, type PoolConnectionOptions, type PoolOptions, type PoolStats, type PreparedQueryParam, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryOptions, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type StreamOptions, type Streamable, type TransactionCallback, type TransactionClient, TransactionError, type TransactionOptions, type TransactionScope, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, blob, buildWhere, clob, createClient, createPool, escapeIdentifier, parseConnectionString };

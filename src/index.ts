@@ -21,6 +21,9 @@ export {
 export { ReadTimeoutError } from "./errors/read-timeout-error.js";
 export { TransactionError } from "./errors/transaction-error.js";
 export type {
+  ArrayRowOptions,
+  ArrayRowQueryable,
+  ArrayStreamOptions,
   BatchExecutable,
   BatchTransactionClient,
   ClientConfig,
@@ -59,6 +62,7 @@ export type {
 } from "./types/pool.js";
 export type { QueryParam, QueryParams } from "./types/query.js";
 export type {
+  ArrayQueryResult,
   CollectionElement,
   CollectionValue,
   ColumnInfo,

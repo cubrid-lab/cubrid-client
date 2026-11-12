@@ -175,6 +175,50 @@ releases that let callers migrate first. It is proposed in
 [ADR 0011](adr/0011-v2-binding-option-and-driver-subpath.md), with the
 migration matrix and release plan in the [v2 API design](design/v2-api.md).
 
+### Array rows
+
+`rowMode: "array"` ([#255](https://github.com/cubrid-lab/cubrid-client/issues/255))
+is a backward-compatible MINOR feature. It adds the exported types `ArrayRowOptions`,
+`ArrayStreamOptions`, `ArrayQueryResult` and `ArrayRowQueryable`, and an overload
+in front of the existing signature of `query`, `queryResult`, `queryPrepared` and
+`queryResultPrepared` on `CubridClient`, `CubridPool`, `CubridTransaction`,
+`NativeCubridAdapter`, `PoolConnection` and `TransactionScope`, and of `stream` on
+`CubridClient`, `CubridPool`, `NativeCubridAdapter` and `PoolConnection`, where a
+third `stream` overload repeats `Streamable.stream` so unions with it stay
+callable. The `tx` of `transaction()` gains `ArrayRowQueryable`. The existing signatures are
+unchanged, so calls resolve as before, including through a union with an interface
+such as `CubridClient | TransactionClient`. `QueryOptions`, `StreamOptions`,
+`Queryable`, `ResultQueryable`, `PreparedQueryable`, `Streamable`,
+`TransactionClient` and `ConnectionLike` are unchanged, so classes and test doubles
+implementing them keep compiling.
+
+Object rows remain the default and are unchanged: for repeated names the last
+column's value, at the first column's position. What changes at runtime:
+
+| Case | Before | Now |
+| --- | --- | --- |
+| No `rowMode` | Object rows | Object rows (unchanged) |
+| `rowMode: "array"` on a statement returning rows | Ignored: object rows | Array rows in select-list order |
+| `rowMode: "object"` | Ignored | Object rows; accepted at runtime, not by the types |
+| Any other `rowMode` value, on any statement method | Ignored | `TypeError` before anything is sent |
+| `rowMode: "array"` with a custom `connectionFactory` connection that returns objects | Object rows | The statement rejects (`QueryError`, or `TransactionError` in a transaction) unless it returned no rows |
+
+Migration: nothing to do for existing code. To keep every value of repeated column
+names, alias them (every 1.x release) or pass `{ rowMode: "array" }` and read the
+names from `queryResult().columns`. A custom connection supports array mode by
+returning arrays when its options carry `rowMode: "array"`. In a 2.0 redesign
+([#249](https://github.com/cubrid-lab/cubrid-client/issues/249)) the row shape
+would stay an option of the statement next to the binding mode, rather than become
+more method names; whether arrays become the default is not decided.
+
+Type-level limits: a `{ rowMode: "array" }` value must be a literal, typed
+`ArrayRowOptions` or written `as const`; in an untyped variable `rowMode` widens to
+`string`, which alone does not compile but beside another option selects the object
+signature, so the rows are typed as objects; `rowMode: "object"` written
+out does not compile; a value typed `{ rowMode?: "object" | "array" }` selects the
+object signature, so its rows are typed as objects; and through a union with a
+user-implementable interface only object mode is offered.
+
 For the complete 1.x line, Node.js 18 and 20 are retained even though they are upstream EOL. [ADR 0006](adr/0006-node-18-support-through-1x.md) records the explicit Node 18 release commitment and independent Node 18 **packed-package** test requirement. A higher Node minimum is reserved for a possible, separately reviewed 2.0 MAJOR, not a 1.x development-tooling update.
 
 ## Node.js, TypeScript and distribution

@@ -25,6 +25,34 @@ convert a runtime value.
 | OBJECT/OID (19), RESULTSET (20), JSON (34), and unknown codes | Query rejects, including for a zero-byte value | Never coerced to `null`; see [values that cannot be decoded](#values-that-cannot-be-decoded) |
 | SQL NULL | `null` | Sent as cell length `-1`. NULL is distinct from unsupported non-NULL values and from a valid empty string, which is `""` |
 
+### Row shape and column names
+
+A row is an object keyed by column label (its alias, or its name when it has
+none) by default. Two columns with the same label, as in `SELECT t1.id, t2.id`,
+share one key: the row holds the **last** one's value, at the position of the
+first. Labels are compared exactly, so `"Id"` and `id` are two keys, and a label
+`__proto__` is an ordinary own key, never the row's prototype. In 1.x, alias
+the columns to keep every value: `SELECT t1.id AS t1_id, t2.id AS t2_id`.
+
+With `rowMode: "array"` a row is instead an array of its values in select-list
+order, and `queryResult()` reports each column's name and type at the same index
+in `columns`; see [Array rows](API_REFERENCE.md#array-rows-rowmode-array). The
+values themselves are the same as in this table. A row type such as
+`[number, string | null]` passed to `query<T>()` is, like an object type,
+checked by TypeScript only.
+
+```ts
+// Object rows: { id: 10 }. Array rows: [1, 10].
+await db.query("SELECT t1.id, t2.id FROM t1 JOIN t2 ON t2.t1_id = t1.id");
+await db.query("SELECT t1.id, t2.id FROM t1 JOIN t2 ON t2.t1_id = t1.id", [], {
+  rowMode: "array",
+});
+```
+
+In array mode every BLOB and CLOB column is read and counts towards
+`maxLobBytes`, including one whose label repeats. In object mode the LOB of a
+column that a later same-named column replaces is not read.
+
 ### Values that cannot be decoded
 
 A failed decode rejects the query with a `QueryError`. Further down its `cause`

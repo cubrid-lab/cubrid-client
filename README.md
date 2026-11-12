@@ -136,6 +136,29 @@ const { rows, columns } = await db.queryResult("SELECT code, name FROM athlete L
 
 `columns` lists every select-list column, so a repeated name such as `SELECT a.id, b.id` appears twice there; each row object still has one key per name, and the last column wins. See [`QueryResult`](docs/API_REFERENCE.md#queryresult).
 
+### Repeated column names
+
+Give the columns distinct aliases. This works with every 1.x release and keeps object rows:
+
+```ts
+const rows = await db.query<{ a_id: number; b_id: number | null }>(
+  "SELECT a.id AS a_id, b.id AS b_id FROM a LEFT JOIN b ON b.a_id = a.id",
+);
+```
+
+Or ask for array rows, which keep every value in select-list order whatever the names, with the names in `columns` at the same index:
+
+```ts
+const { rows, columns } = await db.queryResult(
+  "SELECT a.id, b.id FROM a LEFT JOIN b ON b.a_id = a.id",
+  [],
+  { rowMode: "array" },
+);
+// rows: [[1, 10], [2, null]]; columns.map((c) => c.name): ["id", "id"]
+```
+
+`rowMode: "array"` is accepted by `query`, `queryResult`, their `Prepared` forms and `stream`, typed as `unknown[]` rows unless you pass a tuple such as `query<[number, number | null]>(...)`. Object rows stay the default. See [Array rows](docs/API_REFERENCE.md#array-rows-rowmode-array).
+
 ## Streaming Large Results
 
 `query()` returns all rows in one array. `stream()` reads them as they are needed, holding one server reply of rows at a time:

@@ -49,10 +49,29 @@ export interface ColumnInfo {
  * only NULL still has its type, and a name that appears twice (for example
  * `SELECT a.id, b.id`) appears twice. Each row object is keyed by column name,
  * exactly as `query()` returns it, so for a repeated name the value of the last
- * such column is the one in the row. A statement that returns no result set
- * has no rows and no columns.
+ * such column is the one in the row, at the position of the first. Give such
+ * columns distinct aliases, or use `rowMode: "array"` ({@link ArrayQueryResult}),
+ * to keep every value. A statement that returns no result set has no rows and
+ * no columns.
  */
 export interface QueryResult<T extends QueryResultRow = QueryResultRow> {
+  rows: T[];
+  columns: ColumnInfo[];
+}
+
+/**
+ * Rows as arrays, together with the columns that produced them: what
+ * `queryResult()` and `queryResultPrepared()` return with `rowMode: "array"`.
+ *
+ * Every row holds one value per select-list column, in select-list order, and
+ * `columns[i]` describes the value at index `i` of each row. Columns with the
+ * same name, an empty name or names that differ only in case each keep their
+ * own value. A statement that returns no result set has no rows and no columns.
+ *
+ * `T` describes each row at compile time, for example `[number, string | null]`;
+ * as with object rows, it is not checked at runtime.
+ */
+export interface ArrayQueryResult<T extends readonly unknown[] = unknown[]> {
   rows: T[];
   columns: ColumnInfo[];
 }
