@@ -14,7 +14,7 @@ import { CubridClient } from "../src/client/client.js";
 import { createClient } from "../src/client/create-client.js";
 import { normalizeConfig } from "../src/internals/normalize-config.js";
 import { PacketReader } from "../src/protocol/packet-reader.js";
-import { formatValue } from "../src/protocol/protocol.js";
+import { encodePreparedParams, formatValue, interpolateParams } from "../src/protocol/protocol.js";
 import type { ClientOptions } from "../src/types/client.js";
 import {
   FIXTURE_ZONES,
@@ -297,4 +297,39 @@ test("#250: DST gap and overlap in America/Los_Angeles: local guesses, utc keeps
   const [pdt, pst] = LA_DST.overlap.instants;
   assert.notEqual(pdt, pst);
   assert.equal(LA_DST.overlap.localIso, pdt);
+});
+
+// #273: a Date written to a TIMESTAMPTZ, DATETIMETZ or *LTZ column gets the
+// session zone attached to its UTC fields. No single encoding fixes that without
+// changing TIMESTAMP columns, so the encoding stays a zone-less DATETIME and the
+// caller opts in with FROM_TZ(?, '+00:00') (docs/TYPES.md). Live evidence is in
+// the #273 block of tests/integration.test.ts.
+
+test("#273: a Date is a DATETIME of its UTC fields on the literal and the prepared path, under every TZ", () => {
+  const preparedHex =
+    "00000001" + // type length
+    "16" + // CUBRIDDataType.DATETIME, 22
+    "0000000e" + // value length, 14
+    shorts(...STORED.datetime).toString("hex");
+  for (const zone of ZONES) {
+    withTZ(zone, () => {
+      assert.equal(formatValue(SENT, true), "DATETIME'2025-06-14 23:30:45.678'", zone);
+      assert.equal(formatValue(SENT, false), "DATETIME'2025-06-14 23:30:45.678'", zone);
+      const binds = encodePreparedParams([SENT]);
+      assert.equal(binds.count, 1, zone);
+      assert.equal(binds.bytes.toString("hex"), preparedHex, zone);
+    });
+  }
+});
+
+test("#273: FROM_TZ(?, '+00:00') labels the UTC fields of a Date as UTC on the literal path", () => {
+  for (const zone of ZONES) {
+    withTZ(zone, () => {
+      assert.equal(
+        interpolateParams("INSERT INTO t (at) VALUES (FROM_TZ(?, '+00:00'))", [SENT], true),
+        "INSERT INTO t (at) VALUES (FROM_TZ(DATETIME'2025-06-14 23:30:45.678', '+00:00'))",
+        zone,
+      );
+    });
+  }
 });

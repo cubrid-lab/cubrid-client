@@ -8002,6 +8002,7 @@ describe("Integration: temporal values under TZ=UTC, Asia/Seoul and America/Los_
     }
   });
 
+  // The #273 block below covers this on both paths and in two session zones.
   test("a Date written to a zone-aware column takes the session zone, not UTC", async () => {
     const adapter = new NativeCubridAdapter({ ...TEST_CONFIG, timezone: "utc" });
     try {
@@ -8334,6 +8335,192 @@ describe('Integration: rowMode "array" keeps every column (#255)', { skip: !avai
       } finally {
         await pool.close();
       }
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #273: a Date written to a zone-aware column. Both paths send a zone-less
+// DATETIME of the UTC fields, so a TIMESTAMPTZ, TIMESTAMPLTZ, DATETIMETZ or
+// DATETIMELTZ column attaches the session zone. A zoned encoding would fix those
+// columns but move what a TIMESTAMP column stores, so the encoding stays and the
+// caller opts in with FROM_TZ(?, '+00:00'). Checked on 10.2 and 11.4.
+// ---------------------------------------------------------------------------
+
+describe("Integration: a Date written to a zone-aware column (#273)", { skip: !available }, () => {
+  const TABLE = "cc_tz_273";
+  /** The session zones, with their UTC offset in June 2025 in seconds. */
+  const SESSIONS = [
+    { zone: "Asia/Seoul", offset: 9 * 3600 },
+    { zone: "America/Los_Angeles", offset: -7 * 3600 },
+  ] as const;
+  const SENT_SECONDS = Math.floor(SENT.getTime() / 1000);
+  const ZONED = ["tstz", "tsltz", "dttz", "dtltz"] as const;
+  type Path = "literal" | "prepared";
+  const PATHS: readonly Path[] = ["literal", "prepared"];
+
+  /**
+   * Run `run` in one session per zone and path. In a transaction the broker
+   * keeps the session, and so the zone set by SET TIME ZONE.
+   */
+  async function eachSession(
+    run: (
+      adapter: NativeCubridAdapter,
+      session: (typeof SESSIONS)[number],
+      insert: (sql: string, params: QueryParams) => Promise<unknown>,
+      path: Path,
+    ) => Promise<void>,
+  ) {
+    const adapter = new NativeCubridAdapter({ ...TEST_CONFIG, timezone: "utc" });
+    try {
+      await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`);
+      await adapter.query(
+        `CREATE TABLE ${TABLE} (id INT, d DATE, t TIME, ts TIMESTAMP, dt DATETIME, ` +
+          "tstz TIMESTAMPTZ, tsltz TIMESTAMPLTZ, dttz DATETIMETZ, dtltz DATETIMELTZ)",
+      );
+      for (const session of SESSIONS) {
+        for (const path of PATHS) {
+          await adapter.beginTransaction();
+          try {
+            await adapter.query(`SET TIME ZONE '${session.zone}'`);
+            const insert = (sql: string, params: QueryParams) =>
+              path === "literal"
+                ? adapter.query(sql, params)
+                : adapter.executePrepared(sql, params);
+            await run(adapter, session, insert, path);
+          } finally {
+            await adapter.rollback();
+          }
+        }
+      }
+    } finally {
+      await adapter.query(`DROP TABLE IF EXISTS ${TABLE}`).catch(() => undefined);
+      await adapter.close();
+    }
+  }
+
+  const instants = async (adapter: NativeCubridAdapter) => {
+    const [row] = await adapter.query(
+      `SELECT ${ZONED.map((c) => `UNIX_TIMESTAMP(${c}) AS ${c}`).join(", ")} FROM ${TABLE}`,
+    );
+    return ZONED.map((c) => Number(row?.[c]));
+  };
+
+  test("DATE, TIME, TIMESTAMP and DATETIME columns store the UTC fields of a Date in any session zone", async () => {
+    await eachSession(async (adapter, { zone }, insert, path) => {
+      await insert(`INSERT INTO ${TABLE} (d, t, ts, dt) VALUES (?, ?, ?, ?)`, [
+        SENT,
+        SENT,
+        SENT,
+        SENT,
+      ]);
+      const [row] = await adapter.query(`SELECT d, t, ts, dt FROM ${TABLE}`);
+      assert.deepEqual(
+        {
+          datetime: (row?.dt as Date | undefined)?.toISOString(),
+          timestamp: (row?.ts as Date | undefined)?.toISOString(),
+          date: (row?.d as Date | undefined)?.toISOString(),
+          time: (row?.t as Date | undefined)?.toISOString(),
+        },
+        UTC_DECODED,
+        `${zone} ${path}`,
+      );
+    });
+  });
+
+  test("a bare Date in a zone-aware column takes the session zone", async () => {
+    await eachSession(async (adapter, { zone, offset }, insert, path) => {
+      await insert(`INSERT INTO ${TABLE} (tstz, tsltz, dttz, dtltz) VALUES (?, ?, ?, ?)`, [
+        SENT,
+        SENT,
+        SENT,
+        SENT,
+      ]);
+      assert.deepEqual(
+        await instants(adapter),
+        ZONED.map(() => SENT_SECONDS - offset),
+        `${zone} ${path}`,
+      );
+      const [row] = await adapter.query(`SELECT dttz FROM ${TABLE}`);
+      const dttz = row?.dttz as ZonedDateTime;
+      assert.deepEqual(
+        [dttz.year, dttz.month, dttz.day, dttz.hour, dttz.minute, dttz.second, dttz.millisecond],
+        [2025, 6, 14, 23, 30, 45, 678],
+        `${zone} ${path}`,
+      );
+      assert.ok(dttz.zone.startsWith(zone), `${zone} ${path}: ${dttz.zone}`);
+    });
+  });
+
+  test("FROM_TZ(?, '+00:00') keeps the instant of a Date in every zone-aware column", async () => {
+    await eachSession(async (adapter, { zone }, insert, path) => {
+      const utcDate = "FROM_TZ(?, '+00:00')";
+      await insert(
+        `INSERT INTO ${TABLE} (tstz, tsltz, dttz, dtltz) VALUES (${ZONED.map(() => utcDate).join(", ")})`,
+        [SENT, SENT, SENT, SENT],
+      );
+      assert.deepEqual(
+        await instants(adapter),
+        ZONED.map(() => SENT_SECONDS),
+        `${zone} ${path}`,
+      );
+      const [row] = await adapter.query(`SELECT dttz, dtltz FROM ${TABLE}`);
+      const dttz = row?.dttz as ZonedDateTime;
+      assert.equal(String(dttz), "2025-06-14 23:30:45.678 +00:00", `${zone} ${path}`);
+      // An *LTZ column shows the same instant in the session zone.
+      const dtltz = row?.dtltz as ZonedDateTime;
+      assert.equal(dtltz.millisecond, 678, `${zone} ${path}`);
+      assert.ok(dtltz.zone.startsWith(zone), `${zone} ${path}: ${dtltz.zone}`);
+
+      // 'UTC' keeps the same instant with the zone text "UTC UTC", and a NULL
+      // stays NULL on both paths.
+      const probe = "SELECT FROM_TZ(?, 'UTC') AS u, FROM_TZ(?, '+00:00') AS n FROM db_root";
+      const [values] =
+        path === "literal"
+          ? await adapter.query(probe, [SENT, null])
+          : await adapter.queryPrepared(probe, [SENT, null]);
+      assert.equal(String(values?.u), "2025-06-14 23:30:45.678 UTC UTC", `${zone} ${path}`);
+      assert.equal(values?.n, null, `${zone} ${path}`);
+    });
+  });
+
+  test("a zoned encoding would move TIMESTAMP values and miss the TIMESTAMP rows of today's", async () => {
+    // Why the encoding stays DATETIME: the server converts a DATETIMETZ to the
+    // same instant for a TIMESTAMP as for the zone-aware types and shows it in the
+    // session zone, while today's zone-less DATETIME keeps the TIMESTAMP fields.
+    // The client has no zoned bind, so the zoned value is a literal on both paths.
+    const zoned = "DATETIMETZ'2025-06-14 23:30:45.678 +00:00'";
+    const zonedSeconds = "DATETIMETZ'2025-06-14 23:30:45 +00:00'";
+    await eachSession(async (adapter, { zone, offset }, insert, path) => {
+      await insert(`INSERT INTO ${TABLE} (id, ts) VALUES (1, ?)`, [SENT]);
+      const count = `SELECT COUNT(*) AS n FROM ${TABLE} WHERE id = 1 AND ts = ?`;
+      const [byDate] =
+        path === "literal"
+          ? await adapter.query(count, [SENT])
+          : await adapter.queryPrepared(count, [SENT]);
+      assert.equal(Number(byDate?.n), 1, `${zone} ${path}: a Date finds the row`);
+      const byZoned = async (id: number) => {
+        const [row] = await adapter.query(
+          `SELECT COUNT(*) AS n FROM ${TABLE} WHERE id = ${id} AND ts = ${zonedSeconds}`,
+        );
+        return Number(row?.n);
+      };
+      assert.equal(await byZoned(1), 0, `${zone} ${path}: a zoned value does not`);
+      // Control: the same Date written in a UTC session is found by the same
+      // zoned value, so the miss comes from the session zone of the write, not
+      // from comparing a TIMESTAMP with a DATETIMETZ.
+      await adapter.query("SET TIME ZONE '+00:00'");
+      await insert(`INSERT INTO ${TABLE} (id, ts) VALUES (3, ?)`, [SENT]);
+      await adapter.query(`SET TIME ZONE '${zone}'`);
+      assert.equal(await byZoned(3), 1, `${zone} ${path}: a row written in a UTC session is found`);
+
+      await insert(`INSERT INTO ${TABLE} (id, ts) VALUES (2, ${zoned})`, []);
+      const [row] = await adapter.query(`SELECT ts FROM ${TABLE} WHERE id = 2`);
+      assert.equal(
+        (row?.ts as Date | undefined)?.getTime(),
+        (SENT_SECONDS + offset) * 1000,
+        `${zone} ${path}: the TIMESTAMP fields move by the session offset`,
+      );
     });
   });
 });
