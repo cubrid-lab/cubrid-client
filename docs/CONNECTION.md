@@ -177,7 +177,7 @@ only the ones marked as such apply by default.
 | **Read**: each request after the handshake, while the server is silent | `readTimeout` or a per-statement `readTimeout` | None | `ReadTimeoutError`; the socket is destroyed |
 | **Reply**: the size of one reply from the server | `maxReplyBytes` | 1 GiB | Rejects before the body is read; the connection is closed. See [Reply size limit](#reply-size-limit) |
 | **Queue**: a statement waiting for its turn behind others on the same connection | Nothing by default. A `signal` removes it; a stalled `stream()` refuses it after `consumerTimeout` | None | Rejects without sending anything |
-| **Shutdown**: `close()` | Waits for the statement running and those queued before it, then sends CON_CLOSE | None | — |
+| **Shutdown**: `close()` | Waits for the statement running and those queued before it, then sends CON_CLOSE. Also waits for `transaction()` callbacks already running, with their COMMIT or ROLLBACK, and for their connections still opening (#246) | None | — (call `destroy()` to stop waiting) |
 | **Shutdown**: `destroy()` | Does not wait for anything | Immediate | See [Destroying a client](#destroying-a-client) |
 
 Every socket also has `TCP_NODELAY` set, because each request is one write that
@@ -547,8 +547,15 @@ try {
 
 `close()` is graceful: it waits for the statement running on the shared
 connection, for those queued before it and for schema lookups, then sends
-CON_CLOSE. With no `readTimeout`, a server that never answers makes it wait
-forever. It does not wait for `transaction()` callbacks (#246).
+CON_CLOSE. It also waits for every `transaction()` callback already running to
+commit or roll back and close its connection, so no COMMIT is sent after it
+resolves. A `transaction()` whose callback has not started yet, because its
+connection is still opening or beginning, never runs it: the connection is
+closed (rolled back first if BEGIN was sent) and the call rejects with
+`Client is closed.` (#246). Calling `close()` again returns the same promise.
+Awaited inside a running callback, `close()` waits for no callback, since it
+would wait for itself. With no `readTimeout`, a server that never answers makes it
+wait forever, as does a callback that never returns; `destroy()` ends that wait.
 
 ### Destroying a client
 

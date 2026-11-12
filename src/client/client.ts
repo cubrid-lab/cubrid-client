@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { isAbortReason, mapError } from "../internals/map-error.js";
 import {
   assertValidQueryOptions,
@@ -66,6 +67,29 @@ export class CubridClient
   private readonly openScopes = new Set<ScopedTransaction>();
   /** beginTransactionScope() calls still opening a connection, so close() can wait for them. */
   private readonly beginningScopes = new Set<Promise<unknown>>();
+  /**
+   * transaction() calls from admission to their end, including the connection
+   * factory, BEGIN, the callback, COMMIT or ROLLBACK and the connection close.
+   * The promises never reject. close() waits for them (#246).
+   */
+  private readonly transactions = new Set<Promise<void>>();
+  /** Entries of `transactions` whose callback is running now. */
+  private readonly runningCallbacks = new Set<Promise<void>>();
+  /** The transaction() calls enclosing this async context, so close() never waits for itself. */
+  private readonly enclosingTransactions = new AsyncLocalStorage<ReadonlySet<Promise<void>>>();
+  /** Where transaction() opens its connection: the client's source, refusing once closed. */
+  private readonly transactionSource: ConnectionSource;
+  /** Everything close() waits for but transaction() calls. Rejects as close() does. */
+  private closingConnections: Promise<void> | undefined;
+  /** The transaction() calls running when close() was first called. */
+  private closingTransactions: Promise<void>[] = [];
+  /** close() for every caller outside a running callback, returned to each of them. */
+  private closing: Promise<void> | undefined;
+  private signalDestroyed: () => void = () => undefined;
+  /** Resolves when destroy() runs, which ends the wait of a running close(). */
+  private readonly destroyedSignal = new Promise<void>((resolve) => {
+    this.signalDestroyed = resolve;
+  });
 
   constructor(
     private readonly config: ClientConfig,
@@ -94,6 +118,20 @@ export class CubridClient
         } finally {
           this.dedicated.delete(connection);
         }
+      },
+    };
+    this.transactionSource = {
+      ...this.source,
+      open: async () => {
+        const connection = await this.source.open();
+        // close() ran while the factory did: nothing is sent on this connection.
+        if (this.closed) {
+          await this.source.end(connection, "error").catch(() => {
+            // The client is closed; that is the failure to report.
+          });
+          throw mapError("transaction", new Error("Client is closed."), "Transaction failed.");
+        }
+        return connection;
       },
     };
   }
@@ -276,7 +314,42 @@ export class CubridClient
       throw mapError("transaction", new Error("Client is closed."), "Transaction failed.");
     }
 
-    return runTransaction(this.source, callback, options);
+    const enclosing = this.enclosingTransactions.getStore();
+    let tracked: Promise<void> | undefined;
+    const running = runTransaction(
+      this.transactionSource,
+      async (tx) => {
+        // close() ran while the transaction options were applied or BEGIN was sent:
+        // the callback never starts, and the transaction is rolled back and its
+        // connection closed.
+        if (this.closed) {
+          throw new Error("Client is closed.");
+        }
+        const chain = new Set(enclosing);
+        if (tracked) {
+          chain.add(tracked);
+          this.runningCallbacks.add(tracked);
+        }
+        try {
+          return await this.enclosingTransactions.run(chain, () => callback(tx));
+        } finally {
+          if (tracked) {
+            this.runningCallbacks.delete(tracked);
+          }
+        }
+      },
+      options,
+    );
+    const settled = running.then(
+      () => undefined,
+      () => undefined,
+    );
+    tracked = settled;
+    this.transactions.add(settled);
+    void settled.then(() => {
+      this.transactions.delete(settled);
+    });
+    return running;
   }
 
   /**
@@ -363,13 +436,61 @@ export class CubridClient
     }
   }
 
-  async close(): Promise<void> {
+  /**
+   * Stop the client and close its connections once the work already started is
+   * done. In the same tick, every later call rejects with `Client is closed.`
+   * Statements on the shared connection, schema lookups and `transaction()`
+   * callbacks already running finish, including their COMMIT or ROLLBACK, and
+   * their connections close; a `transaction()` whose callback has not started
+   * yet is rolled back without running it. Scopes nobody ended are discarded.
+   * Calling it again returns the same promise; after `destroy()` it resolves.
+   * Awaited inside a running `transaction()` callback, it waits for no callback,
+   * since it would wait for itself. See `docs/API_REFERENCE.md`.
+   */
+  close(): Promise<void> {
     // Set first, in the same tick, so no later call can open a connection.
     this.closed = true;
     // destroy() has already torn every connection down.
     if (this.destroyed) {
-      return;
+      return Promise.resolve();
     }
+    if (!this.closingConnections) {
+      // No transaction() can start from now on.
+      this.closingTransactions = [...this.transactions];
+      this.closingConnections = this.shutdown();
+    }
+
+    // A callback awaiting close() would wait for itself, and two of them for each
+    // other, so inside a running callback close() waits for no callback. Only
+    // while it runs: a timer it set that calls close() after it returned waits.
+    const own = this.enclosingTransactions.getStore();
+    if (own && [...own].some((transaction) => this.runningCallbacks.has(transaction))) {
+      return this.waitForClose([]);
+    }
+    this.closing ??= this.waitForClose(this.closingTransactions);
+    return this.closing;
+  }
+
+  /**
+   * Resolves once the connections are closed and `transactions` ended, or once
+   * destroy() runs, which is the way out of a close() that waits too long.
+   * Callbacks are waited for alongside the connections, not after them: one may
+   * wait for a lock that only closing the shared connection or a scope releases.
+   */
+  private waitForClose(transactions: Promise<void>[]): Promise<void> {
+    const closed = (async () => {
+      // These never reject.
+      const ended = Promise.all(transactions);
+      try {
+        await this.closingConnections;
+      } finally {
+        await ended;
+      }
+    })();
+    return Promise.race([closed, this.destroyedSignal]);
+  }
+
+  private async shutdown(): Promise<void> {
     // In-flight schema lookups can still require follow-up catalog queries.
     await Promise.allSettled([...this.schemaOperations]);
 
@@ -431,6 +552,7 @@ export class CubridClient
       return;
     }
     this.destroyed = true;
+    this.signalDestroyed();
 
     if (this.sharedConnection) {
       destroyConnection(this.sharedConnection);

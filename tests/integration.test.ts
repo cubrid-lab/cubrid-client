@@ -1374,6 +1374,168 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
   });
 
   // -------------------------------------------------------------------------
+  // close() and transaction() callbacks (#246)
+  // -------------------------------------------------------------------------
+
+  describe("close() and running transaction() callbacks (#246)", () => {
+    const table = "close_lifecycle_test_native";
+    const SLEEP = "SELECT SLEEP(2) AS slept FROM db_root";
+    const closedCause = (error: unknown) =>
+      error instanceof TransactionError &&
+      error.cause instanceof Error &&
+      error.cause.message === "Client is closed.";
+
+    async function withTable(run: (values: () => Promise<string[]>) => Promise<void>) {
+      const setup = createClient(TEST_CONFIG);
+      try {
+        await setup.query(`DROP TABLE IF EXISTS ${table}`);
+        await setup.query(
+          `CREATE TABLE ${table} (id INT AUTO_INCREMENT PRIMARY KEY, val VARCHAR(50))`,
+        );
+        await run(async () => {
+          const rows = await setup.query<{ val: string }>(`SELECT val FROM ${table} ORDER BY id`);
+          return rows.map((row) => row.val);
+        });
+      } finally {
+        await setup.query(`DROP TABLE IF EXISTS ${table}`);
+        await setup.close();
+      }
+    }
+
+    test("close() waits for a callback in SELECT SLEEP(2), which then commits, and refuses new ones", async () => {
+      await withTable(async (values) => {
+        const client = createClient(TEST_CONFIG);
+        const order: string[] = [];
+        let running!: () => void;
+        const started = new Promise<void>((resolve) => {
+          running = resolve;
+        });
+
+        const transaction = client
+          .transaction(async (tx) => {
+            await tx.query(`INSERT INTO ${table} (val) VALUES ('before sleep')`);
+            running();
+            await tx.query(SLEEP);
+            await tx.query(`INSERT INTO ${table} (val) VALUES ('after sleep')`);
+            return "committed";
+          })
+          .then((result) => {
+            order.push("transaction");
+            return result;
+          });
+        await started;
+
+        const begun = Date.now();
+        const closing = client.close().then(() => {
+          order.push("close");
+        });
+        await assert.rejects(
+          client.transaction(async () => undefined),
+          closedCause,
+        );
+        await assert.rejects(client.beginTransactionScope(), closedCause);
+
+        assert.equal(await transaction, "committed");
+        await closing;
+        const waited = Date.now() - begun;
+
+        assert.deepEqual(order, ["transaction", "close"]);
+        assert.ok(waited >= 1000, `close() waited for the sleeping callback (${waited} ms)`);
+        // Committed by the time close() resolved, and each row once.
+        assert.deepEqual(await values(), ["before sleep", "after sleep"]);
+      });
+    });
+
+    test("a callback that fails while close() waits is rolled back before close() resolves", async () => {
+      await withTable(async (values) => {
+        const client = createClient(TEST_CONFIG);
+        const failure = new Error("callback failed");
+        let running!: () => void;
+        const started = new Promise<void>((resolve) => {
+          running = resolve;
+        });
+
+        const transaction = client.transaction(async (tx) => {
+          await tx.query(`INSERT INTO ${table} (val) VALUES ('rolled back')`);
+          running();
+          await tx.query(SLEEP);
+          throw failure;
+        });
+        await started;
+        const closing = client.close();
+
+        await assert.rejects(
+          transaction,
+          (error: unknown) => error instanceof TransactionError && error.cause === failure,
+        );
+        await closing;
+        assert.deepEqual(await values(), []);
+      });
+    });
+
+    test("a callback whose connection is still opening when close() runs never starts", async () => {
+      await withTable(async (values) => {
+        const client = createClient(TEST_CONFIG);
+        let started = false;
+
+        const transaction = client.transaction(async (tx) => {
+          started = true;
+          await tx.query(`INSERT INTO ${table} (val) VALUES ('never')`);
+        });
+        await client.close();
+
+        await assert.rejects(transaction, closedCause);
+        assert.equal(started, false);
+        assert.deepEqual(await values(), []);
+      });
+    });
+
+    test("destroy() ends a close() waiting for SELECT SLEEP(2), and nothing is committed", async () => {
+      await withTable(async (values) => {
+        const client = createClient(TEST_CONFIG);
+        let running!: () => void;
+        const started = new Promise<void>((resolve) => {
+          running = resolve;
+        });
+
+        const transaction = client.transaction(async (tx) => {
+          await tx.query(`INSERT INTO ${table} (val) VALUES ('destroyed')`);
+          running();
+          await tx.query(SLEEP);
+        });
+        await started;
+        const order: string[] = [];
+        const closing = client.close().then(() => {
+          order.push("close");
+        });
+        const settled = transaction.then(
+          () => order.push("transaction resolved"),
+          (error: unknown) => {
+            order.push("transaction rejected");
+            assert.ok(error instanceof TransactionError);
+          },
+        );
+
+        await client.destroy();
+        await closing;
+        // close() resolved on destroy(), not once the SLEEP ended.
+        assert.deepEqual(order, ["close"]);
+        await settled;
+        assert.deepEqual(order, ["close", "transaction rejected"]);
+
+        // The server rolls the session back once its SLEEP ends; poll until it has.
+        const deadline = Date.now() + 15000;
+        let rows = await values();
+        while (rows.length > 0 && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          rows = await values();
+        }
+        assert.deepEqual(rows, []);
+      });
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // Zero dates (#178)
   // -------------------------------------------------------------------------
 
