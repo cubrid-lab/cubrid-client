@@ -8,8 +8,30 @@ test("escapeIdentifier wraps names in brackets", () => {
   assert.equal(escapeIdentifier("users"), "[users]");
 });
 
-test("escapeIdentifier escapes closing brackets", () => {
-  assert.equal(escapeIdentifier("a]b"), "[a]]b]");
+test("escapeIdentifier keeps brackets for every name without ]", () => {
+  for (const name of ["users", "a`b", 'a"b', "a?b", "a b", "a[b", "a\\b", ""]) {
+    assert.equal(escapeIdentifier(name), `[${name}]`);
+  }
+});
+
+test("escapeIdentifier quotes a name with ] in backticks, doubling its backticks", () => {
+  // A CUBRID bracket identifier ends at the first ]: [a]]b] is a syntax error.
+  assert.equal(escapeIdentifier("a]b"), "`a]b`");
+  assert.equal(escapeIdentifier("a]`b"), "`a]``b`");
+  assert.equal(escapeIdentifier("]`"), "`]```");
+  assert.equal(escapeIdentifier('a]"b'), '`a]"b`');
+  assert.equal(escapeIdentifier("a]\\"), "`a]\\`");
+});
+
+test("the lexer reads every escapeIdentifier result as one span without markers", () => {
+  const names = ["a?", "a]?", "a]`?", "a]`` ?", "`?", "]", "a] OR 1=1 --", "a]` = ? --", "a]\\` ?"];
+  for (const name of names) {
+    const sql = `SELECT ${escapeIdentifier(name)} FROM t WHERE x = ?`;
+    for (const mode of [true, false]) {
+      assert.deepEqual(findPlaceholders(sql, mode), [sql.length - 1], `${name} (${mode})`);
+    }
+    assert.deepEqual(findPlaceholders(sql), [sql.length - 1], name);
+  }
 });
 
 test("buildWhere returns empty clause for empty input", () => {
@@ -32,10 +54,10 @@ test("buildWhere uses IS NULL and omits param for null", () => {
   assert.deepEqual(result.params, ["A"]);
 });
 
-test("buildWhere escapes suspicious identifier input", () => {
-  const result = buildWhere({ "id] OR 1=1 --": 7 });
+test("buildWhere quotes a key with ] in backticks", () => {
+  const result = buildWhere({ "id] OR 1=1 --": 7, "a]`b": null });
 
-  assert.equal(result.clause, "WHERE [id]] OR 1=1 --] = ?");
+  assert.equal(result.clause, "WHERE `id] OR 1=1 --` = ? AND `a]``b` IS NULL");
   assert.deepEqual(result.params, [7]);
 });
 
@@ -56,11 +78,11 @@ test("a ? in a buildWhere identifier is not a marker: only the value is bound", 
   }
 });
 
-test("a key that closes its bracket cannot hide the marker behind a comment", () => {
-  // CUBRID ends [id] at the first ]: ]] is not an escape, so the server reads a
-  // stray ] (a syntax error) and the client finds no marker for the value.
+test("a key that would close its bracket keeps its marker and binds its value", () => {
   const { clause, params } = buildWhere({ "id] OR 1=1 --": 7 });
 
-  assert.deepEqual(findPlaceholders(clause, true), []);
-  assert.throws(() => interpolateParams(clause, params, true), /Parameter count mismatch/);
+  for (const mode of [true, false]) {
+    assert.deepEqual(findPlaceholders(clause, mode), [clause.length - 1]);
+    assert.equal(interpolateParams(clause, params, mode), "WHERE `id] OR 1=1 --` = 7");
+  }
 });

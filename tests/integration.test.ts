@@ -42,7 +42,7 @@ import type { ClientLogFields, TransactionClient } from "../src/types/client.js"
 import { blob, clob } from "../src/types/lob.js";
 import type { QueryParam, QueryParams } from "../src/types/query.js";
 import { ZonedDateTime } from "../src/types/zoned-date-time.js";
-import { buildWhere } from "../src/utils/query.js";
+import { buildWhere, escapeIdentifier } from "../src/utils/query.js";
 
 const TEST_CONFIG = {
   host: "127.0.0.1",
@@ -6744,6 +6744,118 @@ describe("Integration: where a ? is a marker (#243)", { skip: !available }, () =
       );
       assert.equal(result.affectedRows, 1);
     });
+  });
+});
+
+describe("Integration: escapeIdentifier and buildWhere quoting (#259)", {
+  skip: !available,
+}, () => {
+  const TABLE = "cc_ident_259";
+  type Client = ReturnType<typeof createClient>;
+
+  /** Creates a table with one column `name`, rows (1, 1) and (2, 2), and runs `run`. */
+  async function withColumn(client: Client, name: string, run: () => Promise<void>): Promise<void> {
+    await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+    try {
+      await client.query(`CREATE TABLE ${TABLE} (id INT, ${escapeIdentifier(name)} INT)`);
+      await client.query(`INSERT INTO ${TABLE} VALUES (1, 1), (2, 2)`);
+      await run();
+    } finally {
+      await client.query(`DROP TABLE IF EXISTS ${TABLE}`).catch(() => undefined);
+    }
+  }
+
+  async function idsWhere(client: Client, conditions: Record<string, unknown>): Promise<number[]> {
+    const { clause, params } = buildWhere(conditions);
+    const rows = await client.query<{ id: number }>(
+      `SELECT id FROM ${TABLE} ${clause} ORDER BY id`,
+      params as QueryParam[],
+    );
+    return rows.map((row) => row.id);
+  }
+
+  async function columnNames(client: Client): Promise<string[]> {
+    const rows = await client.query<{ attr_name: string }>(
+      `SELECT attr_name FROM db_attribute WHERE class_name = '${TABLE}' ORDER BY def_order`,
+    );
+    return rows.map((row) => row.attr_name);
+  }
+
+  test("a name with a backtick, a double quote or a space keeps its bracket form", async () => {
+    const client = createClient(TEST_CONFIG);
+    try {
+      for (const name of ["c`d", 'e"f', "i j", "a\\b"]) {
+        assert.equal(escapeIdentifier(name), `[${name}]`);
+        await withColumn(client, name, async () => {
+          assert.deepEqual(await columnNames(client), ["id", name]);
+          for (const mode of ["no", "yes"]) {
+            await client.query(`SET SYSTEM PARAMETERS 'no_backslash_escapes=${mode}'`);
+            assert.deepEqual(await idsWhere(client, { [name]: 2 }), [2], `${name} (${mode})`);
+          }
+        });
+      }
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("a name with ] is backtick-quoted: 10.2 resolves it and 11.x refuses it", async () => {
+    const client = createClient(TEST_CONFIG);
+    const major = Number((await client.getServerVersion()).split(".")[0]);
+    try {
+      for (const name of ["a]b", "a]`b", 'a]"b', "a] b", "a]\\", "id] or 1=1 --"]) {
+        if (major >= 11) {
+          // 11.x: "Identifier name ... cannot contain '[' or ']'", in any quoting.
+          await assert.rejects(
+            client.query(`CREATE TABLE ${TABLE} (${escapeIdentifier(name)} INT)`),
+            { code: -493 },
+          );
+          await assert.rejects(idsWhere(client, { [name]: 2 }), { code: -493 });
+          continue;
+        }
+        await withColumn(client, name, async () => {
+          assert.deepEqual(await columnNames(client), ["id", name]);
+          for (const mode of ["no", "yes"]) {
+            await client.query(`SET SYSTEM PARAMETERS 'no_backslash_escapes=${mode}'`);
+            assert.deepEqual(await idsWhere(client, { [name]: 2 }), [2], `${name} (${mode})`);
+            assert.deepEqual(await idsWhere(client, { [name]: null }), [], `${name} (${mode})`);
+          }
+          // The value stays bound: the comment in the name does not hide the marker.
+          const { clause, params } = buildWhere({ [name]: 1 });
+          const result = await client.execute(
+            `DELETE FROM ${TABLE} ${clause}`,
+            params as QueryParam[],
+          );
+          assert.equal(result.affectedRows, 1);
+          assert.deepEqual(await idsWhere(client, {}), [2]);
+        });
+      }
+    } finally {
+      await client.query(`DROP TABLE IF EXISTS ${TABLE}`).catch(() => undefined);
+      await client.close();
+    }
+  });
+
+  test("a ? in a backtick-quoted name binds only the value and nothing runs", async () => {
+    const client = createClient(TEST_CONFIG);
+    const major = Number((await client.getServerVersion()).split(".")[0]);
+    try {
+      await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+      await client.query(`CREATE TABLE ${TABLE} (id INT)`);
+      await client.query(`INSERT INTO ${TABLE} VALUES (1), (2)`);
+      const { clause, params } = buildWhere({ "a]?": 1 });
+      assert.equal(clause, "WHERE `a]?` = ?");
+      // 10.2: the broker counts the ? inside the backticks as a host variable
+      // (-1007), as it does inside brackets. 11.x refuses the name first (-493).
+      await assert.rejects(
+        client.execute(`DELETE FROM ${TABLE} ${clause}`, params as QueryParam[]),
+        { code: major >= 11 ? -493 : -1007 },
+      );
+      assert.deepEqual(await idsWhere(client, {}), [1, 2]);
+    } finally {
+      await client.query(`DROP TABLE IF EXISTS ${TABLE}`).catch(() => undefined);
+      await client.close();
+    }
   });
 });
 
