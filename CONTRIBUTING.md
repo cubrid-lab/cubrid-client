@@ -88,6 +88,9 @@ reconnection or transaction change, separately run `npm run test:integration`
 against a real CUBRID server and report the endpoint/version and executed test
 count; state clearly when that check was not run.
 
+The [test case map](docs/TESTING_MAP.md) lists which file and block covers each
+contract, which layer each file tests, and the command for a focused run.
+
 ---
 
 ## Protocol correctness review
