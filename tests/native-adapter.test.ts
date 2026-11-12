@@ -591,6 +591,62 @@ test("NativeCubridAdapter connect passes maxConnectionRetryCount to the CAS and 
   }
 });
 
+// #252: the adapter is public and skips normalizeConfig(), so it checks the
+// OpenDatabase credentials itself, before any socket is opened.
+for (const [field, value, message] of [
+  ["database", "d".repeat(32), "database must be at most 31 bytes in UTF-8."],
+  ["user", "u".repeat(33), "user must be at most 31 bytes in UTF-8."],
+  ["password", "\u00e9".repeat(16), "password must be at most 31 bytes in UTF-8."],
+  ["password", "pass\0word", "password must not contain a NUL character."],
+] as const) {
+  test(`NativeCubridAdapter and CubridClient reject an invalid ${field}, connecting to nothing: ${message}`, async () => {
+    let connections = 0;
+    const broker = createServer((socket) => {
+      connections += 1;
+      socket.destroy();
+    });
+    await new Promise<void>((resolve) => broker.listen(0, "127.0.0.1", resolve));
+    const { port } = broker.address() as { port: number };
+
+    try {
+      const config = { ...DEFAULT_CONFIG, port, [field]: value };
+      assert.throws(() => new NativeCubridAdapter(config), { name: "RangeError", message });
+
+      // CubridClient is public too and checks the same before creating a connection.
+      let created = 0;
+      assert.throws(
+        () =>
+          new CubridClient(config, (c) => {
+            created += 1;
+            return new NativeCubridAdapter(c);
+          }),
+        (error: unknown) => {
+          assert.ok(error instanceof RangeError);
+          assert.equal(error.message, message);
+          assert.ok(!inspect(error).includes(value));
+          return true;
+        },
+      );
+      assert.equal(created, 0);
+      assert.equal(connections, 0);
+    } finally {
+      await new Promise((resolve) => broker.close(resolve));
+    }
+  });
+}
+
+test("NativeCubridAdapter accepts 31-byte credentials", () => {
+  assert.doesNotThrow(
+    () =>
+      new NativeCubridAdapter({
+        ...DEFAULT_CONFIG,
+        database: "d".repeat(31),
+        user: `u${"\uac00".repeat(10)}`,
+        password: `${"\u00e9".repeat(15)}p`,
+      }),
+  );
+});
+
 for (const maxConnectionRetryCount of [Number.NaN, Number.POSITIVE_INFINITY, -1, 1.5]) {
   test(`NativeCubridAdapter rejects maxConnectionRetryCount ${maxConnectionRetryCount}`, () => {
     assert.throws(

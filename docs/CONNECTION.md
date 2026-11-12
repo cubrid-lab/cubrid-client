@@ -39,14 +39,34 @@ await db.close();
 |--------|------|----------|---------|-------------|
 | `host` | `string` | Yes | — | CUBRID server hostname or IP address |
 | `port` | `number` | No | `33000` | CUBRID broker port |
-| `database` | `string` | Yes | — | Database name to connect to |
-| `user` | `string` | Yes | — | Database user (typically `"dba"`) |
-| `password` | `string` | No | `""` | Database password (empty string for no password) |
+| `database` | `string` | Yes | — | Database name to connect to. At most 31 bytes in UTF-8, see [Credential length](#credential-length) |
+| `user` | `string` | Yes | — | Database user (typically `"dba"`). At most 31 bytes in UTF-8 |
+| `password` | `string` | No | `""` | Database password (empty string for no password). At most 31 bytes in UTF-8 |
 | `connectionTimeout` | `number` | No | — | Connection timeout in milliseconds |
 | `readTimeout` | `number` | No | — | Milliseconds of server inactivity before a request fails. See [Read timeout](#read-timeout) |
 | `maxConnectionRetryCount` | `number` | No | — | Retries after a failed TCP connect (default `0`). See [Connection retries](#connection-retries) |
 | `logger` | `unknown` | No | — | Receives redacted diagnostics (connection created, operation timing and failures). See [Logging](#logging) |
 | `connectionFactory` | `ConnectionFactory` | No | — | Custom factory for creating connections (advanced) |
+
+### Credential length
+
+The broker reads `database`, `user` and `password` from 32-byte fields and
+overwrites the last byte of each with a NUL, so it keeps at most **31 bytes** of
+each, counted in UTF-8 (`Buffer.byteLength(value)`): 31 ASCII characters, but
+only 15 two-byte characters such as `é` plus one ASCII byte, or 10 three-byte
+characters such as `가` plus one. A NUL character ends a field early.
+
+A longer value, or one containing a NUL character, is refused rather than cut,
+because the cut value could open a different database or log in as a different
+user or password. `createClient()`, `new CubridClient()` and
+`new NativeCubridAdapter()` throw a `RangeError` before any connection is
+opened, such as `password must be at most 31 bytes in UTF-8.` The message names
+the field and the limit, never the value. CUBRID 10.2 to 11.4 also refuse to
+create a user name or password longer than 31 bytes, so no valid account is
+excluded.
+
+Earlier versions cut a longer value to 32 bytes, and the broker then kept 31,
+so any longer password that began with the right 31 bytes logged in.
 
 ### Full Example with All Options
 

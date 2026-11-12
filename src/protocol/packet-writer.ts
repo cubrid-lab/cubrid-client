@@ -73,14 +73,19 @@ export class PacketWriter {
     this.offset += data.length;
   }
 
-  /** Write a fixed-length string, padded with 0x00 to `length` bytes. */
+  /**
+   * Write a fixed-length string, padded with 0x00 to `length` bytes. A longer
+   * value throws rather than being cut, which could change what it names; the
+   * message leaves the value out, since the fields hold credentials.
+   */
   writeFixedString(value: string, length: number): void {
-    this.ensureCapacity(length);
     const bytes = Buffer.from(value, "utf-8");
-    const copyLen = Math.min(bytes.length, length);
-    bytes.copy(this.buf, this.offset, 0, copyLen);
-    // Zero-fill remainder
-    this.buf.fill(0, this.offset + copyLen, this.offset + length);
+    if (bytes.length > length) {
+      throw new RangeError(`A fixed-width field value must be at most ${length} bytes.`);
+    }
+    this.ensureCapacity(length);
+    bytes.copy(this.buf, this.offset);
+    this.buf.fill(0, this.offset + bytes.length, this.offset + length);
     this.offset += length;
   }
 

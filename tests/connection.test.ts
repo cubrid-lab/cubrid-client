@@ -87,6 +87,29 @@ function closeServer(server: Server): Promise<void> {
 // connect() — full handshake
 // ---------------------------------------------------------------------------
 
+test("CASConnection connect opens no socket for credentials the broker would cut (#252)", async () => {
+  let connections = 0;
+  const { server, port } = await createMockBroker((socket) => {
+    connections += 1;
+    socket.destroy();
+  });
+
+  try {
+    for (const credentials of [
+      { password: "p".repeat(32) },
+      { user: "u".repeat(33) },
+      { database: "testdb\0other" },
+    ]) {
+      const conn = new CASConnection({ ...DEFAULT_CONFIG, port, ...credentials });
+      await assert.rejects(() => conn.connect(), RangeError);
+      assert.equal(conn.isConnected, false);
+    }
+    assert.equal(connections, 0);
+  } finally {
+    await closeServer(server);
+  }
+});
+
 test("CASConnection connect — reuse broker socket (newPort=0)", async () => {
   const { server, port } = await createMockBroker((socket) => {
     // Step 1: Read 10-byte ClientInfoExchange

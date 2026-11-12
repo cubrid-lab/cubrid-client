@@ -533,9 +533,9 @@ Creates a client instance. Connection is established lazily on first query.
 |--------|------|---------|-------------|
 | `host` | `string` | *(required)* | Server hostname |
 | `port` | `number` | `33000` | Broker port |
-| `database` | `string` | *(required)* | Database name |
-| `user` | `string` | *(required)* | Database user |
-| `password` | `string` | `""` | Password |
+| `database` | `string` | *(required)* | Database name. At most 31 bytes in UTF-8, no NUL; see [Credential length](docs/CONNECTION.md#credential-length) |
+| `user` | `string` | *(required)* | Database user. At most 31 bytes in UTF-8, no NUL |
+| `password` | `string` | `""` | Password. At most 31 bytes in UTF-8, no NUL |
 | `connectionTimeout` | `number` | — | Connection timeout (ms) |
 | `maxConnectionRetryCount` | `number` | `0` | Retries after a failed TCP connect to the broker (see [Connection retries](docs/CONNECTION.md#connection-retries)) |
 | `readTimeout` | `number` | — | Fail a query after this many ms with no activity from the server (see [Read timeout](docs/CONNECTION.md#read-timeout)). Unset means no timeout for queries; the connect handshake still gives up after 10 s |

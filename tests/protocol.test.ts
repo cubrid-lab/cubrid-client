@@ -120,12 +120,21 @@ test("PacketWriter writeFixedString pads with zeros", () => {
   assert.deepEqual([...buf.subarray(3, 8)], [0, 0, 0, 0, 0]);
 });
 
-test("PacketWriter writeFixedString truncates if string exceeds length", () => {
+test("PacketWriter writeFixedString fills a field exactly when the value is as long", () => {
   const w = new PacketWriter(8);
-  w.writeFixedString("abcdefghij", 4);
-  const buf = w.toBuffer();
-  assert.equal(buf.length, 4);
-  assert.equal(buf.toString("utf-8"), "abcd");
+  w.writeFixedString("abcd", 4);
+  assert.deepEqual(w.toBuffer(), Buffer.from("abcd"));
+});
+
+test("PacketWriter writeFixedString throws on a longer value instead of cutting it (#252)", () => {
+  const w = new PacketWriter(8);
+  assert.throws(() => w.writeFixedString("abcde", 4), {
+    name: "RangeError",
+    message: "A fixed-width field value must be at most 4 bytes.",
+  });
+  // Two bytes of the 4 fit, but a cut code point is not written either.
+  assert.throws(() => w.writeFixedString("abc\u00e9", 4), RangeError);
+  assert.equal(w.toBuffer().length, 0);
 });
 
 test("PacketWriter writeNullTermString writes length-prefixed null-terminated string", () => {
@@ -618,6 +627,87 @@ test("writeOpenDatabase produces 628-byte packet", () => {
   // 64-95: password
   assert.equal(buf.subarray(64, 70).toString("utf-8"), "secret");
 });
+
+// The CAS overwrites the last byte of each 32-byte field with NUL before
+// reading it (CUBRID src/broker/cas.c, release/10.2 and release/11.4), so 31
+// bytes is the longest value it receives intact.
+const OPEN_DB_FIELDS = [
+  { field: "database", offset: 0 },
+  { field: "user", offset: 32 },
+  { field: "password", offset: 64 },
+] as const;
+
+function openDatabaseWith(field: string, value: string): Buffer {
+  const credentials: Record<string, string> = { database: "testdb", user: "dba", password: "" };
+  credentials[field] = value;
+  return writeOpenDatabase(
+    credentials.database as string,
+    credentials.user as string,
+    credentials.password as string,
+  );
+}
+
+for (const { field, offset } of OPEN_DB_FIELDS) {
+  test(`writeOpenDatabase writes a 31-byte ${field} intact, NUL-terminated at byte 31`, () => {
+    const value = `${"x".repeat(30)}y`;
+    const buf = openDatabaseWith(field, value);
+    assert.equal(buf.length, OPEN_DB_TOTAL_SIZE);
+    assert.equal(buf.subarray(offset, offset + 31).toString("utf-8"), value);
+    assert.equal(buf[offset + 31], 0);
+  });
+
+  test(`writeOpenDatabase writes a 31-byte multibyte ${field} without splitting a code point`, () => {
+    // 15 two-byte characters and one ASCII byte: exactly 31 bytes.
+    const value = `${"\u00e9".repeat(15)}a`;
+    const buf = openDatabaseWith(field, value);
+    assert.equal(buf.subarray(offset, offset + 31).toString("utf-8"), value);
+    assert.equal(buf[offset + 31], 0);
+  });
+
+  for (const [label, value] of [
+    ["32-byte", "x".repeat(32)],
+    ["33-byte", "x".repeat(33)],
+    ["100-byte", "x".repeat(100)],
+    // 30 ASCII bytes and one 3-byte character: 33 bytes, 31 cut mid-character.
+    ["33-byte multibyte", `${"x".repeat(30)}\uac00`],
+    // 16 two-byte characters: 32 bytes in 16 characters.
+    ["32-byte multibyte", "\u00e9".repeat(16)],
+  ] as const) {
+    test(`writeOpenDatabase rejects a ${label} ${field} without echoing it`, () => {
+      assert.throws(
+        () => openDatabaseWith(field, value),
+        (error: unknown) => {
+          assert.ok(error instanceof RangeError);
+          assert.equal(error.message, `${field} must be at most 31 bytes in UTF-8.`);
+          assert.ok(!error.message.includes("xxx"));
+          assert.ok(!error.message.includes("\u00e9"));
+          return true;
+        },
+      );
+    });
+  }
+
+  test(`writeOpenDatabase rejects a ${field} that is not a string, such as a 32-byte Buffer`, () => {
+    const credentials: Record<string, unknown> = { database: "testdb", user: "dba", password: "" };
+    credentials[field] = Buffer.alloc(32, 0x41);
+    assert.throws(
+      () =>
+        writeOpenDatabase(
+          credentials.database as string,
+          credentials.user as string,
+          credentials.password as string,
+        ),
+      { name: "TypeError", message: `${field} must be a string.` },
+    );
+  });
+
+  test(`writeOpenDatabase rejects a ${field} with an embedded NUL`, () => {
+    assert.throws(() => openDatabaseWith(field, "ab\0cd"), {
+      name: "RangeError",
+      message: `${field} must not contain a NUL character.`,
+    });
+  });
+}
 
 test("parseOpenDatabase parses successful response", () => {
   // Build a mock response: CAS_INFO(4) + responseCode(4) + brokerInfo(8) + sessionId(4)

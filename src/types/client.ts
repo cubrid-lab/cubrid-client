@@ -108,8 +108,17 @@ export interface ClientConfig {
 export interface ClientOptions {
   host: string;
   port?: number;
+  /**
+   * At most 31 bytes in UTF-8, the most the broker keeps. A longer value, or one
+   * containing a NUL character, throws a `RangeError` instead of being cut.
+   */
   database: string;
+  /** At most 31 bytes in UTF-8, with no NUL character, as for `database`. */
   user: string;
+  /**
+   * At most 31 bytes in UTF-8, with no NUL character, as for `database`. The
+   * error names the field, never the value. Default: `""`.
+   */
   password?: string;
   connectionTimeout?: number;
   /**

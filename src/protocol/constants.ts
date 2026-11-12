@@ -46,6 +46,13 @@ export const SIZE_BROKER_INFO = 8;
 
 /** Fixed size of OpenDatabase credential blocks. */
 export const OPEN_DB_FIELD_SIZE = 32;
+/**
+ * Longest database name, user or password, in UTF-8 bytes, that OpenDatabase
+ * carries intact. The CAS writes a NUL into the last byte of each 32-byte field
+ * before reading it (src/broker/cas.c, `db_user[SRV_CON_DBUSER_SIZE - 1] = '\0'`
+ * and its siblings, in CUBRID 10.2 to 11.4), so a 32nd byte is dropped there.
+ */
+export const OPEN_DB_MAX_VALUE_BYTES = OPEN_DB_FIELD_SIZE - 1;
 /** Extended info filler size in OpenDatabase. */
 export const OPEN_DB_FILLER_SIZE = 512;
 /** Reserved filler size in OpenDatabase. */

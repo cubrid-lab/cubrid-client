@@ -1,3 +1,4 @@
+import { assertValidCredentials } from "../protocol/protocol.js";
 import type {
   ClientConfig,
   ClientOptions,
@@ -148,7 +149,9 @@ export function assertValidQueryOptions(options: QueryOptions | undefined): void
 
 export function normalizeConfig(options: ClientOptions): ClientConfig {
   const { readTimeout, maxLobBytes, fetchSize, timezone } = options;
+  const password = options.password ?? "";
 
+  assertValidCredentials({ database: options.database, user: options.user, password });
   assertValidReadTimeout(readTimeout);
   assertValidRetryCount(options.maxConnectionRetryCount);
   assertValidMaxLobBytes(maxLobBytes);
@@ -161,7 +164,7 @@ export function normalizeConfig(options: ClientOptions): ClientConfig {
     port: options.port ?? 33000,
     database: options.database,
     user: options.user,
-    password: options.password ?? "",
+    password,
     connectionTimeout: options.connectionTimeout,
     ...(readTimeout !== undefined && { readTimeout }),
     ...(maxLobBytes !== undefined && { maxLobBytes }),

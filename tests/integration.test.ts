@@ -6518,3 +6518,113 @@ describe("Integration: connection pool (#92)", { skip: !available }, () => {
     assert.deepEqual(pool.stats(), { total: 0, idle: 0, active: 0, pending: 0, waiting: 0 });
   });
 });
+
+// #252: the CAS writes a NUL into byte 31 of each 32-byte OpenDatabase field
+// (src/broker/cas.c), so 31 bytes is the longest database, user or password it
+// reads intact. Before the fix a 32-byte value was cut to its first 31 bytes, on
+// the client or on the broker, and logged in as whoever those 31 bytes named.
+describe("Integration: OpenDatabase credential byte limits", { skip: !available }, () => {
+  const USER_31 = `cc252_${"u".repeat(25)}`;
+  const PASSWORD_31 = `${"p".repeat(30)}z`;
+  const USER_MB = "cc252_mb";
+  // 15 two-byte characters and one ASCII byte: 31 bytes in 16 characters.
+  const PASSWORD_MB_31 = `${"é".repeat(15)}z`;
+
+  async function dropUsers(client: ReturnType<typeof createClient>): Promise<void> {
+    for (const user of [USER_31, USER_MB]) {
+      const exists = await client.query("SELECT name FROM db_user WHERE name = ?", [
+        user.toUpperCase(),
+      ]);
+      if (exists.length > 0) {
+        await client.query(`DROP USER ${user}`);
+      }
+    }
+  }
+
+  async function currentUser(user: string, password: string): Promise<unknown> {
+    const client = createClient({ ...TEST_CONFIG, user, password });
+    try {
+      const [row] = await client.query<{ u: string }>("SELECT CURRENT_USER AS u");
+      return row?.u;
+    } finally {
+      await client.close();
+    }
+  }
+
+  before(async () => {
+    assert.equal(Buffer.byteLength(USER_31), 31);
+    assert.equal(Buffer.byteLength(PASSWORD_31), 31);
+    assert.equal(Buffer.byteLength(PASSWORD_MB_31), 31);
+    const client = createClient(TEST_CONFIG);
+    try {
+      await dropUsers(client);
+      await client.query(`CREATE USER ${USER_31} PASSWORD '${PASSWORD_31}'`);
+      await client.query(`CREATE USER ${USER_MB} PASSWORD '${PASSWORD_MB_31}'`);
+    } finally {
+      await client.close();
+    }
+  });
+
+  after(async () => {
+    const client = createClient(TEST_CONFIG);
+    try {
+      await dropUsers(client);
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("the server itself refuses a 32-byte user name and a 32-byte password", async () => {
+    const client = createClient(TEST_CONFIG);
+    try {
+      await assert.rejects(client.query(`CREATE USER cc252_${"v".repeat(26)}`), QueryError);
+      await assert.rejects(
+        client.query(`CREATE USER cc252_pw32 PASSWORD '${"q".repeat(32)}'`),
+        QueryError,
+      );
+      const created = await client.query("SELECT name FROM db_user WHERE name LIKE 'CC252_PW32'");
+      assert.deepEqual(created, []);
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("a 31-byte user with a 31-byte password logs in as that user", async () => {
+    assert.equal(await currentUser(USER_31, PASSWORD_31), USER_31.toUpperCase());
+  });
+
+  test("a 31-byte multibyte password logs in", async () => {
+    assert.equal(await currentUser(USER_MB, PASSWORD_MB_31), USER_MB.toUpperCase());
+  });
+
+  test("the password is checked: one byte short is refused by the server", async () => {
+    const adapter = new NativeCubridAdapter({
+      ...TEST_CONFIG,
+      user: USER_31,
+      password: PASSWORD_31.slice(0, 30),
+    });
+    try {
+      await assert.rejects(adapter.connect(), (error: unknown) => {
+        assert.ok(error instanceof ConnectionError);
+        assert.match(String((error.cause as Error).message), /-171/);
+        return true;
+      });
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  test("32 and 33-byte credentials are refused before connecting, not cut to 31", () => {
+    for (const options of [
+      { user: USER_31, password: `${PASSWORD_31}X` },
+      { user: USER_31, password: `${PASSWORD_31}XY` },
+      { user: `${USER_31}X`, password: PASSWORD_31 },
+      { user: USER_MB, password: `${PASSWORD_MB_31}é` },
+      { database: `${"t".repeat(31)}X` },
+    ]) {
+      const config = { ...TEST_CONFIG, ...options };
+      assert.throws(() => createClient(config), RangeError);
+      assert.throws(() => new NativeCubridAdapter(config), RangeError);
+    }
+  });
+});
