@@ -58,7 +58,9 @@ Node 18 and 20 are end-of-life upstream and deprecated, see the
 [support schedule](docs/API_STABILITY.md#nodejs-support-schedule)). The
 [real-broker CI matrix](https://github.com/cubrid-lab/cubrid-client/actions/runs/42216017228)
 passed 23 integration tests (0 skipped) on CUBRID 10.2, 11.0, 11.2 and
-11.4. A separate real SSL=ON CUBRID 11.4 run also passed 3/3 certificate
+11.4. Pull requests run the live suite on 11.4 only; 10.2, 11.0 and 11.2 run
+on every push to `main` and in the release gate before each release. A
+separate real SSL=ON CUBRID 11.4 run also passed 3/3 certificate
 verification and rejection checks. This is **not exhaustive**
 type, cross-version TLS or fault-injection validation;
 see the [support matrix](docs/SUPPORT_MATRIX.md) before deployment.
@@ -747,18 +749,22 @@ npm run api:check    # public API vs api/index.d.ts (run after build)
 
 ### Integration Tests
 
-Integration tests run against a live CUBRID server. They self-skip their
-database-dependent cases when no server is reachable, so they are safe to run
-anywhere. Point them at a running CUBRID broker on `127.0.0.1:33000` with a
-database named `testdb` and user `dba` (empty password):
+Integration tests run against a live CUBRID server: a broker on
+`127.0.0.1:33000` with a database named `testdb` and user `dba` (empty
+password). Without `CUBRID_LIVE_REQUIRED=1` they self-skip their
+database-dependent cases when no server is reachable:
 
 ```bash
-npm run test:integration              # DB-dependent cases self-skip if unreachable
+npm run test:integration                         # DB cases self-skip if unreachable
+CUBRID_LIVE_REQUIRED=1 npm run test:integration  # fails instead of skipping
 ```
 
-> CI runs this step too, but no CUBRID server is provisioned there, so only the
-> offline cases execute and a warning annotation is emitted. To exercise the full
-> suite, run the command above against your own CUBRID instance.
+CI runs the full suite against a disposable `cubrid/cubrid:11.4` in the
+required **`Live CUBRID`** job (Node 22), which fails on any skip; the
+**`CI gate`** check requires it for every change that is not documentation
+only. To start the same container locally, create the `testu8` database the
+charset tests need and clean up afterwards, follow
+[Reproduce the live lane locally](docs/TESTING_MAP.md#reproduce-the-live-lane-locally).
 
 ## Ecosystem
 

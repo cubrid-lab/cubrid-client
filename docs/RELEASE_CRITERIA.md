@@ -28,7 +28,11 @@ job succeeds.
 | 10 | The npm artifact is the reviewed commit | `publish.yml` publishes through Trusted Publishing with provenance, then checks that the exact version exists on npm | npm `gitHead` differs from the tag commit, or the version is missing |
 
 Test counts, coverage percentages, a pushed tag or a green ordinary PR run are
-**not** release evidence on their own.
+**not** release evidence on their own. In particular, the `CI gate` check on
+a pull request requires live integration on CUBRID 11.4 only (one run, Node
+22, [#264](https://github.com/cubrid-lab/cubrid-client/issues/264)). It does
+not cover 10.2, 11.0 or 11.2; criterion 1 above is what proves those for a
+release.
 
 ## Claims
 
