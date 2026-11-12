@@ -1,6 +1,8 @@
+import { NotSentError } from "../errors/internal-errors.js";
 import { TransactionError } from "../errors/transaction-error.js";
-import { mapError, toError } from "../internals/map-error.js";
+import { mapError, toError, withTransactionOutcome } from "../internals/map-error.js";
 import { pickTransactionOptions } from "../internals/normalize-config.js";
+import { unknownOutcomeProbe } from "../internals/session-state.js";
 import type {
   BatchTransactionClient,
   ClientConfig,
@@ -85,6 +87,7 @@ export async function runTransaction<T>(
   options: TransactionOptions | undefined,
 ): Promise<T> {
   const connection = await source.open();
+  const outcomeUnknown = unknownOutcomeProbe(connection);
   let transaction: CallbackTransaction | undefined;
   let failed = false;
   let details: TransactionError | undefined;
@@ -108,6 +111,8 @@ export async function runTransaction<T>(
       if (transaction?.rollbackFailure) {
         details.rollbackError = transaction.rollbackFailure;
       }
+      // Read before the connection ends: closing it is no request of the transaction.
+      withTransactionOutcome(details, outcomeUnknown(), transaction?.rollbackFailure);
     }
 
     throw failure;
@@ -166,7 +171,7 @@ export async function beginScope(
     await source.end(connection, "in-transaction").catch(() => {
       // The client is closed; that is the failure to report.
     });
-    throw mapError("transaction", new Error(closedMessage), "Failed to begin transaction.");
+    throw mapError("transaction", new NotSentError(closedMessage), "Failed to begin transaction.");
   }
 
   const scope: ScopedTransaction = new ScopedTransaction(connection, source, () => {

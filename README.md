@@ -28,7 +28,7 @@ A modern CUBRID client that speaks the CAS binary protocol directly over TCP —
 | API style | Pure async/await |
 | TypeScript | Full generics (`query<T>()`) |
 | Results | `Record<string, unknown>[]` objects |
-| Errors | `ConnectionError`, `QueryError`, `TransactionError`, with the server's numeric `code` and a `kind` |
+| Errors | `ConnectionError`, `QueryError`, `TransactionError`, with the server's numeric `code`, a `kind` and `outcomeUnknown` |
 | Transactions | `transaction(callback, options?)` with auto commit/rollback, and `isolationLevel` and `lockTimeout` options |
 | Node.js | 18+ |
 
@@ -546,7 +546,7 @@ try {
 }
 ```
 
-Errors also say what happened without parsing a message. `error.code` is the numeric server code and `error.kind` classifies known failures. Outside a transaction, `ConstraintError`, `SqlSyntaxError`, `DeadlockError` and `LockTimeoutError` extend `QueryError`. See [Error details](docs/API_REFERENCE.md#error-details).
+Errors also say what happened without parsing a message. `error.code` is the numeric server code and `error.kind` classifies known failures. `error.outcomeUnknown` is `true` when the request was sent and its reply lost, so a write or `COMMIT` may have been applied: check the database before writing again (see [Unknown outcomes](docs/API_REFERENCE.md#unknown-outcomes)). Outside a transaction, `ConstraintError`, `SqlSyntaxError`, `DeadlockError` and `LockTimeoutError` extend `QueryError`. See [Error details](docs/API_REFERENCE.md#error-details).
 
 ```ts
 import { ConstraintError } from "cubrid-client";

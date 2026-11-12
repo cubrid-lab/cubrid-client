@@ -15,7 +15,7 @@ import {
   StreamBusyError,
 } from "../errors/internal-errors.js";
 import { TransactionError } from "../errors/transaction-error.js";
-import { type ErrorKind, mapError } from "../internals/map-error.js";
+import { type ErrorKind, isAbortReason, mapError, withOutcome } from "../internals/map-error.js";
 import {
   assertValidExecuteOptions,
   assertValidFetchSize,
@@ -250,6 +250,20 @@ export class NativeCubridAdapter implements DriverAdapter {
   private transactionAbort: CasReplyError | null = null;
 
   /**
+   * The connection's `unknownOutcomes` when the open manual transaction began,
+   * or null in autocommit mode. COMMIT and ROLLBACK report an unknown outcome
+   * when any request of the transaction had one, even when they were refused
+   * before sending: the driver cannot prove what the server kept (#254).
+   */
+  private transactionUnknownOutcomes: number | null = null;
+
+  /**
+   * Whether the last manual transaction ended with an unknown outcome, kept until
+   * the next beginTransaction() so a rollback() after a failed commit() says so.
+   */
+  private lastTransactionUnknown = false;
+
+  /**
    * The session's last generated AUTO_INCREMENT value as this adapter last saw
    * it: `undefined` for none, `null` when a statement may have changed it unseen.
    * See readExecuteResult().
@@ -302,7 +316,8 @@ export class NativeCubridAdapter implements DriverAdapter {
     try {
       await cas.connect();
     } catch (error) {
-      throw mapError("connection", error, "Failed to connect to CUBRID.");
+      // Opening a session sends no statement.
+      throw withOutcome(mapError("connection", error, "Failed to connect to CUBRID."), false);
     }
   }
 
@@ -733,6 +748,10 @@ export class NativeCubridAdapter implements DriverAdapter {
         await cas.connect();
       }
 
+      if (this.autoCommit) {
+        this.transactionUnknownOutcomes = cas.unknownOutcomes;
+        this.lastTransactionUnknown = false;
+      }
       this.autoCommit = false;
     } catch (error) {
       throw mapError("transaction", error, "Failed to start transaction.");
@@ -764,9 +783,13 @@ export class NativeCubridAdapter implements DriverAdapter {
       this.assertTransactionSession(cas);
       this.endTransaction();
     } catch (error) {
+      const outcomeUnknown = this.transactionOutcomeUnknown(cas);
       this.recordTransactionAbort(error);
       this.endTransactionIfSessionLost(cas);
-      throw mapError("transaction", error, "Failed to commit transaction.");
+      throw withOutcome(
+        mapError("transaction", error, "Failed to commit transaction."),
+        outcomeUnknown,
+      );
     }
   }
 
@@ -788,19 +811,26 @@ export class NativeCubridAdapter implements DriverAdapter {
 
       this.endTransaction();
     } catch (error) {
+      const outcomeUnknown = this.transactionOutcomeUnknown(cas);
       this.recordTransactionAbort(error);
       this.endTransactionIfSessionLost(cas);
-      throw mapError("transaction", error, "Failed to roll back transaction.");
+      throw withOutcome(
+        mapError("transaction", error, "Failed to roll back transaction."),
+        outcomeUnknown,
+      );
     }
   }
 
   async close(): Promise<void> {
     for (const cursor of this.openCursors) {
       cursor.cancel(
-        mapError(
-          "query",
-          new ConnectionLostError("The connection was closed while this stream was open"),
-          QUERY_FAILED,
+        withOutcome(
+          mapError(
+            "query",
+            new ConnectionLostError("The connection was closed while this stream was open"),
+            QUERY_FAILED,
+          ),
+          cursor.hasBegun,
         ),
       );
     }
@@ -834,7 +864,8 @@ export class NativeCubridAdapter implements DriverAdapter {
         await cas.send(header, payload);
       });
     } catch (error) {
-      throw mapError("connection", error, "Failed to close CUBRID connection.");
+      // CON_CLOSE is sent without waiting for a reply, and it ends the session.
+      throw withOutcome(mapError("connection", error, "Failed to close CUBRID connection."), false);
     } finally {
       this.closingCas = null;
     }
@@ -870,11 +901,15 @@ export class NativeCubridAdapter implements DriverAdapter {
       statement.refuse(new ConnectionLostError(`${DESTROYED_BEFORE_SENT}; nothing was sent`));
     }
     for (const cursor of this.openCursors) {
+      // A stream whose statement was sent may have a request in flight.
       cursor.cancel(
-        mapError(
-          "query",
-          new ConnectionLostError("The connection was destroyed while this stream was open"),
-          QUERY_FAILED,
+        withOutcome(
+          mapError(
+            "query",
+            new ConnectionLostError("The connection was destroyed while this stream was open"),
+            QUERY_FAILED,
+          ),
+          cursor.hasBegun,
         ),
       );
     }
@@ -898,6 +933,7 @@ export class NativeCubridAdapter implements DriverAdapter {
         !this.autoCommit || this.transactionGeneration !== null || this.transactionAbort !== null,
       busy: this.openCursors.size > 0 || this.heldBy !== null || this.waitingStatements.size > 0,
       failedExchanges: this.cas?.failedExchanges ?? 0,
+      unknownOutcomes: this.cas?.unknownOutcomes ?? 0,
       connected: this.cas?.isConnected ?? false,
     };
   }
@@ -952,10 +988,13 @@ export class NativeCubridAdapter implements DriverAdapter {
     }
     if (this.destroyed) {
       return Promise.reject(
-        mapError(
-          kind,
-          new ConnectionLostError(`${DESTROYED_BEFORE_SENT}; nothing was sent`),
-          failureMessage,
+        withOutcome(
+          mapError(
+            kind,
+            new ConnectionLostError(`${DESTROYED_BEFORE_SENT}; nothing was sent`),
+            failureMessage,
+          ),
+          false,
         ),
       );
     }
@@ -965,7 +1004,8 @@ export class NativeCubridAdapter implements DriverAdapter {
     const refused = new Promise<never>((_resolve, reject) => {
       waiting = {
         since: Date.now(),
-        refuse: (reason) => reject(mapError(kind, reason, failureMessage)),
+        // Refused before its turn, so nothing of it was sent.
+        refuse: (reason) => reject(withOutcome(mapError(kind, reason, failureMessage), false)),
       };
       leave = reject;
     });
@@ -986,9 +1026,15 @@ export class NativeCubridAdapter implements DriverAdapter {
       if (!this.waitingStatements.delete(waiting)) {
         return undefined as T;
       }
-      return options && (signal || options.readTimeout !== undefined)
-        ? this.runScoped(statement, { signal, readTimeout: options.readTimeout })
-        : statement();
+      const outcomeUnknown = this.outcomeTracker();
+      try {
+        return await (options && (signal || options.readTimeout !== undefined)
+          ? this.runScoped(statement, { signal, readTimeout: options.readTimeout })
+          : statement());
+      } catch (error) {
+        // The caller's abort reason is passed on unchanged, never marked.
+        throw isAbortReason(error, signal) ? error : withOutcome(error, outcomeUnknown());
+      }
     });
 
     const settled = Promise.race([turn, refused]);
@@ -1028,6 +1074,19 @@ export class NativeCubridAdapter implements DriverAdapter {
       throw signal.reason;
     }
     return result;
+  }
+
+  /**
+   * Call when a statement's turn starts; the function it returns tells, once the
+   * statement has failed, whether a request of it may have reached the server
+   * without a reply saying what it did (#254). The statement queue runs one
+   * statement at a time, so every such request counted meanwhile is this one's.
+   * A connection opened by the statement itself starts its count at 0.
+   */
+  private outcomeTracker(): () => boolean {
+    const cas = this.cas;
+    const before = cas?.unknownOutcomes ?? 0;
+    return () => ((cas ?? this.cas)?.unknownOutcomes ?? 0) !== before;
   }
 
   private queueStatement<T>(statement: () => Promise<T>): Promise<T> {
@@ -1417,7 +1476,7 @@ export class NativeCubridAdapter implements DriverAdapter {
       // A FETCH or the handle's release may have reported the end of the
       // transaction, so this statement cannot be called part of it.
       if (this.transactionEnded(cas)) {
-        await cas.discardSession();
+        await cas.discardSession(false);
         throw new ConnectionLostError("Connection lost during transaction");
       }
       return finished;
@@ -1432,7 +1491,7 @@ export class NativeCubridAdapter implements DriverAdapter {
               cas.isConnected &&
               cas.connectionGeneration === generation
             ) {
-              await cas.discardSession();
+              await cas.discardSession(true);
             }
           },
         );
@@ -1605,7 +1664,8 @@ export class NativeCubridAdapter implements DriverAdapter {
         // This read is outside withQueryHandle(), so a damaged reply, which may
         // not have ended where its frame said, must drop the session here.
         if (error instanceof MalformedReplyError) {
-          await cas.discardSession();
+          // Inside a transaction this drops uncommitted work without a reply saying so.
+          await cas.discardSession(true);
         }
         throw error;
       }
@@ -1633,7 +1693,7 @@ export class NativeCubridAdapter implements DriverAdapter {
       // request here could read stale bytes as its answer, or wait forever.
       // The server rolls back the session's work and frees its handles.
       if (error instanceof MalformedReplyError) {
-        await cas.discardSession();
+        await cas.discardSession(true);
       }
       throw error;
     } finally {
@@ -1693,7 +1753,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     }
 
     if (this.isTransactionSessionLost(cas) || this.transactionEnded(cas)) {
-      await cas.discardSession();
+      await cas.discardSession(false);
       throw new ConnectionLostError("Connection lost during transaction");
     }
   }
@@ -1717,7 +1777,7 @@ export class NativeCubridAdapter implements DriverAdapter {
   /** Dropping the session turns this into a lost transaction, which everything checks. */
   private async dropSessionIfTransactionEnded(cas: CASConnection): Promise<void> {
     if (cas.isConnected && this.transactionEnded(cas)) {
-      await cas.discardSession();
+      await cas.discardSession(false);
     }
   }
 
@@ -1739,7 +1799,19 @@ export class NativeCubridAdapter implements DriverAdapter {
     }
   }
 
+  /** Whether a request of the open manual transaction has an unknown outcome. */
+  private transactionOutcomeUnknown(cas: CASConnection | null): boolean {
+    return (
+      this.lastTransactionUnknown ||
+      (this.transactionUnknownOutcomes !== null &&
+        cas !== null &&
+        cas.unknownOutcomes !== this.transactionUnknownOutcomes)
+    );
+  }
+
   private endTransaction(): void {
+    this.lastTransactionUnknown = this.transactionOutcomeUnknown(this.cas);
+    this.transactionUnknownOutcomes = null;
     this.autoCommit = true;
     this.transactionGeneration = null;
     this.transactionEndReplies = null;
@@ -2083,7 +2155,7 @@ export class NativeCubridAdapter implements DriverAdapter {
       // be trusted to have left the stream aligned, so nothing more goes on this
       // session, not even the query handle's release.
       if (cas.isConnected) {
-        await cas.discardSession();
+        await cas.discardSession(false);
       }
     }
   }
@@ -2145,7 +2217,8 @@ function literalOrRefuse(
     }
     return values;
   } catch (error) {
-    throw mapError("query", error, message);
+    // Refused when called: nothing was sent.
+    throw withOutcome(mapError("query", error, message), false);
   }
 }
 
@@ -2166,7 +2239,8 @@ function bindOrRefuse(
     assertEncodable(sql, charset, "SQL text");
     return encodePreparedParams(params ?? [], charset);
   } catch (error) {
-    throw mapError("query", error, message);
+    // Refused when called: nothing was sent.
+    throw withOutcome(mapError("query", error, message), false);
   }
 }
 
@@ -2209,7 +2283,8 @@ function bindManyOrRefuse(
     }
     return sets;
   } catch (error) {
-    throw mapError("query", error, BATCH_FAILED);
+    // Refused when called: nothing was sent.
+    throw withOutcome(mapError("query", error, BATCH_FAILED), false);
   }
 }
 

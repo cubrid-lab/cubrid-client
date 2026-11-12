@@ -1582,7 +1582,7 @@ test("setSessionParameters applies to the open session and to every session afte
       assert.deepEqual(set, ["1:1=5", "1:2=1500"]);
       assert.equal(requests.at(-1), `1:${CHECK_CAS}`);
 
-      await cas.discardSession();
+      await cas.discardSession(true);
       await cas.ensureSession();
       assert.deepEqual(set, ["1:1=5", "1:2=1500", "2:1=5", "2:2=1500"]);
     });
@@ -2148,7 +2148,7 @@ test("CASConnection sendAndRecvOnSession sends nothing on a replaced session", a
   try {
     await withConnection(port, async (cas) => {
       const generation = cas.connectionGeneration;
-      await cas.discardSession();
+      await cas.discardSession(true);
       await cas.connect();
 
       const response = await cas.sendAndRecvOnSession(generation, REQUEST_HEADER, REQUEST_PAYLOAD);
@@ -2167,7 +2167,7 @@ test("CASConnection sendAndRecvOnSession sends nothing after the socket retired"
   try {
     await withConnection(port, async (cas) => {
       const generation = cas.connectionGeneration;
-      await cas.discardSession();
+      await cas.discardSession(true);
 
       const response = await cas.sendAndRecvOnSession(generation, REQUEST_HEADER, REQUEST_PAYLOAD);
 
@@ -2222,7 +2222,7 @@ test("CASConnection discardSession drops the socket and allows reconnecting", as
     const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
     await cas.connect();
 
-    await cas.discardSession();
+    await cas.discardSession(true);
     assert.equal(cas.isConnected, false);
 
     await cas.connect();

@@ -145,12 +145,13 @@ function isCallbackLease(lease: Lease): boolean {
 }
 
 function poolError(kind: CubridErrorKind, message: string): ConnectionError {
-  return new ConnectionError(message, { kind });
+  return new ConnectionError(message, { kind, outcomeUnknown: false });
 }
 
 function releasedError(): ConnectionError {
   return new ConnectionError(
     "This pool connection was released when its callback settled, so nothing was sent.",
+    { outcomeUnknown: false },
   );
 }
 

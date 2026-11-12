@@ -20,6 +20,12 @@ export interface SessionState {
   busy: boolean;
   /** Requests whose outcome is unknown, counted over the life of the connection. */
   failedExchanges: number;
+  /**
+   * The subset of `failedExchanges` that were written to the server, or whose
+   * session was discarded, without a reply saying what they did (#254).
+   * Absent from a reader that cannot tell.
+   */
+  unknownOutcomes?: number;
   /** A session is open and ready. */
   connected: boolean;
 }
@@ -28,4 +34,15 @@ export interface SessionState {
 export function sessionStateReader(connection: ConnectionLike): (() => SessionState) | undefined {
   const read: unknown = (connection as unknown as Record<symbol, unknown>)[SESSION_STATE];
   return typeof read === "function" ? () => read.call(connection) as SessionState : undefined;
+}
+
+/**
+ * Call when a transaction gets its connection; the function it returns tells
+ * whether a request sent on it since then has an unknown outcome, or undefined
+ * when the connection cannot report it, such as a custom one.
+ */
+export function unknownOutcomeProbe(connection: ConnectionLike): () => boolean | undefined {
+  const read = sessionStateReader(connection);
+  const start = read?.().unknownOutcomes;
+  return () => (read && start !== undefined ? read().unknownOutcomes !== start : undefined);
 }

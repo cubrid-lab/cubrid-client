@@ -1,6 +1,12 @@
 import { TransactionError } from "../errors/transaction-error.js";
-import { isAbortReason, mapError, toError } from "../internals/map-error.js";
+import {
+  isAbortReason,
+  mapError,
+  toError,
+  withTransactionOutcome,
+} from "../internals/map-error.js";
 import { assertValidQueryOptions } from "../internals/normalize-config.js";
+import { unknownOutcomeProbe } from "../internals/session-state.js";
 import type {
   BatchTransactionClient,
   ConnectionLike,
@@ -255,6 +261,13 @@ export class CallbackTransaction extends CubridTransaction {
   /** Why the rollback failed, once one was attempted and rejected. */
   rollbackFailure: Error | undefined;
 
+  /**
+   * Whether the transaction that failed to end has an unknown outcome, reported
+   * again by a commit() or rollback() refused afterwards (#254). Undefined when
+   * the connection could not tell.
+   */
+  protected endOutcome: boolean | undefined = false;
+
   override query<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
@@ -344,7 +357,9 @@ export class CallbackTransaction extends CubridTransaction {
   /** Runs one statement of this transaction, unless the transaction is over. */
   private track<R>(statement: () => Promise<R>): Promise<R> {
     if (this.state !== "open") {
-      const refused = new TransactionError(COMPLETED_MESSAGES[this.state]);
+      const refused = new TransactionError(COMPLETED_MESSAGES[this.state], {
+        outcomeUnknown: false,
+      });
 
       // Work the callback left running is still issuing statements while the client
       // commits for it. This one is never sent, so committing would persist the
@@ -401,7 +416,14 @@ export class CallbackTransaction extends CubridTransaction {
 
   private complete(outcome: "commit" | "rollback"): Promise<void> {
     if (this.state !== "open") {
-      return Promise.reject(new TransactionError(COMPLETED_MESSAGES[this.state]));
+      // Nothing is sent, but the transaction's own outcome is what a caller asks about.
+      const ended = this.state === "failed" || this.state === "discarded";
+      const outcomeUnknown = ended ? this.endOutcome : false;
+      return Promise.reject(
+        new TransactionError(COMPLETED_MESSAGES[this.state], {
+          ...(outcomeUnknown !== undefined && { outcomeUnknown }),
+        }),
+      );
     }
 
     this.state = "completing";
@@ -450,6 +472,7 @@ export class CallbackTransaction extends CubridTransaction {
         this.rollbackFailure = toError(rollbackError);
       }
 
+      this.endOutcome = combinedOutcome(error, this.rollbackFailure);
       throw error;
     }
   }
@@ -463,6 +486,7 @@ export class CallbackTransaction extends CubridTransaction {
     } catch (error) {
       this.state = "failed";
       this.rollbackFailure = toError(error);
+      this.endOutcome = combinedOutcome(error);
       throw error;
     }
   }
@@ -479,6 +503,8 @@ export class CallbackTransaction extends CubridTransaction {
  */
 export class ScopedTransaction extends CallbackTransaction {
   private ending: Promise<void> | undefined;
+  /** Whether a request of this transaction has an unknown outcome; see #254. */
+  private readonly outcomeUnknown: () => boolean | undefined;
 
   constructor(
     private readonly ownConnection: ConnectionLike,
@@ -486,6 +512,7 @@ export class ScopedTransaction extends CallbackTransaction {
     private readonly onEnded: () => void,
   ) {
     super(ownConnection);
+    this.outcomeUnknown = unknownOutcomeProbe(ownConnection);
   }
 
   override commit(): Promise<void> {
@@ -506,6 +533,7 @@ export class ScopedTransaction extends CallbackTransaction {
   async discard(): Promise<void> {
     if (!this.ending) {
       this.state = "discarded";
+      this.endOutcome = this.outcomeUnknown();
       this.ending = this.endOwnConnection("in-transaction");
     }
 
@@ -535,9 +563,13 @@ export class ScopedTransaction extends CallbackTransaction {
       await run();
     } catch (error) {
       failure = mapError("transaction", error, message);
-      // A failed explicit rollback is already the cause.
-      if (committing && failure instanceof TransactionError && this.rollbackFailure) {
-        failure.rollbackError = this.rollbackFailure;
+      if (failure instanceof TransactionError) {
+        // A failed explicit rollback is already the cause.
+        if (committing && this.rollbackFailure) {
+          failure.rollbackError = this.rollbackFailure;
+        }
+        withTransactionOutcome(failure, this.outcomeUnknown(), this.rollbackFailure);
+        this.endOutcome = failure.outcomeUnknown;
       }
     }
 
@@ -563,4 +595,25 @@ export class ScopedTransaction extends CallbackTransaction {
       this.onEnded();
     }
   }
+}
+
+/**
+ * True if any of `errors` has an unknown outcome, false if every one says its
+ * outcome is known, and undefined otherwise. An absent error counts as known.
+ */
+function combinedOutcome(...errors: unknown[]): boolean | undefined {
+  let known = true;
+  for (const error of errors) {
+    if (error === undefined) {
+      continue;
+    }
+    const outcome = (error as { outcomeUnknown?: unknown } | null)?.outcomeUnknown;
+    if (outcome === true) {
+      return true;
+    }
+    if (outcome !== false) {
+      known = false;
+    }
+  }
+  return known ? false : undefined;
 }

@@ -5,6 +5,7 @@ import {
   CasReplyError,
   ConnectionLostError,
   ExecuteManyError,
+  NotSentError,
   StreamBusyError,
 } from "../errors/internal-errors.js";
 import {
@@ -33,7 +34,11 @@ export function mapError(kind: ErrorKind, error: unknown, message: string): Erro
   }
 
   const cause = toError(error);
-  const options: CubridErrorOptions = { cause, ...findErrorDetails(cause) };
+  const options: CubridErrorOptions = {
+    cause,
+    ...findErrorDetails(cause),
+    ...ownOutcome(cause),
+  };
   // A refused statement can only be fixed in the caller's code, so the reason stays
   // in the first line anyone reads rather than at the end of the cause chain.
   const text = options.kind === "stream-busy" ? cause.message : message;
@@ -88,7 +93,9 @@ function findErrorDetails(error: Error): CubridErrorDetails {
       current instanceof TransactionError ||
       current instanceof ConnectionError
     ) {
-      const details = definedErrorDetails(current);
+      // The outcome belongs to the operation that failed, so it is never taken
+      // from a cause, which may be an earlier operation's error. See mapError().
+      const { outcomeUnknown: _outcome, ...details } = definedErrorDetails(current);
 
       if (Object.keys(details).length > 0) {
         return details;
@@ -99,6 +106,79 @@ function findErrorDetails(error: Error): CubridErrorDetails {
   }
 
   return {};
+}
+
+/**
+ * The outcome of `error` itself, when it is one of this driver's errors: a layer
+ * that wraps the error of the same operation keeps it. Never read further down
+ * the cause chain, where an earlier operation's flag could leak into this one.
+ */
+function ownOutcome(error: Error): CubridErrorDetails {
+  if (
+    (error instanceof QueryError ||
+      error instanceof TransactionError ||
+      error instanceof ConnectionError ||
+      error instanceof NotSentError) &&
+    error.outcomeUnknown !== undefined
+  ) {
+    return { outcomeUnknown: error.outcomeUnknown };
+  }
+  return {};
+}
+
+/**
+ * Records on one of this driver's errors whether the operation that failed with
+ * it may have taken effect unseen (#254). Anything else, such as a caller's
+ * abort reason, is not ours to change and is returned as it is. A `true` already
+ * there is kept: something below knew the outcome was unknown.
+ */
+export function withOutcome<T>(error: T, outcomeUnknown: boolean): T {
+  if (
+    isInstance(error, QueryError) ||
+    isInstance(error, ConnectionError) ||
+    isInstance(error, TransactionError)
+  ) {
+    const details = error as { outcomeUnknown?: boolean };
+    details.outcomeUnknown = outcomeUnknown || details.outcomeUnknown === true;
+  }
+  return error;
+}
+
+/**
+ * Records the outcome of a whole transaction on the error it failed with.
+ * `changed` is whether a request sent on its connection since it began has an
+ * unknown outcome, or undefined when the connection cannot tell; then only a
+ * `true` found on the failure or the rollback failure, or down their causes, is
+ * reported, because nothing proves the other requests were answered.
+ */
+export function withTransactionOutcome(
+  failure: TransactionError,
+  changed: boolean | undefined,
+  rollbackFailure: Error | undefined,
+): TransactionError {
+  if (changed !== undefined) {
+    return withOutcome(failure, changed);
+  }
+  const details = failure as { outcomeUnknown?: boolean };
+  if (hasUnknownOutcome(failure) || hasUnknownOutcome(rollbackFailure)) {
+    details.outcomeUnknown = true;
+  } else {
+    delete details.outcomeUnknown;
+  }
+  return failure;
+}
+
+function hasUnknownOutcome(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current = error;
+  while (isInstance(current, Error) && !seen.has(current)) {
+    seen.add(current);
+    if ((current as { outcomeUnknown?: unknown }).outcomeUnknown === true) {
+      return true;
+    }
+    current = current.cause;
+  }
+  return false;
 }
 
 /** `instanceof` throws for a revoked proxy, and callers may throw any value. */

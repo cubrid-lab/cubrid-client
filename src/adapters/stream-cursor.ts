@@ -28,6 +28,11 @@ export class StreamCursor {
     return this.stopped;
   }
 
+  /** True once the statement's turn came and it started to run, so it may have sent requests. */
+  get hasBegun(): boolean {
+    return this.running;
+  }
+
   /** Takes ownership of the queued statement that produces this cursor's rows. */
   run(producer: Promise<void>): void {
     this.producer = producer.then(

@@ -302,7 +302,7 @@ It does not run while the connection is idle, or while a request waits its turn 
 - Requests already queued on that connection fail straight away with a `QueryError`, without being sent. Nothing is replayed automatically, so they are safe to retry.
 - Inside a transaction the session is gone and the server discards its uncommitted work. Later `query()` and `commit()` calls fail instead of continuing on a new session, until `commit()` or `rollback()` acknowledges the loss.
 
-**The outcome of the timed-out request is unknown.** The client stops waiting, but this does not cancel the statement: the server may still finish it. An autocommit write may have been applied, and a timed-out `COMMIT` may have succeeded, so check before retrying either.
+**The outcome of the timed-out request is unknown.** The client stops waiting, but this does not cancel the statement: the server may still finish it. An autocommit write may have been applied, and a timed-out `COMMIT` may have succeeded, so check before retrying either. The error says so with `outcomeUnknown: true`; see [Unknown outcomes](API_REFERENCE.md#unknown-outcomes).
 
 The timeout is per client and applies to the built-in native driver. A custom `connectionFactory` receives the value in its `ClientConfig` and decides what to do with it.
 
@@ -576,9 +576,9 @@ What it guarantees, for the built-in driver:
   closes at once, including one still connecting, in the broker or TLS handshake,
   or waiting between connect retries. Nothing is sent first, not even CON_CLOSE.
 - **What rejects.** A statement in flight rejects with kind `connection-lost`.
-  Its outcome on the server is unknown: an autocommit write may have been applied.
-  Statements queued behind it, and every later call, reject with kind
-  `connection-lost` without being sent. Open streams end with that error.
+  Its outcome on the server is unknown (`outcomeUnknown: true`): an autocommit
+  write may have been applied. Statements queued behind it, and every later call,
+  reject with kind `connection-lost` and `outcomeUnknown: false` without being sent. Open streams end with that error.
   `close()`, before or after, resolves.
 - **No replay, no late replies.** Nothing is retried or sent again. A destroyed
   connection never opens another session, so a reply that arrives late is never
