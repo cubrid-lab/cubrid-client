@@ -19,7 +19,7 @@ and an oracle never shares a builder with the code it checks
 | --- | --- | --- |
 | Packet and parser units | nothing below the parser; test-local frame builders | `protocol.test.ts`, `query-utils.test.ts`, `connection-string.test.ts` |
 | Independent protocol oracle | literal CCI/CAS IDs and frames captured from live 10.2–11.4 brokers (`tests/fixtures/*-frames.ts`) | `protocol-oracles.test.ts`, `jdbc-parity-compare.test.ts` (comparator only) |
-| CAS socket | a scripted broker over real TCP or TLS | `connection.test.ts`, `connection-tls.test.ts`, `destroy.test.ts`, `outcome-unknown.test.ts` |
+| CAS socket | a scripted broker over real TCP or TLS | `connection.test.ts`, `connection-tls.test.ts`, `destroy.test.ts`, `outcome-unknown.test.ts`, `frame-reader.test.ts` |
 | Native adapter | `FakeCASConnection` in place of the socket, plus a scripted TCP CAS for #90 | `native-adapter.test.ts` |
 | Client and transactions | `FakeConnection` in place of the adapter | `client.test.ts`, `transaction-scope.test.ts`, `close-lifecycle.test.ts`, `pool.test.ts`, `row-mode.test.ts`, `schema.test.ts`, `timezone.test.ts`, `logger.test.ts`, `transaction-client-compat.test.ts` (typecheck) |
 | Concurrency | real `createClient()` on a fake CAS that records each request's owner | `concurrent-lifecycle.test.ts` |
@@ -29,7 +29,7 @@ and an oracle never shares a builder with the code it checks
 
 | Command | Files | Where it runs | Result on `25c770d` |
 | --- | --- | --- | --- |
-| `npm test` | the 20 offline `.ts` files, then `verify-npm-version.test.mjs` | `ci.yml` (Node 18–26), `release-validation.yml` | 1416 pass, 0 fail, 0 skipped; then 6 pass |
+| `npm test` | the offline `.ts` files (20 on `25c770d`; 21 with `frame-reader.test.ts`, #253), then `verify-npm-version.test.mjs` | `ci.yml` (Node 18–26), `release-validation.yml` | 1416 pass, 0 fail, 0 skipped; then 6 pass |
 | `npm run test:coverage` | the same 20 files under `c8` | `ci.yml` | same 1416 tests |
 | `npm run test:integration`, no broker | `integration.test.ts` | `ci.yml` `ci` job, step "Integration file, offline cases only": checks the file loads on Node 18–26; it is not live evidence | 1 pass (`connect fails with wrong port`); the 18 top-level suites are skipped |
 | `CUBRID_LIVE_REQUIRED=1 CUBRID_TEST_PORT=1 npm run test:integration` | `integration.test.ts` | `ci.yml` negative check | fails with "Live CUBRID integration was required but the broker was unreachable" |
@@ -167,7 +167,7 @@ are the section comments in each file.
 
 | Area | Offline | Live (`integration.test.ts` unless named) |
 | --- | --- | --- |
-| Connection and handshake | `connection.test.ts`: connect() full handshake, frame validation (#107); `protocol.test.ts`: handshake, writeOpenDatabase byte limits; `native-adapter.test.ts`: connect(), connectionTimeout forwarding; `connection-string.test.ts` | `connect fails with wrong port`, `connect to CUBRID`, `Integration: OpenDatabase credential byte limits` |
+| Connection and handshake | `connection.test.ts`: connect() full handshake, frame validation (#107), a replaced socket's bytes (#280); `frame-reader.test.ts`: the per-socket reader's order, fragmentation, backpressure, TLS hand-off and disposal (#253); `protocol.test.ts`: handshake, writeOpenDatabase byte limits; `native-adapter.test.ts`: connect(), connectionTimeout forwarding; `connection-string.test.ts` | `connect fails with wrong port`, `connect to CUBRID`, `Integration: OpenDatabase credential byte limits` |
 | CAS protocol | `protocol.test.ts`: PacketWriter/Reader, parsers, error replies, captured DML and generated-key replies; `protocol-oracles.test.ts`: literal type and function IDs, captured frames | every live block decodes real replies; `tests/jdbc-parity/` compares with JDBC |
 | Query and fetch | `native-adapter.test.ts`: query() DML/DDL/SELECT, fetchRemaining, query handle lifecycle (#108), prepared binding, executeMany (#86); `protocol.test.ts`: fetch, SQL lexer (#243); `query-utils.test.ts` | `query handle release`, `execute results`, `generated insert ids`, `prepared binding`, `stream()`, `Integration: executeMany (#86)`, `negative literal parameters (#242)`, `where a ? is a marker (#243)`, `escapeIdentifier and buildWhere quoting (#259)` |
 | Transactions | `client.test.ts`: transaction() callback lifecycle, statement guards, observed and unobserved failures (#244); `native-adapter.test.ts`: begin/commit/rollback, connection loss in a transaction (#107), server-side rollback (#184); `transaction-scope.test.ts`; `transaction-client-compat.test.ts` | `beginTransactionScope() ownership`, `transaction callback lifecycle`, `isolation level and lock timeout options` |
