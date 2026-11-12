@@ -138,6 +138,11 @@ interface Waiter {
   fail: (error: unknown) => void;
 }
 
+/** The lease of a `connection()` or `transaction()` call, whose callback may await close(). */
+function isCallbackLease(lease: Lease): boolean {
+  return lease.kind === "connection" || lease.kind === "transaction";
+}
+
 function poolError(kind: CubridErrorKind, message: string): ConnectionError {
   return new ConnectionError(message, { kind });
 }
@@ -451,6 +456,11 @@ export class CubridPool
   implements Queryable, ResultQueryable, Executable, PreparedQueryable, BatchExecutable, Streamable
 {
   private closed = false;
+  /** Everything close() waits for but callbacks; started by the first close(). */
+  private draining: Promise<void> | undefined;
+  /** The leases of `connection()` and `transaction()` calls when close() was first called. */
+  private closingCallbacks: Lease[] = [];
+  /** close() for every caller outside a running callback, returned to each of them. */
   private closing: Promise<void> | undefined;
   private readonly idle: Pooled[] = [];
   private readonly active = new Set<Pooled>();
@@ -465,8 +475,10 @@ export class CubridPool
   private readonly openScopes = new Set<ScopedTransaction>();
   private readonly beginningScopes = new Set<Promise<unknown>>();
   private readonly statements: PoolStatements;
-  /** The callback lease running in this async context, so close() never waits for itself. */
-  private readonly callbackLease = new AsyncLocalStorage<LeaseSlot>();
+  /** Leases whose `connection()` or `transaction()` callback is running now. */
+  private readonly runningCallbacks = new Set<Lease>();
+  /** The callback leases enclosing this async context, so close() never waits for itself. */
+  private readonly enclosingCallbacks = new AsyncLocalStorage<ReadonlySet<Lease>>();
   private readonly emit: (level: ClientLogLevel, message: string, fields: ClientLogFields) => void;
   private readonly config: ClientConfig;
   private readonly connectionFactory: ConnectionFactory;
@@ -602,7 +614,7 @@ export class CubridPool
     );
 
     try {
-      return await this.callbackLease.run({ lease }, () => fn(handle));
+      return await this.runCallback(lease, () => fn(handle));
     } finally {
       this.release(lease);
     }
@@ -630,7 +642,15 @@ export class CubridPool
     const slot: LeaseSlot = {};
     return runTransaction(
       this.sourceFor("transaction", slot),
-      (tx) => this.callbackLease.run(slot, () => callback(tx)),
+      async (tx) => {
+        // close() ran while the transaction options were applied or BEGIN was sent:
+        // the callback never starts, and the transaction is rolled back and its
+        // connection closed, as CubridClient.transaction() does.
+        if (this.closed) {
+          throw poolError("pool-closed", "Pool is closed.");
+        }
+        return this.runCallback(slot.lease, () => callback(tx));
+      },
       options,
     );
   }
@@ -709,14 +729,52 @@ export class CubridPool
    * end, as their connections close; statements, `connection()` callbacks and
    * `transaction()` callbacks run to their end and their connections close.
    * Scopes nobody ended are discarded meanwhile, not after: a statement may be
-   * waiting for a lock that only such a scope holds. Calling it again returns the
-   * same promise.
+   * waiting for a lock that only such a scope holds. A `transaction()` whose
+   * callback has not started yet is rolled back without running it. Calling it
+   * again outside every callback returns the same promise. Awaited inside a
+   * running `connection()` or `transaction()` callback, it waits for no callback,
+   * since it would wait for itself (#268).
    */
   close(): Promise<void> {
-    this.closing ??= this.drain();
+    if (!this.draining) {
+      this.closingCallbacks = [...this.leases.values()].filter(isCallbackLease);
+      this.draining = this.drain();
+    }
+
+    // A callback awaiting close() would wait for itself, and two of them for each
+    // other, so inside a running callback close() waits for no callback. Only
+    // while it runs: a timer it set that calls close() after it returned waits.
+    const own = this.enclosingCallbacks.getStore();
+    if (own && [...own].some((lease) => this.runningCallbacks.has(lease))) {
+      return this.draining;
+    }
+    this.closing ??= this.waitForCallbacks();
     return this.closing;
   }
 
+  /** `draining`, then the callbacks running when close() was first called, and their connections. */
+  private async waitForCallbacks(): Promise<void> {
+    await Promise.allSettled([this.draining, ...this.closingCallbacks.map((lease) => lease.done)]);
+    await this.settleConnections();
+  }
+
+  /** Runs a `connection()` or `transaction()` callback, known to close() while it runs. */
+  private async runCallback<T>(lease: Lease | undefined, run: () => Promise<T>): Promise<T> {
+    const chain = new Set(this.enclosingCallbacks.getStore());
+    if (lease) {
+      chain.add(lease);
+      this.runningCallbacks.add(lease);
+    }
+    try {
+      return await this.enclosingCallbacks.run(chain, run);
+    } finally {
+      if (lease) {
+        this.runningCallbacks.delete(lease);
+      }
+    }
+  }
+
+  /** Never rejects. */
   private async drain(): Promise<void> {
     // Before the first await, so no call made after close() can lease.
     this.closed = true;
@@ -737,21 +795,26 @@ export class CubridPool
         this.destroy(lease.pooled, "closed");
       }
     }
-    // close() called from inside a callback cannot wait for that callback's lease.
-    const own = this.callbackLease.getStore()?.lease;
 
     const scopes = Promise.allSettled([
       ...this.beginningScopes,
       ...[...this.openScopes].map((scope) => scope.discard()),
     ]);
-    // A stream is not awaited: its consumer may never read again.
+    // A stream is not awaited: its consumer may never read again. Callbacks are
+    // waited for by close() itself, alongside this.
     await Promise.allSettled(
       leases
-        .filter((lease) => lease.kind !== "scope" && lease.kind !== "stream" && lease !== own)
+        .filter(
+          (lease) => lease.kind !== "scope" && lease.kind !== "stream" && !isCallbackLease(lease),
+        )
         .map((lease) => lease.done),
     );
     await scopes;
+    await this.settleConnections();
+  }
 
+  /** Waits for the connections being opened or closed now. */
+  private async settleConnections(): Promise<void> {
     // A connection still being opened is closed as soon as it opens.
     while (this.opening.size > 0 || this.closings.size > 0) {
       await Promise.allSettled([...this.opening, ...this.closings]);

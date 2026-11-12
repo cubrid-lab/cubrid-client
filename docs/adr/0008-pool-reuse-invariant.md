@@ -96,9 +96,17 @@ with that wait.
   them on the pool instead.
 - Session variables and other session state set in autocommit mode survive on a
   reused connection, including transaction settings changed with SQL.
-- `close()` awaited inside a `connection()` or `transaction()` callback does not
-  wait for that callback's lease (found by an `AsyncLocalStorage` of the running
-  callback), which would otherwise wait for itself forever.
+- `close()` awaited inside a running `connection()` or `transaction()` callback
+  waits for no callback lease (the enclosing callbacks are found by an
+  `AsyncLocalStorage`), as `CubridClient.close()` does (#246). Waiting for every
+  lease but its own was not enough: two callbacks that each awaited `close()`
+  waited for each other forever (#268). It still waits for statements and
+  discards scopes; a `close()` from outside every callback waits for all the
+  callbacks running when `close()` was first called. A `transaction()` whose
+  callback has not started when the pool closes is rolled back without running
+  it, as in the client. An inside `close()` that waits for a statement blocked
+  on the closing callback's own lock waits until the statement's `readTimeout`
+  or `signal` ends it.
 - The method is internal and not part of the 1.x contract; a custom connection
   cannot opt in.
 
@@ -106,7 +114,8 @@ with that wait.
 
 - [x] Offline tests for each reason, for the custom-connection rule, for FIFO
   order without barging, `max` under 1000 concurrent callers, timeouts, aborts,
-  `maxWaitingClients` and `close()` racing a wait, an open and a transaction
+  `maxWaitingClients` and `close()` racing a wait, an open and a transaction,
+  and `close()` awaited inside one or two callbacks, nested or not
   (`tests/pool.test.ts`).
 - [x] A stub CAS over TCP: a CAS that drops an idle session is replaced in place,
   validation replaces a dead one, and a statement with an unknown outcome closes
