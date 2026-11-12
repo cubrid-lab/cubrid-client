@@ -92,6 +92,8 @@ export interface ClientConfig {
   readTimeout?: number | undefined;
   /** See {@link ClientOptions.maxLobBytes}. */
   maxLobBytes?: number | undefined;
+  /** See {@link ClientOptions.maxReplyBytes}. */
+  maxReplyBytes?: number | undefined;
   /** See {@link ClientOptions.fetchSize}. */
   fetchSize?: number | undefined;
   /** See {@link ClientOptions.timezone}. */
@@ -138,6 +140,18 @@ export interface ClientOptions {
    * `stream()` applies the same limit to each row instead, see {@link StreamOptions}.
    */
   maxLobBytes?: number;
+  /**
+   * Largest single reply the client accepts from the server, in bytes. One reply
+   * holds about 16 KiB of rows, or one whole row when a row is larger, so this
+   * bounds the size of one row, not of a result. An `executeMany()` reply reports
+   * every set of one request and reached 15 MiB for a batch that failed. A longer reply rejects before
+   * its body is read and the connection is closed: the statement's outcome is
+   * unknown, and in a transaction the transaction is lost. Unlike `maxLobBytes`,
+   * it does not limit BLOB and CLOB content, which arrives in replies of 128 KiB
+   * at most. Must be an integer from 1048576 (1 MiB) to 2147483647. Default:
+   * 1073741824 (1 GiB).
+   */
+  maxReplyBytes?: number;
   /**
    * Isolation level of every session this client opens, on the shared connection
    * and on each `transaction()` connection. A session that replaces one gets it

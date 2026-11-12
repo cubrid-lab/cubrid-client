@@ -111,7 +111,11 @@ export interface CASConnectionConfig {
   ca?: string | Buffer;
   /** Server name for SNI and certificate hostname verification. */
   servername?: string;
-  /** Largest accepted frame DATA_LENGTH. Default: DEFAULT_MAX_FRAME_LENGTH. */
+  /**
+   * Largest accepted reply DATA_LENGTH, the `maxReplyBytes` client option. A
+   * longer reply fails before its body is read and retires the socket.
+   * Default: DEFAULT_MAX_FRAME_LENGTH.
+   */
   maxFrameLength?: number;
   /** Sent on each new session before anything else. See applySessionParametersUnlocked(). */
   sessionParameters?: readonly SessionParameter[];
@@ -1037,16 +1041,23 @@ export class CASConnection {
   }
 
   /**
-   * Read one framed response, rejecting an impossible DATA_LENGTH before any
-   * body bytes are awaited. Returns CAS_INFO + payload.
+   * Read one framed response, rejecting an impossible or over-limit DATA_LENGTH
+   * before any body bytes are awaited. Returns CAS_INFO + payload. The rest of a
+   * rejected reply is still on its way, so every caller must discard the socket.
    */
   private async readFrame(socket: Socket): Promise<Buffer> {
     const dataLengthBuf = await this.recvExact(socket, SIZE_DATA_LENGTH);
     const dataLength = dataLengthBuf.readInt32BE(0);
     const maxFrameLength = this.config.maxFrameLength ?? DEFAULT_MAX_FRAME_LENGTH;
 
-    if (dataLength < 0 || dataLength > maxFrameLength) {
+    if (dataLength < 0) {
       throw new Error(`Invalid CAS frame length ${dataLength} (expected 0 to ${maxFrameLength})`);
+    }
+    if (dataLength > maxFrameLength) {
+      throw new Error(
+        `The server's reply of ${dataLength} bytes is over the maxReplyBytes limit of ` +
+          `${maxFrameLength} bytes, so the connection was closed without reading it`,
+      );
     }
 
     return this.recvExact(socket, dataLength + SIZE_CAS_INFO);

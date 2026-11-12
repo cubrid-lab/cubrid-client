@@ -208,6 +208,9 @@ A query over the limit rejects before any content is read, with an
 `UnsupportedValueError` naming the column that crossed it, and the connection and
 any open transaction stay usable. Raise the limit, select fewer rows, or leave the
 LOB column out. The limit counts bytes, including the bytes of a multibyte CLOB.
+It is separate from [`maxReplyBytes`](CONNECTION.md#reply-size-limit), which
+bounds one reply from the server: LOB content arrives in replies of 128 KiB, so
+`maxReplyBytes` never limits it.
 
 [`stream()`](API_REFERENCE.md#streamtsql-params-options) applies the same limit to
 **each row** instead. It reads a row's content when the consumer reaches that row, so

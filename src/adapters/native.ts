@@ -19,6 +19,7 @@ import { type ErrorKind, mapError } from "../internals/map-error.js";
 import {
   assertValidFetchSize,
   assertValidMaxLobBytes,
+  assertValidMaxReplyBytes,
   assertValidQueryOptions,
   assertValidRetryCount,
   assertValidStreamOptions,
@@ -272,6 +273,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     assertValidCredentials(config);
     assertValidRetryCount(config.maxConnectionRetryCount);
     assertValidMaxLobBytes(config.maxLobBytes);
+    assertValidMaxReplyBytes(config.maxReplyBytes);
     assertValidFetchSize(config.fetchSize);
     assertValidTimezone(config.timezone);
     assertValidTransactionOptions(config);
@@ -1711,6 +1713,9 @@ export class NativeCubridAdapter implements DriverAdapter {
         }),
         ...(this.config.readTimeout !== undefined && {
           readTimeout: this.config.readTimeout,
+        }),
+        ...(this.config.maxReplyBytes !== undefined && {
+          maxFrameLength: this.config.maxReplyBytes,
         }),
         sessionParameters: toSessionParameters(this.transactionOptions),
         ...this.resolveSslConfig(),

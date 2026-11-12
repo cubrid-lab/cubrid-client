@@ -542,6 +542,7 @@ Creates a client instance. Connection is established lazily on first query.
 | `fetchSize` | `number` | `100` | Rows requested per FETCH. CUBRID 10.2 to 11.4 ignore it and send about 16 KiB per reply (see [`fetchSize`](docs/API_REFERENCE.md#clientoptions)) |
 | `timezone` | `"local" \| "utc"` | `"local"` | Zone DATE/TIME/TIMESTAMP/DATETIME values are decoded in. `"utc"` makes them independent of the process `TZ` and symmetric with `Date` parameters (see [Date and time values](docs/TYPES.md#date-and-time-values)) |
 | `maxLobBytes` | `number` | 64 MiB | Most BLOB and CLOB content one query may load, in bytes. A query over it rejects (see [BLOB and CLOB columns](docs/TYPES.md#blob-and-clob-columns)) |
+| `maxReplyBytes` | `number` | 1 GiB | Largest single reply from the server, in bytes, and so the largest row. A longer reply rejects and closes the connection (see [Reply size limit](docs/CONNECTION.md#reply-size-limit)) |
 | `isolationLevel` | `"read committed" \| "repeatable read" \| "serializable"` | Server default | Isolation level of every session this client opens, restored after a reconnect (see [Isolation Level and Lock Timeout](docs/CONNECTION.md#isolation-level-and-lock-timeout)) |
 | `lockTimeout` | `number` | Server default | Longest a statement waits for a lock, in ms. `0` does not wait and `-1` has no limit. Restored after a reconnect |
 | `ssl` | `boolean \| ClientSSLOptions` | `false` | Enable TLS. `true` for defaults, or an object for cert/verification control (see [TLS/SSL](#tlsssl)) |

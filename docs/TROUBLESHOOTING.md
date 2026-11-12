@@ -129,6 +129,15 @@ The driver does not export these two classes, so test `name` and not
   [values that cannot be decoded](TYPES.md#values-that-cannot-be-decoded) for how
   to recover.
 
+### A cause says `reply of N bytes is over the maxReplyBytes limit`
+
+One reply from the server, which holds one row when rows are large, was longer
+than [`maxReplyBytes`](CONNECTION.md#reply-size-limit). The client closed the
+connection without reading the reply, so the statement's outcome is unknown and
+an open transaction was rolled back by the server. Raise `maxReplyBytes` if the
+row is expected, or select its large columns in separate statements. BLOB and
+CLOB columns never cause it; they are bounded by `maxLobBytes`.
+
 ### `QueryError` with `CUBRID LOB read failed (-1020)`
 
 The server no longer has the file behind a BLOB or CLOB value. There are two usual

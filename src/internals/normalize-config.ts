@@ -16,6 +16,15 @@ const MAX_FETCH_SIZE = 2 ** 31 - 1;
 /** Largest lock timeout the server's int32 parameter holds, in milliseconds. */
 const MAX_LOCK_TIMEOUT = 2 ** 31 - 1;
 
+/**
+ * Metadata and LOB_READ replies of up to 161 KiB occur in normal use, so no limit
+ * goes below 1 MiB. Rows and executeMany() results can be far larger.
+ */
+const MIN_MAX_REPLY_BYTES = 1024 * 1024;
+
+/** DATA_LENGTH is a signed 32-bit int, so no reply can be longer. */
+const MAX_MAX_REPLY_BYTES = 2 ** 31 - 1;
+
 const ISOLATION_LEVELS: readonly unknown[] = ["read committed", "repeatable read", "serializable"];
 
 /**
@@ -35,6 +44,21 @@ export function assertValidRetryCount(count: number | undefined): void {
 export function assertValidMaxLobBytes(limit: number | undefined): void {
   if (limit !== undefined && !(Number.isSafeInteger(limit) && limit > 0)) {
     throw new RangeError("maxLobBytes must be a positive integer number of bytes.");
+  }
+}
+
+/**
+ * NaN compares false against every length, which would turn the limit off, so
+ * the adapter, which is public and skips normalizeConfig(), checks this too.
+ */
+export function assertValidMaxReplyBytes(limit: number | undefined): void {
+  if (
+    limit !== undefined &&
+    !(Number.isInteger(limit) && limit >= MIN_MAX_REPLY_BYTES && limit <= MAX_MAX_REPLY_BYTES)
+  ) {
+    throw new RangeError(
+      `maxReplyBytes must be an integer from ${MIN_MAX_REPLY_BYTES} to ${MAX_MAX_REPLY_BYTES} bytes.`,
+    );
   }
 }
 
@@ -148,13 +172,14 @@ export function assertValidQueryOptions(options: QueryOptions | undefined): void
 }
 
 export function normalizeConfig(options: ClientOptions): ClientConfig {
-  const { readTimeout, maxLobBytes, fetchSize, timezone } = options;
+  const { readTimeout, maxLobBytes, maxReplyBytes, fetchSize, timezone } = options;
   const password = options.password ?? "";
 
   assertValidCredentials({ database: options.database, user: options.user, password });
   assertValidReadTimeout(readTimeout);
   assertValidRetryCount(options.maxConnectionRetryCount);
   assertValidMaxLobBytes(maxLobBytes);
+  assertValidMaxReplyBytes(maxReplyBytes);
   assertValidFetchSize(fetchSize);
   assertValidTimezone(timezone);
   assertValidTransactionOptions(options);
@@ -168,6 +193,7 @@ export function normalizeConfig(options: ClientOptions): ClientConfig {
     connectionTimeout: options.connectionTimeout,
     ...(readTimeout !== undefined && { readTimeout }),
     ...(maxLobBytes !== undefined && { maxLobBytes }),
+    ...(maxReplyBytes !== undefined && { maxReplyBytes }),
     ...(fetchSize !== undefined && { fetchSize }),
     ...(timezone !== undefined && { timezone }),
     ...pickTransactionOptions(options),
