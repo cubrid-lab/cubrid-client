@@ -1265,6 +1265,7 @@ interface ClientOptions {
   connectionTimeout?: number;
   readTimeout?: number;
   maxLobBytes?: number;
+  maxReplyBytes?: number;
   fetchSize?: number;
   timezone?: "local" | "utc";
   isolationLevel?: IsolationLevel;
@@ -1285,6 +1286,7 @@ interface ClientOptions {
 | `connectionTimeout` | `number` | `10000` | Limit of each TCP connect, to the broker and to the CAS it redirects to, in milliseconds. `0` leaves it to the operating system (about 2 minutes on Linux). It does not bound the handshake or any later request. Unset meant no limit before this release. See [Connection limits](CONNECTION.md#connection-limits) |
 | `readTimeout` | `number` | `undefined` | Milliseconds of server inactivity before a request fails with [`ReadTimeoutError`](#readtimeouterror) and the connection is discarded. `undefined` or `0` means no timeout for requests; the connect handshake then still gives up after 10 seconds of inactivity. Other values must be between 1 and 2147483647, or `createClient()` throws a `RangeError`. See [Read timeout](CONNECTION.md#read-timeout) |
 | `maxLobBytes` | `number` | `67108864` (64 MiB) | Largest total of BLOB and CLOB content, in bytes, one query may load. A query over it rejects with a `QueryError` before any content is read, and the connection stays usable. Must be a positive integer, or `createClient()` throws a `RangeError`. See [BLOB and CLOB columns](TYPES.md#blob-and-clob-columns) |
+| `maxReplyBytes` | `number` | `1073741824` (1 GiB) | Largest single reply the client accepts from the server, in bytes. One reply holds about 16 KiB of rows, or one whole row when a row is larger, so this bounds one row, not a result; an `executeMany()` reply reports every set of one request and reached 15 MiB for a failing batch. BLOB and CLOB content arrives in replies of 128 KiB and is bounded by `maxLobBytes` instead. A longer reply rejects before its body is read and the connection is closed: the statement's outcome is unknown and an open transaction is lost. Must be an integer from `1048576` to `2147483647`, or `createClient()` throws a `RangeError`. See [Reply size limit](CONNECTION.md#reply-size-limit) |
 | `fetchSize` | `number` | `100` | Rows requested in each FETCH by `query()`, `queryResult()` and `stream()`. **CUBRID 10.2, 11.0, 11.2 and 11.4 ignore this number** and answer every FETCH with about 16 KiB of rows, or one row when a row is larger, so on those servers it changes neither round trips nor memory. Must be an integer from 1 to 2147483647, or `createClient()` throws a `RangeError` |
 | `timezone` | `"local" \| "utc"` | `"local"` | Zone that DATE, TIME, TIMESTAMP and DATETIME fields are decoded in, since those SQL types store no zone. `"local"` uses the Node.js process zone (the 1.x behavior), so the same value becomes a different instant under a different `TZ`. `"utc"` reads them as UTC, the zone `Date` parameters are already sent in, so values round-trip to the same instant on every host; read them with the `getUTC*()` getters. Any other value throws a `RangeError`. See [Date and time values](TYPES.md#date-and-time-values) |
 | `isolationLevel` | [`IsolationLevel`](#isolationlevel) | Server default | Isolation level of every session this client opens, on the shared connection and on each `transaction()` connection, and restored on any session that replaces one. Any other value throws a `RangeError`. See [Isolation Level and Lock Timeout](CONNECTION.md#isolation-level-and-lock-timeout) |
@@ -1309,6 +1311,7 @@ interface ClientConfig {
   connectionTimeout?: number | undefined;
   readTimeout?: number | undefined;
   maxLobBytes?: number | undefined;
+  maxReplyBytes?: number | undefined;
   isolationLevel?: IsolationLevel | undefined;
   lockTimeout?: number | undefined;
   maxConnectionRetryCount?: number | undefined;

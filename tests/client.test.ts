@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { NativeCubridAdapter } from "../src/adapters/native.js";
 import { CubridClient } from "../src/client/client.js";
 import { createClient } from "../src/client/create-client.js";
 import { CubridTransaction } from "../src/client/transaction.js";
@@ -209,6 +210,34 @@ for (const consumerTimeout of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 
 for (const maxLobBytes of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 53]) {
   test(`createClient rejects maxLobBytes ${maxLobBytes}`, () => {
     assert.throws(() => createClient({ ...baseOptions(), maxLobBytes }), RangeError);
+  });
+}
+
+test("normalizeConfig keeps a valid maxReplyBytes and adds none by default (#251)", () => {
+  for (const maxReplyBytes of [1024 * 1024, 2 ** 31 - 1]) {
+    assert.equal(normalizeConfig({ ...baseOptions(), maxReplyBytes }).maxReplyBytes, maxReplyBytes);
+  }
+  assert.ok(!("maxReplyBytes" in normalizeConfig(baseOptions())));
+});
+
+for (const maxReplyBytes of [
+  0,
+  -1,
+  1024 * 1024 - 1,
+  2 ** 31,
+  1.5 * 1024 * 1024 + 0.5,
+  Number.NaN,
+  Number.POSITIVE_INFINITY,
+]) {
+  test(`createClient and the adapter reject maxReplyBytes ${maxReplyBytes} (#251)`, () => {
+    assert.throws(() => createClient({ ...baseOptions(), maxReplyBytes }), {
+      name: "RangeError",
+      message: "maxReplyBytes must be an integer from 1048576 to 2147483647 bytes.",
+    });
+    assert.throws(
+      () => new NativeCubridAdapter({ ...baseOptions(), port: 33000, password: "", maxReplyBytes }),
+      RangeError,
+    );
   });
 }
 

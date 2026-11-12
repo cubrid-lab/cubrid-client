@@ -239,9 +239,19 @@ export const TYPE_NAMES: Record<number, string> = {
 };
 
 /**
- * Largest CAS frame body accepted by default. This rejects corrupt or hostile
- * lengths without capping real result batches; memory still grows only as
- * bytes actually arrive, because frames are never preallocated.
+ * Default of the `maxReplyBytes` client option: the largest CAS reply body
+ * (DATA_LENGTH) accepted, 1 GiB. A reply is never preallocated, so memory grows
+ * only as its bytes arrive; the limit stops a corrupt or hostile length from
+ * growing it further.
+ *
+ * Measured on CUBRID 10.2 and 11.4 (#251): a FETCH reply holds about 16 KiB of
+ * rows, or one whole row when a row is larger, so a row's size is the reply's;
+ * column metadata was 161 KiB for 1600 columns; LOB_READ replies hold at most
+ * LOB_READ_CHUNK_SIZE; an executeMany() request whose ~116000 sets all failed
+ * got a 15 MiB reply. One VARCHAR row of 4 x 200 MiB arrived as a
+ * single 800 MiB reply on 11.4, so valid replies approach this limit and it is
+ * not lowered in 1.x. A stock broker restarts a CAS that grows past 1 GiB
+ * (APPL_SERVER_MAX_SIZE_HARD_LIMIT), so only a raised server limit sends more.
  */
 export const DEFAULT_MAX_FRAME_LENGTH = 1024 * 1024 * 1024;
 

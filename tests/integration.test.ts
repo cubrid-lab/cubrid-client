@@ -6750,3 +6750,156 @@ describe("Integration: destroy() (#245)", { skip: !available }, () => {
     await assert.rejects(client.query(QUICK));
   });
 });
+
+describe("Integration: maxReplyBytes (#251)", { skip: !available }, () => {
+  const TABLE = "cc251_reply";
+  const MIB = 1024 * 1024;
+  // Two 600 KiB values make one row, and so one FETCH reply, of about 1.2 MiB.
+  const WIDE = "w".repeat(600 * 1024);
+  const NARROW = "n".repeat(512 * 1024);
+  const LOB = Buffer.alloc(3 * MIB, 0x5c);
+
+  before(async () => {
+    const client = createClient(TEST_CONFIG);
+    await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+    await client.query(`CREATE TABLE ${TABLE} (id INT PRIMARY KEY, a VARCHAR, b VARCHAR, l BLOB)`);
+    const insert = `INSERT INTO ${TABLE} (id, a, b, l) VALUES (?, ?, ?, ?)`;
+    await client.executePrepared(insert, [1, WIDE, WIDE, null]);
+    await client.executePrepared(insert, [2, NARROW, "", null]);
+    await client.executePrepared(insert, [3, "", "", blob(LOB)]);
+    await client.close();
+  });
+
+  after(async () => {
+    const client = createClient(TEST_CONFIG);
+    await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+    await client.close();
+  });
+
+  function overLimit(error: unknown): boolean {
+    for (let e = error; e instanceof Error; e = e.cause) {
+      if (/over the maxReplyBytes limit of 1048576 bytes/.test(e.message)) {
+        return true;
+      }
+    }
+    assert.fail(`not a maxReplyBytes rejection: ${String(error)}`);
+  }
+
+  test("a row under the limit reads intact; a row over it rejects and the session is replaced", async () => {
+    const adapter = new NativeCubridAdapter({ ...TEST_CONFIG, maxReplyBytes: MIB });
+    await adapter.connect();
+    const cas = (adapter as unknown as { cas: CASConnection }).cas;
+
+    try {
+      const [narrow] = await adapter.query<{ a: string }>(`SELECT a FROM ${TABLE} WHERE id = 2`);
+      assert.equal(narrow?.a, NARROW);
+      const generation = cas.connectionGeneration;
+
+      await assert.rejects(adapter.query(`SELECT a, b FROM ${TABLE} WHERE id = 1`), (error) => {
+        assert.ok(error instanceof QueryError);
+        return overLimit(error);
+      });
+      assert.equal(cas.isConnected, false);
+
+      // The next statement opens a new session; nothing of the rejected reply is read.
+      const [row] = await adapter.query<{ one: number }>("SELECT 1 AS one FROM db_root");
+      assert.equal(row?.one, 1);
+      assert.equal(cas.connectionGeneration, generation + 1);
+
+      // Each value alone fits, so the same data reads in two statements.
+      const [a] = await adapter.query<{ a: string }>(`SELECT a FROM ${TABLE} WHERE id = 1`);
+      const [b] = await adapter.query<{ b: string }>(`SELECT b FROM ${TABLE} WHERE id = 1`);
+      assert.equal(a?.a, WIDE);
+      assert.equal(b?.b, WIDE);
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  test("inside a transaction an over-limit reply loses the transaction, which rolls back", async () => {
+    const client = createClient({ ...TEST_CONFIG, maxReplyBytes: MIB });
+
+    try {
+      await assert.rejects(
+        client.transaction(async (tx) => {
+          await tx.query(`INSERT INTO ${TABLE} (id, a) VALUES (100, 'uncommitted')`);
+          await tx.query(`SELECT a, b FROM ${TABLE} WHERE id = 1`);
+        }),
+        (error) => {
+          assert.ok(error instanceof TransactionError);
+          return overLimit(error);
+        },
+      );
+
+      const rows = await client.query(`SELECT id FROM ${TABLE} WHERE id = 100`);
+      assert.deepEqual(rows, []);
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("BLOB content is not bounded by maxReplyBytes: a 3 MiB BLOB reads under a 1 MiB limit", async () => {
+    const client = createClient({ ...TEST_CONFIG, maxReplyBytes: MIB, maxLobBytes: 4 * MIB });
+
+    try {
+      const [row] = await client.query<{ l: Buffer }>(`SELECT l FROM ${TABLE} WHERE id = 3`);
+      assert.ok(row?.l.equals(LOB));
+
+      const streamed: Buffer[] = [];
+      for await (const each of client.stream<{ l: Buffer }>(
+        `SELECT l FROM ${TABLE} WHERE id = 3`,
+      )) {
+        streamed.push(each.l);
+      }
+      assert.equal(streamed.length, 1);
+      assert.ok(streamed[0]?.equals(LOB));
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("the default limit reads a 64 MiB VARCHAR row as one reply (reports memory use)", async (t) => {
+    const size = 64 * MIB;
+    const client = createClient(TEST_CONFIG);
+    let largest = 0;
+    const big = createClient({
+      ...TEST_CONFIG,
+      connectionFactory: async (config) => {
+        const adapter = new NativeCubridAdapter(config);
+        await adapter.connect();
+        const cas = (adapter as unknown as { cas: CASConnection }).cas;
+        const recv = cas.recv.bind(cas);
+        cas.recv = async () => {
+          const reply = await recv();
+          largest = Math.max(largest, reply.length);
+          return reply;
+        };
+        return adapter;
+      },
+    });
+
+    try {
+      await client.executePrepared(`INSERT INTO ${TABLE} (id, a) VALUES (?, ?)`, [
+        200,
+        "m".repeat(size),
+      ]);
+
+      const before = process.memoryUsage();
+      const [row] = await big.query<{ a: string }>(`SELECT a FROM ${TABLE} WHERE id = 200`);
+      const afterRead = process.memoryUsage();
+
+      assert.equal(row?.a.length, size);
+      // One reply carries the whole row: the value plus a few bytes of header.
+      assert.ok(largest >= size && largest < size + 4096, `largest reply ${largest} bytes`);
+      const grown = (n: number) => `${((n / MIB) | 0).toString()} MiB`;
+      t.diagnostic(
+        `64 MiB row: largest reply ${largest} bytes; rss +${grown(afterRead.rss - before.rss)}, ` +
+          `arrayBuffers +${grown(afterRead.arrayBuffers - before.arrayBuffers)}`,
+      );
+    } finally {
+      await client.query(`DELETE FROM ${TABLE} WHERE id = 200`).catch(() => undefined);
+      await client.close();
+      await big.close();
+    }
+  });
+});

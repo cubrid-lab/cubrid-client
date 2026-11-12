@@ -44,6 +44,7 @@ await db.close();
 | `password` | `string` | No | `""` | Database password (empty string for no password). At most 31 bytes in UTF-8 |
 | `connectionTimeout` | `number` | No | `10000` | Limit of each TCP connect in milliseconds; `0` leaves it to the operating system. See [Connection limits](#connection-limits) |
 | `readTimeout` | `number` | No | — | Milliseconds of server inactivity before a request fails. See [Read timeout](#read-timeout) |
+| `maxReplyBytes` | `number` | No | `1073741824` (1 GiB) | Largest single reply accepted from the server, in bytes. See [Reply size limit](#reply-size-limit) |
 | `maxConnectionRetryCount` | `number` | No | — | Retries after a failed TCP connect (default `0`). See [Connection retries](#connection-retries) |
 | `logger` | `unknown` | No | — | Receives redacted diagnostics (connection created, operation timing and failures). See [Logging](#logging) |
 | `connectionFactory` | `ConnectionFactory` | No | — | Custom factory for creating connections (advanced) |
@@ -151,6 +152,7 @@ only the ones marked as such apply by default.
 | **Socket**: a peer that vanished while the connection was idle | TCP keepalive, always on: first probe after 60 s idle, then the operating system's interval and count | On | The next request fails as a lost connection |
 | **Handshake**: broker reply, TLS handshake, OpenDatabase, session settings | `readTimeout`, or 10 s of inactivity when it is unset (#196) | 10 s | `ReadTimeoutError`; not retried |
 | **Read**: each request after the handshake, while the server is silent | `readTimeout` or a per-statement `readTimeout` | None | `ReadTimeoutError`; the socket is destroyed |
+| **Reply**: the size of one reply from the server | `maxReplyBytes` | 1 GiB | Rejects before the body is read; the connection is closed. See [Reply size limit](#reply-size-limit) |
 | **Queue**: a statement waiting for its turn behind others on the same connection | Nothing by default. A `signal` removes it; a stalled `stream()` refuses it after `consumerTimeout` | None | Rejects without sending anything |
 | **Shutdown**: `close()` | Waits for the statement running and those queued before it, then sends CON_CLOSE | None | — |
 | **Shutdown**: `destroy()` | Does not wait for anything | Immediate | See [Destroying a client](#destroying-a-client) |
@@ -167,6 +169,86 @@ slow, or a statement that runs for an hour, keeps answering keepalive probes: us
 `connectionTimeout` had no default in 1.3 and earlier: an unreachable host then waited
 for the operating system's limit. A TCP connect that takes longer than 10
 seconds now fails; set a larger value, or `0`, if your network needs it.
+
+## Reply size limit
+
+Every reply from the server starts with its length. `maxReplyBytes` is the
+largest length the client accepts, in bytes; it defaults to 1 GiB and may be set
+from `1048576` (1 MiB) to `2147483647`, or `createClient()` throws a
+`RangeError`. A reply is never allocated from its length up front: memory grows
+as its bytes arrive, so the limit is what stops a corrupt or hostile length from
+growing it further.
+
+```ts
+// Accept no reply over 64 MiB, so no single row can cost more.
+const db = createClient({ host, database, user, maxReplyBytes: 64 * 1024 * 1024 });
+```
+
+**What one reply holds.** Measured on CUBRID 10.2 and 11.4 with this client
+(#251):
+
+| Reply | Largest measured | Bounded by |
+|-------|------------------|------------|
+| Rows (the first result window, and each FETCH) | About 16 KiB of rows, or **one whole row** when a row is larger: 10 MiB for a row of ten 1 MiB VARCHARs, 192 MiB for one 192 MiB VARCHAR, 800 MiB for a row of four 200 MiB VARCHARs | The largest row. `fetchSize` does not change it, see [`fetchSize`](API_REFERENCE.md#clientoptions) |
+| Column metadata | 155 KiB (10.2) and 161 KiB (11.4) for a 1600-column `SELECT *` | The number and names of the columns |
+| `executeMany()` results | 15 MiB on 10.2 for one request of about 116000 INT sets that all failed on a duplicate key | The sets in one request, which carries 1 MiB of parameters at most, and the length of each failed set's error message |
+| BLOB and CLOB content (LOB_READ) | 80 KiB (10.2) and 128 KiB (11.4) | The client's 128 KiB request, whatever the LOB's size |
+| A BIT VARYING value | 128 MiB | The type: at most 1073741823 bits |
+| A VARCHAR value | 192 MiB; 256 MiB failed on a stock 11.4 broker | The CAS process memory limit, see below |
+
+So `maxReplyBytes` limits the size of **one row**, not of a result: a result of a
+million small rows arrives in many small replies. The exception is
+`executeMany()`, whose reply reports every set of a request: a limit of a few
+MiB can reject a large batch that fails, so leave it at 32 MiB or more if you
+use `executeMany()`. On a stock broker no reply
+can come near 1 GiB: a CAS that grows past `APPL_SERVER_MAX_SIZE_HARD_LIMIT`
+(1024 MB by default) is restarted by the broker, which closed the connection
+while the server built a 256 MiB VARCHAR insert or a 1140 MiB row. With that
+limit raised to 2047 on 11.4, the server sent the 1140 MiB row as one reply, which the
+default rejects and `maxReplyBytes: 2147483647` reads.
+
+**Why the default stays at 1 GiB.** A row of several large VARCHARs is valid and
+reached 800 MiB in one reply on a stock server, so a lower default would reject
+data that 1.x reads today. The default is therefore not lowered in 1.x. Lower it
+when you know your rows are smaller, to bound what one corrupt or hostile reply
+can cost; raise it only for rows over 1 GiB, which also need the server's limit
+raised.
+
+**Memory.** A reply's bytes arrive in pieces that are joined once it is
+complete, so reading it briefly takes up to twice its size, and decoding a row
+then adds the decoded values. Measured with `process.memoryUsage()` around one `query()` on
+11.4, the resident size grew by 77 MiB for a 64 MiB VARCHAR row and by 1.8 GiB
+for an 800 MiB row, before garbage collection. Size the limit against the memory
+one connection may take, times the connections a process opens. `query()` keeps every row of
+the result, so its memory is bounded by the result's size, not by this limit;
+`stream()` holds one reply and the row being read, so this limit bounds it.
+
+**It is not `maxLobBytes`.** The two cover different bytes and neither replaces
+the other:
+
+- `maxReplyBytes` bounds one reply of any kind, and so the inline values of one
+  row. BLOB and CLOB content never counts: it arrives in replies of 128 KiB at most, so a
+  3 MiB BLOB reads under a 1 MiB `maxReplyBytes`.
+- [`maxLobBytes`](TYPES.md#blob-and-clob-columns) bounds the total BLOB and CLOB
+  content one `query()` loads, or one row of a `stream()`. It is checked before
+  any content is read, and the connection stays usable.
+
+**On a reply over the limit** the statement rejects before the reply's body is
+read, with a `QueryError`, a `TransactionError` in a transaction, or a
+`ConnectionError` from `ping()`. Its cause says
+`The server's reply of N bytes is over the maxReplyBytes limit of M bytes, so the
+connection was closed without reading it`. The rest of the reply is still on its
+way, so the connection is closed and never reused:
+
+- The statement's outcome is unknown, as after a [read timeout](#read-timeout):
+  an autocommit write may have been applied.
+- The next statement opens a new session. Nothing is retried, and no byte of the
+  rejected reply is read as another statement's answer.
+- Inside a transaction the session is gone and the server rolls back its
+  uncommitted work, as after a lost connection.
+
+Nothing is truncated: a row is read whole or not at all. To read a row larger
+than the limit, raise it, or select its large columns in separate statements.
 
 ## Read timeout
 

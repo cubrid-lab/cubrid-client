@@ -3,6 +3,8 @@ import { spawn } from "node:child_process";
 import { createServer, type Socket as NetSocket, type Server } from "node:net";
 import test from "node:test";
 
+import { NativeCubridAdapter } from "../src/adapters/native.js";
+import { ConnectionError } from "../src/errors/connection-error.js";
 import { ConnectionLostError } from "../src/errors/internal-errors.js";
 import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { CASConnection, type CASConnectionConfig } from "../src/protocol/connection.js";
@@ -943,7 +945,7 @@ test("CASConnection rejects a frame over the limit without waiting for its body"
 
     await assert.rejects(
       cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD),
-      /Invalid CAS frame length 17 \(expected 0 to 16\)/,
+      /reply of 17 bytes is over the maxReplyBytes limit of 16 bytes/,
     );
     assert.equal(cas.isConnected, false);
   } finally {
@@ -962,7 +964,10 @@ test("CASConnection rejects an oversized OpenDatabase frame", async () => {
 
   try {
     const cas = new CASConnection({ ...DEFAULT_CONFIG, port });
-    await assert.rejects(cas.connect(), /Invalid CAS frame length 2147483647/);
+    await assert.rejects(
+      cas.connect(),
+      /reply of 2147483647 bytes is over the maxReplyBytes limit of 1073741824 bytes/,
+    );
     assert.equal(cas.isConnected, false);
   } finally {
     await closeServer(server);
@@ -982,6 +987,156 @@ test("CASConnection accepts a frame of exactly the limit", async () => {
     const response = await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
     assert.deepEqual(response, body);
     await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});
+
+/** A GET_DB_VERSION reply whose payload is exactly `payloadLength` bytes. */
+function versionReply(payloadLength: number): Buffer {
+  const payload = Buffer.alloc(payloadLength);
+  payload.write("11.4.0.0001", SIZE_DATA_LENGTH, "latin1");
+  return frameResponse(Buffer.concat([CAS_INFO, payload]));
+}
+
+test("maxReplyBytes: a reply of exactly the limit is read and the session is kept (#251)", async () => {
+  const limit = 1024 * 1024;
+  let connections = 0;
+  const { server, port } = await createMockBroker((socket) => {
+    connections += 1;
+    socket.on("error", () => {});
+    socket.once("data", () => {
+      socket.write(Buffer.alloc(4));
+      socket.once("data", () => {
+        socket.write(frameResponse(buildOpenDbResponse(connections)));
+        socket.on("data", () => socket.write(versionReply(limit)));
+      });
+    });
+  });
+
+  try {
+    const adapter = new NativeCubridAdapter({ ...DEFAULT_CONFIG, port, maxReplyBytes: limit });
+    assert.equal(await adapter.ping(), "11.4.0.0001");
+    assert.equal(await adapter.ping(), "11.4.0.0001");
+    assert.equal(connections, 1);
+    await adapter.close();
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("maxReplyBytes: a reply one byte over the limit closes the session, which is never reused (#251)", async () => {
+  const limit = 1024 * 1024;
+  let connections = 0;
+  const closed: number[] = [];
+  const { server, port } = await createMockBroker((socket) => {
+    const connection = ++connections;
+    socket.on("error", () => {});
+    socket.on("close", () => closed.push(connection));
+    socket.once("data", () => {
+      socket.write(Buffer.alloc(4));
+      socket.once("data", () => {
+        socket.write(frameResponse(buildOpenDbResponse(connection)));
+        socket.on("data", () => {
+          if (connection === 1) {
+            // Only part of the over-limit body: the client must not wait for the rest.
+            socket.write(versionReply(limit + 1).subarray(0, 64 * 1024));
+          } else {
+            socket.write(versionReply(32));
+          }
+        });
+      });
+    });
+  });
+
+  try {
+    // A client that waited for the rest of the reply would time out instead.
+    const adapter = new NativeCubridAdapter({
+      ...DEFAULT_CONFIG,
+      port,
+      maxReplyBytes: limit,
+      readTimeout: 2000,
+    });
+    await assert.rejects(adapter.ping(), (error: Error) => {
+      assert.ok(error instanceof ConnectionError);
+      assert.ok(!(error.cause instanceof ConnectionLostError));
+      assert.match(
+        String((error.cause as Error).message),
+        /reply of 1048577 bytes is over the maxReplyBytes limit of 1048576 bytes, so the connection was closed/,
+      );
+      return true;
+    });
+    const deadline = Date.now() + 5000;
+    while (!closed.includes(1)) {
+      assert.ok(Date.now() < deadline, "the client kept the over-limit socket open");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    // The next request opens a new session; nothing of the rejected reply leaks into it.
+    assert.equal(await adapter.ping(), "11.4.0.0001");
+    assert.equal(connections, 2);
+    await adapter.close();
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("an over-limit reply to the CHECK_CAS probe replaces the session before the request (#251)", async () => {
+  let connections = 0;
+  const { server, port } = await createMockBroker((socket) => {
+    const connection = ++connections;
+    socket.on("error", () => {});
+    socket.once("data", () => {
+      socket.write(Buffer.alloc(4));
+      socket.once("data", () => {
+        socket.write(frameResponse(buildOpenDbResponse(connection)));
+        let request = 0;
+        socket.on("data", () => {
+          const index = request++;
+          if (connection === 2) {
+            socket.write(frameResponse(CAS_INFO));
+          } else if (index === 0) {
+            // OUT_TRAN, so the next request is preceded by a CHECK_CAS probe.
+            socket.write(frameResponse(Buffer.from([0x00, 0x02, 0x03, 0x04])));
+          } else {
+            socket.write(Buffer.concat([frameHeader(17), CAS_INFO]));
+          }
+        });
+      });
+    });
+  });
+
+  try {
+    const cas = new CASConnection({ ...DEFAULT_CONFIG, port, maxFrameLength: 16 });
+    await cas.connect();
+    await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+
+    const response = await cas.sendAndRecv(REQUEST_HEADER, REQUEST_PAYLOAD);
+    assert.equal(response.length, 0);
+    assert.equal(cas.sessionId, 2);
+    assert.equal(connections, 2);
+    await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("an over-limit reply while the session settings are sent leaves no session (#251)", async () => {
+  const { server, port } = await brokerWith((socket) => socket.write(frameHeader(17)));
+
+  try {
+    const cas = new CASConnection({
+      ...DEFAULT_CONFIG,
+      port,
+      maxFrameLength: 16,
+      sessionParameters: SESSION_PARAMETERS,
+    });
+    await assert.rejects(cas.connect(), (error: Error) => {
+      assert.match(error.message, /session settings could not be applied/);
+      assert.match(String((error.cause as Error).message), /over the maxReplyBytes limit of 16/);
+      return true;
+    });
+    assert.equal(cas.isConnected, false);
   } finally {
     await closeServer(server);
   }
