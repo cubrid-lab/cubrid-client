@@ -1,5 +1,10 @@
 name: Live CUBRID integration
 
+# Pull requests and pushes to main reach this workflow only through ci.yml,
+# whose "CI gate" job requires it whenever a change can affect runtime (#264).
+# A path-filtered trigger here would duplicate that run and could never be a
+# required check, because a workflow that does not start stays pending.
+# release-validation.yml calls it with full_matrix: true.
 on:
   workflow_call:
     inputs:
@@ -11,22 +16,6 @@ on:
         type: boolean
         required: false
         default: false
-  pull_request:
-    branches: [main]
-    paths:
-      - "src/**"
-      - "tests/integration.test.ts"
-      - "package.json"
-      - "package-lock.json"
-      - ".github/workflows/live-cubrid.yml"
-  push:
-    branches: [main]
-    paths:
-      - "src/**"
-      - "tests/integration.test.ts"
-      - "package.json"
-      - "package-lock.json"
-      - ".github/workflows/live-cubrid.yml"
   workflow_dispatch:
 
 permissions:
@@ -40,8 +29,8 @@ jobs:
     strategy:
       fail-fast: false
       # Keep pull-request checks useful without downloading four large server
-      # images on every code review. Full compatibility matrix runs on main
-      # and can also be invoked manually before a release.
+      # images on every code review: a pull request runs 11.4 only. A push to
+      # main, a manual dispatch and the release gate run all four versions.
       matrix:
         cubrid: ${{ fromJSON((inputs.full_matrix || github.event_name != 'pull_request') && '["10.2","11.0","11.2","11.4"]' || '["11.4"]') }}
     steps:
@@ -67,7 +56,7 @@ jobs:
         run: |
           set -euo pipefail
           ready=false
-          for attempt in $(seq 1 36); do
+          for _ in $(seq 1 36); do
             # Run csql as the service user, never as root. A root csql that wins
             # the race with the entrypoint's createdb creates $CUBRID/log owned
             # by root; the server then cannot write its logs and reports lock
@@ -83,7 +72,38 @@ jobs:
             echo "::error::CUBRID ${{ matrix.cubrid }} did not start; this is not a skipped integration test"
             exit 1
           fi
-          docker inspect --format '{{.Config.Image}}' cubrid-live
+      - name: Record server and broker versions and the image digest
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="cubrid/cubrid:${{ matrix.cubrid }}"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$image" || true)
+          server=$(docker exec --user cubrid cubrid-live csql -u dba testdb -c "SELECT VERSION()" 2>/dev/null \
+            | grep -oE "'[0-9][0-9.]*'" | tr -d "'" | head -1 || true)
+          build=$(docker exec --user cubrid cubrid-live bash -lc cubrid_rel | grep -m1 CUBRID || true)
+          # getServerVersion() asks the broker's CAS, so this is the version the
+          # client actually talks to on port 33000.
+          broker=$(node --import tsx --input-type=module -e '
+            const { createClient } = await import("./src/index.ts");
+            const client = createClient({ host: "127.0.0.1", port: 33000, database: "testdb", user: "dba", password: "" });
+            try { console.log(await client.getServerVersion()); } finally { await client.close(); }' || true)
+          if [ -z "$digest" ] || [ -z "$server" ] || [ -z "$broker" ] || [ -z "$build" ]; then
+            echo "::error::Could not record the image digest, server, broker or build version"
+            exit 1
+          fi
+          {
+            echo "### CUBRID ${{ matrix.cubrid }} live lane"
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Image | \`$image\` |"
+            echo "| Image digest | \`$digest\` |"
+            echo "| Server version (\`SELECT VERSION()\`) | \`$server\` |"
+            echo "| Broker version (\`getServerVersion()\` on port 33000) | \`$broker\` |"
+            echo "| Build (\`cubrid_rel\`) | \`$build\` |"
+            echo "| Node.js | \`$(node --version)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "image=$image digest=$digest server=$server broker=$broker"
       - name: Create a utf8 database for the charset tests (#238)
         shell: bash
         run: |
@@ -96,6 +116,7 @@ jobs:
              cubrid server start testu8'
           docker exec --user cubrid cubrid-live csql -u dba testu8 -c "SELECT 1" >/dev/null
       - name: Execute non-skippable live integration tests
+        timeout-minutes: 15
         env:
           CUBRID_LIVE_REQUIRED: "1"
           CUBRID_TEST_PORT: "33000"
@@ -103,16 +124,49 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          npm run test:integration 2>&1 | tee live-integration.tap
-          if grep -Eq '^# skipped [1-9]' live-integration.tap; then
-            echo "::error::Live CUBRID tests were skipped"
+          # CUBRID_LIVE_REQUIRED=1 turns an unreachable broker into a thrown
+          # error; a failing test makes the run exit non-zero. Keep the exit
+          # status so the counts still reach the summary before failing.
+          # Ask for TAP explicitly: Node 23 and later print the spec reporter
+          # even when piped, which has no "# tests" lines to check.
+          status=0
+          node --import tsx --test --test-reporter=tap tests/integration.test.ts 2>&1 \
+            | tee live-integration.tap || status=$?
+          count() { sed -n "s/^# $1 //p" live-integration.tap | tail -1; }
+          tests=$(count tests); passed=$(count pass); failed=$(count fail)
+          skipped=$(count skipped); todo=$(count todo); cancelled=$(count cancelled)
+          {
+            echo "### CUBRID ${{ matrix.cubrid }} live integration tests"
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Live tests executed | ${tests:-none} |"
+            echo "| Passed / failed / cancelled / skipped / todo | ${passed:-?} / ${failed:-?} / ${cancelled:-?} / ${skipped:-?} / ${todo:-?} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Live integration run exited with status $status"
             exit 1
           fi
-          passed=$(sed -n 's/^# pass //p' live-integration.tap | tail -1)
-          if [ -z "$passed" ] || [ "$passed" -lt 20 ]; then
-            echo "::error::Expected at least 20 live integration assertions; got ${passed:-none}"
+          for value in "$tests" "$passed" "$failed" "$skipped" "$todo" "$cancelled"; do
+            [[ "$value" =~ ^[0-9]+$ ]] || { echo "::error::Live test summary missing from TAP output"; exit 1; }
+          done
+          if [ "$skipped" -ne 0 ] || [ "$todo" -ne 0 ] || grep -Eq '^\s*(not )?ok [0-9]+ - .*# (SKIP|TODO)' live-integration.tap; then
+            echo "::error::Live CUBRID tests or suites were skipped"
             exit 1
           fi
+          if [ "$failed" -ne 0 ] || [ "$cancelled" -ne 0 ] || [ "$passed" -ne "$tests" ]; then
+            echo "::error::Live CUBRID tests did not all pass: $passed of $tests"
+            exit 1
+          fi
+          if [ "$tests" -lt 20 ]; then
+            echo "::error::Expected at least 20 live integration tests; got $tests"
+            exit 1
+          fi
+          # The CREATE/INSERT/SELECT/ROLLBACK round trip must have run and passed.
+          if ! grep -Eq '^\s*ok [0-9]+ - getServerVersion returns the server version and leaves a transaction.s row to rollback\(\)$' live-integration.tap; then
+            echo "::error::The create/insert/rollback/select round trip did not pass"
+            exit 1
+          fi
+          echo "Live CUBRID ${{ matrix.cubrid }}: $passed of $tests tests passed, 0 skipped"
       - name: Checkout original node-cubrid driver at reviewed source revision
         uses: actions/checkout@v7
         with:
@@ -130,7 +184,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          node --import tsx --test tests/legacy-parity.test.ts 2>&1 | tee legacy-parity.tap
+          node --import tsx --test --test-reporter=tap tests/legacy-parity.test.ts 2>&1 | tee legacy-parity.tap
           grep -q '^# tests 1$' legacy-parity.tap
           grep -q '^# pass 1$' legacy-parity.tap
           grep -q '^# fail 0$' legacy-parity.tap

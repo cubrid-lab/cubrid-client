@@ -80,13 +80,39 @@ npm run typecheck
 npm run check
 ```
 
-This executes type checking and offline unit tests with coverage. The PR CI
-also builds the package and invokes `npm run test:integration`, but it does
-**not** provision CUBRID: its database-dependent integration tests self-skip.
-A green CI run is not a live CAS round-trip verification. For a protocol,
-reconnection or transaction change, separately run `npm run test:integration`
-against a real CUBRID server and report the endpoint/version and executed test
-count; state clearly when that check was not run.
+This executes type checking and offline unit tests with coverage.
+
+### Pull request checks
+
+The `CI` workflow ends in one aggregate job, **`CI gate`**. It is the check to
+mark as required for `main` (there is no branch protection or ruleset yet, so
+a maintainer has to set it). For any change that is not documentation only,
+the gate requires both:
+
+- the offline `ci` matrix on Node 18, 20, 22, 24 and 26 (typecheck, lint,
+  coverage, build, API check). Its "Integration file, offline cases only"
+  step has no CUBRID server, so its live suites skip; it is **not** live
+  evidence;
+- the **`Live CUBRID`** job: the full `tests/integration.test.ts` against a
+  disposable `cubrid/cubrid:11.4`, once, on Node 22. It fails on an
+  unreachable broker, any skipped test or suite, too few cases or a timeout,
+  and its job summary records the server and broker version, the image digest
+  and the number of executed tests.
+
+A documentation-only pull request skips both and passes on the docs check.
+An 11.4 pass does not cover 10.2, 11.0 or 11.2; pushes to `main` and the
+release gate run all four. Details and the full list of fail-closed checks are
+in [the test case map](docs/TESTING_MAP.md#required-live-cubrid-114-lane-264).
+
+To reproduce the live lane before pushing, start `cubrid/cubrid:11.4`, create
+`testu8`, run `CUBRID_LIVE_REQUIRED=1 CUBRID_TEST_UTF8_DATABASE=testu8 npm run
+test:integration` and remove the container afterwards; the exact commands are
+in [Reproduce the live lane locally](docs/TESTING_MAP.md#reproduce-the-live-lane-locally).
+Report the image digest, server version and executed test count; state
+clearly when that check was not run.
+
+The [test case map](docs/TESTING_MAP.md) lists which file and block covers each
+contract, which layer each file tests, and the command for a focused run.
 
 ---
 

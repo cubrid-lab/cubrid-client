@@ -113,6 +113,14 @@ repository now, checked against `main` at `8ee7a10`, and what is still missing.
 | No-publish release validation and manual approval ([#106](https://github.com/cubrid-lab/cubrid-client/issues/106), [#120](https://github.com/cubrid-lab/cubrid-client/issues/120), open) | `release-validation.yml` (live matrix, TLS, `npm audit`, consumer smoke, a gate job that rejects skipped or cancelled jobs) is called by `publish.yml` before the `npm-publish` environment job; checklist in [RELEASE_DECISION.md](RELEASE_DECISION.md) | The human sign-off fields in RELEASE_DECISION.md are unfilled, and #120 stays open. As of 2026-11-07 the `v1.2.0` tag and GitHub Release exist, but npm still serves 1.1.0 because `npm publish` failed with E404 (see #106). Do not treat 1.2.0 as available on npm |
 | Review checklist | "Protocol correctness review" in [CONTRIBUTING.md](../CONTRIBUTING.md) and the checklist below | It is guidance read by reviewers; no workflow checks that it was followed |
 
+**Update ([#264](https://github.com/cubrid-lab/cubrid-client/issues/264)).**
+The three live-job rows above describe `main` on 2026-11-07. Since #264 the
+`CI` workflow calls `live-cubrid.yml` as its `Live CUBRID` job for every change
+that is not documentation only, and its `CI gate` job fails unless that run
+passed; the offline integration step no longer claims to be an integration
+run. `CI gate` still has to be marked as a required check by a maintainer.
+See [the test case map](TESTING_MAP.md#required-live-cubrid-114-lane-264).
+
 Still absent: a required-check setting for the live jobs, an independent
 audit of the remaining wire areas (collections, LOBs, JSON, error codes), and
 any recorded review of what the v1.0.0 reviewer inspected. Assignees and dates

@@ -33,7 +33,7 @@ For each 1.x release candidate, verify the **built/packed npm artifact** from a 
 
 `tests/integration.test.ts` exists; `npm run test:integration` invokes it. Without a reachable broker the default lane **may self-skip** real DB cases. An ordinary successful exit therefore does **not** prove a live CUBRID integration run.
 
-Set up a disposable CUBRID broker and database through a tested external/provisioned environment, verify its host, port, version and authentication, and then run:
+Set up a disposable CUBRID broker and database (the commands for `cubrid/cubrid:11.4`, the `testu8` database, the environment variables and cleanup are in [Reproduce the live lane locally](TESTING_MAP.md#reproduce-the-live-lane-locally)), verify its host, port, version and authentication, and then run:
 
 ```sh
 CUBRID_LIVE_REQUIRED=1 npm run test:integration
