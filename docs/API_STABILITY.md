@@ -64,19 +64,56 @@ correctness repair, because the affected calls could silently break atomicity:
 | Swallowed `tx.commit()` failure, then resolve | Client committed again | Rolls back once and rejects | Handle the failure or let it propagate |
 | Swallowed `tx.rollback()` failure, then resolve | Client **committed** | Rejects without a commit | Handle the failure or let it propagate |
 | `tx` used after `transaction()` settled | The built-in adapter opened a new session and ran the statement in **autocommit** | Rejects with `TransactionError` | Await all work inside the callback |
-| A query not awaited by the callback fails while the commit waits for it | Client committed the rest, with an unhandled rejection | Rolls back and rejects `transaction()` | Await every statement; catch the error if the transaction may continue |
+| A query not awaited by the callback fails while the commit waits for it | Client committed the rest, with an unhandled rejection | Rolls back and rejects `transaction()` (since #244, when nothing observed the query, whenever it failed) | Await every statement; catch the error if the transaction may continue |
 | Close fails after another failure | Close error replaced the original | `cause` is the original, `closeError` is set | Read `cause` |
 | `beginTransaction()` fails | Rollback attempted anyway | No rollback is sent | None |
 | `db.transaction()` after `db.close()` | Opened a new connection and ran the callback | Rejects with `TransactionError` and opens no connection | Start the transaction before closing, or create a new client |
 
 Code that completes a transaction once and then returns or throws keeps working.
-A failure the callback awaited and handled still commits. A query that was not
-awaited and rejected before the callback's last `await` resumed cannot be
-detected and does not stop the commit.
+A failure the callback awaited and handled still commits. How a failure the
+callback never observed is detected changed in #244; see
+[unobserved statement failures](#unobserved-statement-failures).
 A `CubridTransaction` you construct yourself keeps forwarding every call: only
 the instance `transaction()` creates is guarded. Removing `commit()` and
 `rollback()` from the callback's `tx`, if ever wanted, would be a MAJOR change
 under the policy above.
+
+### Unobserved statement failures
+
+In 1.3.0 a failed statement the callback did not await stopped the commit only
+if it failed within two microtask turns of the callback returning, an inference
+from timing ([#244](https://github.com/cubrid-lab/cubrid-client/issues/244)).
+The same code could commit or roll back depending on when the server replied.
+Now the rule is whether code **observed** the statement's promise, by attaching
+a rejection handler to it (`await`, `.catch()`, `Promise.allSettled()` and so
+on), not when it failed
+([ADR 0009](adr/0009-unobserved-statement-failures-roll-back.md)). No API was
+added or removed and no type changed. Code that awaits its statements, caught
+or not, behaves exactly as before. What changes is code that did not await a
+statement, whose outcome used to depend on timing: it now has one outcome,
+which is a **rollback** where nothing observed the failure and a **commit**
+where a handler did, including handlers that do not really handle the error
+(rows below). Proposed as a correctness repair in a MINOR, like #109; because
+some of these cases move from rollback to commit, it needs explicit maintainer
+acceptance.
+
+| Inside `transaction()` | 1.3.0 | Now |
+| --- | --- | --- |
+| A failure awaited and caught (`try`/`catch`, `.catch()` awaited), then more work | Committed | Committed (unchanged) |
+| `await Promise.allSettled([...])` or a caught `Promise.all([...])` with a failure | Committed | Committed (unchanged) |
+| `void tx.query(sql)` that fails while the commit waits for it | Rolled back | Rolled back (unchanged) |
+| `void tx.query(sql)` that fails before the callback's last step | Committed, with an unhandled rejection | **Rolled back**, no unhandled rejection |
+| `tx.query(sql).catch(handler)`, not awaited, fails before the callback returns | Committed | Committed (unchanged) |
+| The same, failing after the callback returned | Rolled back | **Committed**: the handler observed it |
+| Not awaited and observed without being handled: `.finally()`, `void Promise.all([...])`, `void Promise.resolve(p)`, `.then(f, (e) => { throw e })`, or a fire-and-forget `(async () => { await tx.query(sql) })()`, failing after the callback returned | Rolled back | **Committed**, and Node.js reports the derived promise's rejection |
+| The same, failing before the callback's last step | Committed, with an unhandled rejection | Committed, with an unhandled rejection (unchanged) |
+| An unobserved failure, then the callback throws | Rolled back; an unhandled rejection unless it failed late | Rolled back, no unhandled rejection |
+| A statement issued after an explicit `tx.commit()` | Refused; the commit stands | Refused; the commit stands (unchanged) |
+| A statement issued after the callback returned, while the client commits for it | Refused; the rest committed without it | Refused. Best effort: when a handler of a statement the commit was waiting for issued it directly, the commit is refused too (rollback); deeper in a chain, the rest is committed without it, as before |
+
+The migration is to await every statement or attach a handler where a failure
+is acceptable. Code that awaited and caught its failures needs no change.
+`beginTransactionScope()` follows the same rule; it is not in 1.3.0.
 
 ### Isolation level and lock timeout
 
