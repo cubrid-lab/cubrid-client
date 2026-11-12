@@ -148,6 +148,8 @@ export class CASConnection {
   private _protoVersion = 1;
   private _sessionId = 0;
   private receiveBuffer: Buffer = Buffer.alloc(0);
+  /** The socket `receiveBuffer` was read from. A read on any other socket discards it. */
+  private receiveBufferSocket: Socket | null = null;
   private _connectionGeneration = 0;
   private _failedExchanges = 0;
   private _unknownOutcomes = 0;
@@ -341,6 +343,9 @@ export class CASConnection {
 
       // Step 3: If port > 0, connect to CAS on new port; if 0, reuse broker socket
       if (newPort > 0) {
+        // Anything the broker sent past the port goes with its socket, as in JDBC:
+        // a CAS sends nothing before OPEN_DATABASE, and recvExact() never lets the
+        // broker socket's buffered bytes answer a read on the CAS socket.
         brokerSocket.destroy();
         this.socket = await this.createSocket(this.config.host, newPort);
       } else {
@@ -1195,6 +1200,12 @@ export class CASConnection {
    */
   private recvExact(socket: Socket, size: number): Promise<Buffer> {
     const read = new Promise<Buffer>((resolve, reject) => {
+      // Bytes buffered from a replaced or retired socket are not this socket's.
+      if (this.receiveBufferSocket !== socket) {
+        this.receiveBuffer = Buffer.alloc(0);
+        this.receiveBufferSocket = socket;
+      }
+
       // Check if we already have enough buffered data
       if (this.receiveBuffer.length >= size) {
         resolve(this.takeBuffered(size));
@@ -1219,6 +1230,7 @@ export class CASConnection {
         if (received >= size) {
           cleanup();
           this.receiveBuffer = Buffer.concat(chunks, received);
+          this.receiveBufferSocket = socket;
           resolve(this.takeBuffered(size));
         }
       };

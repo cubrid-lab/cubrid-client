@@ -1268,6 +1268,31 @@ test("CASConnection sends requests after a broker redirect", async () => {
   }
 });
 
+test("bytes the broker sends past the redirect port never answer a read on the CAS socket (#280)", async () => {
+  // Every socket used to share one receive buffer, so the broker's stray frame
+  // answered OPEN_DATABASE on the CAS socket: session 666 instead of 7.
+  const { server: casServer, port: casPort } = await createMockBroker((socket) => {
+    socket.once("data", () => socket.write(frameResponse(buildOpenDbResponse(7))));
+  });
+  const { server: broker, port: brokerPort } = await createMockBroker((socket) => {
+    socket.on("error", () => {});
+    socket.once("data", () =>
+      socket.write(Buffer.concat([frameHeader(casPort), frameResponse(buildOpenDbResponse(666))])),
+    );
+  });
+
+  const cas = new CASConnection({ ...DEFAULT_CONFIG, port: brokerPort });
+  try {
+    await cas.connect();
+    assert.equal(cas.sessionId, 7);
+  } finally {
+    // Closes the CAS socket even when the assertion fails, so the servers can close.
+    cas.destroy();
+    await closeServer(broker);
+    await closeServer(casServer);
+  }
+});
+
 /** CAS_INFO status of a reply: no transaction is open. */
 const OUT_TRAN = Buffer.from([0x00, 0x02, 0x03, 0x04]);
 
