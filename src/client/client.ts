@@ -1,5 +1,4 @@
-import { TransactionError } from "../errors/transaction-error.js";
-import { isAbortReason, mapError, toError } from "../internals/map-error.js";
+import { isAbortReason, mapError } from "../internals/map-error.js";
 import {
   assertValidQueryOptions,
   assertValidStreamOptions,
@@ -39,13 +38,22 @@ import type {
   SchemaPrimaryKey,
   SchemaTable,
 } from "../types/schema.js";
+import {
+  applyTransactionOptions,
+  beginScope,
+  type ConnectionSource,
+  factorySource,
+  runTransaction,
+} from "./connection-source.js";
 import * as schema from "./schema.js";
-import { CallbackTransaction, ScopedTransaction } from "./transaction.js";
+import type { ScopedTransaction } from "./transaction.js";
 
 export class CubridClient
   implements Queryable, ResultQueryable, Executable, PreparedQueryable, BatchExecutable, Streamable
 {
   private sharedConnectionPromise: Promise<ConnectionLike> | undefined;
+  /** Where transaction() and beginTransactionScope() open their own connections. */
+  private readonly source: ConnectionSource;
   private closed = false;
   private readonly schemaOperations = new Set<Promise<unknown>>();
   private readonly openScopes = new Set<ScopedTransaction>();
@@ -58,6 +66,7 @@ export class CubridClient
   ) {
     assertValidTransactionOptions(config);
     assertValidTimezone(config.timezone);
+    this.source = factorySource(config, connectionFactory);
   }
 
   /**
@@ -219,58 +228,7 @@ export class CubridClient
   ): AsyncGenerator<T, void, undefined> {
     assertValidStreamOptions(options);
     refuseLobParams(params);
-    return this.streamRows<T>(sql, params, options);
-  }
-
-  private async *streamRows<T extends QueryResultRow>(
-    sql: string,
-    params: QueryParams | undefined,
-    options: StreamOptions | undefined,
-  ): AsyncGenerator<T, void, undefined> {
-    // An abort is the caller's own decision, so its reason stays as it is.
-    const failure = (error: unknown): unknown =>
-      options?.signal?.aborted && error === options.signal.reason
-        ? error
-        : mapError("query", error, "Query failed.");
-
-    let rows: AsyncIterator<T>;
-    try {
-      const connection = await this.getSharedConnection();
-      if (!connection.stream) {
-        throw new Error("Underlying connection does not support stream.");
-      }
-      rows = connection.stream<T>(sql, params, options)[Symbol.asyncIterator]();
-    } catch (error) {
-      throw failure(error);
-    }
-
-    let exhausted = false;
-    try {
-      for (;;) {
-        let next: IteratorResult<T>;
-        try {
-          next = await rows.next();
-        } catch (error) {
-          exhausted = true;
-          throw failure(error);
-        }
-
-        if (next.done) {
-          exhausted = true;
-          return;
-        }
-        yield next.value;
-      }
-    } finally {
-      if (!exhausted) {
-        try {
-          await rows.return?.();
-        } catch (error) {
-          // biome-ignore lint/correctness/noUnsafeFinally: a failed cleanup of an unfinished stream is the error the caller must see
-          throw failure(error);
-        }
-      }
-    }
+    return streamRows<T>(() => this.getSharedConnection(), sql, params, options);
   }
 
   async transaction<T>(
@@ -289,50 +247,7 @@ export class CubridClient
       throw mapError("transaction", new Error("Client is closed."), "Transaction failed.");
     }
 
-    const connection = await this.connectionFactory(this.config);
-    let transaction: CallbackTransaction | undefined;
-    let failed = false;
-    let details: TransactionError | undefined;
-
-    try {
-      await this.applyTransactionOptions(connection, {
-        ...pickTransactionOptions(this.config),
-        ...pickTransactionOptions(options),
-      });
-      await connection.beginTransaction();
-      transaction = new CallbackTransaction(connection);
-      const result = await callback(transaction);
-      await transaction.finish();
-      return result;
-    } catch (error) {
-      failed = true;
-      await transaction?.abort();
-      const failure = mapError("transaction", error, "Transaction failed.");
-
-      // mapError returns a ReadTimeoutError unchanged, and that object is not ours to modify.
-      if (failure instanceof TransactionError) {
-        details = failure;
-
-        if (transaction?.rollbackFailure) {
-          details.rollbackError = transaction.rollbackFailure;
-        }
-      }
-
-      throw failure;
-    } finally {
-      try {
-        await connection.close();
-      } catch (closeError) {
-        if (!failed) {
-          // biome-ignore lint/correctness/noUnsafeFinally: after a commit, a failed close is the 1.x result of transaction()
-          throw closeError;
-        }
-
-        if (details) {
-          details.closeError = toError(closeError);
-        }
-      }
-    }
+    return runTransaction(this.source, callback, options);
   }
 
   /**
@@ -363,36 +278,14 @@ export class CubridClient
     }
   }
 
-  private async openScope(options: TransactionOptions | undefined): Promise<TransactionScope> {
-    let connection: ConnectionLike | undefined;
-    try {
-      connection = await this.connectionFactory(this.config);
-      await this.applyTransactionOptions(connection, {
-        ...pickTransactionOptions(this.config),
-        ...pickTransactionOptions(options),
-      });
-      await connection.beginTransaction();
-    } catch (error) {
-      await connection?.close().catch(() => {
-        // The failure to begin is the one to report.
-      });
-      throw mapError("transaction", error, "Failed to begin transaction.");
-    }
-
-    // close() may have run while the connection was opening: it could not see
-    // this transaction, so nothing would ever end it.
-    if (this.closed) {
-      await connection.close().catch(() => {
-        // The client is closed; that is the failure to report.
-      });
-      throw mapError("transaction", new Error("Client is closed."), "Failed to begin transaction.");
-    }
-
-    const scope: ScopedTransaction = new ScopedTransaction(connection, () => {
-      this.openScopes.delete(scope);
-    });
-    this.openScopes.add(scope);
-    return scope;
+  private openScope(options: TransactionOptions | undefined): Promise<TransactionScope> {
+    return beginScope(
+      this.source,
+      options,
+      () => this.closed,
+      "Client is closed.",
+      this.openScopes,
+    );
   }
 
   /**
@@ -587,7 +480,7 @@ export class CubridClient
   }
   private async prepareSharedConnection(connection: ConnectionLike): Promise<ConnectionLike> {
     try {
-      await this.applyTransactionOptions(connection, pickTransactionOptions(this.config));
+      await applyTransactionOptions(connection, pickTransactionOptions(this.config));
       return connection;
     } catch (error) {
       await connection.close().catch(() => {
@@ -595,26 +488,6 @@ export class CubridClient
       });
       throw error;
     }
-  }
-
-  /**
-   * Hands `options` to a new connection before anything runs on it. A connection
-   * that cannot take them fails here: the statements would otherwise run, with no
-   * sign of it, under the server's defaults.
-   */
-  private async applyTransactionOptions(
-    connection: ConnectionLike,
-    options: TransactionOptions,
-  ): Promise<void> {
-    if (Object.keys(options).length === 0) {
-      return;
-    }
-
-    if (!connection.setTransactionOptions) {
-      throw new Error("Underlying connection does not support transaction options.");
-    }
-
-    await connection.setTransactionOptions(options);
   }
 }
 
@@ -639,5 +512,62 @@ async function runStatement<R>(
       throw error;
     }
     throw mapError("query", error, failureMessage);
+  }
+}
+
+/**
+ * Reads the rows of `stream()` from the connection `connect` gives. A failure
+ * of `connect` or of a read is a QueryError; the reason of the caller's own
+ * abort is passed on unchanged. A stream left early is closed on its connection.
+ */
+export async function* streamRows<T extends QueryResultRow>(
+  connect: () => Promise<ConnectionLike>,
+  sql: string,
+  params: QueryParams | undefined,
+  options: StreamOptions | undefined,
+): AsyncGenerator<T, void, undefined> {
+  // An abort is the caller's own decision, so its reason stays as it is.
+  const failure = (error: unknown): unknown =>
+    options?.signal?.aborted && error === options.signal.reason
+      ? error
+      : mapError("query", error, "Query failed.");
+
+  let rows: AsyncIterator<T>;
+  try {
+    const connection = await connect();
+    if (!connection.stream) {
+      throw new Error("Underlying connection does not support stream.");
+    }
+    rows = connection.stream<T>(sql, params, options)[Symbol.asyncIterator]();
+  } catch (error) {
+    throw failure(error);
+  }
+
+  let exhausted = false;
+  try {
+    for (;;) {
+      let next: IteratorResult<T>;
+      try {
+        next = await rows.next();
+      } catch (error) {
+        exhausted = true;
+        throw failure(error);
+      }
+
+      if (next.done) {
+        exhausted = true;
+        return;
+      }
+      yield next.value;
+    }
+  } finally {
+    if (!exhausted) {
+      try {
+        await rows.return?.();
+      } catch (error) {
+        // biome-ignore lint/correctness/noUnsafeFinally: a failed cleanup of an unfinished stream is the error the caller must see
+        throw failure(error);
+      }
+    }
   }
 }

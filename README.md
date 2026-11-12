@@ -391,6 +391,53 @@ try {
 call on `db` joins the open transaction
 ([#112](https://github.com/cubrid-lab/cubrid-client/issues/112)).
 
+## Connection Pool
+
+A client sends every statement over one shared connection, one at a time. A pool
+keeps several connections and lends one to each statement, so independent
+statements run in parallel:
+
+```ts
+import { createPool } from "cubrid-client";
+
+const pool = createPool({
+  host: "localhost",
+  database: "demodb",
+  user: "dba",
+  max: 10, // connections at most, counting those being opened
+  acquireTimeoutMs: 30_000, // then reject with kind "pool-timeout"
+});
+
+const rows = await pool.query("SELECT name FROM athlete WHERE code = ?", [10999]);
+
+await pool.transaction(async (tx) => {
+  await tx.execute("UPDATE account SET balance = balance - 10 WHERE id = ?", [1]);
+  await tx.execute("UPDATE account SET balance = balance + 10 WHERE id = ?", [2]);
+});
+
+// Several autocommit statements on one session, released when fn settles.
+await pool.connection(async (conn) => {
+  await conn.execute("INSERT INTO logs (msg) VALUES (?)", ["imported"]);
+  return conn.query("SELECT COUNT(*) AS n FROM logs");
+});
+
+await pool.close();
+```
+
+The pool has the client's statement methods, `stream()`, `transaction()`,
+`beginTransactionScope()`, `ping()`, `getServerVersion()` and the schema methods.
+Each statement leases a connection for itself; a stream keeps its lease until it
+ends, so a query awaited inside the loop uses another connection. Callers wait in
+arrival order. A connection goes back to the pool only when its session is
+clean: no open transaction, nothing still running, no request with an unknown
+outcome (after a read timeout or an abort) and no per-call transaction settings
+other than the pool's. Otherwise it is closed and the next caller gets a new one
+([ADR 0008](docs/adr/0008-pool-reuse-invariant.md)). Session variables, and an
+isolation level or lock timeout changed with SQL, stay on a reused session; set
+`isolationLevel` and `lockTimeout` on the pool instead. `pool.stats()` reports
+`{ total, idle, active, pending, waiting }`. See
+[`CubridPool`](docs/API_REFERENCE.md#cubridpool) for every option.
+
 ## TLS/SSL
 
 Connect to an SSL-enabled CUBRID broker (`SSL=ON` in `cubrid_broker.conf`) by
@@ -498,6 +545,13 @@ Creates a client instance. Connection is established lazily on first query.
 | `isolationLevel` | `"read committed" \| "repeatable read" \| "serializable"` | Server default | Isolation level of every session this client opens, restored after a reconnect (see [Isolation Level and Lock Timeout](docs/CONNECTION.md#isolation-level-and-lock-timeout)) |
 | `lockTimeout` | `number` | Server default | Longest a statement waits for a lock, in ms. `0` does not wait and `-1` has no limit. Restored after a reconnect |
 | `ssl` | `boolean \| ClientSSLOptions` | `false` | Enable TLS. `true` for defaults, or an object for cert/verification control (see [TLS/SSL](#tlsssl)) |
+
+### `createPool(options): CubridPool`
+
+Creates a pool of connections. It takes every `createClient()` option plus `max`
+(10), `min` (0), `acquireTimeoutMs` (30000), `maxWaitingClients` (`Infinity`),
+`idleTimeoutMs` (30000), `maxLifetimeMs` (none) and `validateAfterIdleMs` (none).
+An invalid value throws a `RangeError`. See [Connection Pool](#connection-pool).
 
 ### `client.stream<T>(sql, params?, options?): AsyncGenerator<T>`
 

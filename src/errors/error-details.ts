@@ -17,6 +17,12 @@
  * - `read-timeout`: the client gave up waiting, see `ReadTimeoutError`.
  * - `stream-busy`: the client refused a statement that waited behind a `stream()`
  *   whose consumer stopped asking for rows. Nothing was sent.
+ * - `pool-timeout`: a pool had no connection to lease within `acquireTimeoutMs`.
+ *   Nothing was sent.
+ * - `pool-full`: a pool already had `maxWaitingClients` callers waiting for a
+ *   connection. Nothing was sent.
+ * - `pool-closed`: the pool was closed before a connection could be leased.
+ *   Nothing was sent.
  */
 export type CubridErrorKind =
   | "unique-violation"
@@ -30,7 +36,10 @@ export type CubridErrorKind =
   | "authentication"
   | "connection-lost"
   | "read-timeout"
-  | "stream-busy";
+  | "stream-busy"
+  | "pool-timeout"
+  | "pool-full"
+  | "pool-closed";
 
 /** One parameter set of an `executeMany()` call that the server reported as failed. */
 export interface ExecuteManySetFailure {

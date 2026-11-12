@@ -14,6 +14,7 @@ import type {
 import { LobParamError, type PreparedQueryParam, refuseLobParams } from "../types/lob.js";
 import type { QueryParams } from "../types/query.js";
 import type { QueryResult, QueryResultRow } from "../types/result.js";
+import type { ConnectionSource, ConnectionVerdict } from "./connection-source.js";
 
 export class CubridTransaction
   implements
@@ -394,18 +395,20 @@ export class CallbackTransaction extends CubridTransaction {
 }
 
 /**
- * The handle `CubridClient.beginTransactionScope()` returns (#112). It owns a
- * dedicated connection, so statements sent on the client meanwhile cannot join
- * its transaction. It keeps the guarantees of the `transaction()` callback's
- * `tx`: one terminal outcome, a commit refused while one of its statements is
- * still failing, and a rollback after a failed commit. Whichever way it ends, its
- * connection is closed and the client stops tracking it.
+ * The handle `beginTransactionScope()` returns (#112). It owns a dedicated
+ * connection, so statements sent on the client meanwhile cannot join its
+ * transaction. It keeps the guarantees of the `transaction()` callback's `tx`:
+ * one terminal outcome, a commit refused while one of its statements is still
+ * failing, and a rollback after a failed commit. Whichever way it ends, its
+ * connection goes back to `source` (closed by a client, released or destroyed
+ * by a pool) and its owner stops tracking it.
  */
 export class ScopedTransaction extends CallbackTransaction {
   private ending: Promise<void> | undefined;
 
   constructor(
     private readonly ownConnection: ConnectionLike,
+    private readonly source: ConnectionSource,
     private readonly onEnded: () => void,
   ) {
     super(ownConnection);
@@ -420,7 +423,7 @@ export class ScopedTransaction extends CallbackTransaction {
   }
 
   /**
-   * For `CubridClient.close()`: ends a transaction nobody ended by closing its
+   * For `close()` of the client or pool: ends a transaction nobody ended by closing its
    * connection, and the server discards the uncommitted work with it. It does not
    * wait for statements still running first, unlike rollback(): one may be waiting
    * for a lock that only another connection being closed would release. A
@@ -429,7 +432,7 @@ export class ScopedTransaction extends CallbackTransaction {
   async discard(): Promise<void> {
     if (!this.ending) {
       this.state = "discarded";
-      this.ending = this.closeOwnConnection();
+      this.ending = this.endOwnConnection("in-transaction");
     }
 
     await this.ending.catch(() => {
@@ -471,7 +474,7 @@ export class ScopedTransaction extends CallbackTransaction {
     }
 
     try {
-      await this.closeOwnConnection();
+      await this.endOwnConnection(this.rollbackFailure ? "in-transaction" : "reuse");
     } catch (closeError) {
       // The outcome is decided by now: a committed transaction stays committed,
       // and an uncommitted one is discarded by the server with the connection.
@@ -485,9 +488,9 @@ export class ScopedTransaction extends CallbackTransaction {
     }
   }
 
-  private async closeOwnConnection(): Promise<void> {
+  private async endOwnConnection(verdict: ConnectionVerdict): Promise<void> {
     try {
-      await this.ownConnection.close();
+      await this.source.end(this.ownConnection, verdict);
     } finally {
       this.onEnded();
     }

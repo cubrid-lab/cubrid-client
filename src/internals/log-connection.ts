@@ -21,6 +21,7 @@ import type {
 import type { PreparedQueryParam } from "../types/lob.js";
 import type { QueryParams } from "../types/query.js";
 import type { QueryResult, QueryResultRow } from "../types/result.js";
+import { SESSION_STATE, sessionStateReader } from "./session-state.js";
 
 /** Values of all the sets of an `executeMany()`, without failing on a malformed argument. */
 function countValues(paramSets: readonly QueryParams[]): number {
@@ -38,7 +39,7 @@ function countValues(paramSets: readonly QueryParams[]): number {
  * emitted, so a logger that implements only some levels is honored and a
  * non-conforming value is ignored. A throwing logger never affects a request.
  */
-function createEmit(logger: unknown) {
+export function createEmit(logger: unknown) {
   return (level: ClientLogLevel, message: string, fields: ClientLogFields): void => {
     if (typeof logger !== "object" || logger === null) {
       return;
@@ -82,7 +83,7 @@ const ERROR_NAMES: ReadonlyArray<readonly [abstract new (...args: never[]) => Er
   [URIError, "URIError"],
 ];
 
-function errorName(error: unknown): string {
+export function errorName(error: unknown): string {
   return ERROR_NAMES.find(([type]) => error instanceof type)?.[1] ?? "Error";
 }
 
@@ -279,6 +280,11 @@ export function withLogging(factory: ConnectionFactory, logger: unknown): Connec
     const ping = inner.ping?.bind(inner);
     if (ping) {
       wrapped.ping = () => timed("ping", {}, ping);
+    }
+    // The pool reads the session's state through the wrapper.
+    const readState = sessionStateReader(inner);
+    if (readState) {
+      Object.defineProperty(wrapped, SESSION_STATE, { value: readState });
     }
     return wrapped;
   };

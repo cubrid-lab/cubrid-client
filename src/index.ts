@@ -1,6 +1,7 @@
 export { NativeCubridAdapter } from "./adapters/native.js";
 export { CubridClient } from "./client/client.js";
 export { createClient } from "./client/create-client.js";
+export { CubridPool, createPool } from "./client/pool.js";
 export { CubridTransaction } from "./client/transaction.js";
 export { ConnectionError } from "./errors/connection-error.js";
 export type {
@@ -49,6 +50,12 @@ export type {
 } from "./types/client.js";
 export type { BlobSource, ClobSource, LobParam, PreparedQueryParam } from "./types/lob.js";
 export { blob, clob } from "./types/lob.js";
+export type {
+  PoolConnection,
+  PoolConnectionOptions,
+  PoolOptions,
+  PoolStats,
+} from "./types/pool.js";
 export type { QueryParam, QueryParams } from "./types/query.js";
 export type {
   CollectionElement,
