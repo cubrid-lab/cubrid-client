@@ -65,7 +65,17 @@ A value without a zone cannot fully encode an instant, in either mode:
   a zone-less DATETIME, so the server attaches the **session** zone to its UTC
   fields. Under `SET TIME ZONE 'Asia/Seoul'` the stored DATETIMETZ is
   `2025-06-14 23:30:45.678 Asia/Seoul KST`, nine hours before the `Date` sent.
-  The `timezone` option is not involved: it is a write-side problem.
+  The `timezone` option is not involved: it is a write-side problem, tracked in
+  [#273](https://github.com/cubrid-lab/cubrid-client/issues/273). Measured on
+  10.2 and 11.4, no encoding of a `Date` fixes it without changing TIMESTAMP
+  columns: the server converts a zoned value (`DATETIMETZ'... +00:00'`,
+  `FROM_TZ`, or a DATETIMETZ bind) to the same instant for a TIMESTAMP as for the
+  zone-aware types, so in a non-UTC session the TIMESTAMP fields move by the
+  session offset and `WHERE ts = ?` no longer finds rows written today. The
+  encoding therefore stays DATETIME (changing it, even in a MAJOR, would move
+  TIMESTAMP columns and needs its own decision), and callers write
+  `FROM_TZ(?, '+00:00')` for a zone-aware column
+  ([TYPES](../TYPES.md#a-date-in-a-zone-aware-column)).
 
 The internal `encodeBindParams()` helper in `src/protocol/protocol.ts` still
 writes local fields. No client path calls it and the package does not export it,
@@ -98,7 +108,9 @@ cleanup, not as part of this decision.
    The documentation must not claim a universal round-trip identity.
 5. **Separate from the default change**, tracked as their own issues and
    classified on their own:
-   - a `Date` written to a zone-aware column takes the session zone (Context);
+   - a `Date` written to a zone-aware column takes the session zone (Context;
+     [#273](https://github.com/cubrid-lab/cubrid-client/issues/273): documented
+     with the `FROM_TZ(?, '+00:00')` opt-in, encoding unchanged);
    - the unused local-field `encodeBindParams()` helper.
 
 ### Breaking change versus bug fix
@@ -107,7 +119,7 @@ cleanup, not as part of this decision.
 | --- | --- | --- |
 | Default `timezone` from `"local"` to `"utc"` | **Breaking default change.** Every DATE/TIME/TIMESTAMP/DATETIME `Date` changes instant on a non-UTC host; the code still compiles | 2.0 MAJOR only, with notice in a prior 1.x release |
 | README and `docs/TYPES.md` warnings, this ADR, characterization tests | Documentation | Any 1.x |
-| A `Date` sent to a zone-aware column labelled with the session zone instead of UTC | **Bug fix candidate**: the stored instant is wrong whenever the session zone is not UTC. The fix changes what is stored, so its SemVer level is classified in its own issue under API stability, not assumed to be a PATCH | Its own issue; may land in 1.x if it keeps DATETIME, DATE, TIME and TIMESTAMP columns unchanged |
+| A `Date` sent to a zone-aware column labelled with the session zone instead of UTC | **Bug fix candidate**: the stored instant is wrong whenever the session zone is not UTC. [#273](https://github.com/cubrid-lab/cubrid-client/issues/273) found no encoding that keeps TIMESTAMP columns unchanged, so the encoding stays and the opt-in `FROM_TZ(?, '+00:00')` is documented. A zoned parameter type (for example accepting `ZonedDateTime`) would be an additive MINOR | Documentation in 1.x; a zoned parameter type is its own issue |
 | Align or remove `encodeBindParams()` | Internal cleanup; no public behavior | Any |
 | Refusing or warning on local-mode DST gaps and overlaps | Not proposed. In `"local"` mode it would change 1.x results; `"utc"` has neither | None |
 
@@ -185,9 +197,10 @@ cleanup, not as part of this decision.
 - [x] README and `docs/TYPES.md` warn about the 1.x default before the first
   `Date` example, with a `timezone: "utc"` snippet.
 - [ ] Maintainer acceptance of this ADR in a reviewed PR.
-- [ ] Before 2.0: a 1.x release note announcing the change; the issue for the
-  zone-aware write; in the 2.0 PR, the fixtures' "default" expectations move to
-  `UTC_DECODED` and an explicit `"local"` test keeps `LOCAL_DECODED`.
+- [ ] Before 2.0: a 1.x release note announcing the change; the zone-aware
+  write (#273: documented, encoding unchanged); in the 2.0 PR, the fixtures'
+  "default" expectations move to `UTC_DECODED` and an explicit `"local"` test
+  keeps `LOCAL_DECODED`.
 
 ## References
 

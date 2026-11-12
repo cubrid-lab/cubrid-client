@@ -1636,6 +1636,10 @@ function writePreparedBigint(w: PacketWriter, value: bigint): void {
  * Always the 14-byte DATETIME layout, using UTC components as the literal path
  * does. Only DATETIME is sent: JavaScript has no date-only or time-only value,
  * and the CAS reads TIME at offset 6 without checking the length.
+ *
+ * It carries no zone, so a zone-aware column attaches the session zone (#273).
+ * A DATETIMETZ bind would fix those columns but move TIMESTAMP ones, which the
+ * server converts to the same instant; callers write FROM_TZ(?, '+00:00').
  */
 function writePreparedDate(w: PacketWriter, value: Date): void {
   const year = value.getUTCFullYear();
@@ -2080,6 +2084,7 @@ function assertStorableText(value: string): void {
   }
 }
 
+/** A zone-less DATETIME of the UTC fields, like writePreparedDate() (#273). */
 function formatDatetime(date: Date): string {
   const y = date.getUTCFullYear();
   const mo = String(date.getUTCMonth() + 1).padStart(2, "0");
