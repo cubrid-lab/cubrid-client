@@ -30,6 +30,7 @@ import {
   EXECUTE_QUERY_ALL,
   OPEN_DB_FIELD_SIZE,
   OPEN_DB_FILLER_SIZE,
+  OPEN_DB_MAX_VALUE_BYTES,
   OPEN_DB_RESERVED_SIZE,
   PREPARE_NORMAL,
   SIZE_BROKER_INFO,
@@ -162,9 +163,48 @@ export function parseClientInfoExchange(data: Buffer): number {
 }
 
 /**
- * Build OpenDatabase request (628 bytes, unframed).
+ * The broker keeps only the first 31 bytes of each OpenDatabase field (see
+ * OPEN_DB_MAX_VALUE_BYTES) and stops at a NUL, so a longer value or one holding
+ * a NUL would quietly open another database or log in as another user or with
+ * another password. createClient(), CubridClient and the adapter check this
+ * before connecting, and writeOpenDatabase() before any socket opens. The
+ * messages name the field, never its value.
+ *
+ * Values that are not strings are skipped: CubridClient may serve a connection
+ * factory that uses no credentials. writeOpenDatabase() refuses them.
+ */
+export function assertValidCredentials(credentials: {
+  database: unknown;
+  user: unknown;
+  password: unknown;
+}): void {
+  for (const field of ["database", "user", "password"] as const) {
+    const value = credentials[field];
+    if (typeof value !== "string") {
+      continue;
+    }
+    if (value.includes("\0")) {
+      throw new RangeError(`${field} must not contain a NUL character.`);
+    }
+    if (Buffer.byteLength(value, "utf-8") > OPEN_DB_MAX_VALUE_BYTES) {
+      throw new RangeError(`${field} must be at most ${OPEN_DB_MAX_VALUE_BYTES} bytes in UTF-8.`);
+    }
+  }
+}
+
+/**
+ * Build OpenDatabase request (628 bytes, unframed). Throws on a value the
+ * broker would not read intact, see assertValidCredentials(), and on one that
+ * is not a string, which Buffer.from() would otherwise accept unchecked.
  */
 export function writeOpenDatabase(database: string, user: string, password: string): Buffer {
+  const credentials = { database, user, password };
+  for (const [field, value] of Object.entries(credentials)) {
+    if (typeof value !== "string") {
+      throw new TypeError(`${field} must be a string.`);
+    }
+  }
+  assertValidCredentials(credentials);
   const w = new PacketWriter(OPEN_DB_FIELD_SIZE * 3 + OPEN_DB_FILLER_SIZE + OPEN_DB_RESERVED_SIZE);
   w.writeFixedString(database, OPEN_DB_FIELD_SIZE);
   w.writeFixedString(user, OPEN_DB_FIELD_SIZE);

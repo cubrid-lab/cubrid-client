@@ -49,6 +49,7 @@ import {
   assertParameterCount,
   assertPreparableSql,
   assertSingleStatement,
+  assertValidCredentials,
   bindLobHandles,
   type ColumnMeta,
   encodePreparedParams,
@@ -261,6 +262,7 @@ export class NativeCubridAdapter implements DriverAdapter {
   private readonly utcDates: boolean;
 
   constructor(private readonly config: ClientConfig) {
+    assertValidCredentials(config);
     assertValidRetryCount(config.maxConnectionRetryCount);
     assertValidMaxLobBytes(config.maxLobBytes);
     assertValidFetchSize(config.fetchSize);

@@ -271,6 +271,13 @@ export class CASConnection {
     // An aborted statement opens no connection.
     this.throwIfAborted();
 
+    // Built first, so credentials the broker would not read intact open no socket.
+    const openDatabase = writeOpenDatabase(
+      this.config.database,
+      this.config.user,
+      this.config.password,
+    );
+
     this.socketDead = false;
     this.inHandshake = true;
 
@@ -308,10 +315,7 @@ export class CASConnection {
       }
 
       // Step 4: Send OpenDatabase (628 bytes, unframed)
-      await this.socketWrite(
-        this.socket,
-        writeOpenDatabase(this.config.database, this.config.user, this.config.password),
-      );
+      await this.socketWrite(this.socket, openDatabase);
 
       // Step 5: Receive framed OpenDatabase response
       const responseBody = await this.readFrame(this.socket);

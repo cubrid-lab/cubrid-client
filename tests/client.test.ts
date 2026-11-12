@@ -130,6 +130,62 @@ test("normalizeConfig keeps a valid maxLobBytes and adds none by default", () =>
   assert.ok(!("maxLobBytes" in normalizeConfig(baseOptions())));
 });
 
+// #252: the broker keeps 31 bytes of each OpenDatabase field and stops at a NUL.
+for (const field of ["database", "user", "password"] as const) {
+  test(`normalizeConfig keeps a 31-byte ${field}, also when multibyte`, () => {
+    for (const value of ["x".repeat(31), `${"\u00e9".repeat(15)}a`, `x${"\uac00".repeat(10)}`]) {
+      assert.equal(Buffer.byteLength(value), 31);
+      assert.equal(normalizeConfig(baseOptions({ [field]: value }))[field], value);
+    }
+  });
+
+  for (const [label, value] of [
+    ["32-byte", "s".repeat(32)],
+    ["33-byte", "s".repeat(33)],
+    ["32-byte multibyte (16 characters)", "\u00e9".repeat(16)],
+    ["33-byte multibyte (31 bytes cut mid-character)", `${"s".repeat(30)}\uac00`],
+    ["long", "s".repeat(200)],
+  ] as const) {
+    test(`createClient rejects a ${label} ${field}, naming the field and limit but not the value`, () => {
+      assert.throws(
+        () => createClient(baseOptions({ [field]: value })),
+        (error: unknown) => {
+          assert.ok(error instanceof RangeError);
+          assert.equal(error.message, `${field} must be at most 31 bytes in UTF-8.`);
+          assert.ok(!error.message.includes("sss"));
+          assert.ok(!error.message.includes("\u00e9"));
+          return true;
+        },
+      );
+    });
+  }
+
+  test(`createClient rejects a ${field} with an embedded NUL`, () => {
+    assert.throws(() => createClient(baseOptions({ [field]: "se\0cret" })), {
+      name: "RangeError",
+      message: `${field} must not contain a NUL character.`,
+    });
+  });
+}
+
+test("createClient checks credentials before the connection factory is reached", () => {
+  let created = 0;
+  assert.throws(
+    () =>
+      createClient(
+        baseOptions({
+          password: "p".repeat(32),
+          connectionFactory: () => {
+            created += 1;
+            return new FakeConnection();
+          },
+        }),
+      ),
+    RangeError,
+  );
+  assert.equal(created, 0);
+});
+
 test("normalizeConfig keeps a valid fetchSize and adds none by default", () => {
   assert.equal(normalizeConfig({ ...baseOptions(), fetchSize: 500 }).fetchSize, 500);
   assert.ok(!("fetchSize" in normalizeConfig(baseOptions())));

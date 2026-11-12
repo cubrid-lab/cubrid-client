@@ -1243,9 +1243,9 @@ interface ClientOptions {
 |-------|------|---------|-------------|
 | `host` | `string` | — | CUBRID broker hostname or IP address |
 | `port` | `number` | `33000` | CUBRID broker port |
-| `database` | `string` | — | Database name to connect to |
-| `user` | `string` | — | Database user (e.g., `"dba"`) |
-| `password` | `string` | `""` | Database password |
+| `database` | `string` | — | Database name to connect to. At most 31 bytes in UTF-8 |
+| `user` | `string` | — | Database user (e.g., `"dba"`). At most 31 bytes in UTF-8 |
+| `password` | `string` | `""` | Database password. At most 31 bytes in UTF-8 |
 | `connectionTimeout` | `number` | `undefined` | Connection timeout in milliseconds |
 | `readTimeout` | `number` | `undefined` | Milliseconds of server inactivity before a request fails with [`ReadTimeoutError`](#readtimeouterror) and the connection is discarded. `undefined` or `0` means no timeout for requests; the connect handshake then still gives up after 10 seconds of inactivity. Other values must be between 1 and 2147483647, or `createClient()` throws a `RangeError`. See [Read timeout](CONNECTION.md#read-timeout) |
 | `maxLobBytes` | `number` | `67108864` (64 MiB) | Largest total of BLOB and CLOB content, in bytes, one query may load. A query over it rejects with a `QueryError` before any content is read, and the connection stays usable. Must be a positive integer, or `createClient()` throws a `RangeError`. See [BLOB and CLOB columns](TYPES.md#blob-and-clob-columns) |
@@ -1256,6 +1256,8 @@ interface ClientOptions {
 | `maxConnectionRetryCount` | `number` | `undefined` | Retries after a failed first attempt to open the TCP connection to the broker (refused, unreachable, timed out). Non-negative integer, default `0`; anything else throws a `RangeError`. See [Connection retries](CONNECTION.md#connection-retries) |
 | `logger` | `unknown` (see `ClientLogger`) | `undefined` | Receives redacted diagnostics for connections, queries and transactions. See [Logging](CONNECTION.md#logging) |
 | `connectionFactory` | [`ConnectionFactory`](#connectionfactory) | Built-in `NativeCubridAdapter` | Custom factory for creating connections |
+
+**Credential length.** A `database`, `user` or `password` longer than 31 bytes in UTF-8, or containing a NUL character, is never cut: `createClient()`, `new CubridClient()` and `new NativeCubridAdapter()` throw a `RangeError` naming the field and the limit, but not the value, before any connection opens. See [Credential length](CONNECTION.md#credential-length).
 
 ### ClientConfig
 
