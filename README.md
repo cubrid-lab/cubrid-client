@@ -47,9 +47,10 @@ CUBRID compatibility; review the version support evidence and release notes.
 
 ## Installation
 
-> **Upgrade from 0.2.0–1.3.x:** in these versions a negative number right after
-> a minus sign in a parameter (`bal-?` with `-1`) can drop a `WHERE` clause or
-> give wrong values, and 1.2.0–1.3.x also fill in a `?` inside a `//` comment.
+> **Upgrade from versions before 1.4.0:** a negative number right after a minus
+> sign in a parameter (`bal-?` with `-1`) can give wrong values, and from 0.2.0
+> can drop a `WHERE` clause. 1.2.0–1.3.x also fill in a `?` inside a `//`
+> comment.
 > See the [upgrade advisory](docs/advisories/literal-parameters-1.4.0.md).
 
 ```bash

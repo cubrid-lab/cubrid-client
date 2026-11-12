@@ -1,8 +1,9 @@
 # Upgrade advisory: literal parameters before 1.4.0
 
-**Upgrade to `cubrid-client@1.4.0` or later.** In versions 0.2.0 through
-1.3.0, a negative number passed as a parameter right after a minus sign can make
-a scoped `UPDATE` change every row, or silently write and return wrong values.
+**Upgrade to `cubrid-client@1.4.0` or later.** In every version before 1.4.0,
+a negative number passed as a parameter right after a minus sign can silently
+return wrong values. In 0.2.0 through 1.3.0 it can also make a scoped `UPDATE`
+change every row, or write wrong values.
 Version 1.4.0 fixes this ([#242](https://github.com/cubrid-lab/cubrid-client/issues/242),
 [#243](https://github.com/cubrid-lab/cubrid-client/issues/243), PR
 [#258](https://github.com/cubrid-lab/cubrid-client/pull/258)).
@@ -56,7 +57,7 @@ rather than inspecting the generated SQL. Versions 0.x and 1.0.0 hand values to
 | C1b same with `-1n` | n/a¹ | error | error | **all rows** | **all rows** | **all rows** | 1 row |
 | C1c `DELETE ... WHERE bal-? > 0 AND id = ?` | n/a¹ | error | error | error | error | error | 1 row |
 | C1d C1 with `WHERE` on the next line | n/a¹ | *value lost* | *value lost* | *value lost* | *value lost* | *value lost* | correct |
-| C1e `SELECT bal-? AS adj` with `-1` | n/a¹ | *wrong value* | *wrong value* | *wrong value* | *wrong value* | *wrong value* | correct |
+| C1e `SELECT bal-? AS adj` with `-1` | *wrong value* | *wrong value* | *wrong value* | *wrong value* | *wrong value* | *wrong value* | correct |
 | C2 string containing a quote and `--` | n/a¹ | safe | safe | safe | safe | safe | safe |
 | C2b string containing a backslash, a quote and `--` | n/a¹ | safe | safe | safe | safe | safe | safe |
 | C3 string with `\` and a newline stored unchanged | n/a¹ | altered | altered | altered | yes | yes | yes |
@@ -66,23 +67,26 @@ rather than inspecting the generated SQL. Versions 0.x and 1.0.0 hand values to
 | C7 `?` inside a `[bracket]` identifier | filled in | filled in | filled in | filled in | filled in | filled in | refused |
 
 ¹ 0.1.0 cannot run `UPDATE`, `DELETE`, `INSERT` or DDL through `query()` at
-all, so these cases could not run. Its `SELECT` path behaved like 0.2.0.
+all, so these cases do not apply. Its table was created and read back with
+1.4.0 (`node scripts/audit-literal-params.mjs ./v0.1.0 ./v1.4.0`), and its
+`SELECT` cases ran through 0.1.0.
 
 **Bold** marks a statement that changed rows its `WHERE` clause should have
 excluded. *Italics* mark a statement that succeeded with a wrong result and no
 error. "Altered" (C3) means 0.2.0 to 1.1.0 stored a backslash as two backslashes
 and a newline as the characters `\n` on a default server; data written through
-those versions may need checking. "Refused" means 1.4.0 raised a `QueryError` before sending any SQL:
-it does not count a `?` inside a comment or a quoted identifier as a
-placeholder, so the value count no longer matches.
+those versions may need checking. "Refused" means 1.4.0 raised a `QueryError`
+before sending any SQL because the value count does not match the
+placeholders. In C5 and C7 that is because it does not count a `?` inside a
+comment or a quoted identifier as a placeholder.
 
 Summary:
 
 | Version | Status |
 | --- | --- |
-| 0.1.0 | Not confirmed: the fixture cannot run. Upgrade anyway; it is unsupported. |
-| 0.2.0, 1.0.0, 1.1.0 | **Affected** (C1). |
-| 1.2.0, 1.3.0 | **Affected** (C1, C5). |
+| 0.1.0 | **Affected** (C1e, wrong `SELECT` values). It cannot run `UPDATE` or `DELETE`, so the `WHERE`-dropping cases do not apply. |
+| 0.2.0, 1.0.0, 1.1.0 | **Affected** (C1, C1d, C1e). |
+| 1.2.0, 1.3.0 | **Affected** (C1, C1d, C1e, C5). |
 | 1.4.0 | Fixed. Tested from the published npm artifact. |
 
 No CVE has been assigned. These results show that SQL written in the patterns
@@ -128,10 +132,11 @@ account uses two-factor authentication):
 
 ```sh
 npm deprecate 'cubrid-client@>=0.2.0 <1.4.0' 'Upgrade to >=1.4.0: a negative number after a minus sign in a parameter can drop a WHERE clause or give wrong values. See https://github.com/cubrid-lab/cubrid-client/blob/main/docs/advisories/literal-parameters-1.4.0.md'
-npm deprecate 'cubrid-client@0.1.0' 'Unsupported; upgrade to >=1.4.0. See https://github.com/cubrid-lab/cubrid-client/blob/main/docs/advisories/literal-parameters-1.4.0.md'
+npm deprecate 'cubrid-client@0.1.0' 'Upgrade to >=1.4.0: a negative number after a minus sign in a parameter can give wrong SELECT values. See https://github.com/cubrid-lab/cubrid-client/blob/main/docs/advisories/literal-parameters-1.4.0.md'
 ```
 
-0.1.0 gets its own message because the defect could not be confirmed there.
+0.1.0 gets its own message because it cannot run `UPDATE` or `DELETE`, so the
+`WHERE`-dropping cases do not apply to it.
 Check the result with `npm view cubrid-client@1.3.0 deprecated`. Deprecation
 makes `npm install` print a warning. It does not remove or change the published
 packages.
