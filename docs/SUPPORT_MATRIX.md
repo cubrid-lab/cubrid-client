@@ -132,8 +132,9 @@ Identifier quoting by `escapeIdentifier()` and `buildWhere()` is asserted agains
 local `cubrid/cubrid` 10.2 and 11.4 containers in both `no_backslash_escapes`
 modes ([#259](https://github.com/cubrid-lab/cubrid-client/issues/259)). Names with a
 backtick, a double quote, a space or a backslash stay in brackets on both.
-Names with `]` are backtick-quoted. 10.2 resolves them, and 11.4 refuses any
-identifier with `[` or `]` (code `-493`). 11.0 and 11.2 were not run.
+Names with `]` are backtick-quoted. 10.2 and 11.0 resolve them, and 11.2 and
+11.4 refuse any identifier with `[` or `]` (code `-493`), as measured by the live
+matrix.
 
 The connection pool (`createPool()`) is asserted against local `cubrid/cubrid`
 10.2 and 11.4 containers: concurrency bounded by `max`, a clean session reused, a

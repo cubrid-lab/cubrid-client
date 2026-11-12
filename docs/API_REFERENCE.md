@@ -1145,9 +1145,9 @@ each backtick in it doubled: `a]b` becomes `` `a]b` `` and ``a]`b`` becomes
 they quote a string when `ansi_quotes=no`.
 
 Whether the server accepts a name with `]` depends on its version. CUBRID 10.2
-accepts it. CUBRID 11.4 refuses `[` and `]` in every identifier, however it is
-quoted, with a [`QueryError`](#queryerror) (code `-493`), so such a column cannot
-exist there.
+and 11.0 accept it. CUBRID 11.2 and later refuse `[` and `]` in every
+identifier, however it is quoted, with a [`QueryError`](#queryerror) (code
+`-493`), so such a column cannot exist there.
 
 `buildWhere()` returns a `WHERE` clause that matches every entry of `conditions`,
 joined with `AND`, and the values to pass with it. Each key is quoted with

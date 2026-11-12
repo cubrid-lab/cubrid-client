@@ -7,8 +7,8 @@
  * doubled: `a]b` becomes `` `a]b` ``. Backticks quote the same way whatever
  * `ansi_quotes` and `no_backslash_escapes` are set to.
  *
- * CUBRID 11.4 refuses `[` and `]` in any identifier, so the server rejects such
- * a name there; CUBRID 10.2 accepts it.
+ * CUBRID 11.2 and later refuse `[` and `]` in any identifier, so the server
+ * rejects such a name there; CUBRID 10.2 and 11.0 accept it.
  */
 export function escapeIdentifier(name: string): string {
   if (name.includes("]")) {

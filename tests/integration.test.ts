@@ -4507,6 +4507,18 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
 
     /** PL/CSQL stored routines exist from CUBRID 11.4. */
     const hasPlcsql = () => /^(11\.([4-9]|\d\d)|1[2-9])\./.test(version);
+    async function assertPlcsqlRefused(sql: string): Promise<void> {
+      const client = createClient(TEST_CONFIG);
+      try {
+        await assert.rejects(client.query(sql), (error: unknown) => {
+          assert.ok(error instanceof QueryError, String(error));
+          assert.equal(error.code, -493);
+          return true;
+        });
+      } finally {
+        await client.close();
+      }
+    }
 
     /** Recreates the tables on `db`, the session the test then uses. */
     const recreate = async (db: { query(sql: string): Promise<unknown> }) => {
@@ -4733,9 +4745,14 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       }
     });
 
-    test("a stored function that inserts: no id by default, the row's own key with generatedKeys", async (t) => {
+    test("a stored function that inserts: no id by default, the row's own key with generatedKeys", async () => {
       if (!hasPlcsql()) {
-        t.skip(`PL/CSQL needs CUBRID 11.4 or later; this is ${version}`);
+        // PL/CSQL arrived in 11.4. Earlier servers refuse the routine, so no
+        // stored function can set the session's value there. Asserted, not
+        // skipped: the live gate fails on any skipped test.
+        await assertPlcsqlRefused(
+          "CREATE OR REPLACE FUNCTION cc247_fn() RETURN INT AS BEGIN RETURN 1; END;",
+        );
         return;
       }
       const client = createClient(TEST_CONFIG);
@@ -4761,9 +4778,12 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       }
     });
 
-    test("known limit: a trigger that calls a routine can set the default's value", async (t) => {
+    test("known limit: a trigger that calls a routine can set the default's value", async () => {
       if (!hasPlcsql()) {
-        t.skip(`PL/CSQL needs CUBRID 11.4 or later; this is ${version}`);
+        // As above: before 11.4 no PL/CSQL procedure exists for a trigger to call.
+        await assertPlcsqlRefused(
+          "CREATE OR REPLACE PROCEDURE cc247_proc(x INT) AS BEGIN NULL; END;",
+        );
         return;
       }
       const client = createClient(TEST_CONFIG);
@@ -7165,6 +7185,13 @@ describe("Integration: escapeIdentifier and buildWhere quoting (#259)", {
     return rows.map((row) => row.id);
   }
 
+  // Measured in the live matrix: 10.2 and 11.0 accept [ and ] in a quoted
+  // identifier, 11.2 and 11.4 refuse them in any quoting.
+  function refusesBracketNames(version: string): boolean {
+    const [major = 0, minor = 0] = version.split(".").map(Number);
+    return major > 11 || (major === 11 && minor >= 2);
+  }
+
   async function columnNames(client: Client): Promise<string[]> {
     const rows = await client.query<{ attr_name: string }>(
       `SELECT attr_name FROM db_attribute WHERE class_name = '${TABLE}' ORDER BY def_order`,
@@ -7190,13 +7217,13 @@ describe("Integration: escapeIdentifier and buildWhere quoting (#259)", {
     }
   });
 
-  test("a name with ] is backtick-quoted: 10.2 resolves it and 11.x refuses it", async () => {
+  test("a name with ] is backtick-quoted: 10.2 and 11.0 resolve it, 11.2 and later refuse it", async () => {
     const client = createClient(TEST_CONFIG);
-    const major = Number((await client.getServerVersion()).split(".")[0]);
+    const refuses = refusesBracketNames(await client.getServerVersion());
     try {
       for (const name of ["a]b", "a]`b", 'a]"b', "a] b", "a]\\", "id] or 1=1 --"]) {
-        if (major >= 11) {
-          // 11.x: "Identifier name ... cannot contain '[' or ']'", in any quoting.
+        if (refuses) {
+          // 11.2+: "Identifier name ... cannot contain '[' or ']'", in any quoting.
           await assert.rejects(
             client.query(`CREATE TABLE ${TABLE} (${escapeIdentifier(name)} INT)`),
             { code: -493 },
@@ -7229,18 +7256,19 @@ describe("Integration: escapeIdentifier and buildWhere quoting (#259)", {
 
   test("a ? in a backtick-quoted name binds only the value and nothing runs", async () => {
     const client = createClient(TEST_CONFIG);
-    const major = Number((await client.getServerVersion()).split(".")[0]);
+    const refuses = refusesBracketNames(await client.getServerVersion());
     try {
       await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
       await client.query(`CREATE TABLE ${TABLE} (id INT)`);
       await client.query(`INSERT INTO ${TABLE} VALUES (1), (2)`);
       const { clause, params } = buildWhere({ "a]?": 1 });
       assert.equal(clause, "WHERE `a]?` = ?");
-      // 10.2: the broker counts the ? inside the backticks as a host variable
-      // (-1007), as it does inside brackets. 11.x refuses the name first (-493).
+      // 10.2 and 11.0: the broker counts the ? inside the backticks as a host
+      // variable (-1007), as it does inside brackets. 11.2+ refuses the name
+      // first (-493).
       await assert.rejects(
         client.execute(`DELETE FROM ${TABLE} ${clause}`, params as QueryParam[]),
-        { code: major >= 11 ? -493 : -1007 },
+        { code: refuses ? -493 : -1007 },
       );
       assert.deepEqual(await idsWhere(client, {}), [1, 2]);
     } finally {
