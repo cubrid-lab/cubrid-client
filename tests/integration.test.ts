@@ -6628,3 +6628,125 @@ describe("Integration: OpenDatabase credential byte limits", { skip: !available 
     }
   });
 });
+
+describe("Integration: destroy() (#245)", { skip: !available }, () => {
+  const TABLE = "cc245_destroy";
+  const LOG = "cc245_destroy_log";
+  const SLOW = "SELECT SLEEP(5) AS slept FROM db_root";
+  const QUICK = "SELECT 1 AS one FROM db_root";
+  // The statement must be on the wire before destroy(); the host may be loaded.
+  const SENT_MS = 1000;
+  const PROMPT_MS = 3000;
+
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  before(async () => {
+    const client = createClient(TEST_CONFIG);
+    await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+    await client.query(`DROP TABLE IF EXISTS ${LOG}`);
+    await client.query(`CREATE TABLE ${TABLE} (id INT PRIMARY KEY, v INT)`);
+    await client.query(`CREATE TABLE ${LOG} (id INT)`);
+    await client.close();
+  });
+
+  after(async () => {
+    const client = createClient(TEST_CONFIG);
+    await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+    await client.query(`DROP TABLE IF EXISTS ${LOG}`);
+    await client.close();
+  });
+
+  function assertLost(error: unknown): boolean {
+    assert.equal((error as { kind?: string }).kind, "connection-lost", String(error));
+    return true;
+  }
+
+  test("destroy() during SELECT SLEEP(5) settles at once, and a new client works", {
+    timeout: 60_000,
+  }, async () => {
+    const client = createClient(TEST_CONFIG);
+    await client.query(QUICK);
+    const running = client.query(SLOW);
+    const queued = client.query(QUICK);
+    const closing = client.close();
+    await sleep(SENT_MS);
+
+    const started = Date.now();
+    await client.destroy();
+    await assert.rejects(running, assertLost);
+    await assert.rejects(queued, assertLost);
+    await closing;
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < PROMPT_MS, `settled ${elapsed}ms after destroy()`);
+
+    const next = createClient(TEST_CONFIG);
+    try {
+      assert.deepEqual(await next.query(QUICK), [{ one: 1 }]);
+    } finally {
+      await next.close();
+    }
+  });
+
+  test("destroy() inside a scope rolls its work back on the server and frees its locks", {
+    timeout: 60_000,
+  }, async () => {
+    const client = createClient(TEST_CONFIG);
+    const scope = await client.beginTransactionScope();
+    await scope.execute(`INSERT INTO ${TABLE} (id, v) VALUES (1, 1)`);
+    const running = scope.query(SLOW);
+    await sleep(SENT_MS);
+
+    await client.destroy();
+    await assert.rejects(running, assertLost);
+    await assert.rejects(scope.commit(), TransactionError);
+
+    // The server rolls the transaction back once its CAS notices the client is
+    // gone, after SLEEP(5) returns, so wait for the row lock rather than fail.
+    const next = createClient({ ...TEST_CONFIG, lockTimeout: 30_000 });
+    try {
+      await next.execute(`INSERT INTO ${TABLE} (id, v) VALUES (1, 2)`);
+      assert.deepEqual(await next.query(`SELECT id, v FROM ${TABLE} ORDER BY id`), [
+        { id: 1, v: 2 },
+      ]);
+    } finally {
+      await next.query(`DELETE FROM ${TABLE}`).catch(() => undefined);
+      await next.close();
+    }
+  });
+
+  test("an autocommit INSERT destroyed mid-statement runs at most once", {
+    timeout: 60_000,
+  }, async () => {
+    const client = createClient(TEST_CONFIG);
+    await client.query(QUICK);
+    const running = client.execute(`INSERT INTO ${LOG} (id) SELECT SLEEP(5) FROM db_root`);
+    await sleep(SENT_MS);
+
+    await client.destroy();
+    await assert.rejects(running, assertLost);
+
+    // Its outcome is unknown, but it is never sent again: wait past the sleep.
+    await sleep(6000);
+    const next = createClient(TEST_CONFIG);
+    try {
+      const [row] = await next.query(`SELECT COUNT(*) AS n FROM ${LOG}`);
+      const count = Number(row?.n);
+      assert.ok(count === 0 || count === 1, `the INSERT ran ${count} times`);
+    } finally {
+      await next.query(`DELETE FROM ${LOG}`).catch(() => undefined);
+      await next.close();
+    }
+  });
+
+  test("destroy() of an idle client and repeated destroy() and close() calls settle", {
+    timeout: 60_000,
+  }, async () => {
+    const client = createClient(TEST_CONFIG);
+    assert.deepEqual(await client.query(QUICK), [{ one: 1 }]);
+
+    await client.destroy();
+    await client.destroy();
+    await client.close();
+    await assert.rejects(client.query(QUICK));
+  });
+});

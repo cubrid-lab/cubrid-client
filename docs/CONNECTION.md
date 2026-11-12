@@ -42,7 +42,7 @@ await db.close();
 | `database` | `string` | Yes | — | Database name to connect to. At most 31 bytes in UTF-8, see [Credential length](#credential-length) |
 | `user` | `string` | Yes | — | Database user (typically `"dba"`). At most 31 bytes in UTF-8 |
 | `password` | `string` | No | `""` | Database password (empty string for no password). At most 31 bytes in UTF-8 |
-| `connectionTimeout` | `number` | No | — | Connection timeout in milliseconds |
+| `connectionTimeout` | `number` | No | `10000` | Limit of each TCP connect in milliseconds; `0` leaves it to the operating system. See [Connection limits](#connection-limits) |
 | `readTimeout` | `number` | No | — | Milliseconds of server inactivity before a request fails. See [Read timeout](#read-timeout) |
 | `maxConnectionRetryCount` | `number` | No | — | Retries after a failed TCP connect (default `0`). See [Connection retries](#connection-retries) |
 | `logger` | `unknown` | No | — | Receives redacted diagnostics (connection created, operation timing and failures). See [Logging](#logging) |
@@ -98,6 +98,7 @@ const client = createClient({ host: "localhost", database: "demodb", user: "dba"
 | Level | Event | Fields |
 |-------|-------|--------|
 | `info` | A connection was created (`operation: "connection"`) | `host`, `port`, `database` |
+| `info` | A connection was destroyed by `destroy()` (`operation: "destroy"`), only for a connection that has `destroy()` | `operation` |
 | `debug` | `connect`, `query`, `queryResult`, `stream`, `beginTransaction`, `commit`, `rollback`, `close` or `ping` succeeded. A `stream` reports once, when it ends or closes early | `operation`, `durationMs`; `paramCount` and `rowCount` for `query` and `stream` |
 | `error` | The same operations failed | `operation`, `durationMs`, `errorName`; `paramCount` for `query` |
 | `error` | A connection could not be created (`operation: "connection"`; the original error is rethrown unchanged) | `operation`, `host`, `port`, `database`, `durationMs`, `errorName` |
@@ -138,6 +139,34 @@ Only that step is retried. A retry never runs SQL again and never replays a requ
 - There is no fallback to another host.
 
 When every attempt fails, the last failure is kept as the innermost `cause`. The outer error depends on the operation that triggered the connection: `client.query()` rejects with a `QueryError`, `client.transaction()` and the transaction methods with a `TransactionError`, and `client.ping()` with a `ConnectionError`. Read `error.cause` (and its `cause`) for the `Failed to connect to host:port` error.
+
+## Connection limits
+
+Each stage of a connection has its own limit. None of them replaces another, and
+only the ones marked as such apply by default.
+
+| Stage | What bounds it | Default | On expiry |
+|-------|----------------|---------|-----------|
+| **Socket**: opening each TCP connection, to the broker and to the CAS it redirects to | `connectionTimeout` | 10 s (`0`: the operating system's limit, about 2 min on Linux) | Fails without sending anything; retried by `maxConnectionRetryCount` |
+| **Socket**: a peer that vanished while the connection was idle | TCP keepalive, always on: first probe after 60 s idle, then the operating system's interval and count | On | The next request fails as a lost connection |
+| **Handshake**: broker reply, TLS handshake, OpenDatabase, session settings | `readTimeout`, or 10 s of inactivity when it is unset (#196) | 10 s | `ReadTimeoutError`; not retried |
+| **Read**: each request after the handshake, while the server is silent | `readTimeout` or a per-statement `readTimeout` | None | `ReadTimeoutError`; the socket is destroyed |
+| **Queue**: a statement waiting for its turn behind others on the same connection | Nothing by default. A `signal` removes it; a stalled `stream()` refuses it after `consumerTimeout` | None | Rejects without sending anything |
+| **Shutdown**: `close()` | Waits for the statement running and those queued before it, then sends CON_CLOSE | None | — |
+| **Shutdown**: `destroy()` | Does not wait for anything | Immediate | See [Destroying a client](#destroying-a-client) |
+
+Every socket also has `TCP_NODELAY` set, because each request is one write that
+waits for its reply. Neither setting can be changed in 1.x.
+
+**Keepalive is not a read timeout.** It only notices a peer that is gone, such as
+a host that crashed or a network path that broke, and only after the idle delay
+plus several unanswered probes, which takes minutes. A server that is alive but
+slow, or a statement that runs for an hour, keeps answering keepalive probes: use
+`readTimeout`, a per-statement `signal`, or `destroy()` to bound those.
+
+`connectionTimeout` had no default in 1.3 and earlier: an unreachable host then waited
+for the operating system's limit. A TCP connect that takes longer than 10
+seconds now fails; set a larger value, or `0`, if your network needs it.
 
 ## Read timeout
 
@@ -410,6 +439,53 @@ try {
 ```
 
 `close()` is safe to call multiple times — if no connection was established (no queries were ever made), it's a no-op. A closed client stays closed: a query issued after `close()` is called, even in the same tick, rejects and never opens a new connection.
+
+`close()` is graceful: it waits for the statement running on the shared
+connection, for those queued before it and for schema lookups, then sends
+CON_CLOSE. With no `readTimeout`, a server that never answers makes it wait
+forever. It does not wait for `transaction()` callbacks (#246).
+
+### Destroying a client
+
+`destroy()` tears every connection of the client down at once, without waiting
+for anything. Use it when `close()` would wait too long: a server that stopped
+answering, a deadline on process shutdown, or a request you must abandon.
+
+```ts
+const closing = db.close();
+const deadline = setTimeout(() => void db.destroy(), 5000);
+await closing; // settles once destroy() has run, if it had to
+clearTimeout(deadline);
+```
+
+What it guarantees, for the built-in driver:
+
+- **Out of band.** It does not queue behind the request in flight. Every socket
+  closes at once, including one still connecting, in the broker or TLS handshake,
+  or waiting between connect retries. Nothing is sent first, not even CON_CLOSE.
+- **What rejects.** A statement in flight rejects with kind `connection-lost`.
+  Its outcome on the server is unknown: an autocommit write may have been applied.
+  Statements queued behind it, and every later call, reject with kind
+  `connection-lost` without being sent. Open streams end with that error.
+  `close()`, before or after, resolves.
+- **No replay, no late replies.** Nothing is retried or sent again. A destroyed
+  connection never opens another session, so a reply that arrives late is never
+  read as the answer to another request.
+- **Transactions.** Every connection the client opened is destroyed: the shared
+  one, `beginTransactionScope()` handles (discarded) and `transaction()`
+  callbacks. No COMMIT is sent after `destroy()`, so a callback that goes on
+  fails with a `TransactionError`. A COMMIT already in flight has an unknown
+  outcome. The server rolls back an open transaction once it notices the client
+  is gone, which may be only after the statement it is running finishes, so its
+  locks can outlive `destroy()` by that long.
+- **Idempotent.** It stops new calls as `close()` does, resolves at once, and
+  calling `destroy()` or `close()` again resolves too.
+
+A custom `connectionFactory` connection without a `destroy()` method is closed
+instead, without waiting for its `close()`. A connection is reached only once the
+factory has returned it: an async factory that is still running is destroyed
+when it returns, so one that awaits its own `connect()` keeps waiting until then. `CubridPool` has no `destroy()` yet;
+`pool.close()` waits for running statements.
 
 ## Connection Errors
 

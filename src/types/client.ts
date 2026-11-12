@@ -26,7 +26,7 @@ export type ClientLogLevel = "debug" | "info" | "error";
  * parameter values, row data, credentials or error messages.
  */
 export interface ClientLogFields {
-  /** `connection`, `connect`, `query`, `queryResult`, `execute`, `queryPrepared`, `queryResultPrepared`, `executePrepared`, `executeMany`, `stream`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`, and for a pool `pool.create`, `pool.destroy` or `pool.acquire-timeout`. */
+  /** `connection`, `connect`, `query`, `queryResult`, `execute`, `queryPrepared`, `queryResultPrepared`, `executePrepared`, `executeMany`, `stream`, `beginTransaction`, `commit`, `rollback`, `close`, `ping` or `destroy`, and for a pool `pool.create`, `pool.destroy` or `pool.acquire-timeout`. */
   operation?: string;
   host?: string;
   port?: number;
@@ -470,6 +470,14 @@ export interface ConnectionLike {
     options?: StreamOptions,
   ): AsyncIterable<T>;
   ping?(): Promise<string>;
+  /**
+   * Tears the connection down at once, without waiting for the statement in
+   * flight, and makes every pending and later call reject. Synchronous and
+   * idempotent; `close()` afterwards resolves. Optional so 1.x connection
+   * factories keep compiling: `CubridClient.destroy()` falls back to `close()`,
+   * without waiting for it, on a connection that does not provide it.
+   */
+  destroy?(): void;
 }
 
 export type ConnectionFactory = (config: ClientConfig) => ConnectionLike | Promise<ConnectionLike>;

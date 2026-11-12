@@ -114,6 +114,9 @@ const DEFAULT_FETCH_SIZE = 100;
 
 const QUERY_FAILED = "Failed to execute CUBRID query.";
 
+/** Why destroy() refused a statement that had not reached the server. */
+const DESTROYED_BEFORE_SENT = "The connection was destroyed before this statement was sent";
+
 /**
  * Whether `sql` may run SET SYSTEM PARAMETERS: "system" followed anywhere later by
  * "parameters". Loose on purpose: a needless match only costs one more
@@ -194,6 +197,10 @@ function toSessionParameters({
 
 export class NativeCubridAdapter implements DriverAdapter {
   private cas: CASConnection | null = null;
+  /** The CAS a running close() took out of `cas`, so destroy() can still reach it. */
+  private closingCas: CASConnection | null = null;
+  /** Set by destroy(); this adapter never opens a session again. */
+  private destroyed = false;
   private autoCommit = true;
 
   /** What every session of this connection must hold. See setTransactionOptions(). */
@@ -773,12 +780,14 @@ export class NativeCubridAdapter implements DriverAdapter {
   private async closeNow(): Promise<void> {
     this.transactionOptions = pickTransactionOptions(this.config);
 
-    if (!this.cas) {
+    // A destroyed adapter keeps its destroyed CAS, so nothing can open another.
+    if (!this.cas || this.destroyed) {
       return;
     }
 
     const cas = this.cas;
     this.cas = null;
+    this.closingCas = cas;
     this.noBackslashEscapes = null;
     this.backslashModeGeneration = null;
     this.insertIdBaseline = undefined;
@@ -795,7 +804,52 @@ export class NativeCubridAdapter implements DriverAdapter {
       });
     } catch (error) {
       throw mapError("connection", error, "Failed to close CUBRID connection.");
+    } finally {
+      this.closingCas = null;
     }
+  }
+
+  /**
+   * Tear the connection down now, without waiting for the statement running on
+   * it: its socket closes at once and nothing more is sent, not even CON_CLOSE.
+   * The server then ends the session and rolls back its open transaction.
+   *
+   * The running statement rejects with kind `connection-lost`; its outcome on the
+   * server is unknown and it is never retried. Every statement waiting behind it
+   * and every later call rejects the same way without sending anything, and an
+   * open stream ends with that error. This adapter never opens another session;
+   * close() afterwards resolves. Synchronous and idempotent.
+   */
+  destroy(): void {
+    if (this.destroyed) {
+      return;
+    }
+    // Before setting the flag: a destroyed adapter must still hold a CAS, so
+    // that every later call meets a destroyed one instead of opening a session.
+    const cas = this.getOrCreateCAS();
+    this.destroyed = true;
+
+    if (this.refusalTimer) {
+      clearTimeout(this.refusalTimer);
+      this.refusalTimer = null;
+    }
+    const waiting = [...this.waitingStatements];
+    this.waitingStatements.clear();
+    for (const statement of waiting) {
+      statement.refuse(new ConnectionLostError(`${DESTROYED_BEFORE_SENT}; nothing was sent`));
+    }
+    for (const cursor of this.openCursors) {
+      cursor.cancel(
+        mapError(
+          "query",
+          new ConnectionLostError("The connection was destroyed while this stream was open"),
+          QUERY_FAILED,
+        ),
+      );
+    }
+
+    cas.destroy();
+    this.closingCas?.destroy();
   }
 
   async ping(): Promise<string> {
@@ -864,6 +918,15 @@ export class NativeCubridAdapter implements DriverAdapter {
     const signal = options?.signal;
     if (signal?.aborted) {
       return Promise.reject(signal.reason);
+    }
+    if (this.destroyed) {
+      return Promise.reject(
+        mapError(
+          kind,
+          new ConnectionLostError(`${DESTROYED_BEFORE_SENT}; nothing was sent`),
+          failureMessage,
+        ),
+      );
     }
 
     let waiting!: WaitingStatement;

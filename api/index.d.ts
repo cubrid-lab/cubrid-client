@@ -151,7 +151,7 @@ type ClientLogLevel = "debug" | "info" | "error";
  * parameter values, row data, credentials or error messages.
  */
 interface ClientLogFields {
-    /** `connection`, `connect`, `query`, `queryResult`, `execute`, `queryPrepared`, `queryResultPrepared`, `executePrepared`, `executeMany`, `stream`, `beginTransaction`, `commit`, `rollback`, `close` or `ping`, and for a pool `pool.create`, `pool.destroy` or `pool.acquire-timeout`. */
+    /** `connection`, `connect`, `query`, `queryResult`, `execute`, `queryPrepared`, `queryResultPrepared`, `executePrepared`, `executeMany`, `stream`, `beginTransaction`, `commit`, `rollback`, `close`, `ping` or `destroy`, and for a pool `pool.create`, `pool.destroy` or `pool.acquire-timeout`. */
     operation?: string;
     host?: string;
     port?: number;
@@ -506,6 +506,14 @@ interface ConnectionLike {
      */
     stream?<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncIterable<T>;
     ping?(): Promise<string>;
+    /**
+     * Tears the connection down at once, without waiting for the statement in
+     * flight, and makes every pending and later call reject. Synchronous and
+     * idempotent; `close()` afterwards resolves. Optional so 1.x connection
+     * factories keep compiling: `CubridClient.destroy()` falls back to `close()`,
+     * without waiting for it, on a connection that does not provide it.
+     */
+    destroy?(): void;
 }
 type ConnectionFactory = (config: ClientConfig) => ConnectionLike | Promise<ConnectionLike>;
 
@@ -531,6 +539,10 @@ interface DriverAdapter extends ConnectionLike {
 declare class NativeCubridAdapter implements DriverAdapter {
     private readonly config;
     private cas;
+    /** The CAS a running close() took out of `cas`, so destroy() can still reach it. */
+    private closingCas;
+    /** Set by destroy(); this adapter never opens a session again. */
+    private destroyed;
     private autoCommit;
     /** What every session of this connection must hold. See setTransactionOptions(). */
     private transactionOptions;
@@ -647,6 +659,18 @@ declare class NativeCubridAdapter implements DriverAdapter {
     private rollbackNow;
     close(): Promise<void>;
     private closeNow;
+    /**
+     * Tear the connection down now, without waiting for the statement running on
+     * it: its socket closes at once and nothing more is sent, not even CON_CLOSE.
+     * The server then ends the session and rolls back its open transaction.
+     *
+     * The running statement rejects with kind `connection-lost`; its outcome on the
+     * server is unknown and it is never retried. Every statement waiting behind it
+     * and every later call rejects the same way without sending anything, and an
+     * open stream ends with that error. This adapter never opens another session;
+     * close() afterwards resolves. Synchronous and idempotent.
+     */
+    destroy(): void;
     ping(): Promise<string>;
     /**
      * For the pool: whether this session may go to another caller. Read
@@ -745,8 +769,8 @@ declare class NativeCubridAdapter implements DriverAdapter {
     /**
      * Sends EXECUTE for the handle in a PREPARE reply. It must reach the session
      * that prepared it: on any other session the same number is another statement
-     * or nothing. The CAS ignores extra values and the literal path ignores extra
-     * parameters, so the count is checked against the server's here.
+     * or nothing. The CAS ignores extra values, so the count is checked against
+     * the server's here.
      */
     private executeHandle;
     /**
@@ -942,9 +966,14 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
     private readonly config;
     private readonly connectionFactory;
     private sharedConnectionPromise;
+    /** The shared connection as soon as the factory returns it, before it is ready. */
+    private sharedConnection;
     /** Where transaction() and beginTransactionScope() open their own connections. */
     private readonly source;
     private closed;
+    private destroyed;
+    /** Connections of transaction() and beginTransactionScope() not ended yet, for destroy(). */
+    private readonly dedicated;
     private readonly schemaOperations;
     private readonly openScopes;
     /** beginTransactionScope() calls still opening a connection, so close() can wait for them. */
@@ -1032,6 +1061,26 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
     rollback(): Promise<void>;
     close(): Promise<void>;
     private closeSharedConnection;
+    /**
+     * Tear down every connection of this client now, without waiting for anything
+     * on them: the shared connection, `beginTransactionScope()` handles and
+     * `transaction()` callbacks, even mid-handshake once the connection factory has
+     * returned the connection. For when `close()` would wait
+     * too long, such as a server that stopped answering or a process shutting down.
+     *
+     * Like `close()`, it stops new calls first. A statement in flight rejects with
+     * kind `connection-lost`; its outcome on the server is unknown, it is never
+     * retried, and the server rolls back its open transaction. Every statement
+     * still waiting rejects the same way without being sent. No COMMIT is sent
+     * after destroy(): a `transaction()` callback that goes on fails, and a commit
+     * already in flight has an unknown outcome. Open scopes are discarded and open
+     * streams end with that error. Resolves at once; calling `destroy()` or `close()` again
+     * resolves too.
+     *
+     * A custom connection without `destroy()` is closed instead, without waiting
+     * for its `close()`.
+     */
+    destroy(): Promise<void>;
     ping(): Promise<string>;
     /**
      * Return the CUBRID server version, for example `11.4.6.1963`. It sends the

@@ -281,6 +281,14 @@ export function withLogging(factory: ConnectionFactory, logger: unknown): Connec
     if (ping) {
       wrapped.ping = () => timed("ping", {}, ping);
     }
+    // Only when the inner connection has one: its absence tells callers to fall back.
+    const destroy = inner.destroy?.bind(inner);
+    if (destroy) {
+      wrapped.destroy = () => {
+        emit("info", "cubrid-client: connection destroyed", { operation: "destroy" });
+        destroy();
+      };
+    }
     // The pool reads the session's state through the wrapper.
     const readState = sessionStateReader(inner);
     if (readState) {

@@ -15,7 +15,8 @@ Solutions for common issues when using `cubrid-client`.
 | `ECONNREFUSED 127.0.0.1:33000` | CUBRID broker is not running | Start CUBRID: `cubrid service start` or `docker compose up -d` |
 | `ENOTFOUND some-host` | Hostname cannot be resolved | Check `host` option — use IP address or valid hostname |
 | `ETIMEDOUT` | Firewall blocking port or wrong port | Check `port` (default: 33000) and firewall rules |
-| `connect timeout` | Server too slow to respond | Increase `connectionTimeout` option |
+| `Connection to host:port timed out` | The TCP connect took longer than `connectionTimeout` (10 s by default) | Check the host, port and firewall; raise `connectionTimeout`, or set `0` for the OS limit |
+| `The connection was destroyed ...` | `client.destroy()` was called | Expected after `destroy()`; the outcome of a statement in flight is unknown |
 | `ReadTimeoutError` | Server sent nothing for `readTimeout` ms: stalled broker or network, or a statement slower than the limit | Check the server, or raise `readTimeout`. Check whether a write or `COMMIT` took effect before retrying it |
 
 **Example**: Diagnose connection failures gracefully:

@@ -53,9 +53,14 @@ export class CubridClient
   implements Queryable, ResultQueryable, Executable, PreparedQueryable, BatchExecutable, Streamable
 {
   private sharedConnectionPromise: Promise<ConnectionLike> | undefined;
+  /** The shared connection as soon as the factory returns it, before it is ready. */
+  private sharedConnection: ConnectionLike | undefined;
   /** Where transaction() and beginTransactionScope() open their own connections. */
   private readonly source: ConnectionSource;
   private closed = false;
+  private destroyed = false;
+  /** Connections of transaction() and beginTransactionScope() not ended yet, for destroy(). */
+  private readonly dedicated = new Set<ConnectionLike>();
   private readonly schemaOperations = new Set<Promise<unknown>>();
   private readonly openScopes = new Set<ScopedTransaction>();
   /** beginTransactionScope() calls still opening a connection, so close() can wait for them. */
@@ -68,7 +73,27 @@ export class CubridClient
     assertValidCredentials(config);
     assertValidTransactionOptions(config);
     assertValidTimezone(config.timezone);
-    this.source = factorySource(config, connectionFactory);
+    const source = factorySource(config, connectionFactory);
+    this.source = {
+      ...source,
+      open: async () => {
+        const connection = await source.open();
+        if (this.destroyed) {
+          // Its calls then reject as lost, so the transaction fails as one would.
+          destroyConnection(connection);
+        } else {
+          this.dedicated.add(connection);
+        }
+        return connection;
+      },
+      end: async (connection, verdict) => {
+        try {
+          await source.end(connection, verdict);
+        } finally {
+          this.dedicated.delete(connection);
+        }
+      },
+    };
   }
 
   /**
@@ -339,6 +364,10 @@ export class CubridClient
   async close(): Promise<void> {
     // Set first, in the same tick, so no later call can open a connection.
     this.closed = true;
+    // destroy() has already torn every connection down.
+    if (this.destroyed) {
+      return;
+    }
     // In-flight schema lookups can still require follow-up catalog queries.
     await Promise.allSettled([...this.schemaOperations]);
 
@@ -367,7 +396,49 @@ export class CubridClient
       await connection.close();
       this.sharedConnectionPromise = undefined;
     } catch (error) {
+      // A destroy() that ran meanwhile is what failed it, and that is not a failed close.
+      if (this.destroyed) {
+        return;
+      }
       throw mapError("connection", error, "Failed to close client connection.");
+    }
+  }
+
+  /**
+   * Tear down every connection of this client now, without waiting for anything
+   * on them: the shared connection, `beginTransactionScope()` handles and
+   * `transaction()` callbacks, even mid-handshake once the connection factory has
+   * returned the connection. For when `close()` would wait
+   * too long, such as a server that stopped answering or a process shutting down.
+   *
+   * Like `close()`, it stops new calls first. A statement in flight rejects with
+   * kind `connection-lost`; its outcome on the server is unknown, it is never
+   * retried, and the server rolls back its open transaction. Every statement
+   * still waiting rejects the same way without being sent. No COMMIT is sent
+   * after destroy(): a `transaction()` callback that goes on fails, and a commit
+   * already in flight has an unknown outcome. Open scopes are discarded and open
+   * streams end with that error. Resolves at once; calling `destroy()` or `close()` again
+   * resolves too.
+   *
+   * A custom connection without `destroy()` is closed instead, without waiting
+   * for its `close()`.
+   */
+  async destroy(): Promise<void> {
+    this.closed = true;
+    if (this.destroyed) {
+      return;
+    }
+    this.destroyed = true;
+
+    if (this.sharedConnection) {
+      destroyConnection(this.sharedConnection);
+    }
+    for (const connection of this.dedicated) {
+      destroyConnection(connection);
+    }
+    for (const scope of this.openScopes) {
+      // Its connection is gone, so ending it does not wait. Never rejects.
+      void scope.discard();
     }
   }
 
@@ -471,7 +542,13 @@ export class CubridClient
 
     if (!this.sharedConnectionPromise) {
       this.sharedConnectionPromise = Promise.resolve(this.connectionFactory(this.config))
-        .then((connection) => this.prepareSharedConnection(connection))
+        .then((connection) => {
+          this.sharedConnection = connection;
+          if (this.destroyed) {
+            destroyConnection(connection);
+          }
+          return this.prepareSharedConnection(connection);
+        })
         .catch((error) => {
           this.sharedConnectionPromise = undefined;
           throw error;
@@ -490,6 +567,30 @@ export class CubridClient
       });
       throw error;
     }
+  }
+}
+
+/**
+ * destroy() of `connection`, or for a custom connection without one, a close()
+ * nobody waits for. Never throws.
+ */
+function destroyConnection(connection: ConnectionLike): void {
+  try {
+    if (connection.destroy) {
+      // Declared void, but a custom one may still return a promise that rejects.
+      const result: unknown = connection.destroy();
+      if (typeof result === "object" && result !== null && "then" in result) {
+        (result as PromiseLike<unknown>).then(undefined, () => undefined);
+      }
+      return;
+    }
+    Promise.resolve()
+      .then(() => connection.close())
+      .catch(() => {
+        // Nobody waits for it, and the connection is abandoned either way.
+      });
+  } catch {
+    // A custom destroy() that throws must not stop the others.
   }
 }
 
