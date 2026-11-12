@@ -5,6 +5,9 @@
 //   CUBRID_PORT=33000 node scripts/audit-literal-params.mjs ./v1.3.0
 //
 // 0.x and 1.0.0 also need `node-cubrid@^11` installed next to the package.
+// 0.1.0 cannot run CREATE or INSERT through query(); pass a second package
+// directory to create and read back the table with that version instead:
+//   node scripts/audit-literal-params.mjs ./v0.1.0 ./v1.4.0
 // The script creates and drops the table `audit_lit_params`. Never point it at a
 // database that holds data you care about.
 import path from "node:path";
@@ -17,36 +20,39 @@ if (!dir) {
   );
   process.exit(2);
 }
-const entry = path.resolve(dir, "node_modules/cubrid-client/dist/index.js");
-const { createClient } = await import(pathToFileURL(entry).href);
-const client = createClient({
-  host: process.env.CUBRID_HOST ?? "127.0.0.1",
-  port: Number(process.env.CUBRID_PORT ?? 33000),
-  database: process.env.CUBRID_DATABASE ?? "testdb",
-  user: process.env.CUBRID_USER ?? "dba",
-  password: process.env.CUBRID_PASSWORD ?? "",
-});
+async function connect(packageDir) {
+  const entry = path.resolve(packageDir, "node_modules/cubrid-client/dist/index.js");
+  const { createClient } = await import(pathToFileURL(entry).href);
+  return createClient({
+    host: process.env.CUBRID_HOST ?? "127.0.0.1",
+    port: Number(process.env.CUBRID_PORT ?? 33000),
+    database: process.env.CUBRID_DATABASE ?? "testdb",
+    user: process.env.CUBRID_USER ?? "dba",
+    password: process.env.CUBRID_PASSWORD ?? "",
+  });
+}
+// `client` is the version under test; `setup` creates, resets and reads the table.
+const client = await connect(dir);
+const setup = process.argv[3] ? await connect(process.argv[3]) : client;
 
 const T = "audit_lit_params";
 async function dropTable() {
   try {
-    await client.query(`DROP TABLE ${T}`);
+    await setup.query(`DROP TABLE ${T}`);
   } catch {
     // The table does not exist yet.
   }
 }
 async function reset() {
   await dropTable();
-  await client.query(
-    `CREATE TABLE ${T} (id INT PRIMARY KEY, bal INT, flag INT, note VARCHAR(200))`,
-  );
+  await setup.query(`CREATE TABLE ${T} (id INT PRIMARY KEY, bal INT, flag INT, note VARCHAR(200))`);
   for (const id of [1, 2, 3]) {
-    await client.query(`INSERT INTO ${T} VALUES (${id}, 10, 0, 'n${id}')`);
+    await setup.query(`INSERT INTO ${T} VALUES (${id}, 10, 0, 'n${id}')`);
   }
 }
 // Rows as id:bal/flag, read back from the database.
 async function rows() {
-  const result = await client.query(`SELECT id, bal, flag FROM ${T} ORDER BY id`);
+  const result = await setup.query(`SELECT id, bal, flag FROM ${T} ORDER BY id`);
   return result.map((r) => `${r.id}:${r.bal}/${r.flag}`).join(" ");
 }
 
@@ -119,7 +125,7 @@ const cases = [
       await reset();
       const value = "a\\b\nc";
       await client.query(`UPDATE ${T} SET note = ? WHERE id = 1`, [value]);
-      const [row] = await client.query(`SELECT note FROM ${T} WHERE id = 1`);
+      const [row] = await setup.query(`SELECT note FROM ${T} WHERE id = 1`);
       return row.note === value ? "intact" : `altered ${JSON.stringify(row.note)}`;
     },
   ],
@@ -169,6 +175,7 @@ for (const [name, run] of cases) {
 }
 await dropTable();
 await client.close?.();
+if (setup !== client) await setup.close?.();
 for (const [name, outcome] of Object.entries(results)) {
   console.log(`${name.padEnd(48)} ${outcome}`);
 }
