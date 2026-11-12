@@ -12,7 +12,11 @@
    Owns transaction-scoped queries and the single commit or rollback of a callback transaction.
 4. `adapters/native.ts`
    Default `NativeCubridAdapter` — implements CAS binary protocol directly over TCP.
-5. `internals/*`
+5. `protocol/connection.ts`
+   `CASConnection`: the socket lifecycle, the broker handshake, TLS, framed send and receive, and the request queue.
+6. `protocol/frame-reader.ts`
+   One `FrameReader` per socket: a single data listener that queues the socket's bytes and hands them to one read at a time, in order. A replaced socket's bytes never reach its successor's reads.
+7. `internals/*`
    Normalizes config and translates errors.
 
 ## Current Tradeoffs

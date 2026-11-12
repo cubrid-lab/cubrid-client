@@ -273,6 +273,100 @@ is new state on the path every statement takes, for no measurable gain.
 **Decision.** Eager release stays. No prototype was built, because the
 measured upper bound is below the threshold, and the source was not changed.
 
+
+## Socket reader
+
+Until #253, every framed read attached `data`, `error`, `close` and `end`
+listeners to the socket and removed them again: 8 listener calls per reply, or
+16 when the reply arrived in pieces. Since #253 each socket has one
+`FrameReader` (`src/protocol/frame-reader.ts`) that keeps a single data listener
+and queues the socket's bytes for one read at a time. The change was made only
+after profiling it against a gain threshold that was fixed before the design.
+
+**Threshold.** Replace the reader only if, in each of three confirmation runs, a
+prototype of the new reader (an upper bound on the saving) cut client CPU time
+or median latency per primary-key SELECT by at least 10% against the per-read
+reader, by more than the gap between two identical per-read clients (A/A) in
+the same run. FETCH windows and a 64 MiB row could not get worse beyond that
+A/A gap. A FETCH saving counted only beyond what a three-line fix of the old
+reader gets (`per-read-nocopy`: it skips copying a chunk that already covers a
+read).
+
+**Microbenchmark** (`scripts/bench-reader.ts`): `CASConnection.recv()` against an
+in-memory socket, with each chunk delivered from its own macrotask the way a
+real socket delivers it. Node.js 24.14, medians of 5 rounds, CPU time per frame:
+
+| Reply | per-read | per-read-nocopy | framed (shipped) |
+|---|---:|---:|---:|
+| 64 B, one chunk | 9.29 µs | 8.94 µs | 4.69 µs |
+| 64 B, three chunks | 21.15 µs | 20.98 µs | 12.16 µs |
+| 1000-row FETCH (~100 KiB), 64 KiB chunks | 63.78 µs | 47.03 µs | 37.76 µs |
+| 1000-row FETCH (~100 KiB), 16 KiB chunks | 62.50 µs | 56.53 µs | 48.81 µs |
+| 64 MiB, 64 KiB chunks | 37.5 ms | 38.4 ms | 37.7 ms |
+
+**Live** (`scripts/bench-reader-live.ts`): one client per reader against
+CUBRID 11.4.6.1963 in Docker, 20 blocks per reader in rotating order, on a
+shared 6-CPU host with a load average between 16 and 24. Each cell is the
+change in client CPU time per operation against the mean of the two per-read
+clients. Latency is in the text below the tables.
+
+The prototype gate. These runs decided whether the design went ahead:
+
+| Run | A/A | select by primary key (3 frames) | 10000 rows (72 frames) | 64 MiB row |
+|---|---:|---:|---:|---:|
+| 4 | −1.2% | −14.6% | −16.5% | −5.1% |
+| 5 | −2.4% | −13.2% | −15.7% | −5.9% |
+| 6 | −4.3% | −11.9% | −23.9% | −1.9% |
+
+The shipped reader, measured the same way after implementation:
+
+| Run | A/A | select by primary key | 10000 rows | 64 MiB row |
+|---|---:|---:|---:|---:|
+| 1 | +3.2% | −15.0% | −19.3% | −5.0% |
+| 2 | −1.0% | −8.9% | −16.9% | +4.1% |
+| 3 | −0.8% | −11.0% | −18.7% | −4.6% |
+
+- **CPU.** The prototype met the threshold in every run. The shipped reader saves
+  about 30 µs of client CPU per primary-key SELECT (0.280 → 0.248 ms, −11.6%
+  over the three runs). It met 10% in two runs and missed with −8.9% in run 2,
+  the run with the highest host load.
+- **FETCH.** Against `per-read-nocopy`, the shipped reader saves a further 4–13%
+  of CPU on FETCH windows. About half of the FETCH saving is that copy.
+- **Latency.** Median latency per primary-key SELECT stayed within ±4%, which
+  is the noise; the round trip, not the client, bounds it. FETCH windows were
+  5–8% faster.
+- **64 MiB row.** No regression beyond the A/A gap in either latency or CPU.
+
+So the gain is CPU headroom for busy processes, not faster queries.
+
+The new reader also addresses two things the profile found:
+
+- The old reader shared one receive buffer across sockets, and a broker
+  redirect left the broker socket's surplus in it. A broker that sent more than
+  the 4-byte redirect port therefore had its stray frame read as the CAS
+  socket's OPEN_DATABASE reply (#280). 1.4.0 fixed this with a guard that
+  discards another socket's buffered bytes (#283). Each socket now has its own
+  reader, which replaces that guard, and a replaced socket's bytes are dropped
+  with it.
+- The old reader relied on each chunk being emitted from its own I/O callback.
+  A stream that emitted two chunks in one tick, with DATA_LENGTH ending in the
+  first, lost the second. This did not reproduce on `net.Socket` or `TLSSocket`
+  on Node.js 24, but the new reader does not depend on it.
+
+Two behaviors changed, and both apply only to a server that breaks the protocol:
+
+- Bytes that arrive with no read waiting are queued in order and read as the
+  next reply. Before, most of them were lost.
+- Past 64 KiB of such bytes (`SURPLUS_LIMIT`), the reader pauses the socket
+  until the next read. While it is paused, Node.js holds back the socket's
+  `end` event, so a server that hangs up then is noticed on the next request,
+  not before it.
+
+```bash
+node --import tsx --expose-gc scripts/bench-reader.ts 5
+CUBRID_TEST_PORT=33000 node --import tsx scripts/bench-reader-live.ts 20
+```
+
 ## Running Benchmarks
 
 1. Clone `https://github.com/cubrid-lab/cubrid-benchmark`.

@@ -459,3 +459,57 @@ test("destroy() settles a request in flight over TLS, and the queue behind it", 
     await closeServer(server);
   }
 });
+
+// The reader of the raw socket hands back what it read past the redirect int (#253).
+test("bytes read past the redirect int are handed to the TLS layer, not dropped", {
+  timeout: 5000,
+}, async () => {
+  let handshakeStarted = false;
+  const server = createServer((socket: NetSocket) => {
+    socket.on("error", () => {});
+    socket.once("data", () => {
+      // The redirect int and a stray byte in one write: the client's reader gets
+      // both, and the stray byte must reach TLS as the first byte from the server.
+      socket.write(Buffer.concat([int32(0), Buffer.from([0x99])]));
+      const tls = new TLSSocket(socket, { isServer: true, cert: TEST_CERT, key: TEST_KEY });
+      tls.on("error", () => {});
+      tls.once("secure", () => {
+        handshakeStarted = true;
+      });
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const port = typeof address === "object" && address ? address.port : 0;
+
+  try {
+    const cas = new CASConnection({ ...TLS_CONFIG, port, readTimeout: 2000 });
+    // Dropped, the byte would let the handshake succeed and OPEN_DATABASE time out.
+    await assert.rejects(cas.connect(), /TLS handshake failed/);
+    assert.equal(handshakeStarted, false);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("a reply spanning several TLS records arrives whole", { timeout: 5000 }, async () => {
+  // TLS can decrypt several records from one network read. Every byte of them
+  // must reach the reader, whichever read is waiting when they arrive.
+  const payload = Buffer.alloc(40_000, 0x61);
+  const { server, port } = await createMockSslBroker({
+    onRequest: (tls) => tls.write(frameResponse(Buffer.concat([Buffer.alloc(4), payload]))),
+  });
+
+  try {
+    const cas = new CASConnection({ ...TLS_CONFIG, port });
+    await cas.connect();
+    for (let i = 0; i < 20; i += 1) {
+      const answer = await cas.sendAndRecv(Buffer.alloc(8), Buffer.from([1]));
+      assert.equal(answer.length, payload.length);
+      assert.ok(answer.equals(payload));
+    }
+    await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});

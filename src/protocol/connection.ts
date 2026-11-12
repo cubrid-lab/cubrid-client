@@ -21,6 +21,7 @@ import {
   SIZE_CAS_INFO,
   SIZE_DATA_LENGTH,
 } from "./constants.js";
+import { FrameReader } from "./frame-reader.js";
 import {
   type OpenDatabaseResult,
   parseCheckCas,
@@ -147,9 +148,6 @@ export class CASConnection {
   private _casInfo: Buffer = Buffer.alloc(SIZE_CAS_INFO);
   private _protoVersion = 1;
   private _sessionId = 0;
-  private receiveBuffer: Buffer = Buffer.alloc(0);
-  /** The socket `receiveBuffer` was read from. A read on any other socket discards it. */
-  private receiveBufferSocket: Socket | null = null;
   private _connectionGeneration = 0;
   private _failedExchanges = 0;
   private _unknownOutcomes = 0;
@@ -169,6 +167,13 @@ export class CASConnection {
 
   /** Every socket this connection opened that has not closed, handshake ones included. */
   private readonly sockets = new Set<Socket>();
+
+  /**
+   * The reader of each socket, from connect (or the TLS handshake) on. Never
+   * removed on 'close', so bytes that arrived before it are still read; it goes
+   * with the socket. See dropSocket().
+   */
+  private readonly readers = new WeakMap<Socket, FrameReader>();
 
   /** Rejects each operation waiting on the socket or a timer when destroy() runs. */
   private readonly onDestroy = new Set<(error: Error) => void>();
@@ -337,16 +342,16 @@ export class CASConnection {
       const newPort = parseClientInfoExchange(portData);
 
       if (newPort < 0) {
-        brokerSocket.destroy();
+        this.dropSocket(brokerSocket);
         throw new Error(`CUBRID broker rejected connection (code: ${newPort})`);
       }
 
       // Step 3: If port > 0, connect to CAS on new port; if 0, reuse broker socket
       if (newPort > 0) {
         // Anything the broker sent past the port goes with its socket, as in JDBC:
-        // a CAS sends nothing before OPEN_DATABASE, and recvExact() never lets the
-        // broker socket's buffered bytes answer a read on the CAS socket.
-        brokerSocket.destroy();
+        // a CAS sends nothing before OPEN_DATABASE, and dropSocket() disposes the
+        // broker socket's reader, so its bytes never answer a read on the CAS socket.
+        this.dropSocket(brokerSocket);
         this.socket = await this.createSocket(this.config.host, newPort);
       } else {
         this.socket = brokerSocket;
@@ -384,10 +389,9 @@ export class CASConnection {
     } catch (error) {
       this.connected = false;
       this.settingUp = false;
-      brokerSocket.destroy();
-      this.socket?.destroy();
+      this.dropSocket(brokerSocket);
+      this.dropSocket(this.socket);
       this.socket = null;
-      this.receiveBuffer = Buffer.alloc(0);
       throw error;
     } finally {
       this.inHandshake = false;
@@ -680,8 +684,8 @@ export class CASConnection {
       this.socket = null;
       this.connected = false;
       this.socketDead = false;
-      this.receiveBuffer = Buffer.alloc(0);
 
+      this.readers.get(socket)?.dispose();
       socket.removeAllListeners();
       socket.destroy();
     }, true);
@@ -707,10 +711,9 @@ export class CASConnection {
     this.connected = false;
     this.settingUp = false;
     this.socket = null;
-    this.receiveBuffer = Buffer.alloc(0);
 
     for (const socket of this.sockets) {
-      socket.destroy();
+      this.dropSocket(socket);
     }
     this.sockets.clear();
 
@@ -930,6 +933,7 @@ export class CASConnection {
 
         // Track remote socket closure (broker may close after auto-commit)
         this.trackSocketDeath(socket);
+        this.readers.set(socket, new FrameReader(socket));
         resolve(socket);
       });
     });
@@ -991,14 +995,15 @@ export class CASConnection {
    * performs the TLS handshake.
    */
   private async upgradeToTls(rawSocket: Socket): Promise<TLSSocket> {
-    // Guarantee a clean boundary before wrapping with TLS. Any bytes buffered
-    // past the redirect-port int must be pushed back onto the raw socket so
+    // Guarantee a clean boundary before wrapping with TLS. The raw socket's
+    // reader lets go of it paused, so nothing is emitted unread, and any bytes
+    // it holds past the redirect-port int are pushed back onto the raw socket so
     // tls.connect() sees them as the start of the TLS stream. Over-read is
     // unlikely (the server cannot send ServerHello before our ClientHello) but
     // is guarded defensively.
-    if (this.receiveBuffer.length > 0) {
-      const leftover = this.receiveBuffer;
-      this.receiveBuffer = Buffer.alloc(0);
+    const leftover = this.readers.get(rawSocket)?.detach();
+    this.readers.delete(rawSocket);
+    if (leftover && leftover.length > 0 && !rawSocket.readableEnded) {
       rawSocket.unshift(leftover);
     }
 
@@ -1031,6 +1036,7 @@ export class CASConnection {
 
         // Re-wire dead-socket tracking onto the TLS socket.
         this.trackSocketDeath(tlsSocket);
+        this.readers.set(tlsSocket, new FrameReader(tlsSocket));
         resolve(tlsSocket);
       };
 
@@ -1042,7 +1048,7 @@ export class CASConnection {
     try {
       return await this.withReadTimeout(tlsSocket, handshake);
     } catch (error) {
-      tlsSocket.destroy();
+      this.dropSocket(tlsSocket);
       throw error;
     }
   }
@@ -1075,8 +1081,16 @@ export class CASConnection {
     const socket = this.socket;
     this.socket = null;
     this.connected = false;
-    this.receiveBuffer = Buffer.alloc(0);
-    socket?.destroy();
+    this.dropSocket(socket);
+  }
+
+  /** Destroy `socket` and drop the bytes its reader holds; a read waiting on it rejects. */
+  private dropSocket(socket: Socket | null): void {
+    if (!socket) {
+      return;
+    }
+    this.readers.get(socket)?.dispose();
+    socket.destroy();
   }
 
   /**
@@ -1195,80 +1209,14 @@ export class CASConnection {
   }
 
   /**
-   * Read exactly `size` bytes from the socket.
-   * Accumulates data chunks until the required amount is received.
+   * Read exactly `size` bytes from the socket, through its reader. A socket
+   * with no reader has been dropped, so the read fails like a closed one.
    */
   private recvExact(socket: Socket, size: number): Promise<Buffer> {
-    const read = new Promise<Buffer>((resolve, reject) => {
-      // Bytes buffered from a replaced or retired socket are not this socket's.
-      if (this.receiveBufferSocket !== socket) {
-        this.receiveBuffer = Buffer.alloc(0);
-        this.receiveBufferSocket = socket;
-      }
-
-      // Check if we already have enough buffered data
-      if (this.receiveBuffer.length >= size) {
-        resolve(this.takeBuffered(size));
-        return;
-      }
-
-      // A destroyed socket emits nothing further, so waiting would never end.
-      if (socket.destroyed) {
-        reject(new ConnectionLostError("Connection closed while reading"));
-        return;
-      }
-
-      // Collect chunks and join once: re-concatenating on every chunk is
-      // quadratic in the frame size.
-      const chunks: Buffer[] = [this.receiveBuffer];
-      let received = this.receiveBuffer.length;
-
-      const onData = (chunk: Buffer): void => {
-        chunks.push(chunk);
-        received += chunk.length;
-
-        if (received >= size) {
-          cleanup();
-          this.receiveBuffer = Buffer.concat(chunks, received);
-          this.receiveBufferSocket = socket;
-          resolve(this.takeBuffered(size));
-        }
-      };
-
-      const onError = (err: Error): void => {
-        cleanup();
-        reject(new ConnectionLostError(err.message, { cause: err }));
-      };
-
-      const onClose = (): void => {
-        cleanup();
-        reject(new ConnectionLostError("Connection closed while reading"));
-      };
-
-      const onEnd = (): void => {
-        cleanup();
-        reject(new ConnectionLostError("Connection ended while reading"));
-      };
-
-      const cleanup = (): void => {
-        socket.removeListener("data", onData);
-        socket.removeListener("error", onError);
-        socket.removeListener("close", onClose);
-        socket.removeListener("end", onEnd);
-      };
-
-      socket.on("data", onData);
-      socket.once("error", onError);
-      socket.once("close", onClose);
-      socket.once("end", onEnd);
-    });
-
+    const reader = this.readers.get(socket);
+    const read = reader
+      ? reader.read(size)
+      : Promise.reject(new ConnectionLostError("Connection closed while reading"));
     return this.withReadTimeout(socket, read);
-  }
-
-  private takeBuffered(size: number): Buffer {
-    const result = this.receiveBuffer.subarray(0, size);
-    this.receiveBuffer = this.receiveBuffer.subarray(size);
-    return result;
   }
 }
