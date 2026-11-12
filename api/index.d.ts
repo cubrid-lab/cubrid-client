@@ -378,6 +378,19 @@ interface QueryOptions {
      */
     readTimeout?: number;
 }
+/** Options of `execute()` and `executePrepared()`. */
+interface ExecuteOptions extends QueryOptions {
+    /**
+     * Report `lastInsertId` from the keys the server says this INSERT generated
+     * (CAS GET_GENERATED_KEYS, as JDBC's `RETURN_GENERATED_KEYS`), instead of from
+     * the session's last insert id. Exact for every INSERT the server runs, but on
+     * CUBRID 11.0 to 11.4 the server rejects an INSERT that generates a key in a
+     * table with an INSERT trigger, and the statement fails. See
+     * docs/API_REFERENCE.md#generated-ids. A custom
+     * `connectionFactory` connection receives it and may ignore it.
+     */
+    generatedKeys?: boolean;
+}
 interface Queryable {
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
 }
@@ -436,7 +449,7 @@ interface ExecuteResult {
 }
 /** Runs a statement and reports its {@link ExecuteResult} instead of rows. */
 interface Executable {
-    execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
+    execute(sql: string, params?: QueryParams, options?: ExecuteOptions): Promise<ExecuteResult>;
 }
 /**
  * Runs statements with server-side prepared binding: the values travel as typed
@@ -448,7 +461,7 @@ interface Executable {
 interface PreparedQueryable {
     queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<T[]>;
     queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<QueryResult<T>>;
-    executePrepared(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<ExecuteResult>;
+    executePrepared(sql: string, params?: readonly PreparedQueryParam[], options?: ExecuteOptions): Promise<ExecuteResult>;
 }
 /**
  * Outcome of `executeMany()`. Reported only when every set ran without error.
@@ -529,7 +542,7 @@ interface ConnectionLike {
      * Optional so 1.x connection factories keep compiling. `execute()` on a
      * client or transaction fails when its connection does not provide it.
      */
-    execute?(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
+    execute?(sql: string, params?: QueryParams, options?: ExecuteOptions): Promise<ExecuteResult>;
     /**
      * Optional so 1.x connection factories keep compiling. The prepared methods
      * on a client or transaction fail when their connection does not provide
@@ -537,7 +550,7 @@ interface ConnectionLike {
      */
     queryPrepared?<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<T[]>;
     queryResultPrepared?<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<QueryResult<T>>;
-    executePrepared?(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<ExecuteResult>;
+    executePrepared?(sql: string, params?: readonly PreparedQueryParam[], options?: ExecuteOptions): Promise<ExecuteResult>;
     /**
      * Optional so 1.x connection factories keep compiling. `executeMany()` on a
      * client or transaction fails when its connection does not provide it, rather
@@ -669,10 +682,10 @@ declare class NativeCubridAdapter implements DriverAdapter {
      */
     stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncGenerator<T, void, undefined>;
     private streamRows;
-    execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
+    execute(sql: string, params?: QueryParams, options?: ExecuteOptions): Promise<ExecuteResult>;
     queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<T[]>;
     queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<QueryResult<T>>;
-    executePrepared(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<ExecuteResult>;
+    executePrepared(sql: string, params?: readonly PreparedQueryParam[], options?: ExecuteOptions): Promise<ExecuteResult>;
     /**
      * Runs one INSERT, UPDATE, DELETE or MERGE once per set in `paramSets`: one
      * PREPARE, then EXECUTE_ARRAY requests on that handle, split by size, each
@@ -792,12 +805,11 @@ declare class NativeCubridAdapter implements DriverAdapter {
      * autocommit statement that ran is committed anyway.
      */
     private streamWindows;
-    /** An INSERT executed by a query path can invalidate the insert-ID baseline. */
-    private forgetInsertIdAfterQuery;
     private executeQuery;
     /**
-     * Counts a statement's affected rows and, after an INSERT, asks for the
-     * session's last generated AUTO_INCREMENT value. See ExecuteResult.
+     * Counts a statement's affected rows and, after one INSERT, reads its generated
+     * AUTO_INCREMENT value while the handle is open and before COMMIT. See
+     * ExecuteResult for when `lastInsertId` is set.
      */
     private readExecuteResult;
     /**
@@ -856,7 +868,7 @@ declare class NativeCubridAdapter implements DriverAdapter {
     private forgetInsertId;
     /**
      * When the baseline is unknown, read the server's value before a statement that
-     * may ask for it. REPLACE replies as an INSERT, and no other SQL text does.
+     * may ask for it: see readExecuteResult().
      */
     private readInsertIdBaseline;
     /**
@@ -1035,6 +1047,27 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
     private readonly openScopes;
     /** beginTransactionScope() calls still opening a connection, so close() can wait for them. */
     private readonly beginningScopes;
+    /**
+     * transaction() calls from admission to their end, including the connection
+     * factory, BEGIN, the callback, COMMIT or ROLLBACK and the connection close.
+     * The promises never reject. close() waits for them (#246).
+     */
+    private readonly transactions;
+    /** Entries of `transactions` whose callback is running now. */
+    private readonly runningCallbacks;
+    /** The transaction() calls enclosing this async context, so close() never waits for itself. */
+    private readonly enclosingTransactions;
+    /** Where transaction() opens its connection: the client's source, refusing once closed. */
+    private readonly transactionSource;
+    /** Everything close() waits for but transaction() calls. Rejects as close() does. */
+    private closingConnections;
+    /** The transaction() calls running when close() was first called. */
+    private closingTransactions;
+    /** close() for every caller outside a running callback, returned to each of them. */
+    private closing;
+    private signalDestroyed;
+    /** Resolves when destroy() runs, which ends the wait of a running close(). */
+    private readonly destroyedSignal;
     constructor(config: ClientConfig, connectionFactory: ConnectionFactory);
     /**
      * Run a statement and return its rows. See {@link QueryOptions} for `signal`
@@ -1045,10 +1078,10 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
      */
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
     queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
-    execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
+    execute(sql: string, params?: QueryParams, options?: ExecuteOptions): Promise<ExecuteResult>;
     queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<T[]>;
     queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<QueryResult<T>>;
-    executePrepared(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<ExecuteResult>;
+    executePrepared(sql: string, params?: readonly PreparedQueryParam[], options?: ExecuteOptions): Promise<ExecuteResult>;
     /**
      * Run one INSERT, UPDATE, DELETE or MERGE once per parameter set, with
      * server-side prepared binding: one PREPARE, then one EXECUTE_ARRAY request
@@ -1116,7 +1149,26 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
      * @deprecated Use the `rollback()` of a {@link beginTransactionScope} handle. See issue #112.
      */
     rollback(): Promise<void>;
+    /**
+     * Stop the client and close its connections once the work already started is
+     * done. In the same tick, every later call rejects with `Client is closed.`
+     * Statements on the shared connection, schema lookups and `transaction()`
+     * callbacks already running finish, including their COMMIT or ROLLBACK, and
+     * their connections close; a `transaction()` whose callback has not started
+     * yet is rolled back without running it. Scopes nobody ended are discarded.
+     * Calling it again returns the same promise; after `destroy()` it resolves.
+     * Awaited inside a running `transaction()` callback, it waits for no callback,
+     * since it would wait for itself. See `docs/API_REFERENCE.md`.
+     */
     close(): Promise<void>;
+    /**
+     * Resolves once the connections are closed and `transactions` ended, or once
+     * destroy() runs, which is the way out of a close() that waits too long.
+     * Callbacks are waited for alongside the connections, not after them: one may
+     * wait for a lock that only closing the shared connection or a scope releases.
+     */
+    private waitForClose;
+    private shutdown;
     private closeSharedConnection;
     /**
      * Tear down every connection of this client now, without waiting for anything
@@ -1294,10 +1346,10 @@ declare class CubridPool implements Queryable, ResultQueryable, Executable, Prep
     /** Run a statement on a leased connection and return its rows. See {@link QueryOptions}. */
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
     queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
-    execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
+    execute(sql: string, params?: QueryParams, options?: ExecuteOptions): Promise<ExecuteResult>;
     queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<T[]>;
     queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<QueryResult<T>>;
-    executePrepared(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<ExecuteResult>;
+    executePrepared(sql: string, params?: readonly PreparedQueryParam[], options?: ExecuteOptions): Promise<ExecuteResult>;
     /** `executeMany()` of the client, on one leased connection, in autocommit mode. */
     executeMany(sql: string, paramSets: readonly QueryParams[], options?: QueryOptions): Promise<ExecuteManyResult>;
     /**
@@ -1408,10 +1460,10 @@ declare class CubridTransaction implements ResultTransactionClient, ExecutableTr
     constructor(connection: ConnectionLike);
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
     queryResult<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<QueryResult<T>>;
-    execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
+    execute(sql: string, params?: QueryParams, options?: ExecuteOptions): Promise<ExecuteResult>;
     queryPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<T[]>;
     queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<QueryResult<T>>;
-    executePrepared(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<ExecuteResult>;
+    executePrepared(sql: string, params?: readonly PreparedQueryParam[], options?: ExecuteOptions): Promise<ExecuteResult>;
     /**
      * `executeMany()` inside this transaction. A failed set rejects with every
      * set's outcome in `batch` and leaves the transaction as it is: the sets that
@@ -1598,4 +1650,4 @@ declare function buildWhere(conditions: Record<string, unknown>): {
     params: unknown[];
 };
 
-export { type BatchExecutable, type BatchTransactionClient, type BlobSource, type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type ClobSource, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridPool, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteManyFailure, type ExecuteManyResult, type ExecuteManySetFailure, type ExecuteResult, type IsolationLevel, type LobParam, LockTimeoutError, NativeCubridAdapter, type PoolConnection, type PoolConnectionOptions, type PoolOptions, type PoolStats, type PreparedQueryParam, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryOptions, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type StreamOptions, type Streamable, type TransactionCallback, type TransactionClient, TransactionError, type TransactionOptions, type TransactionScope, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, blob, buildWhere, clob, createClient, createPool, escapeIdentifier, parseConnectionString };
+export { type BatchExecutable, type BatchTransactionClient, type BlobSource, type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type ClobSource, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridPool, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteManyFailure, type ExecuteManyResult, type ExecuteManySetFailure, type ExecuteOptions, type ExecuteResult, type IsolationLevel, type LobParam, LockTimeoutError, NativeCubridAdapter, type PoolConnection, type PoolConnectionOptions, type PoolOptions, type PoolStats, type PreparedQueryParam, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryOptions, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type StreamOptions, type Streamable, type TransactionCallback, type TransactionClient, TransactionError, type TransactionOptions, type TransactionScope, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, blob, buildWhere, clob, createClient, createPool, escapeIdentifier, parseConnectionString };

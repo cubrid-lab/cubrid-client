@@ -256,6 +256,20 @@ export interface QueryOptions {
   readTimeout?: number;
 }
 
+/** Options of `execute()` and `executePrepared()`. */
+export interface ExecuteOptions extends QueryOptions {
+  /**
+   * Report `lastInsertId` from the keys the server says this INSERT generated
+   * (CAS GET_GENERATED_KEYS, as JDBC's `RETURN_GENERATED_KEYS`), instead of from
+   * the session's last insert id. Exact for every INSERT the server runs, but on
+   * CUBRID 11.0 to 11.4 the server rejects an INSERT that generates a key in a
+   * table with an INSERT trigger, and the statement fails. See
+   * docs/API_REFERENCE.md#generated-ids. A custom
+   * `connectionFactory` connection receives it and may ignore it.
+   */
+  generatedKeys?: boolean;
+}
+
 export interface Queryable {
   query<T extends QueryResultRow = QueryResultRow>(
     sql: string,
@@ -331,7 +345,7 @@ export interface ExecuteResult {
 
 /** Runs a statement and reports its {@link ExecuteResult} instead of rows. */
 export interface Executable {
-  execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
+  execute(sql: string, params?: QueryParams, options?: ExecuteOptions): Promise<ExecuteResult>;
 }
 
 /**
@@ -355,7 +369,7 @@ export interface PreparedQueryable {
   executePrepared(
     sql: string,
     params?: readonly PreparedQueryParam[],
-    options?: QueryOptions,
+    options?: ExecuteOptions,
   ): Promise<ExecuteResult>;
 }
 
@@ -460,7 +474,7 @@ export interface ConnectionLike {
    * Optional so 1.x connection factories keep compiling. `execute()` on a
    * client or transaction fails when its connection does not provide it.
    */
-  execute?(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult>;
+  execute?(sql: string, params?: QueryParams, options?: ExecuteOptions): Promise<ExecuteResult>;
   /**
    * Optional so 1.x connection factories keep compiling. The prepared methods
    * on a client or transaction fail when their connection does not provide
@@ -479,7 +493,7 @@ export interface ConnectionLike {
   executePrepared?(
     sql: string,
     params?: readonly PreparedQueryParam[],
-    options?: QueryOptions,
+    options?: ExecuteOptions,
   ): Promise<ExecuteResult>;
   /**
    * Optional so 1.x connection factories keep compiling. `executeMany()` on a

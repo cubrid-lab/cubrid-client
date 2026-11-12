@@ -2087,6 +2087,37 @@ test("client.execute returns the connection's affected rows and insert id", asyn
   assert.deepEqual(executed, [{ sql: "INSERT INTO users (name) VALUES (?)", params: ["Alice"] }]);
 });
 
+test("client and transaction pass generatedKeys through to the connection", async () => {
+  const seen: unknown[] = [];
+  const base = new FakeConnection();
+  const connection: ConnectionLike = {
+    connect: () => base.connect(),
+    query: () => Promise.resolve([]),
+    execute: async (_sql, _params, options) => {
+      seen.push(options?.generatedKeys);
+      return { affectedRows: 1, lastInsertId: 1 };
+    },
+    executePrepared: async (_sql, _params, options) => {
+      seen.push(options?.generatedKeys);
+      return { affectedRows: 1 };
+    },
+    beginTransaction: () => base.beginTransaction(),
+    commit: () => base.commit(),
+    rollback: () => base.rollback(),
+    close: () => base.close(),
+  };
+  const client = createClient(baseOptions({ connectionFactory: () => connection }));
+
+  await client.execute("INSERT INTO t (v) VALUES (1)", [], { generatedKeys: true });
+  await client.executePrepared("INSERT INTO t (v) VALUES (?)", [1], { generatedKeys: true });
+  await client.transaction((tx) =>
+    tx.execute("INSERT INTO t (v) VALUES (1)", [], { generatedKeys: true }),
+  );
+  await client.execute("INSERT INTO t (v) VALUES (1)");
+
+  assert.deepEqual(seen, [true, true, true, undefined]);
+});
+
 test("tx.execute runs on the transaction's own connection", async () => {
   const { connection, executed } = executingConnection({ affectedRows: 2 });
   const client = createClient(baseOptions({ connectionFactory: () => connection }));

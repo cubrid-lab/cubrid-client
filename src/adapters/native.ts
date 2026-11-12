@@ -17,6 +17,7 @@ import {
 import { TransactionError } from "../errors/transaction-error.js";
 import { type ErrorKind, mapError } from "../internals/map-error.js";
 import {
+  assertValidExecuteOptions,
   assertValidFetchSize,
   assertValidMaxLobBytes,
   assertValidMaxReplyBytes,
@@ -57,6 +58,8 @@ import {
   encodePreparedParams,
   findPlaceholders,
   interpolateParams,
+  isPlainInsert,
+  isSingleInsert,
   LobLocator,
   MalformedReplyError,
   mayHoldLob,
@@ -65,6 +68,7 @@ import {
   parseExecute,
   parseExecuteArray,
   parseFetch,
+  parseGetGeneratedKeys,
   parseGetLastInsertId,
   parseLobNew,
   parseLobRead,
@@ -82,6 +86,7 @@ import {
   writeExecute,
   writeExecuteArray,
   writeFetch,
+  writeGetGeneratedKeys,
   writeGetLastInsertId,
   writeLobNew,
   writeLobRead,
@@ -92,6 +97,7 @@ import {
 import type {
   ClientConfig,
   ExecuteManyResult,
+  ExecuteOptions,
   ExecuteResult,
   QueryOptions,
   StreamOptions,
@@ -392,8 +398,12 @@ export class NativeCubridAdapter implements DriverAdapter {
     }
   }
 
-  async execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult> {
-    assertValidQueryOptions(options);
+  async execute(
+    sql: string,
+    params?: QueryParams,
+    options?: ExecuteOptions,
+  ): Promise<ExecuteResult> {
+    assertValidExecuteOptions(options);
     const values = literalOrRefuse(
       sql,
       params,
@@ -405,7 +415,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     return this.inTurn(
       "query",
       "Failed to execute CUBRID statement.",
-      () => this.executeNow(sql, values, issued, undefined),
+      () => this.executeNow(sql, values, issued, undefined, wantsKeys(sql, options)),
       options,
     );
   }
@@ -438,16 +448,16 @@ export class NativeCubridAdapter implements DriverAdapter {
   async executePrepared(
     sql: string,
     params?: readonly PreparedQueryParam[],
-    options?: QueryOptions,
+    options?: ExecuteOptions,
   ): Promise<ExecuteResult> {
-    assertValidQueryOptions(options);
+    assertValidExecuteOptions(options);
     const binds = bindOrRefuse(sql, params, "Failed to execute CUBRID statement.", this.charset);
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
     return this.inTurn(
       "query",
       "Failed to execute CUBRID statement.",
-      () => this.executeNow(sql, undefined, issued, binds),
+      () => this.executeNow(sql, undefined, issued, binds, wantsKeys(sql, options)),
       options,
     );
   }
@@ -598,16 +608,21 @@ export class NativeCubridAdapter implements DriverAdapter {
     params: QueryParams | undefined,
     issued: IssuedOn,
     binds: PreparedBinds | undefined,
+    generatedKeys: boolean,
   ): Promise<ExecuteResult> {
     try {
-      await this.readInsertIdBaseline(sql);
+      if (!generatedKeys) {
+        await this.readInsertIdBaseline(sql);
+      }
       return await this.runStatement(
         sql,
         params,
         issued,
-        (cas, result) => this.readExecuteResult(cas, result),
+        (cas, result, generation) =>
+          this.readExecuteResult(cas, result, sql, generatedKeys, generation),
         true,
         binds,
+        generatedKeys,
       );
     } catch (error) {
       this.forgetInsertId();
@@ -645,7 +660,7 @@ export class NativeCubridAdapter implements DriverAdapter {
   ): Promise<void> {
     try {
       await this.runStatement(sql, params, issued, async (cas, result) => {
-        this.forgetInsertIdAfterQuery(result);
+        this.forgetInsertId();
 
         if (result.statementType === StatementType.SELECT) {
           await this.streamWindows(cursor, cas, result, fetchSize);
@@ -1155,13 +1170,6 @@ export class NativeCubridAdapter implements DriverAdapter {
     }
   }
 
-  /** An INSERT executed by a query path can invalidate the insert-ID baseline. */
-  private forgetInsertIdAfterQuery(result: PrepareAndExecuteResult): void {
-    if (result.resultInfos.some((info) => info.statementType !== StatementType.SELECT)) {
-      this.forgetInsertId();
-    }
-  }
-
   private executeQuery<T extends QueryResultRow>(
     sql: string,
     params: QueryParams | undefined,
@@ -1172,11 +1180,10 @@ export class NativeCubridAdapter implements DriverAdapter {
       cas: CASConnection,
       result: PrepareAndExecuteResult,
     ): Promise<QueryResult<T>> => {
-      // This may generate a value that nobody reads, so a later execute() on this
-      // session could not tell it from its own.
-      if (result.resultInfos.some((info) => info.statementType !== StatementType.SELECT)) {
-        this.forgetInsertId();
-      }
+      // Any statement may generate a value that nobody reads, a SELECT too when it
+      // calls a stored function that inserts, so a later execute() on this session
+      // could not tell it from its own.
+      this.forgetInsertId();
 
       if (result.statementType !== StatementType.SELECT) {
         return { rows: [], columns: [] };
@@ -1214,12 +1221,16 @@ export class NativeCubridAdapter implements DriverAdapter {
   }
 
   /**
-   * Counts a statement's affected rows and, after an INSERT, asks for the
-   * session's last generated AUTO_INCREMENT value. See ExecuteResult.
+   * Counts a statement's affected rows and, after one INSERT, reads its generated
+   * AUTO_INCREMENT value while the handle is open and before COMMIT. See
+   * ExecuteResult for when `lastInsertId` is set.
    */
   private async readExecuteResult(
     cas: CASConnection,
     result: PrepareAndExecuteResult,
+    sql: string,
+    generatedKeys: boolean,
+    generation: number,
   ): Promise<ExecuteResult> {
     let affectedRows = 0;
     for (const { statementType, resultCount } of result.resultInfos) {
@@ -1229,31 +1240,44 @@ export class NativeCubridAdapter implements DriverAdapter {
     }
 
     const executed: ExecuteResult = { affectedRows };
-    if (!result.resultInfos.some((info) => info.statementType === StatementType.INSERT)) {
-      if (affectedRows > 0) {
-        this.forgetInsertId();
+    const [only, ...others] = result.resultInfos;
+    const oneInsert = only?.statementType === StatementType.INSERT && others.length === 0;
+
+    if (generatedKeys) {
+      // The keys belong to this statement's handle, so nothing else can be
+      // mistaken for them; the session's last insert id may have changed.
+      this.forgetInsertId();
+      if (oneInsert) {
+        const { header, payload } = writeGetGeneratedKeys(result.queryHandle, cas.casInfo);
+        const reply = await this.exchangeOnSession(cas, generation, header, payload);
+        setInsertId(executed, parseGetGeneratedKeys(reply));
       }
       return executed;
     }
 
-    const text = await this.fetchLastInsertId(cas);
+    if (!oneInsert || !isPlainInsert(sql)) {
+      // Any statement can set the session's value, even one that changed no row:
+      // CREATE TABLE ... AS SELECT into an AUTO_INCREMENT column, or a SELECT whose
+      // stored function inserts. Nor can it be told which of several statements,
+      // or which routine run by one, generated it.
+      this.forgetInsertId();
+      return executed;
+    }
+
+    const text = await this.fetchLastInsertId(cas, generation);
     // The value belongs to the session: on CUBRID 10.2 to 11.4 nothing clears it,
     // not COMMIT, ROLLBACK or a failed statement, and an INSERT into a table
     // without AUTO_INCREMENT reports it again. Two tables can also generate the
     // same number, so nothing in the reply says whether this statement generated
-    // it. A value that differs from the one seen before the statement is certainly
+    // it. A value that differs from the one seen just before the statement is
     // new; an equal one is ambiguous and reported as no id, because a wrong id is
     // worse than none.
     this.followInsertIdSession(cas);
     const generated =
       text !== undefined && this.insertIdBaseline !== null && text !== this.insertIdBaseline;
     this.insertIdBaseline = text;
-    if (text !== undefined && generated) {
-      const id = BigInt(text);
-      executed.lastInsertId =
-        id >= BigInt(Number.MIN_SAFE_INTEGER) && id <= BigInt(Number.MAX_SAFE_INTEGER)
-          ? Number(id)
-          : id;
+    if (generated) {
+      setInsertId(executed, text);
     }
     return executed;
   }
@@ -1278,9 +1302,10 @@ export class NativeCubridAdapter implements DriverAdapter {
     sql: string,
     params: QueryParams | undefined,
     issued: IssuedOn,
-    use: (cas: CASConnection, result: PrepareAndExecuteResult) => Promise<R>,
+    use: (cas: CASConnection, result: PrepareAndExecuteResult, generation: number) => Promise<R>,
     commitAfter = false,
     binds?: PreparedBinds,
+    generatedKeys = false,
   ): Promise<R> {
     return this.runOnSession(
       sql,
@@ -1290,10 +1315,12 @@ export class NativeCubridAdapter implements DriverAdapter {
       binds !== undefined,
       async (cas, reply, generation) => {
         const result: PrepareAndExecuteResult = binds
-          ? await this.executeHandle(cas, reply, binds, generation)
+          ? await this.executeHandle(cas, reply, binds, generation, generatedKeys)
           : parsePrepareAndExecute(reply, cas.protoVersion, this.utcDates, this.charset);
-        return use(cas, result);
+        return use(cas, result, generation);
       },
+      false,
+      generatedKeys,
     );
   }
 
@@ -1310,6 +1337,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     prepared: boolean,
     run: (cas: CASConnection, reply: Buffer, generation: number) => Promise<R>,
     discardIfRollbackFails = false,
+    generatedKeys = false,
   ): Promise<R> {
     const cas = this.getOrCreateCAS();
 
@@ -1361,6 +1389,7 @@ export class NativeCubridAdapter implements DriverAdapter {
           this.autoCommit && !deferCommit,
           cas.casInfo,
           this.charset,
+          generatedKeys,
         );
 
     // Before the first statement a ping may truthfully report OUT_TRAN.
@@ -1423,6 +1452,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     prepareReply: Buffer,
     binds: PreparedBinds,
     generation: number,
+    generatedKeys: boolean,
   ): Promise<PrepareAndExecuteResult> {
     const statement = parsePrepare(prepareReply, this.charset);
     if (statement.bindCount !== binds.count) {
@@ -1432,7 +1462,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     }
 
     const ready = binds.lobs ? await this.uploadLobs(cas, generation, binds) : binds;
-    const { header, payload } = writeExecute(statement, ready, cas.casInfo);
+    const { header, payload } = writeExecute(statement, ready, cas.casInfo, generatedKeys);
     const reply = await this.exchangeOnSession(cas, generation, header, payload);
     return parseExecute(reply, statement, cas.protoVersion, this.utcDates, this.charset);
   }
@@ -1527,9 +1557,16 @@ export class NativeCubridAdapter implements DriverAdapter {
   }
 
   /** Sends GET_LAST_INSERT_ID and returns the session's value, or undefined if it has none. */
-  private async fetchLastInsertId(cas: CASConnection): Promise<string | undefined> {
+  private async fetchLastInsertId(
+    cas: CASConnection,
+    generation?: number,
+  ): Promise<string | undefined> {
     const { header, payload } = writeGetLastInsertId(cas.casInfo);
-    return parseGetLastInsertId(await cas.sendAndRecv(header, payload));
+    const reply =
+      generation === undefined
+        ? await cas.sendAndRecv(header, payload)
+        : await this.exchangeOnSession(cas, generation, header, payload);
+    return parseGetLastInsertId(reply);
   }
 
   /** A new session starts with no value, whatever the last one held. */
@@ -1550,12 +1587,12 @@ export class NativeCubridAdapter implements DriverAdapter {
 
   /**
    * When the baseline is unknown, read the server's value before a statement that
-   * may ask for it. REPLACE replies as an INSERT, and no other SQL text does.
+   * may ask for it: see readExecuteResult().
    */
   private async readInsertIdBaseline(sql: string): Promise<void> {
     const cas = this.getOrCreateCAS();
     this.followInsertIdSession(cas);
-    if (this.insertIdBaseline !== null || !/insert|replace/i.test(sql)) {
+    if (this.insertIdBaseline !== null || !isPlainInsert(sql)) {
       return;
     }
     this.assertTransactionSession(cas);
@@ -2227,4 +2264,25 @@ function decodeLob(
       cause: error,
     });
   }
+}
+
+/**
+ * `generatedKeys` for one INSERT or REPLACE only: the flag is never sent with
+ * another statement, where it would change nothing but could make an INSERT later
+ * in an `a; b` string fail on 11.x.
+ */
+function wantsKeys(sql: string, options: ExecuteOptions | undefined): boolean {
+  return options?.generatedKeys === true && isSingleInsert(sql);
+}
+
+/** A `number` while the id is a safe integer, a `bigint` beyond that. */
+function setInsertId(executed: ExecuteResult, text: string | undefined): void {
+  if (text === undefined) {
+    return;
+  }
+  const id = BigInt(text);
+  executed.lastInsertId =
+    id >= BigInt(Number.MIN_SAFE_INTEGER) && id <= BigInt(Number.MAX_SAFE_INTEGER)
+      ? Number(id)
+      : id;
 }

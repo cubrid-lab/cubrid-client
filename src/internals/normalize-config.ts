@@ -3,6 +3,7 @@ import { assertValidCredentials } from "../protocol/protocol.js";
 import type {
   ClientConfig,
   ClientOptions,
+  ExecuteOptions,
   QueryOptions,
   StreamOptions,
   TransactionOptions,
@@ -170,6 +171,15 @@ export function assertValidQueryOptions(options: QueryOptions | undefined): void
   }
 
   assertValidReadTimeout(options.readTimeout);
+}
+
+/** assertValidQueryOptions() for execute() and executePrepared(). */
+export function assertValidExecuteOptions(options: ExecuteOptions | undefined): void {
+  assertValidQueryOptions(options);
+  const generatedKeys = options?.generatedKeys;
+  if (generatedKeys !== undefined && typeof generatedKeys !== "boolean") {
+    throw new TypeError("generatedKeys must be a boolean.");
+  }
 }
 
 export function normalizeConfig(options: ClientOptions): ClientConfig {

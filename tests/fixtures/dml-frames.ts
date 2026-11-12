@@ -76,6 +76,73 @@ export const LAST_INSERT_ID_FRAMES = {
 } as const;
 
 /**
+ * GET_GENERATED_KEYS (function code 34) replies, captured byte for byte through a
+ * raw socket client speaking protocol version 7 after a PREPARE_AND_EXECUTE with
+ * EXECUTE_QUERY_ALL | EXECUTE_RETURN_GENERATED_KEYS (0x42) and autocommit off,
+ * before END_TRAN. They are literal bytes, never produced by the decoder under
+ * test. These came from cubrid/cubrid:11.4 (11.4.6.1963); 11.0.16 and 11.2.9 sent
+ * the same bytes for every frame, and 10.2.18 differs only in the 8-byte OID of
+ * each row, kept below as `insertOneRow102`. The PREPARE_AND_EXECUTE replies with
+ * the flag are the same bytes as `DML_FRAMES.insertOneRow` and `insertThreeRows`.
+ */
+export const GENERATED_KEYS_FRAMES = {
+  /** `INSERT INTO k_ai (v) VALUES (10)` into an empty table: INT column `id`, value 1. */
+  insertOneRow:
+    "00000000150000000101000000010800000000000a0000000369640000000001000000010000000000000000" +
+    "0000000400000001",
+  /** The same reply from 10.2, which fills in the row's OID. */
+  insertOneRow102:
+    "00000000150000000101000000010800000000000a00000003696400000000010000000100000d81001a0000" +
+    "0000000400000001",
+  /** A three-row INSERT: one row per generated value, 2, 3 and 4. */
+  insertThreeRows:
+    "00000000150000000301000000010800000000000a0000000369640000000003000000010000000000000000" +
+    "0000000400000002000000020000000000000000000000040000000300000003000000000000000000000004" +
+    "00000004",
+  /** An INSERT into a table without AUTO_INCREMENT: no column and no row. */
+  noAutoIncrement: "000000001500000000010000000000000000",
+  /** `INSERT INTO k_ai (id, v) VALUES (100, 1)`: a supplied key is not a generated one. */
+  explicitKey: "000000001500000000010000000000000000",
+  /** A BIGINT column at 2^53 - 1 (Number.MAX_SAFE_INTEGER). */
+  bigintMaxSafe:
+    "0000000015000000010100000001150000000000130000000369640000000001000000010000000000000000" +
+    "00000008001fffffffffffff",
+  /** The next value of that column, 2^53. */
+  bigintBeyondSafe:
+    "0000000015000000010100000001150000000000130000000369640000000001000000010000000000000000" +
+    "000000080020000000000000",
+  /** A SMALLINT column starting at -32768. */
+  smallint:
+    "0000000015000000010100000001090000000000050000000369640000000001000000010000000000000000" +
+    "000000028000",
+  /** A NUMERIC(20,0) column at 12345678901234567890, sent as text. */
+  numeric:
+    "0000000015000000010100000001070000000000140000000369640000000001000000010000000000000000" +
+    "00000015313233343536373839303132333435363738393000",
+  /** A table with two AUTO_INCREMENT columns, `a` = 1 and `b` = 100. */
+  twoColumns:
+    "00000000150000000101000000020800000000000a0000000261000800000000000a00000002620000000001" +
+    "00000001000000000000000000000004000000010000000400000064",
+  /** Asked after an UPDATE: response code -2, error code 0. */
+  afterUpdate: "fffffffe000000004e6f206572726f72206d65737361676520617661696c61626c652e00",
+  /** Asked after CLOSE_REQ_HANDLE: response code -1, CAS error -1006 (CAS_ER_SRV_HANDLE). */
+  closedHandle: "fffffffffffffc1200",
+} as const;
+
+/**
+ * PREPARE and EXECUTE (with 0x42) replies for `INSERT INTO k_ai (v) VALUES (?)`
+ * bound to 30, and its GET_GENERATED_KEYS reply (value 6), captured as above;
+ * the same bytes on 10.2 to 11.4 except the OID of the 10.2 key row.
+ */
+export const PREPARED_GENERATED_KEYS_FRAMES = {
+  prepare: "00000001ffffffff14000000010000000000",
+  execute: "00000001000000000114000000010000000000000000000000000000000000fffffffe",
+  keys:
+    "00000000150000000101000000010800000000000a0000000369640000000001000000010000000000000000" +
+    "0000000400000006",
+} as const;
+
+/**
  * Replies to PREPARE (function code 2) and EXECUTE (function code 3) captured byte
  * for byte through a raw socket client speaking protocol version 7, with
  * EXECUTE_QUERY_ALL. They are literal bytes, never produced by the decoder under

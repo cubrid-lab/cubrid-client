@@ -24,8 +24,10 @@ import { CAPTURED_FRAMES } from "./fixtures/collection-frames.js";
 import {
   DML_FRAMES,
   EXECUTE_ARRAY_FRAMES,
+  GENERATED_KEYS_FRAMES,
   LAST_INSERT_ID_FRAMES,
   PREPARED_FRAMES,
+  PREPARED_GENERATED_KEYS_FRAMES,
 } from "./fixtures/dml-frames.js";
 import { LOB_FRAMES, LOB_READ_REPLY_LIMIT, LOB_WRITE_FRAMES } from "./fixtures/lob-frames.js";
 import { ZONED_FRAMES } from "./fixtures/zoned-frames.js";
@@ -2897,12 +2899,70 @@ test("execute reports 0 rows for an UPDATE that matched nothing and for DDL", as
 test("execute adds the rows of every statement of a multi-statement string", async () => {
   const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
   fakeCAS.queueResponse(hex(DML_FRAMES.twoInserts.hex));
-  fakeCAS.queueResponse(hex("000000000000000483073300")); // the last INSERT started at 3
 
-  assert.deepEqual(await adapter.execute(DML_FRAMES.twoInserts.sql), {
-    affectedRows: 3,
-    lastInsertId: 3,
+  // The session's value cannot say which statement set it, so it is not asked for.
+  assert.deepEqual(await adapter.execute(DML_FRAMES.twoInserts.sql), { affectedRows: 3 });
+  assert.deepEqual(sentCodes(fakeCAS), [PREPARE_AND_EXECUTE, END_TRAN, CLOSE_REQ_HANDLE]);
+});
+
+test("execute does not ask for the session value after an INSERT that calls a function", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  // A stored function that inserts into another AUTO_INCREMENT table leaves its
+  // own id as the session's value (seen with PL/CSQL on CUBRID 11.4).
+  for (const sql of [
+    "INSERT INTO t (v) VALUES (f())",
+    "INSERT INTO t (v) SELECT v FROM s",
+    "INSERT INTO t (v) VALUES (1); INSERT INTO u (v) VALUES (2)",
+  ]) {
+    fakeCAS.sentPayloads.length = 0;
+    fakeCAS.queueResponse(hex(DML_FRAMES.insertOneRow.hex));
+    assert.deepEqual(await adapter.execute(sql), { affectedRows: 1 }, sql);
+    assert.deepEqual(sentCodes(fakeCAS), [PREPARE_AND_EXECUTE, END_TRAN, CLOSE_REQ_HANDLE], sql);
+  }
+});
+
+test("execute reads the value again after a statement that changed no row", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  fakeCAS.queueResponse(hex(DML_FRAMES.insertOneRow.hex));
+  fakeCAS.queueResponse(hex(LAST_INSERT_ID_FRAMES.one));
+  assert.equal((await adapter.execute("INSERT INTO keyed (v) VALUES (1)")).lastInsertId, 1);
+
+  // CREATE TABLE ... AS SELECT into an AUTO_INCREMENT column changes the value
+  // and reports 0 rows (verified on CUBRID 10.2 and 11.4).
+  fakeCAS.queueResponse(hex(DML_FRAMES.createTable.hex));
+  assert.deepEqual(await adapter.execute(DML_FRAMES.createTable.sql), { affectedRows: 0 });
+  fakeCAS.sentPayloads.length = 0;
+
+  fakeCAS.queueResponse(hex(LAST_INSERT_ID_FRAMES.firstOfThreeRows)); // set by the CREATE
+  fakeCAS.queueResponse(hex(DML_FRAMES.insertOneRow.hex));
+  fakeCAS.queueResponse(hex(LAST_INSERT_ID_FRAMES.firstOfThreeRows));
+  const plain = await adapter.execute("INSERT INTO plain_table (v) VALUES (1)");
+
+  assert.deepEqual(plain, { affectedRows: 1 });
+  assert.equal(sentCodes(fakeCAS)[0], GET_LAST_INSERT_ID);
+});
+
+test("execute reads the value again after a query() SELECT, which can call a routine", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  fakeCAS.queueResponse(hex(DML_FRAMES.insertOneRow.hex));
+  fakeCAS.queueResponse(hex(LAST_INSERT_ID_FRAMES.one));
+  await adapter.execute("INSERT INTO keyed (v) VALUES (1)");
+
+  // buildSelectResponse() builds a protocol 1 reply.
+  fakeCAS._protoVersion = 1;
+  fakeCAS.queueResponse(buildSelectResponse([{ name: "f", type: 2 }], [["1"]]));
+  await adapter.query("SELECT f() AS f");
+  fakeCAS._protoVersion = 7;
+  fakeCAS.sentPayloads.length = 0;
+
+  fakeCAS.queueResponse(hex(LAST_INSERT_ID_FRAMES.firstOfThreeRows)); // set by f()
+  fakeCAS.queueResponse(hex(DML_FRAMES.insertOneRow.hex));
+  fakeCAS.queueResponse(hex(LAST_INSERT_ID_FRAMES.firstOfThreeRows));
+
+  assert.deepEqual(await adapter.execute("INSERT INTO plain_table (v) VALUES (1)"), {
+    affectedRows: 1,
   });
+  assert.equal(sentCodes(fakeCAS)[0], GET_LAST_INSERT_ID);
 });
 
 test("execute returns a bigint for an id beyond the safe integer range", async () => {
@@ -2954,6 +3014,186 @@ test("execute inside a transaction does not repeat an earlier statement's id", a
   const second = await adapter.execute("INSERT INTO no_auto_increment (v) VALUES (1)");
 
   assert.deepEqual(second, { affectedRows: 1 });
+});
+
+// ---------------------------------------------------------------------------
+// execute(..., { generatedKeys: true }): GET_GENERATED_KEYS (captured replies)
+// ---------------------------------------------------------------------------
+
+const GET_GENERATED_KEYS = CASFunctionCode.GET_GENERATED_KEYS;
+const KEYS = { generatedKeys: true } as const;
+
+test("generatedKeys asks the statement's handle for its keys before COMMIT", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  fakeCAS.queueResponse(hex(DML_FRAMES.insertOneRow.hex));
+  fakeCAS.queueResponse(hex(GENERATED_KEYS_FRAMES.insertOneRow));
+
+  const result = await adapter.execute(DML_FRAMES.insertOneRow.sql, undefined, KEYS);
+
+  assert.deepEqual(result, { affectedRows: 1, lastInsertId: 1 });
+  assert.deepEqual(sentCodes(fakeCAS), [
+    PREPARE_AND_EXECUTE,
+    GET_GENERATED_KEYS,
+    END_TRAN,
+    CLOSE_REQ_HANDLE,
+  ]);
+  assert.deepEqual(
+    fakeCAS.sentPayloads[0],
+    writePrepareAndExecute(DML_FRAMES.insertOneRow.sql, false, DML_CAS_INFO, "utf-8", true).payload,
+  );
+  // The handle of the reply, 1, as the CAS argument.
+  assert.equal(fakeCAS.sentPayloads[1]?.toString("hex"), "22" + "00000004" + "00000001");
+  assert.deepEqual(endTranTypes(fakeCAS), [COMMIT]);
+});
+
+test("generatedKeys tells two tables that both generate 1 from a table that generates none", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  const run = async (sql: string, keys: keyof typeof GENERATED_KEYS_FRAMES) => {
+    fakeCAS.queueResponse(hex(DML_FRAMES.insertOneRow.hex));
+    fakeCAS.queueResponse(hex(GENERATED_KEYS_FRAMES[keys]));
+    return adapter.execute(sql, undefined, KEYS);
+  };
+
+  assert.deepEqual(
+    [
+      await run("INSERT INTO a (v) VALUES (1)", "insertOneRow"),
+      await run("INSERT INTO b (v) VALUES (1)", "insertOneRow"),
+      await run("INSERT INTO plain (id) VALUES (1)", "noAutoIncrement"),
+      await run("INSERT INTO a (id, v) VALUES (100, 1)", "explicitKey"),
+    ],
+    [
+      { affectedRows: 1, lastInsertId: 1 },
+      { affectedRows: 1, lastInsertId: 1 },
+      { affectedRows: 1 },
+      { affectedRows: 1 },
+    ],
+  );
+  assert.equal(sentCodes(fakeCAS).includes(GET_LAST_INSERT_ID), false);
+});
+
+test("generatedKeys reports the first key of a multi-row INSERT and keeps number and bigint apart", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  const cases = [
+    ["insertThreeRows", 2],
+    ["bigintMaxSafe", Number.MAX_SAFE_INTEGER],
+    ["bigintBeyondSafe", 9007199254740992n],
+    ["smallint", -32768],
+    ["numeric", 12345678901234567890n],
+    ["twoColumns", undefined],
+  ] as const;
+  for (const [frame, expected] of cases) {
+    fakeCAS.queueResponse(hex(DML_FRAMES.insertOneRow.hex));
+    fakeCAS.queueResponse(hex(GENERATED_KEYS_FRAMES[frame]));
+    const result = await adapter.execute("INSERT INTO t (v) VALUES (1)", undefined, KEYS);
+    assert.strictEqual(result.lastInsertId, expected, frame);
+    assert.equal("lastInsertId" in result, expected !== undefined, frame);
+  }
+});
+
+test("generatedKeys works on the prepared path, with the flag on EXECUTE", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  fakeCAS.queueResponse(preparedReply(PREPARED_GENERATED_KEYS_FRAMES.prepare));
+  fakeCAS.queueResponse(preparedReply(PREPARED_GENERATED_KEYS_FRAMES.execute));
+  fakeCAS.queueResponse(preparedReply(PREPARED_GENERATED_KEYS_FRAMES.keys));
+
+  const result = await adapter.executePrepared("INSERT INTO k_ai (v) VALUES (?)", [30], KEYS);
+
+  assert.deepEqual(result, { affectedRows: 1, lastInsertId: 6 });
+  assert.deepEqual(sentCodes(fakeCAS), [
+    CASFunctionCode.PREPARE,
+    CASFunctionCode.EXECUTE,
+    GET_GENERATED_KEYS,
+    END_TRAN,
+    CLOSE_REQ_HANDLE,
+  ]);
+  assert.equal(fakeCAS.sentPayloads[1]?.[13], 0x42); // EXECUTE_QUERY_ALL | RETURN_GENERATED_KEYS
+});
+
+test("without generatedKeys the execute flag stays EXECUTE_QUERY_ALL", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  fakeCAS.queueResponse(preparedReply(PREPARED_GENERATED_KEYS_FRAMES.prepare));
+  fakeCAS.queueResponse(preparedReply(PREPARED_GENERATED_KEYS_FRAMES.execute));
+  fakeCAS.queueResponse(hex(LAST_INSERT_ID_FRAMES.none));
+  fakeCAS.queueResponse(hex(LAST_INSERT_ID_FRAMES.one));
+
+  await adapter.executePrepared("INSERT INTO k_ai (v) VALUES (?)", [30]);
+
+  const execute = fakeCAS.sentPayloads.find((p) => p[0] === CASFunctionCode.EXECUTE);
+  assert.equal(execute?.[13], 0x02);
+  assert.equal(sentCodes(fakeCAS).includes(GET_GENERATED_KEYS), false);
+});
+
+test("generatedKeys asks nothing after a statement that is not one INSERT", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  fakeCAS.queueResponse(hex(DML_FRAMES.updateThreeRows.hex));
+  assert.deepEqual(await adapter.execute(DML_FRAMES.updateThreeRows.sql, undefined, KEYS), {
+    affectedRows: 3,
+  });
+  // The CAS would answer only for the first statement of the string.
+  fakeCAS.queueResponse(hex(DML_FRAMES.twoInserts.hex));
+  assert.deepEqual(await adapter.execute(DML_FRAMES.twoInserts.sql, undefined, KEYS), {
+    affectedRows: 3,
+  });
+
+  assert.equal(sentCodes(fakeCAS).includes(GET_GENERATED_KEYS), false);
+  assert.equal(sentCodes(fakeCAS).includes(GET_LAST_INSERT_ID), false);
+  // Nor is the flag sent: on 11.x it could make an INSERT of the string fail.
+  for (const payload of fakeCAS.sentPayloads.filter((p) => p[0] === PREPARE_AND_EXECUTE)) {
+    assert.equal(payload.toString("hex").includes("0000000142"), false);
+  }
+});
+
+test("generatedKeys inside a transaction leaves committing to the caller", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  await adapter.beginTransaction();
+  fakeCAS.queueResponse(hex(DML_FRAMES.insertOneRow.hex));
+  fakeCAS.queueResponse(hex(GENERATED_KEYS_FRAMES.insertOneRow102));
+
+  const result = await adapter.execute(DML_FRAMES.insertOneRow.sql, undefined, KEYS);
+
+  assert.deepEqual(result, { affectedRows: 1, lastInsertId: 1 });
+  assert.deepEqual(sentCodes(fakeCAS), [PREPARE_AND_EXECUTE, GET_GENERATED_KEYS, CLOSE_REQ_HANDLE]);
+});
+
+test("generatedKeys rolls the statement back when the server refuses the keys", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  fakeCAS.queueResponse(hex(DML_FRAMES.insertOneRow.hex));
+  fakeCAS.queueResponse(hex(GENERATED_KEYS_FRAMES.closedHandle));
+
+  await assert.rejects(
+    () => adapter.execute(DML_FRAMES.insertOneRow.sql, undefined, KEYS),
+    QueryError,
+  );
+
+  assert.deepEqual(endTranTypes(fakeCAS), [ROLLBACK]);
+});
+
+test("generatedKeys never reaches a session other than the one that ran the INSERT", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  fakeCAS.queueResponse(hex(DML_FRAMES.insertOneRow.hex));
+  // The session that ran the INSERT is gone before its keys are asked for.
+  fakeCAS.sendAndRecvOnSession = async () => null;
+
+  await assert.rejects(
+    () => adapter.execute(DML_FRAMES.insertOneRow.sql, undefined, KEYS),
+    (error: Error) => error instanceof QueryError && error.kind === "connection-lost",
+  );
+  assert.deepEqual(sentCodes(fakeCAS), [PREPARE_AND_EXECUTE]);
+});
+
+test("generatedKeys must be a boolean", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  const options = { generatedKeys: "yes" } as unknown as { generatedKeys: boolean };
+
+  await assert.rejects(
+    () => adapter.execute("INSERT INTO t (v) VALUES (1)", [], options),
+    TypeError,
+  );
+  await assert.rejects(
+    () => adapter.executePrepared("INSERT INTO t (v) VALUES (?)", [1], options),
+    TypeError,
+  );
+  assert.deepEqual(fakeCAS.sentPayloads, []);
 });
 
 test("query still returns an empty array for DML and sends the autocommit flag", async () => {

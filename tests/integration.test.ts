@@ -38,7 +38,7 @@ import {
   writeFetch,
   writePrepareAndExecute,
 } from "../src/protocol/protocol.js";
-import type { ClientLogFields, TransactionClient } from "../src/types/client.js";
+import type { ClientLogFields, ExecuteResult, TransactionClient } from "../src/types/client.js";
 import { blob, clob } from "../src/types/lob.js";
 import type { QueryParam, QueryParams } from "../src/types/query.js";
 import { ZonedDateTime } from "../src/types/zoned-date-time.js";
@@ -4453,6 +4453,378 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
         }
       } finally {
         await client.close();
+      }
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Generated insert ids (#247)
+  // -------------------------------------------------------------------------
+
+  describe("generated insert ids", () => {
+    const A = "cc247_a";
+    const B = "cc247_b";
+    const PLAIN = "cc247_plain";
+    const BIG = "cc247_big";
+    const SOURCE = "cc247_src";
+    const COPY = "cc247_ctas";
+    const LOG = "cc247_log";
+    const TRIGGERED = "cc247_trg";
+    const ALL = [A, B, PLAIN, BIG, SOURCE, COPY, LOG, TRIGGERED];
+    const KEYS = { generatedKeys: true } as const;
+
+    /**
+     * A generatedKeys result: the expected key, or none. From 11.0 the server
+     * sometimes answers GET_GENERATED_KEYS with the row but without its key, mostly
+     * for the first INSERTs into a newly created table; it never sent a wrong one.
+     */
+    const assertKey = (result: ExecuteResult, rows: number, key: number | bigint) => {
+      assert.equal(result.affectedRows, rows);
+      if (result.lastInsertId !== undefined || version.startsWith("10.")) {
+        assert.strictEqual(result.lastInsertId, key);
+      }
+    };
+    let version = "";
+
+    /** PL/CSQL stored routines exist from CUBRID 11.4. */
+    const hasPlcsql = () => /^(11\.([4-9]|\d\d)|1[2-9])\./.test(version);
+
+    /** Recreates the tables on `db`, the session the test then uses. */
+    const recreate = async (db: { query(sql: string): Promise<unknown> }) => {
+      const client = db;
+      await client.query("DROP TRIGGER IF EXISTS cc247_trg_ai").catch(() => undefined);
+      for (const table of ALL) {
+        await client.query(`DROP TABLE IF EXISTS ${table}`);
+      }
+      for (const table of [A, B, TRIGGERED]) {
+        await client.query(`CREATE TABLE ${table} (id INT AUTO_INCREMENT PRIMARY KEY, v INT)`);
+      }
+      await client.query(`CREATE TABLE ${PLAIN} (id INT PRIMARY KEY, v INT)`);
+      await client.query(`CREATE TABLE ${SOURCE} (v INT)`);
+      await client.query(`INSERT INTO ${SOURCE} VALUES (1), (2), (3)`);
+      await client.query(`CREATE TABLE ${LOG} (id INT AUTO_INCREMENT(800, 1) PRIMARY KEY, n INT)`);
+      await client.query(
+        `CREATE TABLE ${BIG} (id BIGINT AUTO_INCREMENT(9007199254740991, 1) PRIMARY KEY, v INT)`,
+      );
+    };
+
+    before(async () => {
+      const client = createClient(TEST_CONFIG);
+      try {
+        version = await client.getServerVersion();
+      } finally {
+        await client.close();
+      }
+    });
+
+    after(async () => {
+      const client = createClient(TEST_CONFIG);
+      try {
+        await client.query("DROP TRIGGER IF EXISTS cc247_trg_ai").catch(() => undefined);
+        if (hasPlcsql()) {
+          await client.query("DROP FUNCTION IF EXISTS cc247_fn").catch(() => undefined);
+          await client.query("DROP PROCEDURE IF EXISTS cc247_proc").catch(() => undefined);
+        }
+        for (const table of ALL) {
+          await client.query(`DROP TABLE IF EXISTS ${table}`);
+        }
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("tables A and B that both generate 1: generatedKeys reports both, the default only A", async () => {
+      const client = createClient(TEST_CONFIG);
+      try {
+        await recreate(client);
+        // The session's last insert id is 1 after each, so the default cannot tell
+        // B's genuine 1 from A's stale one and reports none.
+        assert.deepEqual(await client.execute(`INSERT INTO ${A} (v) VALUES (1)`), {
+          affectedRows: 1,
+          lastInsertId: 1,
+        });
+        assert.deepEqual(await client.execute(`INSERT INTO ${B} (v) VALUES (1)`), {
+          affectedRows: 1,
+        });
+        assert.deepEqual(await client.execute(`INSERT INTO ${PLAIN} VALUES (1, 1)`), {
+          affectedRows: 1,
+        });
+
+        await recreate(client);
+        assertKey(await client.execute(`INSERT INTO ${A} (v) VALUES (?)`, [1], KEYS), 1, 1);
+        assertKey(await client.executePrepared(`INSERT INTO ${B} (v) VALUES (?)`, [1], KEYS), 1, 1);
+        // The session still holds 1, but this INSERT generated nothing.
+        assert.deepEqual(await client.execute(`INSERT INTO ${PLAIN} VALUES (2, 2)`, [], KEYS), {
+          affectedRows: 1,
+        });
+        assert.deepEqual(
+          await client.executePrepared(`INSERT INTO ${PLAIN} VALUES (?, ?)`, [3, 3], KEYS),
+          { affectedRows: 1 },
+        );
+        // A key the statement supplies is not a generated one.
+        assert.deepEqual(
+          await client.execute(`INSERT INTO ${A} (id, v) VALUES (50, 1)`, [], KEYS),
+          {
+            affectedRows: 1,
+          },
+        );
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("multi-row INSERT and INSERT ... SELECT", async () => {
+      const client = createClient(TEST_CONFIG);
+      try {
+        await recreate(client);
+        // Both report the first generated value of the statement.
+        assert.deepEqual(await client.execute(`INSERT INTO ${A} (v) VALUES (1), (2), (3)`), {
+          affectedRows: 3,
+          lastInsertId: 1,
+        });
+        assertKey(
+          await client.execute(`INSERT INTO ${A} (v) VALUES (4), (5)`, undefined, KEYS),
+          2,
+          4,
+        );
+        // INSERT ... SELECT can run a routine through a view or subquery, so the
+        // default reports none; the keys of the statement are exact.
+        assert.deepEqual(await client.execute(`INSERT INTO ${B} (v) SELECT v FROM ${SOURCE}`), {
+          affectedRows: 3,
+        });
+        assertKey(
+          await client.execute(`INSERT INTO ${B} (v) SELECT v FROM ${SOURCE}`, undefined, KEYS),
+          3,
+          4,
+        );
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("a failed INSERT, a rollback and a reconnect leave no stale id behind", async () => {
+      const adapter = new NativeCubridAdapter(TEST_CONFIG);
+      try {
+        await recreate(adapter);
+        assert.equal((await adapter.execute(`INSERT INTO ${A} (v) VALUES (1)`)).lastInsertId, 1);
+        await assert.rejects(
+          () => adapter.execute(`INSERT INTO ${A} (id, v) VALUES (1, 1)`, [], KEYS),
+          ConstraintError,
+        );
+        assert.deepEqual(await adapter.execute(`INSERT INTO ${PLAIN} VALUES (1, 1)`), {
+          affectedRows: 1,
+        });
+
+        await adapter.beginTransaction();
+        // The key is the statement's own, even though the row is rolled back.
+        assertKey(await adapter.execute(`INSERT INTO ${A} (v) VALUES (2)`, [], KEYS), 1, 2);
+        await adapter.rollback();
+        // The server keeps 2 as the session's value through ROLLBACK.
+        assert.deepEqual(await adapter.execute(`INSERT INTO ${PLAIN} VALUES (2, 2)`), {
+          affectedRows: 1,
+        });
+        assert.deepEqual(await adapter.execute(`INSERT INTO ${PLAIN} VALUES (3, 3)`, [], KEYS), {
+          affectedRows: 1,
+        });
+
+        // A new session starts with no value.
+        await adapter.close();
+        assert.deepEqual(await adapter.execute(`INSERT INTO ${PLAIN} VALUES (4, 4)`), {
+          affectedRows: 1,
+        });
+        assert.deepEqual(await adapter.execute(`INSERT INTO ${B} (v) VALUES (1)`), {
+          affectedRows: 1,
+          lastInsertId: 1,
+        });
+      } finally {
+        await adapter.close();
+      }
+    });
+
+    test("a statement that changed no row cannot leave its value to the next INSERT", async () => {
+      const client = createClient(TEST_CONFIG);
+      try {
+        await recreate(client);
+        assert.equal((await client.execute(`INSERT INTO ${A} (v) VALUES (1)`)).lastInsertId, 1);
+        // Sets the session's value to 700 and reports 0 rows.
+        assert.deepEqual(
+          await client.execute(
+            `CREATE TABLE ${COPY} (id INT AUTO_INCREMENT(700, 1), v INT) AS SELECT v FROM ${SOURCE}`,
+          ),
+          { affectedRows: 0 },
+        );
+        assert.deepEqual(await client.execute(`INSERT INTO ${PLAIN} VALUES (1, 1)`), {
+          affectedRows: 1,
+        });
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("number and bigint at the safe-integer boundary", async () => {
+      const client = createClient(TEST_CONFIG);
+      try {
+        await recreate(client);
+        assertKey(
+          await client.execute(`INSERT INTO ${BIG} (v) VALUES (1)`, [], KEYS),
+          1,
+          Number.MAX_SAFE_INTEGER,
+        );
+        assertKey(
+          await client.executePrepared(`INSERT INTO ${BIG} (v) VALUES (?)`, [2], KEYS),
+          1,
+          9007199254740992n,
+        );
+        assert.deepEqual(await client.execute(`INSERT INTO ${BIG} (v) VALUES (3)`), {
+          affectedRows: 1,
+          lastInsertId: 9007199254740993n,
+        });
+      } finally {
+        await client.close();
+      }
+    });
+
+    test("an INSERT trigger: the default reports the row's id, generatedKeys fails from 11.0", async () => {
+      const client = createClient(TEST_CONFIG);
+      try {
+        await recreate(client);
+        await client.query(
+          `CREATE TRIGGER cc247_trg_ai AFTER INSERT ON ${TRIGGERED} EXECUTE INSERT INTO ${LOG} (n) VALUES (obj.v)`,
+        );
+        assert.deepEqual(await client.execute(`INSERT INTO ${TRIGGERED} (v) VALUES (1)`), {
+          affectedRows: 1,
+          lastInsertId: 1,
+        });
+        const keyed = client.execute(`INSERT INTO ${TRIGGERED} (v) VALUES (2)`, [], KEYS);
+        if (version.startsWith("10.")) {
+          assertKey(await keyed, 1, 2);
+        } else {
+          // The server runs this INSERT on the client side, and returning its
+          // key fails there: "Instances of a reusable OID class are non-referable."
+          await assert.rejects(keyed, QueryError);
+        }
+        // Only the rows of the successful statements are there.
+        const rows = await client.query<{ n: number | bigint }>(
+          `SELECT COUNT(*) AS n FROM ${TRIGGERED}`,
+        );
+        assert.equal(Number(rows[0]?.n), version.startsWith("10.") ? 2 : 1);
+      } finally {
+        await client.query("DROP TRIGGER IF EXISTS cc247_trg_ai").catch(() => undefined);
+        await client.close();
+      }
+    });
+
+    test("a stored function that inserts: no id by default, the row's own key with generatedKeys", async (t) => {
+      if (!hasPlcsql()) {
+        t.skip(`PL/CSQL needs CUBRID 11.4 or later; this is ${version}`);
+        return;
+      }
+      const client = createClient(TEST_CONFIG);
+      try {
+        await recreate(client);
+        await client.query(
+          `CREATE OR REPLACE FUNCTION cc247_fn() RETURN INT AS BEGIN INSERT INTO ${LOG} (n) VALUES (1); RETURN 1; END;`,
+        );
+        assert.equal((await client.execute(`INSERT INTO ${A} (v) VALUES (1)`)).lastInsertId, 1);
+        // The function sets the session's value to 800.
+        assert.deepEqual(await client.query("SELECT cc247_fn() AS f"), [{ f: 1 }]);
+        assert.deepEqual(await client.execute(`INSERT INTO ${PLAIN} VALUES (1, 1)`), {
+          affectedRows: 1,
+        });
+        // The row gets 2 and the function's insert 801.
+        assert.deepEqual(await client.execute(`INSERT INTO ${A} (v) VALUES (cc247_fn())`), {
+          affectedRows: 1,
+        });
+        assertKey(await client.execute(`INSERT INTO ${A} (v) VALUES (cc247_fn())`, [], KEYS), 1, 3);
+      } finally {
+        await client.query("DROP FUNCTION IF EXISTS cc247_fn").catch(() => undefined);
+        await client.close();
+      }
+    });
+
+    test("known limit: a trigger that calls a routine can set the default's value", async (t) => {
+      if (!hasPlcsql()) {
+        t.skip(`PL/CSQL needs CUBRID 11.4 or later; this is ${version}`);
+        return;
+      }
+      const client = createClient(TEST_CONFIG);
+      try {
+        await recreate(client);
+        await client.query(
+          `CREATE OR REPLACE PROCEDURE cc247_proc(x INT) AS BEGIN INSERT INTO ${LOG} (n) VALUES (x); END;`,
+        );
+        await client.query(
+          `CREATE TRIGGER cc247_trg_ai AFTER INSERT ON ${TRIGGERED} EXECUTE CALL cc247_proc(obj.v)`,
+        );
+        // Nothing in the statement's text shows the routine, and the session's
+        // value is the routine's 800, not the row's 1. docs/API_REFERENCE.md
+        // documents this; generatedKeys would refuse the INSERT here instead.
+        assert.deepEqual(await client.execute(`INSERT INTO ${TRIGGERED} (v) VALUES (1)`), {
+          affectedRows: 1,
+          lastInsertId: 800,
+        });
+      } finally {
+        await client.query("DROP TRIGGER IF EXISTS cc247_trg_ai").catch(() => undefined);
+        await client.query("DROP PROCEDURE IF EXISTS cc247_proc").catch(() => undefined);
+        await client.close();
+      }
+    });
+
+    test("after DDL on the table the keys may be missing, never wrong", async () => {
+      const ddl = createClient(TEST_CONFIG);
+      const client = createClient(TEST_CONFIG);
+      const seen: Array<number | bigint | undefined> = [];
+      try {
+        for (const layout of [
+          "(id INT AUTO_INCREMENT PRIMARY KEY, v INT)",
+          "(v INT, w INT, id INT AUTO_INCREMENT(500, 1) PRIMARY KEY)",
+        ]) {
+          await ddl.query(`DROP TABLE IF EXISTS ${A}`);
+          await ddl.query(`CREATE TABLE ${A} ${layout}`);
+          for (let i = 0; i < 2; i++) {
+            const { lastInsertId } = await client.execute(
+              `INSERT INTO ${A} (v) VALUES (1)`,
+              [],
+              KEYS,
+            );
+            const [{ m }] = (await client.query(`SELECT MAX(id) AS m FROM ${A}`)) as [
+              { m: number },
+            ];
+            assert.ok(
+              lastInsertId === undefined || Number(lastInsertId) === m,
+              String(lastInsertId),
+            );
+            seen.push(lastInsertId);
+          }
+        }
+        if (version.startsWith("10.")) {
+          assert.equal(seen.includes(undefined), false);
+        }
+      } finally {
+        await ddl.close();
+        await client.close();
+      }
+    });
+
+    test("pool.execute passes generatedKeys on", async () => {
+      const pool = createPool({ ...TEST_CONFIG, max: 1 });
+      try {
+        await recreate(pool);
+        assertKey(await pool.execute(`INSERT INTO ${A} (v) VALUES (1)`, [], KEYS), 1, 1);
+        assertKey(await pool.execute(`INSERT INTO ${B} (v) VALUES (1)`, [], KEYS), 1, 1);
+        if (!version.startsWith("10.")) {
+          // Only the flag the option sends makes 11.x refuse a triggered INSERT.
+          await pool.query(
+            `CREATE TRIGGER cc247_trg_ai AFTER INSERT ON ${TRIGGERED} EXECUTE INSERT INTO ${LOG} (n) VALUES (obj.v)`,
+          );
+          await assert.rejects(
+            pool.execute(`INSERT INTO ${TRIGGERED} (v) VALUES (1)`, [], KEYS),
+            QueryError,
+          );
+          await pool.query("DROP TRIGGER cc247_trg_ai");
+        }
+      } finally {
+        await pool.close();
       }
     });
   });

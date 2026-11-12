@@ -95,6 +95,19 @@ batch and an abort during a lock wait
 the same EXECUTE_ARRAY frames apart from error message text. 11.0 and 11.2 were
 not run.
 
+Generated insert ids (`lastInsertId`, GET_LAST_INSERT_ID and, with
+`{ generatedKeys: true }`, GET_GENERATED_KEYS) are asserted against local
+`cubrid/cubrid` 10.2, 11.0, 11.2 and 11.4 containers: tables that both generate
+1, a table without AUTO_INCREMENT, a supplied key, multi-row INSERT,
+INSERT ... SELECT, a failed INSERT, ROLLBACK, a new session, CREATE TABLE ... AS
+SELECT, the number/bigint boundary, an INSERT trigger and, on 11.4 only (PL/CSQL),
+a stored function and a trigger that calls a procedure
+([#247](https://github.com/cubrid-lab/cubrid-client/issues/247)). The four servers
+sent the same GET_GENERATED_KEYS frames apart from the row OIDs, which only 10.2
+fills in. From 11.0 the server refuses `generatedKeys` for an INSERT into a table
+with an INSERT trigger; 10.2 runs it. From 11.0 a `generatedKeys` INSERT, mostly one of the first
+into a newly created table, can come back without its key (absent, never wrong).
+
 BLOB and CLOB writes (`blob()` and `clob()` on the prepared methods, LOB_NEW and
 LOB_WRITE) are asserted against local `cubrid/cubrid` 10.2, 11.0, 11.2 and 11.4
 containers, 9/9 cases on each: an 8 MiB BLOB from a `Buffer` and from a `Readable`

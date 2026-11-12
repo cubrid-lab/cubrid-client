@@ -24,6 +24,7 @@ import type {
   Executable,
   ExecutableTransactionClient,
   ExecuteManyResult,
+  ExecuteOptions,
   ExecuteResult,
   PreparedQueryable,
   PreparedTransactionClient,
@@ -274,7 +275,7 @@ class PoolStatements implements PoolConnection {
     });
   }
 
-  execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult> {
+  execute(sql: string, params?: QueryParams, options?: ExecuteOptions): Promise<ExecuteResult> {
     return this.runLiteral(params, options, "Statement failed.", (connection) => {
       if (!connection.execute) {
         throw new Error("Underlying connection does not support execute.");
@@ -312,7 +313,7 @@ class PoolStatements implements PoolConnection {
   executePrepared(
     sql: string,
     params?: readonly PreparedQueryParam[],
-    options?: QueryOptions,
+    options?: ExecuteOptions,
   ): Promise<ExecuteResult> {
     return this.run(options, "Statement failed.", (connection) => {
       if (!connection.executePrepared) {
@@ -518,7 +519,7 @@ export class CubridPool
     return this.statements.queryResult<T>(sql, params, options);
   }
 
-  execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult> {
+  execute(sql: string, params?: QueryParams, options?: ExecuteOptions): Promise<ExecuteResult> {
     return this.statements.execute(sql, params, options);
   }
 
@@ -541,7 +542,7 @@ export class CubridPool
   executePrepared(
     sql: string,
     params?: readonly PreparedQueryParam[],
-    options?: QueryOptions,
+    options?: ExecuteOptions,
   ): Promise<ExecuteResult> {
     return this.statements.executePrepared(sql, params, options);
   }

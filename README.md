@@ -195,9 +195,27 @@ const { affectedRows, lastInsertId } = await db.execute(
 // affectedRows: 1, lastInsertId: 1 (a bigint beyond Number.MAX_SAFE_INTEGER)
 ```
 
-`db.transaction((tx) => tx.execute(...))` works the same way. See
-[`execute()`](docs/API_REFERENCE.md#executesql-params) for what the server
-reports for multi-row and multi-statement inserts.
+`db.transaction((tx) => tx.execute(...))` works the same way.
+
+`lastInsertId` is optional and never guessed. By default it comes from the
+session's last insert id, so it is left out whenever the client cannot tell the
+value is this statement's: an `INSERT` that generates the same number the session
+already held (tables `A` and `B` that both generate `1`), a table without
+`AUTO_INCREMENT`, `INSERT ... SELECT`, values that call a function, and
+multi-statement strings. It costs one more request after the `INSERT`, and one
+before it when another kind of statement ran last. Pass `{ generatedKeys: true }`
+to get the key the statement itself generated, as JDBC's `RETURN_GENERATED_KEYS`
+does, for one request after the `INSERT`:
+
+```ts
+await db.execute("INSERT INTO b (v) VALUES (?)", [1], { generatedKeys: true });
+// { affectedRows: 1, lastInsertId: 1 }, even right after table a generated 1
+```
+
+On CUBRID 11.0 to 11.4 that option makes an `INSERT` into a table with an
+`INSERT` trigger fail, and an `INSERT` into a newly created table can come back
+without its key. See [Generated ids](docs/API_REFERENCE.md#generated-ids)
+for every case and its cost.
 
 ### Server-side prepared binding
 

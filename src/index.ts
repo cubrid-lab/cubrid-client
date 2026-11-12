@@ -33,6 +33,7 @@ export type {
   Executable,
   ExecutableTransactionClient,
   ExecuteManyResult,
+  ExecuteOptions,
   ExecuteResult,
   IsolationLevel,
   PreparedQueryable,
