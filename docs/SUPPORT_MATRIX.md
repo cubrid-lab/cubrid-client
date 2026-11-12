@@ -44,13 +44,26 @@ not all possible SQL types, broker options or fault-injection scenarios.
 | 11.4 | 23/23 passed, 0 skipped | Current integration suite with a real broker |
 | Other versions | Not tested in this workflow | No coverage claim |
 
-Pull requests touching runtime code or the live workflow execute the 11.4
-integration suite; a push to main executes the four-version matrix. A manual
-dispatch can run all four versions before a release. The dedicated workflow
-uses `CUBRID_LIVE_REQUIRED=1` so an unreachable server fails rather than
-quietly self-skipping. The separate general-purpose Node.js CI still runs
-its offline/self-skipping integration command and is **not** evidence of live
-CUBRID coverage.
+Every pull request that is not documentation only runs the 11.4 integration
+suite once, on Node 22, in the `Live CUBRID` job of the `CI` workflow, and
+the `CI gate` check fails unless it passed
+([#264](https://github.com/cubrid-lab/cubrid-client/issues/264)). A push to
+main runs the four-version matrix, and so does the release gate
+(`release-validation.yml`), which must pass before every release. A manual
+dispatch of the live workflow can run all four versions at any time. The live
+job uses `CUBRID_LIVE_REQUIRED=1` so an unreachable server fails rather than
+quietly self-skipping, rejects any skipped test, and records the server
+version, image digest and executed test count in its job summary. The
+offline Node.js matrix still loads the integration file without a server and
+is **not** evidence of live CUBRID coverage.
+
+**Scope of the 10.2–11.4 claim.** The README and this page claim 10.2, 11.0,
+11.2 and 11.4. An 11.4 pass on a pull request says nothing about the older
+three. They are verified on every push to `main` and, before each release, by
+the full matrix in the release gate ([release criteria](RELEASE_CRITERIA.md),
+criterion 1). A release whose gate did not pass on all four is not published,
+so the published claim stays backed by a full-matrix run on the released
+commit.
 
 These results are a substantial improvement over the earlier targeted manual
 checks, but the suite is not an exhaustive type round-trip or

@@ -31,22 +31,122 @@ and an oracle never shares a builder with the code it checks
 | --- | --- | --- | --- |
 | `npm test` | the 20 offline `.ts` files, then `verify-npm-version.test.mjs` | `ci.yml` (Node 18–26), `release-validation.yml` | 1416 pass, 0 fail, 0 skipped; then 6 pass |
 | `npm run test:coverage` | the same 20 files under `c8` | `ci.yml` | same 1416 tests |
-| `npm run test:integration`, no broker | `integration.test.ts` | `ci.yml` (warns that it is offline only) | 1 pass (`connect fails with wrong port`); the 18 top-level suites are skipped |
+| `npm run test:integration`, no broker | `integration.test.ts` | `ci.yml` `ci` job, step "Integration file, offline cases only": checks the file loads on Node 18–26; it is not live evidence | 1 pass (`connect fails with wrong port`); the 18 top-level suites are skipped |
 | `CUBRID_LIVE_REQUIRED=1 CUBRID_TEST_PORT=1 npm run test:integration` | `integration.test.ts` | `ci.yml` negative check | fails with "Live CUBRID integration was required but the broker was unreachable" |
-| `CUBRID_LIVE_REQUIRED=1 CUBRID_TEST_UTF8_DATABASE=testu8 npm run test:integration` | `integration.test.ts` | `live-cubrid.yml` (11.4 on PRs; 10.2, 11.0, 11.2, 11.4 on `main` and releases) | CUBRID 11.4.6, broker on 127.0.0.1:33410: 309 pass, 0 fail, 0 skipped, 39 suites, 834 s |
+| `CUBRID_LIVE_REQUIRED=1 CUBRID_TEST_UTF8_DATABASE=testu8 npm run test:integration` | `integration.test.ts` | `live-cubrid.yml`, called by the `Live CUBRID` job in `ci.yml` and required by `CI gate` (11.4 on Node 22 for PRs; 10.2, 11.0, 11.2, 11.4 on `main`), and by `release-validation.yml` (all four) | CUBRID 11.4.6, broker on 127.0.0.1:33410: 309 pass, 0 fail, 0 skipped, 39 suites, 834 s |
 | `node --import tsx --test tests/integration-tls.test.ts` | `integration-tls.test.ts` | `live-cubrid-tls.yml`, which requires `# tests 3` | offline: 3 skipped; not run live here |
 | `node --import tsx --test tests/legacy-parity.test.ts` | `legacy-parity.test.ts` | `live-cubrid.yml`, which requires 1 pass and 0 skipped | not run here; throws without `NODE_CUBRID_ENTRY` |
 | `npm run test:jdbc-parity` | `tests/jdbc-parity/` | `jdbc-parity.yml` | not run here (needs Java and the pinned JAR) |
 | `npm run test:all` | every `tests/*.test.ts` | no workflow | fails offline by design: 1417 pass, 1 fail (`legacy-parity.test.ts`), 3 skipped (TLS) |
 | `node --test tests/api-public-surface.test.mjs`, `npm run api:check` | public API parser and `api/index.d.ts` | `ci.yml` (Node 22) | 3 pass; "Public API matches api/index.d.ts." |
 
-`live-cubrid.yml` fails the job if the TAP output has `# skipped` above 0 or
-fewer than 20 passes. Two facts behind those gates:
+## Required live CUBRID 11.4 lane (#264)
+
+`CI gate` in `ci.yml` is the one aggregate check. Mark **`CI gate`** as the
+required status check in a branch protection rule or ruleset for `main`; no
+other check needs to be required. (`main` had no branch protection and no
+ruleset when this lane was added, so nothing is enforced until a maintainer
+sets it.)
+
+- `Classify changed paths` runs `scripts/ci-impact.mjs`. A pull request that
+  changes only documentation gets `runtime=false`; every other change, any
+  deletion, an unreadable diff and every push to `main` get `runtime=true`.
+- With `runtime=true`, `CI gate` requires the Node 18–26 `ci` matrix **and**
+  the `Live CUBRID` job (`live-cubrid.yml` through `workflow_call`) to
+  succeed. A failed, cancelled, timed-out or skipped live job fails the gate.
+- With `runtime=false` (docs only), both may be skipped and the gate passes on
+  the docs check alone. A failed classification fails the gate.
+- The live job runs once, on Node 22, against `cubrid/cubrid:11.4`. It is not
+  multiplied by the Node matrix. A push to `main` runs 10.2, 11.0, 11.2 and
+  11.4 on every push, documentation included (before #264 the main run was
+  path-filtered), so every push to `main` is a full check. A
+  failure on an older server turns `CI gate` red on that commit.
+- `ci.yml` has no `merge_group` trigger. If a merge queue is turned on with
+  `CI gate` required, add that trigger first, or the check never reports.
+- `live-cubrid.yml` no longer has its own `pull_request` or `push` trigger: a
+  path-filtered workflow that does not start stays pending and cannot be a
+  required check. It keeps `workflow_dispatch`.
+
+The live job fails closed. Each case fails the job, and so the gate:
+
+| Failure | What catches it |
+| --- | --- |
+| The server never becomes ready | the readiness loop (36 × 5 s) |
+| The broker is unreachable from the tests | `CUBRID_LIVE_REQUIRED=1`, which throws before any suite registers |
+| A test or a whole suite is skipped, or marked todo | `# skipped`/`# todo` above 0, or any `# SKIP`/`# TODO` directive in the TAP |
+| Zero or too few cases | the TAP summary is missing, or `# tests` is below 20, or `# pass` differs from `# tests` |
+| The round trip did not run | the test "getServerVersion returns the server version and leaves a transaction's row to rollback()" (CREATE, INSERT, rollback, SELECT) must be reported `ok` |
+| A hang | `timeout-minutes: 15` on the test step and 25 on the job; a timed-out job is `cancelled` or `failure`, which the gate rejects |
+
+The job summary (`$GITHUB_STEP_SUMMARY`) records the image tag and its digest
+(`docker inspect --format '{{index .RepoDigests 0}}'`), the server version
+from `SELECT VERSION()`, the version the broker reports to the client
+(`getServerVersion()` on port 33000), the `cubrid_rel` build line, the Node
+version and the executed, passed, failed, cancelled, skipped and todo counts.
+
+An 11.4 pass on a pull request is not evidence for 10.2, 11.0 or 11.2. Those
+run on every push to `main` and in `release-validation.yml`, whose
+**All reviewed release checks passed** job gates every release
+([release criteria](RELEASE_CRITERIA.md)). The TLS lane
+(`live-cubrid-tls.yml`) and the JDBC comparison (`jdbc-parity.yml`) keep their
+own path-filtered triggers and are not part of `CI gate`; the release gate
+runs both.
+
+### Reproduce the live lane locally
+
+The commands mirror `live-cubrid.yml`. Use `cubrid/cubrid:11.4`; another tag
+only for a declared compatibility check (for example `cubrid/cubrid:10.2`
+before a release), and say which one you ran.
+
+```bash
+# Start a disposable server with testdb and a broker on 127.0.0.1:33000.
+docker run -d --name cubrid-live -e CUBRID_DB=testdb \
+  -p 127.0.0.1:33000:33000 cubrid/cubrid:11.4
+
+# Wait until testdb answers. Run csql as the cubrid user, never as root (#203).
+until docker exec --user cubrid cubrid-live csql -u dba testdb -c "SELECT 1" >/dev/null 2>&1; do
+  sleep 5
+done
+
+# The charset tests (#238) need a second database created with en_US.utf8.
+docker exec --user cubrid cubrid-live bash -lc \
+  'mkdir -p "$CUBRID_DATABASES/testu8" && cd "$CUBRID_DATABASES/testu8" &&
+   cubrid createdb --db-volume-size=20M --log-volume-size=20M testu8 en_US.utf8 &&
+   cubrid server start testu8'
+
+# Record what you ran against.
+docker inspect --format '{{index .RepoDigests 0}}' cubrid/cubrid:11.4
+docker exec --user cubrid cubrid-live csql -u dba testdb -c "SELECT VERSION()"
+
+# Run the suite as CI does. It fails instead of skipping when the broker is
+# unreachable. --test-reporter=tap prints the "# tests", "# pass" and
+# "# skipped" lines (Node 23 and later default to the spec reporter).
+CUBRID_LIVE_REQUIRED=1 CUBRID_TEST_PORT=33000 CUBRID_TEST_UTF8_DATABASE=testu8 \
+  node --import tsx --test --test-reporter=tap tests/integration.test.ts | tee live-integration.tap
+
+# Clean up: the container holds both databases, so removing it removes them.
+docker rm -f cubrid-live
+rm -f live-integration.tap
+```
+
+The suite connects as `dba` with an empty password to `testdb` on
+`127.0.0.1`. `CUBRID_TEST_PORT` picks another host port, for example
+`-p 127.0.0.1:33264:33000` with `CUBRID_TEST_PORT=33264` when 33000 is taken.
+Without `CUBRID_TEST_UTF8_DATABASE` the charset tests skip, which the CI lane
+rejects. Report the image digest, the server version and the `# tests`,
+`# pass` and `# skipped` lines with any live claim.
+
+### TAP details behind the gates
+
+The live step asks for `--test-reporter=tap` itself: from Node 23 the default
+reporter is `spec` even when the output is piped, and it has no `# tests`
+lines to check.
 
 - A suite skipped with `describe(..., { skip })` is counted under `# suites`,
   not `# skipped`. The offline run above reports `# skipped 0`. What turns an
   unreachable broker into a failure is `CUBRID_LIVE_REQUIRED=1`, which throws
-  before any suite registers; the pass floor is the second guard.
+  before any suite registers. The second guard is the `# SKIP` directive that
+  a skipped suite still prints on its `ok` line, which the job rejects.
 - The nested `text charsets (#238)` tests skip themselves without
   `CUBRID_TEST_UTF8_DATABASE`, and those do count as `# skipped`, so the gate
   catches a missing `testu8`.
@@ -117,8 +217,8 @@ candidates did, so the suite stays as it is:
 - **Moving a live group out of `integration.test.ts`** (pool #92 and #268 was
   the most self-contained). The new file would need the broker availability
   check and its `CUBRID_LIVE_REQUIRED` throw, a change to `test:integration`,
-  and new `paths` entries in `live-cubrid.yml`, which only lists
-  `tests/integration.test.ts`. `node --test` runs files in parallel, so the
+  and a check that the live lane runs it (`live-cubrid.yml` runs only
+  `npm run test:integration`). `node --test` runs files in parallel, so the
   pool timing assertions (`>= 2900` ms, peak sessions) would share one broker
   with the rest of the suite unless concurrency is pinned. The gain is small:
   `--test-name-pattern` already runs one live suite. The group's

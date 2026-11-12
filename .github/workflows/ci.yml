@@ -110,10 +110,12 @@ jobs:
         if: matrix.node-version == 26
         run: npm test
 
-      - name: Integration tests (self-skipping without live CUBRID)
-        run: |
-          echo "::warning title=Integration tests not run against a live CUBRID::tests/integration.test.ts self-skips its database-dependent cases because no CUBRID server is provisioned in this workflow. Only offline cases run here. Run 'npm run test:integration' against a live CUBRID (127.0.0.1:33000, database 'testdb', user 'dba') to exercise the full suite."
-          npm run test:integration
+      # Offline only: this job has no CUBRID server, so the live suites skip
+      # and only the wrong-port case runs. It checks that the integration file
+      # still loads on every Node line. The live cases are owned by the
+      # "Live CUBRID" job below, which fails on any skip (#264).
+      - name: Integration file, offline cases only (live cases run in the Live CUBRID job)
+        run: npm run test:integration
 
       - name: Build
         run: npm run build
@@ -145,10 +147,12 @@ jobs:
             "$RUNNER_TEMP/negative-broker-test.log"
           echo "Confirmed: missing broker causes a hard integration failure"
 
-      - name: Validate release workflow syntax and expressions
+      - name: Validate release and gate workflow syntax and expressions
         if: matrix.node-version == 22
         run: |
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 \
+            .github/workflows/ci.yml \
+            .github/workflows/live-cubrid.yml \
             .github/workflows/publish.yml \
             .github/workflows/release-please.yml
 
@@ -174,10 +178,26 @@ jobs:
           grep -q 'not ok.*literal CCI data-type IDs' "$RUNNER_TEMP/wire-mutant.log"
           echo "Confirmed: BIGINT = 26 is rejected by the independent protocol oracle"
 
+  # Real CUBRID 11.4 on Node 22, once, not per Node version (#264). It is
+  # selected exactly like the Node matrix, and the gate below requires it
+  # whenever runtime is selected. A push to main runs all four server
+  # versions; release-validation.yml runs them before every release.
+  live-cubrid:
+    name: Live CUBRID
+    needs: impact
+    if: ${{ always() && (github.event_name != 'pull_request' || needs.impact.result != 'success' || needs.impact.outputs.runtime != 'false') }}
+    uses: ./.github/workflows/live-cubrid.yml
+    with:
+      full_matrix: false
+
+  # The one check to mark as required in branch protection or a ruleset.
+  # It fails closed: a selected lane that failed, was cancelled, timed out or
+  # was skipped fails the gate. Only a docs-only pull request may skip the
+  # runtime lanes, and then only when classification itself succeeded.
   ci-gate:
     name: CI gate
     if: always()
-    needs: [impact, docs-check, ci]
+    needs: [impact, docs-check, ci, live-cubrid]
     runs-on: ubuntu-latest
     env:
       EVENT_NAME: ${{ github.event_name }}
@@ -185,6 +205,7 @@ jobs:
       RUNTIME: ${{ needs.impact.outputs.runtime }}
       DOCS: ${{ needs.impact.outputs.docs }}
       CI_RESULT: ${{ needs.ci.result }}
+      LIVE_RESULT: ${{ needs.live-cubrid.result }}
       DOCS_RESULT: ${{ needs.docs-check.result }}
     steps:
       - name: Require all selected validation lanes
@@ -194,9 +215,14 @@ jobs:
           [[ "$IMPACT_RESULT" == success ]] || { echo "::error::CI impact classification failed"; exit 1; }
           if [[ "$EVENT_NAME" != pull_request || "$RUNTIME" != false ]]; then
             [[ "$CI_RESULT" == success ]] || { echo "::error::Required runtime matrix: $CI_RESULT"; exit 1; }
-          elif [[ "$CI_RESULT" != skipped && "$CI_RESULT" != success ]]; then
-            echo "::error::Unexpected runtime result: $CI_RESULT"
-            exit 1
+            [[ "$LIVE_RESULT" == success ]] || { echo "::error::Required live CUBRID lane: $LIVE_RESULT"; exit 1; }
+          else
+            for result in "$CI_RESULT" "$LIVE_RESULT"; do
+              if [[ "$result" != skipped && "$result" != success ]]; then
+                echo "::error::Unexpected runtime result: $result"
+                exit 1
+              fi
+            done
           fi
           if [[ "$DOCS" == true ]]; then
             [[ "$DOCS_RESULT" == success ]] || { echo "::error::Required docs validation: $DOCS_RESULT"; exit 1; }
@@ -204,4 +230,4 @@ jobs:
             echo "::error::Unexpected docs result: $DOCS_RESULT"
             exit 1
           fi
-          echo "Selected validation completed: runtime=$RUNTIME docs=$DOCS"
+          echo "Selected validation completed: runtime=$RUNTIME docs=$DOCS live=$LIVE_RESULT"
