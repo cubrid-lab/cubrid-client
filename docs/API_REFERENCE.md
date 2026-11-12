@@ -403,7 +403,7 @@ What happens depends on where the statement is when the signal aborts:
 
 - **The outcome is unknown after an abort in flight.** The server may still run the statement to its end, and in autocommit mode it may be committed; nothing asks the server to stop it. Verify the outcome before running a statement that is not idempotent again, as after a [`ReadTimeoutError`](#readtimeouterror).
 - **Inside a transaction an abort in flight loses the transaction.** Its connection is gone and the server rolls back the uncommitted work. The next statement and `commit()` fail with the existing connection-lost errors (a [`TransactionError`](#transactionerror) on `tx`), and nothing reaches a new session until the transaction is ended. Statements queued behind an aborted one behave as they do after a read timeout: they fail without being sent, and the next statement issued reconnects.
-- **The reason is passed on unchanged.** The promise rejects with the exact `signal.reason` (an `AbortError` `DOMException` for `controller.abort()` without a reason, a `TimeoutError` for `AbortSignal.timeout()`), never wrapped in a `QueryError`. `transaction()` itself still wraps an error that its callback rethrows in a `TransactionError`, with the reason as `cause`.
+- **The reason is passed on unchanged.** The promise rejects with the exact `signal.reason` (an `AbortError` `DOMException` for `controller.abort()` without a reason, a `TimeoutError` for `AbortSignal.timeout()`), never wrapped in a `QueryError`, and it gains no [`outcomeUnknown`](#unknown-outcomes). `transaction()` itself still wraps an error that its callback rethrows in a `TransactionError`, with the reason as `cause` and `outcomeUnknown: true` when the aborted statement had been sent.
 - **`readTimeout`** behaves exactly like [the client's](CONNECTION.md#read-timeout), for this statement and all of its follow-up requests only: an inactivity limit that rejects with `ReadTimeoutError` and discards the socket. `0` means no timeout for this statement, even when the client has one. Time spent waiting behind other statements does not count.
 - **Validation.** A `readTimeout` that the client option would refuse rejects with a `RangeError`, and a `signal` that is not an `AbortSignal` (or options that are not an object) with a `TypeError`, before anything is queued or sent.
 - The abort listener is removed when the statement settles, so one signal can be passed to any number of statements.
@@ -1192,6 +1192,7 @@ class QueryError extends Error {
   readonly origin?: "server" | "cas";
   readonly sqlState?: string;
   readonly kind?: CubridErrorKind;
+  readonly outcomeUnknown?: boolean; // See "Unknown outcomes"
 }
 ```
 
@@ -1224,6 +1225,7 @@ class TransactionError extends Error {
   readonly origin?: "server" | "cas";
   readonly sqlState?: string;
   readonly kind?: CubridErrorKind;
+  readonly outcomeUnknown?: boolean; // See "Unknown outcomes"
   rollbackError?: Error; // transaction() only: rolling back also failed
   closeError?: Error; // transaction() only: closing the connection also failed
 }
@@ -1256,7 +1258,7 @@ class ReadTimeoutError extends ConnectionError {
 }
 ```
 
-The connection has been discarded. The outcome of the request on the server is unknown, so do not retry a write or a `COMMIT` blindly. See [Read timeout](CONNECTION.md#read-timeout).
+The connection has been discarded. The outcome of the request on the server is unknown, so do not retry a write or a `COMMIT` blindly: `outcomeUnknown` is `true` whenever the request had been written. A timeout while a session was still being opened, before the statement was sent, is `false`. See [Read timeout](CONNECTION.md#read-timeout) and [Unknown outcomes](#unknown-outcomes).
 
 ```ts
 import { ReadTimeoutError } from "cubrid-client";
@@ -1283,6 +1285,7 @@ try {
 | `kind` | `CubridErrorKind` | Classification of a known failure. |
 | `sqlState` | `string` | Never set by this driver: CAS error replies carry no SQLSTATE and CUBRID documents no mapping from its codes. It stays available for a custom `connectionFactory` that has a real value to report. |
 | `batch` | `ExecuteManyFailure` | Set only when [`executeMany()`](#executemanysql-paramsets-options) failed because the server reported a parameter set as failed. `code`, `origin` and `kind` are then the first failed set's. |
+| `outcomeUnknown` | `boolean` | Whether the failed operation may have taken effect on the server without the driver knowing. See [Unknown outcomes](#unknown-outcomes). |
 
 ```ts
 interface ExecuteManyFailure {
@@ -1360,6 +1363,63 @@ After any `deadlock`, roll back and retry the transaction from its start.
 The connection itself stays usable: it is not closed or reopened, and it is back in **autocommit** afterwards, so call `beginTransaction()` before redoing the work. Inside `transaction()`, a callback that catches the error and carries on gets rejections from `tx.query()`, and `transaction()` itself rejects with a `TransactionError` instead of committing.
 
 Only `-72` is treated this way. The server's reply carries no other signal: its transaction status still says active. On CUBRID 10.2, 11.0, 11.2 and 11.4, `-72` was also what `rollback_on_lock_escalation=yes` reported, and `-74`, `-75`, `-967` and `-968` left the transaction open with its earlier statements intact. A statement rejected with those codes can be followed by more statements and a commit.
+
+### Unknown outcomes
+
+Once a request is written to the socket, the server may run it even if no reply ever comes back. A statement, or the `COMMIT` of a transaction, whose reply was lost may have been applied. `outcomeUnknown` tells you which case you are in, so that you do not run a write twice:
+
+| Value | Meaning | What to do |
+|-------|---------|------------|
+| `true` | A request of the operation was written and no reply says what it did. The write or the `COMMIT` may have been applied, or not. The connection was retired; nothing was sent again | Check the database before you write again (see the example below) |
+| `false` | No request is in doubt: either nothing was sent, or the driver has a reply for every request that was. The class, `kind` and `code` say what happened | Act on the error itself. `false` is **not** permission to retry, and it does not mean nothing changed: a statement can fail after a reply that reported success, and the `transaction()` close error after a successful commit is `false` |
+| absent | The driver did not determine it, as for an error from a custom `connectionFactory` connection | Treat it as unknown |
+
+`false` says only what the driver can prove. A cancellation on the client side is not a rollback: after an abort, a `readTimeout` or `destroy()`, the server may still finish the statement, and in autocommit mode commit it. When a request of a transaction had an unknown outcome, the server is expected to roll back the uncommitted work once the session is gone, but the driver has no reply that proves it, so the transaction, its `commit()` and a `rollback()` after it report `true`.
+
+Where each failure lands:
+
+| Where the failure happened | `outcomeUnknown` |
+|----------------------------|------------------|
+| Before anything was sent: an invalid argument, a closed client or pool, a pool that could not lend a connection, a `stream-busy` refusal, a statement queued behind `destroy()` or behind a statement whose outcome is unknown, a failed connect | `false` |
+| A request was written and the socket closed, a `readTimeout` expired, `destroy()` ran, only part of the reply arrived, or the reply was over `maxReplyBytes` | `true` |
+| A reply too damaged to read (its session is discarded) | `true` |
+| A request that opens or sets up a session, such as the handshake, a liveness probe or the settings of [`TransactionOptions`](#transactionoptions), timed out or lost its reply. These run no SQL, and their session is retired before any statement uses it | `false` |
+| The server answered with an error, or the client refused the result after a complete reply (for example a decoding or parameter-count failure), even if releasing the query handle failed afterwards | `false` |
+| `END_TRAN` of a `commit()`: the reply was lost | `true` |
+| `END_TRAN` of a `commit()`: the server answered with an error | `false` |
+| `commit()` or `rollback()` refused before sending, because a statement of the same transaction had an unknown outcome | `true` |
+| `commit()` or `rollback()` refused before sending, because the server had ended the transaction and every reply is in hand | `false` |
+| `transaction()` and a [`beginTransactionScope()`](#begintransactionscopeoptions) handle | `true` if any request on the transaction's connection had an unknown outcome, otherwise `false`. A later `commit()` or `rollback()` refused because the transaction already failed reports the same value |
+| A `stream()` that `close()` or `destroy()` cut short | `true` once its statement had started (conservative: nothing may be in flight), `false` if it had not |
+
+It applies to every statement method, including the prepared variants, `executeMany()`, `stream()` and the LOB_NEW and LOB_WRITE requests of a [`blob()` or `clob()`](#blob-and-clob) upload, on a client, a transaction and a [pool](#cubridpool).
+
+**An abort rejects with `signal.reason` unchanged**, as [Cancelling one statement](#cancelling-one-statement) describes, so the bare rejection carries no `outcomeUnknown`: the driver never changes your reason object. Treat an aborted statement as unknown unless the signal was already aborted when you called the method. A `transaction()` or scope that fails because of the abort rejects with a `TransactionError` that does carry it.
+
+`ReadTimeoutError` is passed on as it is, also by `transaction()`, so read the flag on that error.
+
+Reconcile by something the write itself records, such as a key you chose, before writing again:
+
+```ts
+import { ConnectionError, QueryError } from "cubrid-client";
+
+async function placeOrder(id: string, item: string): Promise<void> {
+  try {
+    await db.execute("INSERT INTO orders (id, item) VALUES (?, ?)", [id, item]);
+  } catch (error) {
+    if (!(error instanceof QueryError || error instanceof ConnectionError)) throw error;
+    if (error.outcomeUnknown === false) throw error; // The server's answer is in `error`.
+
+    // true, or not determined: the INSERT may have run. Look before writing again.
+    const [row] = await db.query<{ n: number }>("SELECT COUNT(*) AS n FROM orders WHERE id = ?", [id]);
+    if (Number(row?.n) === 0) {
+      await db.execute("INSERT INTO orders (id, item) VALUES (?, ?)", [id, item]);
+    }
+  }
+}
+```
+
+The same holds for a transaction: after a `TransactionError` with `outcomeUnknown: true`, read back what its `COMMIT` would have written before running it again. On a busy server the old session may still be finishing, so the check can need a short wait, as the live tests do. A unique key on the identifier makes a second write fail instead of duplicating, whatever the timing.
 
 All error classes preserve the original driver error via the standard `cause` property:
 

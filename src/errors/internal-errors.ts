@@ -77,6 +77,14 @@ export class ConnectionLostError extends Error {
   readonly kind: CubridErrorKind = "connection-lost";
 }
 
+/**
+ * A refusal before anything of the operation was sent, such as a call on a
+ * closed client: its outcome is known (#254).
+ */
+export class NotSentError extends Error {
+  readonly outcomeUnknown = false;
+}
+
 /** A statement stopped waiting behind a stream whose consumer stopped asking for rows. */
 export class StreamBusyError extends Error {
   readonly kind: CubridErrorKind = "stream-busy";

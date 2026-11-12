@@ -643,6 +643,18 @@ declare class NativeCubridAdapter implements DriverAdapter {
      */
     private transactionAbort;
     /**
+     * The connection's `unknownOutcomes` when the open manual transaction began,
+     * or null in autocommit mode. COMMIT and ROLLBACK report an unknown outcome
+     * when any request of the transaction had one, even when they were refused
+     * before sending: the driver cannot prove what the server kept (#254).
+     */
+    private transactionUnknownOutcomes;
+    /**
+     * Whether the last manual transaction ended with an unknown outcome, kept until
+     * the next beginTransaction() so a rollback() after a failed commit() says so.
+     */
+    private lastTransactionUnknown;
+    /**
      * The session's last generated AUTO_INCREMENT value as this adapter last saw
      * it: `undefined` for none, `null` when a statement may have changed it unseen.
      * See readExecuteResult().
@@ -780,6 +792,14 @@ declare class NativeCubridAdapter implements DriverAdapter {
      * is lost, which the next statement reports.
      */
     private runScoped;
+    /**
+     * Call when a statement's turn starts; the function it returns tells, once the
+     * statement has failed, whether a request of it may have reached the server
+     * without a reply saying what it did (#254). The statement queue runs one
+     * statement at a time, so every such request counted meanwhile is this one's.
+     * A connection opened by the statement itself starts its count at 0.
+     */
+    private outcomeTracker;
     private queueStatement;
     /**
      * Arms the timer that refuses statements stuck behind a held stream, at the
@@ -906,6 +926,8 @@ declare class NativeCubridAdapter implements DriverAdapter {
     /** Retain a failed first statement's session so reconnection cannot hide it. */
     private bindSessionLostByFirstStatement;
     private recordTransactionAbort;
+    /** Whether a request of the open manual transaction has an unknown outcome. */
+    private transactionOutcomeUnknown;
     private endTransaction;
     /** The server discarded the work, so there is nothing left to end. */
     private endTransactionIfSessionLost;
@@ -1321,6 +1343,11 @@ declare function createPool(options: PoolOptions): CubridPool;
  */
 declare class CubridPool implements Queryable, ResultQueryable, Executable, PreparedQueryable, BatchExecutable, Streamable {
     private closed;
+    /** Everything close() waits for but callbacks; started by the first close(). */
+    private draining;
+    /** The leases of `connection()` and `transaction()` calls when close() was first called. */
+    private closingCallbacks;
+    /** close() for every caller outside a running callback, returned to each of them. */
     private closing;
     private readonly idle;
     private readonly active;
@@ -1335,8 +1362,10 @@ declare class CubridPool implements Queryable, ResultQueryable, Executable, Prep
     private readonly openScopes;
     private readonly beginningScopes;
     private readonly statements;
-    /** The callback lease running in this async context, so close() never waits for itself. */
-    private readonly callbackLease;
+    /** Leases whose `connection()` or `transaction()` callback is running now. */
+    private readonly runningCallbacks;
+    /** The callback leases enclosing this async context, so close() never waits for itself. */
+    private readonly enclosingCallbacks;
     private readonly emit;
     private readonly config;
     private readonly connectionFactory;
@@ -1398,11 +1427,21 @@ declare class CubridPool implements Queryable, ResultQueryable, Executable, Prep
      * end, as their connections close; statements, `connection()` callbacks and
      * `transaction()` callbacks run to their end and their connections close.
      * Scopes nobody ended are discarded meanwhile, not after: a statement may be
-     * waiting for a lock that only such a scope holds. Calling it again returns the
-     * same promise.
+     * waiting for a lock that only such a scope holds. A `transaction()` whose
+     * callback has not started yet is rolled back without running it. Calling it
+     * again outside every callback returns the same promise. Awaited inside a
+     * running `connection()` or `transaction()` callback, it waits for no callback,
+     * since it would wait for itself (#268).
      */
     close(): Promise<void>;
+    /** `draining`, then the callbacks running when close() was first called, and their connections. */
+    private waitForCallbacks;
+    /** Runs a `connection()` or `transaction()` callback, known to close() while it runs. */
+    private runCallback;
+    /** Never rejects. */
     private drain;
+    /** Waits for the connections being opened or closed now. */
+    private settleConnections;
     private total;
     /** Connections open now, leaving out those still opening. */
     private open;
@@ -1558,6 +1597,27 @@ interface CubridErrorDetails {
      * a parameter set as failed. Absent for every other failure.
      */
     batch?: ExecuteManyFailure;
+    /**
+     * Whether the failed operation may have taken effect on the server without
+     * the driver knowing.
+     *
+     * - `true`: a request of the operation was written to the server and no reply
+     *   says what it did: the reply was lost, cut short, over `maxReplyBytes`, not
+     *   awaited after a `readTimeout`, `destroy()` or abort, or its session was
+     *   discarded. A write or a COMMIT may have been applied. The connection was
+     *   retired and nothing was sent again.
+     * - `false`: the driver can prove which requests reached the server and has
+     *   the reply to each: none was sent, or every one was answered. The class,
+     *   `kind` and `code` then say what happened. It does **not** mean that
+     *   nothing changed: a statement can fail after a successful reply.
+     * - absent: the driver did not determine it, such as for an error of a custom
+     *   connection. Treat it as unknown.
+     *
+     * After `true`, or when absent, check the database before writing again. A
+     * `false` is no permission to retry either: act on what the error says. An
+     * abort rejects with the caller's `signal.reason`, which never carries this.
+     */
+    outcomeUnknown?: boolean;
 }
 interface CubridErrorOptions extends ErrorOptions, CubridErrorDetails {
 }
@@ -1644,7 +1704,24 @@ interface ConnectionConfig {
 }
 declare function parseConnectionString(url: string): ConnectionConfig;
 
+/**
+ * Quotes `name` as one CUBRID identifier.
+ *
+ * A name without `]` is wrapped in brackets as is: `users` becomes `[users]`.
+ * A CUBRID bracket identifier ends at the first `]` and has no escape, so a name
+ * that contains `]` is wrapped in backticks instead, with each backtick in it
+ * doubled: `a]b` becomes `` `a]b` ``. Backticks quote the same way whatever
+ * `ansi_quotes` and `no_backslash_escapes` are set to.
+ *
+ * CUBRID 11.4 refuses `[` and `]` in any identifier, so the server rejects such
+ * a name there; CUBRID 10.2 accepts it.
+ */
 declare function escapeIdentifier(name: string): string;
+/**
+ * Builds a `WHERE` clause that matches every entry of `conditions`. Each key is
+ * quoted with {@link escapeIdentifier}; each non-null value becomes a `?` marker
+ * and is returned in `params`, and `null` becomes `IS NULL` with no value.
+ */
 declare function buildWhere(conditions: Record<string, unknown>): {
     clause: string;
     params: unknown[];

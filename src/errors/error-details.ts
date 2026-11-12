@@ -100,6 +100,27 @@ export interface CubridErrorDetails {
    * a parameter set as failed. Absent for every other failure.
    */
   batch?: ExecuteManyFailure;
+  /**
+   * Whether the failed operation may have taken effect on the server without
+   * the driver knowing.
+   *
+   * - `true`: a request of the operation was written to the server and no reply
+   *   says what it did: the reply was lost, cut short, over `maxReplyBytes`, not
+   *   awaited after a `readTimeout`, `destroy()` or abort, or its session was
+   *   discarded. A write or a COMMIT may have been applied. The connection was
+   *   retired and nothing was sent again.
+   * - `false`: the driver can prove which requests reached the server and has
+   *   the reply to each: none was sent, or every one was answered. The class,
+   *   `kind` and `code` then say what happened. It does **not** mean that
+   *   nothing changed: a statement can fail after a successful reply.
+   * - absent: the driver did not determine it, such as for an error of a custom
+   *   connection. Treat it as unknown.
+   *
+   * After `true`, or when absent, check the database before writing again. A
+   * `false` is no permission to retry either: act on what the error says. An
+   * abort rejects with the caller's `signal.reason`, which never carries this.
+   */
+  outcomeUnknown?: boolean;
 }
 
 export interface CubridErrorOptions extends ErrorOptions, CubridErrorDetails {}
@@ -111,6 +132,7 @@ export function definedErrorDetails({
   sqlState,
   kind,
   batch,
+  outcomeUnknown,
 }: CubridErrorDetails = {}): CubridErrorDetails {
   return {
     ...(code !== undefined && { code }),
@@ -118,5 +140,6 @@ export function definedErrorDetails({
     ...(sqlState !== undefined && { sqlState }),
     ...(kind !== undefined && { kind }),
     ...(batch !== undefined && { batch }),
+    ...(outcomeUnknown !== undefined && { outcomeUnknown }),
   };
 }

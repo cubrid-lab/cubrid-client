@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { NotSentError } from "../errors/internal-errors.js";
 import { isAbortReason, mapError } from "../internals/map-error.js";
 import {
   assertValidQueryOptions,
@@ -130,7 +131,11 @@ export class CubridClient
           await this.source.end(connection, "error").catch(() => {
             // The client is closed; that is the failure to report.
           });
-          throw mapError("transaction", new Error("Client is closed."), "Transaction failed.");
+          throw mapError(
+            "transaction",
+            new NotSentError("Client is closed."),
+            "Transaction failed.",
+          );
         }
         return connection;
       },
@@ -312,7 +317,7 @@ export class CubridClient
     assertValidTransactionOptions(options);
 
     if (this.closed) {
-      throw mapError("transaction", new Error("Client is closed."), "Transaction failed.");
+      throw mapError("transaction", new NotSentError("Client is closed."), "Transaction failed.");
     }
 
     const enclosing = this.enclosingTransactions.getStore();
@@ -324,7 +329,7 @@ export class CubridClient
         // the callback never starts, and the transaction is rolled back and its
         // connection closed.
         if (this.closed) {
-          throw new Error("Client is closed.");
+          throw new NotSentError("Client is closed.");
         }
         const chain = new Set(enclosing);
         if (tracked) {
@@ -369,7 +374,11 @@ export class CubridClient
     assertValidTransactionOptions(options);
 
     if (this.closed) {
-      throw mapError("transaction", new Error("Client is closed."), "Failed to begin transaction.");
+      throw mapError(
+        "transaction",
+        new NotSentError("Client is closed."),
+        "Failed to begin transaction.",
+      );
     }
 
     const beginning = this.openScope(options);
@@ -622,7 +631,9 @@ export class CubridClient
   /** Run catalog inspections on a captured shared connection until completion. */
   private runSchemaOperation<T>(operation: (query: schema.SchemaQuery) => Promise<T>): Promise<T> {
     if (this.closed) {
-      return Promise.reject(mapError("query", new Error("Client is closed."), "Query failed."));
+      return Promise.reject(
+        mapError("query", new NotSentError("Client is closed."), "Query failed."),
+      );
     }
     // Capture the connection immediately. Subsequent catalog queries must still
     // run even after close() rejects new public operations.
@@ -662,7 +673,7 @@ export class CubridClient
 
   private getSharedConnection(): Promise<ConnectionLike> {
     if (this.closed) {
-      return Promise.reject(new Error("Client is closed."));
+      return Promise.reject(new NotSentError("Client is closed."));
     }
 
     if (!this.sharedConnectionPromise) {

@@ -150,6 +150,7 @@ export class CASConnection {
   private receiveBuffer: Buffer = Buffer.alloc(0);
   private _connectionGeneration = 0;
   private _failedExchanges = 0;
+  private _unknownOutcomes = 0;
   private inHandshake = false;
   private _outOfTransaction = false;
   private _outOfTransactionReplies = 0;
@@ -265,7 +266,8 @@ export class CASConnection {
     }
 
     if (scope.sent) {
-      await this.discardSession();
+      // The request written may have run, and its reply will never be read.
+      await this.discardSession(true);
     }
     scope.aborted = true;
     throw signal.reason;
@@ -470,6 +472,13 @@ export class CASConnection {
    * Both buffers are written as a single TCP send.
    */
   async send(header: Buffer, payload: Buffer): Promise<void> {
+    const socket = this.assertWritable();
+    const combined = Buffer.concat([header, payload]);
+    await this.socketWrite(socket, combined);
+  }
+
+  /** The socket a request can be written to now; throws, writing nothing, if there is none. */
+  private assertWritable(): Socket {
     this.throwIfDestroyed(DESTROYED_IN_FLIGHT);
     if (!this.socket || !this.connected) {
       throw new ConnectionLostError("CASConnection is not connected");
@@ -478,9 +487,7 @@ export class CASConnection {
     if (this.socketDead) {
       throw new ConnectionLostError("Socket has been closed by the remote side");
     }
-
-    const combined = Buffer.concat([header, payload]);
-    await this.socketWrite(this.socket, combined);
+    return this.socket;
   }
 
   /**
@@ -567,6 +574,7 @@ export class CASConnection {
       if (scope.sent) {
         if (outcomeUnknownOnFailure) {
           this._failedExchanges += 1;
+          this._unknownOutcomes += 1;
         }
         this.retireSocket();
       }
@@ -574,7 +582,12 @@ export class CASConnection {
     }
 
     let response: Buffer;
+    // Set once the request is handed to the socket: from then on the server may
+    // have received it, whatever happens to the reply.
+    let written = false;
     try {
+      this.assertWritable();
+      written = true;
       if (scope) {
         scope.sent = true;
       }
@@ -585,6 +598,9 @@ export class CASConnection {
       // socket can never be trusted to line up with the next frame.
       if (outcomeUnknownOnFailure) {
         this._failedExchanges += 1;
+        if (written) {
+          this._unknownOutcomes += 1;
+        }
       }
       this.retireSocket();
       throw error;
@@ -604,17 +620,24 @@ export class CASConnection {
   }
 
   /**
-   * Drop the current session so the server discards its uncommitted work. The
-   * statement that led here has an unknown outcome, so it counts as a failed
-   * exchange. Queued: serialized against in-flight requests.
+   * Drop the current session so the server discards its uncommitted work. It
+   * counts as a failed exchange. Queued: serialized against in-flight requests.
+   *
+   * `outcomeUnknown` says whether a request of the statement that led here may
+   * have reached the server without a reply saying what it did (#254): true for
+   * an abort after a request was written or a reply too damaged to read, false
+   * when every request was answered or none was sent yet.
    */
-  async discardSession(): Promise<void> {
+  async discardSession(outcomeUnknown: boolean): Promise<void> {
     return this.enqueue(async () => {
       // Nothing is left to discard, and a destroyed connection is never reused.
       if (this.destroyed) {
         return;
       }
       this._failedExchanges += 1;
+      if (outcomeUnknown) {
+        this._unknownOutcomes += 1;
+      }
       this.retireSocket();
     }, true);
   }
@@ -802,6 +825,17 @@ export class CASConnection {
    */
   get failedExchanges(): number {
     return this._failedExchanges;
+  }
+
+  /**
+   * Requests that were handed to the socket, or whose session was discarded,
+   * without a reply that says what they did: the server may or may not have
+   * run them. Unlike `failedExchanges` this leaves out a request that failed
+   * before any byte of it was written, which the server cannot have seen. A
+   * statement whose run raised this count has an unknown outcome (#254).
+   */
+  get unknownOutcomes(): number {
+    return this._unknownOutcomes;
   }
 
   /**

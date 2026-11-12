@@ -152,6 +152,18 @@ change. It is proposed for 2.0 in
 [ADR 0010](adr/0010-utc-temporal-default-in-2-0.md), with `"local"` kept as an
 explicit setting; set `timezone` explicitly now to be unaffected.
 
+### Unknown outcomes
+
+`outcomeUnknown` on `CubridErrorDetails`, and so on `ConnectionError`, `QueryError`,
+`TransactionError` and their subclasses, is an additive MINOR change
+([#254](https://github.com/cubrid-lab/cubrid-client/issues/254)). It is optional:
+errors the driver raises carry `true` or `false`, and an error it did not classify,
+such as one from a custom connection, has none. No class, `kind`, message or `cause`
+changes, and an abort still rejects with the caller's `signal.reason` unchanged. A
+required property, wrapped abort reasons or a richer outcome than a boolean are left
+to a 2.0 decision. The mapping from each failure to its value is public behavior;
+see [Unknown outcomes](API_REFERENCE.md#unknown-outcomes).
+
 For the complete 1.x line, Node.js 18 and 20 are retained even though they are upstream EOL. [ADR 0006](adr/0006-node-18-support-through-1x.md) records the explicit Node 18 release commitment and independent Node 18 **packed-package** test requirement. A higher Node minimum is reserved for a possible, separately reviewed 2.0 MAJOR, not a 1.x development-tooling update.
 
 ## Node.js, TypeScript and distribution

@@ -291,6 +291,16 @@ try {
 }
 ```
 
+### Was the failed write applied? (`outcomeUnknown`)
+
+A write that failed while its request was on the wire may still have been applied: the server can finish a statement or a `COMMIT` whose reply never arrives. Check `error.outcomeUnknown` before running it again:
+
+- `true`: the request was sent and no reply says what it did, after a lost connection, a `readTimeout`, `destroy()`, a cut or over-limit reply, or a lost `COMMIT` reply. Read the database (for example by the key the write used) before writing again. The driver never resends it.
+- `false`: no request is in doubt, and the error says what happened. It is not a signal to retry: a statement can fail after a reply that reported success.
+- absent: not determined, for example by a custom connection. Treat it as unknown.
+
+A statement cancelled with an `AbortSignal` rejects with your `signal.reason`, which carries no flag; treat it as unknown if the statement was already running. Cancelling on the client side does not roll anything back on the server. See [Unknown outcomes](API_REFERENCE.md#unknown-outcomes) for every case and a reconciliation example.
+
 ### `transaction()` rejected but the data was committed
 
 Two situations leave committed data behind a rejection, so check before retrying:

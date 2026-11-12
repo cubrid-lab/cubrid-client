@@ -150,12 +150,15 @@ async function resolveTable(
   if (found.length === 0) {
     throw new QueryError(
       `Table ${label} was not found, or the connected user may not SELECT from it.`,
+      { outcomeUnknown: false },
     );
   }
 
   if (found.length > 1) {
     const owners = found.map((row) => String(row.owner_name)).join(", ");
-    throw new QueryError(`Table ${table} is owned by several users (${owners}); pass schema.`);
+    throw new QueryError(`Table ${table} is owned by several users (${owners}); pass schema.`, {
+      outcomeUnknown: false,
+    });
   }
 
   const [row] = found;

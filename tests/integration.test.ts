@@ -8026,3 +8026,133 @@ describe("Integration: temporal values under TZ=UTC, Asia/Seoul and America/Los_
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// outcomeUnknown (#254)
+// ---------------------------------------------------------------------------
+
+describe("Integration: outcomeUnknown on uncertain outcomes (#254)", { skip: !available }, () => {
+  const TABLE = "outcome_unknown_254_t";
+  const SLEEP = "SELECT SLEEP(2) AS slept FROM db_root";
+  const setup = createClient(TEST_CONFIG);
+
+  before(async () => {
+    await setup.query(`DROP TABLE IF EXISTS ${TABLE}`);
+    await setup.query(`CREATE TABLE ${TABLE} (id INT PRIMARY KEY, v VARCHAR(20))`);
+  });
+
+  after(async () => {
+    await setup.query(`DROP TABLE IF EXISTS ${TABLE}`);
+    await setup.close();
+  });
+
+  async function count(id: number): Promise<number> {
+    const [row] = await setup.query<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM ${TABLE} WHERE id = ?`,
+      [id],
+    );
+    return Number(row?.n);
+  }
+
+  test("a syntax error has a known outcome", async () => {
+    const client = createClient(TEST_CONFIG);
+    try {
+      await assert.rejects(client.query("SELEC 1"), (error: unknown) => {
+        assert.ok(error instanceof SqlSyntaxError);
+        assert.equal(error.code, -493);
+        assert.equal(error.outcomeUnknown, false);
+        return true;
+      });
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("destroy() during SELECT SLEEP(2) leaves the outcome unknown", async () => {
+    const client = createClient(TEST_CONFIG);
+    await client.ping();
+    const running = client.query(SLEEP);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    client.destroy();
+
+    await assert.rejects(running, (error: unknown) => {
+      assert.ok(error instanceof QueryError);
+      assert.equal(error.kind, "connection-lost");
+      assert.equal(error.outcomeUnknown, true);
+      return true;
+    });
+  });
+
+  test("a duplicate key in transaction() is known; the rollback leaves no row", async () => {
+    await setup.query(`INSERT INTO ${TABLE} (id, v) VALUES (1, 'first')`);
+    const client = createClient(TEST_CONFIG);
+    try {
+      await assert.rejects(
+        client.transaction(async (tx) => {
+          await tx.query(`INSERT INTO ${TABLE} (id, v) VALUES (2, 'tx')`);
+          await tx.query(`INSERT INTO ${TABLE} (id, v) VALUES (1, 'dup')`);
+        }),
+        (error: unknown) => {
+          assert.ok(error instanceof TransactionError);
+          assert.equal(error.kind, "unique-violation");
+          assert.equal(error.outcomeUnknown, false);
+          return true;
+        },
+      );
+      assert.equal(await count(2), 0);
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("an aborted transaction statement is unknown, and reconciling by key never duplicates", async () => {
+    const client = createClient(TEST_CONFIG);
+    const controller = new AbortController();
+    try {
+      const transaction = client.transaction(async (tx) => {
+        await tx.query(`INSERT INTO ${TABLE} (id, v) VALUES (3, 'maybe')`);
+        await tx.query(SLEEP, [], { signal: controller.signal });
+      });
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      controller.abort();
+
+      await assert.rejects(transaction, (error: unknown) => {
+        assert.ok(error instanceof TransactionError);
+        assert.equal((error.cause as Error).name, "AbortError");
+        assert.equal(error.outcomeUnknown, true);
+        return true;
+      });
+
+      // The documented reconciliation: read the row by its key before writing again.
+      // The server rolls the dropped session back once its SLEEP ends; poll for it.
+      const deadline = Date.now() + 15000;
+      while ((await count(3)) !== 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      if ((await count(3)) === 0) {
+        await client.query(`INSERT INTO ${TABLE} (id, v) VALUES (3, 'retried')`);
+      }
+      assert.equal(await count(3), 1);
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("a readTimeout on SELECT SLEEP(2) is unknown, and the next statement runs once", async () => {
+    const client = createClient({ ...TEST_CONFIG, readTimeout: 500 });
+    try {
+      await assert.rejects(client.query(SLEEP), (error: unknown) => {
+        assert.ok(error instanceof ReadTimeoutError);
+        assert.equal(error.outcomeUnknown, true);
+        return true;
+      });
+      // A new session may wait for a free CAS while the old one still sleeps.
+      await client.query(`INSERT INTO ${TABLE} (id, v) VALUES (4, 'after')`, [], {
+        readTimeout: 0,
+      });
+      assert.equal(await count(4), 1);
+    } finally {
+      await client.close();
+    }
+  });
+});

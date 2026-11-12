@@ -253,7 +253,7 @@ test("a destroyed CASConnection never opens another session or reads a late repl
         null,
       );
       assert.equal(await cas.releaseOnSession(generation, REQUEST_HEADER, REQUEST_PAYLOAD), null);
-      await cas.discardSession();
+      await cas.discardSession(true);
       await cas.close();
       await cas.close();
       destroyStarted = Date.now();
