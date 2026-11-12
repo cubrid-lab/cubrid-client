@@ -16,6 +16,16 @@ import { normalizeConfig } from "../src/internals/normalize-config.js";
 import { PacketReader } from "../src/protocol/packet-reader.js";
 import { formatValue } from "../src/protocol/protocol.js";
 import type { ClientOptions } from "../src/types/client.js";
+import {
+  FIXTURE_ZONES,
+  LA_DST,
+  LOCAL_DECODED,
+  LOCAL_MIDNIGHT_SENT,
+  LOCAL_ROUND_TRIP_SHIFT_MS,
+  SENT,
+  STORED,
+  UTC_DECODED,
+} from "./fixtures/temporal-zones.js";
 
 const ZONES = ["UTC", "Asia/Seoul", "America/Los_Angeles", "Asia/Kolkata", "Pacific/Chatham"];
 
@@ -183,4 +193,108 @@ test("timezone option: accepted values, default and validation", () => {
       timezone,
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// #250: the 1.x default and the proposed 2.0 default, as fixtures. The design
+// is docs/adr/0010-utc-temporal-default-in-2-0.md; tests/integration.test.ts
+// checks the same fixtures against a live server.
+// ---------------------------------------------------------------------------
+
+function decodeAll(utcDates: boolean): Record<keyof typeof STORED, string> {
+  const read = (fields: readonly number[]) => new PacketReader(shorts(...fields), 0, utcDates);
+  return {
+    datetime: read(STORED.datetime).parseDatetime().toISOString(),
+    timestamp: read(STORED.timestamp).parseTimestamp().toISOString(),
+    date: read(STORED.date).parseDate().toISOString(),
+    time: read(STORED.time).parseTime().toISOString(),
+  };
+}
+
+test("#250 1.x default: each process TZ decodes the stored fields as its own instant", () => {
+  // A PacketReader built without the flag is the default every client gets.
+  assert.ok(!("timezone" in normalizeConfig({ host: "h", database: "d", user: "u" })));
+  for (const zone of FIXTURE_ZONES) {
+    withTZ(zone, () => {
+      assert.deepEqual(decodeAll(false), LOCAL_DECODED[zone], zone);
+      assert.equal(
+        new PacketReader(shorts(...STORED.datetime)).parseDatetime().toISOString(),
+        LOCAL_DECODED[zone].datetime,
+        zone,
+      );
+    });
+  }
+});
+
+test("#250 proposed 2.0 default (utc): every process TZ decodes the same instants", () => {
+  for (const zone of FIXTURE_ZONES) {
+    withTZ(zone, () => {
+      assert.deepEqual(decodeAll(true), UTC_DECODED, zone);
+    });
+  }
+  // A host already on TZ=UTC reads exactly what it reads today.
+  assert.deepEqual(UTC_DECODED, LOCAL_DECODED.UTC);
+});
+
+test("#250: a Date parameter read back moves by the zone offset under the default only", () => {
+  for (const zone of FIXTURE_ZONES) {
+    withTZ(zone, () => {
+      const literal = formatValue(SENT, true);
+      assert.equal(literal, "DATETIME'2025-06-14 23:30:45.678'", zone);
+      const local = new PacketReader(shorts(...STORED.datetime)).parseDatetime();
+      assert.equal(local.getTime() - SENT.getTime(), LOCAL_ROUND_TRIP_SHIFT_MS[zone], zone);
+      assert.equal(
+        utc(shorts(...STORED.datetime))
+          .parseDatetime()
+          .getTime(),
+        SENT.getTime(),
+        zone,
+      );
+    });
+  }
+});
+
+test("#250: a local-midnight Date is sent as UTC fields, so a DATE east of UTC is the day before", () => {
+  for (const zone of FIXTURE_ZONES) {
+    withTZ(zone, () => {
+      assert.equal(formatValue(new Date(2025, 5, 15), true), LOCAL_MIDNIGHT_SENT[zone].literal);
+      // A UTC-midnight Date names the same day in every zone.
+      assert.equal(
+        formatValue(new Date(Date.UTC(2025, 5, 15)), true),
+        "DATETIME'2025-06-15 00:00:00.000'",
+      );
+    });
+  }
+});
+
+test("#250: wall-clock fields come back through local getters by default, UTC getters with utc", () => {
+  const fields = (date: Date, inUtc: boolean) =>
+    inUtc
+      ? [date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate(), date.getUTCHours()]
+      : [date.getFullYear(), date.getMonth() + 1, date.getDate(), date.getHours()];
+  for (const zone of FIXTURE_ZONES) {
+    withTZ(zone, () => {
+      const stored = shorts(...STORED.datetime);
+      assert.deepEqual(fields(new PacketReader(stored).parseDatetime(), false), [2025, 6, 14, 23]);
+      assert.deepEqual(fields(utc(stored).parseDatetime(), true), [2025, 6, 14, 23]);
+    });
+  }
+});
+
+test("#250: DST gap and overlap in America/Los_Angeles: local guesses, utc keeps the fields", () => {
+  withTZ("America/Los_Angeles", () => {
+    for (const { fields, localIso, utcIso } of [LA_DST.gap, LA_DST.overlap]) {
+      assert.equal(new PacketReader(shorts(...fields)).parseDatetime().toISOString(), localIso);
+      assert.equal(
+        utc(shorts(...fields))
+          .parseDatetime()
+          .toISOString(),
+        utcIso,
+      );
+    }
+  });
+  // The overlap's fields stand for two instants; a zone-less value cannot say which.
+  const [pdt, pst] = LA_DST.overlap.instants;
+  assert.notEqual(pdt, pst);
+  assert.equal(LA_DST.overlap.localIso, pdt);
 });

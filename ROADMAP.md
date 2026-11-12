@@ -74,6 +74,10 @@ and 26; Node 18 and 20 are deprecated and a removal candidate for 2.0, see
 1.x. [API stability](docs/API_STABILITY.md) requires a MAJOR for incompatible
 changes, including increasing the Node.js minimum. A build-tool upgrade
 (e.g. `tsup`) does not by itself justify changing the consumer Node.js floor.
+Reading DATE, TIME, TIMESTAMP and DATETIME as UTC by default (`timezone: "utc"`)
+is a 2.0 candidate ([ADR 0010](docs/adr/0010-utc-temporal-default-in-2-0.md),
+[#250](https://github.com/cubrid-lab/cubrid-client/issues/250)); every 1.x release
+keeps the `"local"` default.
 
 See the [TypeScript type mapping](docs/TYPES.md),
 [verified support matrix](docs/SUPPORT_MATRIX.md) and

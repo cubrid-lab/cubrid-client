@@ -84,6 +84,21 @@ console.log(rows);
 await db.close();
 ```
 
+> **Date and time zones.** `Date` parameters are sent as their **UTC** fields,
+> but DATE, TIME, TIMESTAMP and DATETIME values are read back in the **local
+> zone of the Node.js process** by default (`timezone: "local"`, the 1.x
+> behavior). On a host that is not on UTC a `Date` you write does not come back
+> as the same instant: under `TZ=Asia/Seoul` it reads back 9 hours early. To read
+> the fields as UTC, the zone they were written in, opt in:
+>
+> ```ts
+> const db = createClient({ host: "localhost", database: "demodb", user: "dba", timezone: "utc" });
+> ```
+>
+> The 1.x default does not change. `"utc"` is proposed as the 2.0 default; see
+> [date and time values](docs/TYPES.md#date-and-time-values) and
+> [ADR 0010](docs/adr/0010-utc-temporal-default-in-2-0.md).
+
 See [CUBRID-to-JavaScript type behavior](docs/TYPES.md) for the current
 result and input mapping, including `BIGINT` as `bigint`, decimal `NUMERIC`
 as `string`, SET/MULTISET/SEQUENCE collections as arrays, and values
