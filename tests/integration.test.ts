@@ -355,6 +355,152 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
   });
 
   // -------------------------------------------------------------------------
+  // Text charsets (#238)
+  // -------------------------------------------------------------------------
+
+  describe("text charsets (#238)", () => {
+    const CAFE = "caf\u00e9";
+    const latin1 = { ...TEST_CONFIG, charset: "iso-8859-1" as const };
+    const isIso88591 = async (): Promise<boolean> => {
+      const client = createClient(TEST_CONFIG);
+      try {
+        const [row] = await client.query("SELECT CHARSET('x') AS cs FROM db_root");
+        return row?.cs === "iso88591";
+      } finally {
+        await client.close();
+      }
+    };
+
+    test("utf-8, the default, keeps UTF-8 bytes on an iso88591 database", async (t) => {
+      if (!(await isIso88591())) return t.skip("testdb is not iso88591");
+      for (const options of [TEST_CONFIG, { ...TEST_CONFIG, charset: "utf-8" as const }]) {
+        const client = createClient(options);
+        try {
+          await client.execute("DROP TABLE IF EXISTS cc238_text");
+          await client.execute("CREATE TABLE cc238_text (id INT, s VARCHAR(40))");
+          await client.executePrepared("INSERT INTO cc238_text VALUES (?, ?)", [1, CAFE]);
+          await client.execute("INSERT INTO cc238_text VALUES (?, ?)", [2, CAFE]);
+          const rows = await client.query(
+            "SELECT s, HEX(s) AS h, LENGTH(s) AS l, CHR(233) AS c FROM cc238_text ORDER BY id",
+          );
+          // The server keeps the UTF-8 bytes as five Latin-1 characters, and the
+          // Latin-1 byte E9 is not UTF-8: unchanged 1.x behavior.
+          const expected = { s: CAFE, h: "636166C3A9", l: 5, c: "\ufffd" };
+          assert.deepEqual(rows, [expected, expected], JSON.stringify(options));
+        } finally {
+          await client.execute("DROP TABLE IF EXISTS cc238_text").catch(() => {});
+          await client.close();
+        }
+      }
+    });
+
+    test("iso-8859-1 writes and reads Latin-1 and decodes each column in its charset", async (t) => {
+      if (!(await isIso88591())) return t.skip("testdb is not iso88591");
+      const client = createClient(latin1);
+      try {
+        await client.execute("DROP TABLE IF EXISTS cc238_text");
+        await client.execute(
+          "CREATE TABLE cc238_text (id INT, s VARCHAR(40), u VARCHAR(40) CHARSET utf8, " +
+            `e ENUM('${CAFE}', 'x'), m SET(VARCHAR(10)), c CLOB)`,
+        );
+        await client.executePrepared("INSERT INTO cc238_text VALUES (?, ?, ?, ?, ?, ?)", [
+          1,
+          CAFE,
+          CAFE,
+          CAFE,
+          null,
+          clob(CAFE),
+        ]);
+        await client.execute(`INSERT INTO cc238_text (id, s, u, m) VALUES (2, ?, ?, {'${CAFE}'})`, [
+          CAFE,
+          CAFE,
+        ]);
+        const rows = await client.query(
+          "SELECT s, HEX(s) AS hs, LENGTH(s) AS ls, u, HEX(u) AS hu, e, m, c, " +
+            "HEX(CLOB_TO_CHAR(c)) AS hc, CHR(233) AS chr " +
+            `FROM cc238_text ORDER BY id`,
+        );
+        const common = {
+          s: CAFE,
+          hs: "636166E9",
+          ls: 4,
+          u: CAFE,
+          hu: "636166C3A9",
+          chr: CAFE.at(-1),
+        };
+        assert.deepEqual(rows, [
+          { ...common, e: CAFE, m: null, c: CAFE, hc: "636166E9" },
+          { ...common, e: null, m: [CAFE], c: null, hc: null },
+        ]);
+
+        // A bound `SELECT ?` cell states its own charset; a label is SQL text.
+        const result = await client.queryResultPrepared(`SELECT ? AS [${CAFE}]`, [CAFE]);
+        assert.deepEqual(result.rows, [{ [CAFE]: CAFE }]);
+        assert.equal(result.columns[0]?.name, CAFE);
+      } finally {
+        await client.execute("DROP TABLE IF EXISTS cc238_text").catch(() => {});
+        await client.close();
+      }
+    });
+
+    test("iso-8859-1 refuses text above U+00FF before sending it", async (t) => {
+      if (!(await isIso88591())) return t.skip("testdb is not iso88591");
+      const client = createClient(latin1);
+      try {
+        await client.execute("DROP TABLE IF EXISTS cc238_text");
+        await client.execute("CREATE TABLE cc238_text (s VARCHAR(40), c CLOB)");
+        const refusals: Array<() => Promise<unknown>> = [
+          () => client.execute("INSERT INTO cc238_text (s) VALUES ('\u2603')"),
+          () => client.execute("INSERT INTO cc238_text (s) VALUES (?)", ["\u2603"]),
+          () => client.executePrepared("INSERT INTO cc238_text (s) VALUES (?)", ["\u2603"]),
+        ];
+        for (const refused of refusals) {
+          await assert.rejects(refused, (error: Error) => {
+            assert.ok(error instanceof QueryError);
+            assert.match(String((error.cause as Error).cause), /cannot encode/);
+            return true;
+          });
+        }
+        // As for clob() content that is not UTF-8 in the default mode: a TypeError.
+        await assert.rejects(
+          () => client.executePrepared("INSERT INTO cc238_text (c) VALUES (?)", [clob("\u2603")]),
+          (error: Error) => error instanceof TypeError && /cannot encode/.test(error.message),
+        );
+        // COUNT(*) is INTEGER on 10.2 and BIGINT on 11.x.
+        const [count] = await client.query("SELECT COUNT(*) AS n FROM cc238_text");
+        assert.equal(Number(count?.n), 0);
+      } finally {
+        await client.execute("DROP TABLE IF EXISTS cc238_text").catch(() => {});
+        await client.close();
+      }
+    });
+
+    // Needs a database created with `cubrid createdb <name> en_US.utf8`.
+    const utf8Database = process.env.CUBRID_TEST_UTF8_DATABASE;
+    test("on a utf8 database text round-trips as UTF-8 and iso-8859-1 reads utf8 columns as UTF-8", {
+      skip: !utf8Database && "set CUBRID_TEST_UTF8_DATABASE",
+    }, async () => {
+      const text = `${CAFE} \ud55c\uae00 \u2603`;
+      const writer = createClient({ ...TEST_CONFIG, database: utf8Database! });
+      const reader = createClient({ ...latin1, database: utf8Database! });
+      try {
+        await writer.execute("DROP TABLE IF EXISTS cc238_text");
+        await writer.execute("CREATE TABLE cc238_text (id INT, s VARCHAR(40))");
+        await writer.executePrepared("INSERT INTO cc238_text VALUES (?, ?)", [1, text]);
+        await writer.execute("INSERT INTO cc238_text VALUES (?, ?)", [2, text]);
+        const sql = "SELECT s, LENGTH(s) AS l, CHARSET(s) AS cs FROM cc238_text ORDER BY id";
+        const expected = { s: text, l: 9, cs: "utf8" };
+        assert.deepEqual(await writer.query(sql), [expected, expected]);
+        // The column says utf8, so a Latin-1 client still reads it as UTF-8.
+        assert.deepEqual(await reader.query(sql), [expected, expected]);
+      } finally {
+        await writer.execute("DROP TABLE IF EXISTS cc238_text").catch(() => {});
+        await Promise.allSettled([writer.close(), reader.close()]);
+      }
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // NULL handling
   // -------------------------------------------------------------------------
 

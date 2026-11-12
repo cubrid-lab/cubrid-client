@@ -53,7 +53,8 @@ public class JdbcRunner {
     @SuppressWarnings("unchecked")
     Map<String, Object> corpus =
         (Map<String, Object>) new Json(Files.readString(Path.of(args[0]))).parse();
-    String url = "jdbc:cubrid:" + args[2] + ":" + args[3] + ":" + args[4] + ":dba::?charset=utf-8";
+    String base = "jdbc:cubrid:" + args[2] + ":" + args[3] + ":" + args[4] + ":dba::?charset=";
+    String url = base + "utf-8";
     Class.forName("cubrid.jdbc.driver.CUBRIDDriver");
 
     Map<String, Object> out = new LinkedHashMap<>();
@@ -72,7 +73,22 @@ public class JdbcRunner {
         @SuppressWarnings("unchecked")
         Map<String, Object> testCase = (Map<String, Object>) c;
         long started = System.nanoTime();
-        results.add(runCase(testCase, a, b));
+        Object charset = testCase.get("charset");
+        if (charset == null || testCase.containsKey("unverified")) {
+          results.add(runCase(testCase, a, b));
+        } else {
+          // Its own pair of connections, so the charset applies to this case only.
+          try (Connection ca = DriverManager.getConnection(base + charset);
+              Connection cb = DriverManager.getConnection(base + charset)) {
+            results.add(runCase(testCase, ca, cb));
+          } catch (SQLException e) {
+            Map<String, Object> failed = new LinkedHashMap<>();
+            failed.put("id", testCase.get("id"));
+            failed.put("status", "failed");
+            failed.put("failure", e.toString());
+            results.add(failed);
+          }
+        }
         System.err.printf("jdbc %-40s %6d ms%n", testCase.get("id"), (System.nanoTime() - started) / 1000000);
       }
     }

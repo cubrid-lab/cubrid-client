@@ -7,6 +7,9 @@
  *   is carried by a representation listed as intentional, with its reason.
  * - `known-limitation`: values differ, and the case declares `knownLimitation`
  *   with the local issue.
+ * - `intentional-difference`: values differ by a documented design decision,
+ *   declared as `intentional` with the issue or ADR that records it. Unlike
+ *   `intentional-node-representation`, the values are not the same.
  * - `defect`: values differ without a declaration, or a representation pair is
  *   in neither table. A verified defect recorded as `expectedDefect` (not fixed
  *   by this comparison) keeps this classification but does not fail the run.
@@ -24,6 +27,7 @@ export type Classification =
   | "equivalent"
   | "intentional-node-representation"
   | "known-limitation"
+  | "intentional-difference"
   | "defect"
   | "unverified";
 
@@ -179,10 +183,12 @@ export function compare(corpus: Corpus, jdbc: RunnerOutput, ts: RunnerOutput): C
       report.differences.push(`representation JDBC ${jr}, TS ${tr} is in neither table`);
     }
 
-    const declaration = spec.knownLimitation ?? spec.expectedDefect;
+    const declaration = spec.knownLimitation ?? spec.intentional ?? spec.expectedDefect;
     const label = spec.knownLimitation
       ? `known limitation ${spec.knownLimitation.issue}`
-      : `recorded defect ${spec.expectedDefect?.issue ?? "(no issue yet)"}`;
+      : spec.intentional
+        ? `intentional difference ${spec.intentional.issue}`
+        : `recorded defect ${spec.expectedDefect?.issue ?? "(no issue yet)"}`;
     if (report.differences.length > 0) {
       const covered = (d: string) => {
         const step = /^step (\d+):/.exec(d)?.[1];
@@ -191,7 +197,11 @@ export function compare(corpus: Corpus, jdbc: RunnerOutput, ts: RunnerOutput): C
           (step !== undefined && declaration.steps.includes(Number(step)))
         );
       };
-      report.classification = spec.knownLimitation ? "known-limitation" : "defect";
+      report.classification = spec.knownLimitation
+        ? "known-limitation"
+        : spec.intentional
+          ? "intentional-difference"
+          : "defect";
       if (declaration) report.reasons.unshift(`${label}: ${declaration.reason}`);
       if (!declaration || !report.differences.every(covered)) report.unexpected = true;
       if (spec.expectedDefect && spec.expectedDefect.issue === null) {
@@ -209,6 +219,7 @@ export function compare(corpus: Corpus, jdbc: RunnerOutput, ts: RunnerOutput): C
     equivalent: 0,
     "intentional-node-representation": 0,
     "known-limitation": 0,
+    "intentional-difference": 0,
     defect: 0,
     unverified: 0,
     unexpected: cases.filter((c) => c.unexpected).length,

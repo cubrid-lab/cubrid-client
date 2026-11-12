@@ -104,6 +104,18 @@ test("a known limitation is classified with its issue", () => {
   assert.match(stale.cases[0]?.warnings.join() ?? "", /did not reproduce/);
 });
 
+test("an intentional difference is its own class, limited to its declared steps", () => {
+  const declared = { intentional: { issue: "#238", reason: "r", steps: [1] } };
+  const report = run(declared, rows(["a"], ["Integer"]), rows(["b"], ["number"]));
+  assert.equal(report.cases[0]?.classification, "intentional-difference");
+  assert.match(report.cases[0]?.reasons[0] ?? "", /intentional difference #238: r/);
+  assert.equal(report.counts["intentional-difference"], 1);
+  assert.equal(report.ok, true);
+
+  const elsewhere = { intentional: { issue: "#238", reason: "r", steps: [2] } };
+  assert.equal(run(elsewhere, rows(["a"], ["Integer"]), rows(["b"], ["number"])).ok, false);
+});
+
 test("a runner failure or a missing case fails the run", () => {
   const failed: CaseResult = { id: "c", status: "failed", failure: "boom" };
   assert.equal(run({}, failed, rows(["1"], ["number"])).ok, false);

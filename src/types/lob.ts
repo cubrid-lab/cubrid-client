@@ -1,6 +1,7 @@
 import type { Readable } from "node:stream";
 import { TextDecoder } from "node:util";
 
+import { NOT_LATIN1, type TextCharset } from "../protocol/charset.js";
 import type { QueryParam } from "./query.js";
 
 /** Content for {@link blob}: bytes, or a stream of byte chunks read once. */
@@ -8,7 +9,9 @@ export type BlobSource = Buffer | Uint8Array | AsyncIterable<Buffer | Uint8Array
 
 /**
  * Content for {@link clob}: text, UTF-8 bytes, or a stream of either read once.
- * Bytes must be valid UTF-8 and text must not hold a lone surrogate.
+ * Bytes must be valid UTF-8 and text must not hold a lone surrogate. With
+ * `ClientOptions.charset` "iso-8859-1" the bytes are ISO-8859-1 instead, sent as
+ * they are, and text must not hold a character above U+00FF.
  */
 export type ClobSource = string | Buffer | AsyncIterable<string | Buffer | Uint8Array> | Readable;
 
@@ -58,6 +61,8 @@ export function blob(source: BlobSource): LobParam {
  * encoded, a Buffer must already be UTF-8, and an AsyncIterable or Readable may
  * yield either and is read once. Content that is not valid UTF-8 or text with a
  * lone surrogate fails the statement with a TypeError, and nothing is stored.
+ * With `ClientOptions.charset` "iso-8859-1" it is stored as ISO-8859-1: see
+ * {@link ClobSource}.
  */
 export function clob(source: ClobSource): LobParam {
   if (typeof source !== "string" && !Buffer.isBuffer(source) && !isAsyncIterable(source)) {
@@ -140,10 +145,22 @@ const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[
  * shorter. A stream source is read with `for await`, so it is pulled only as fast
  * as the chunks are sent; small chunks are merged and large ones sliced. A CLOB
  * is checked as it goes: bytes must be UTF-8 and text must not hold a lone
- * surrogate. A chunk is valid only until the next one is asked for.
+ * surrogate. With charset "iso-8859-1" a CLOB is that charset instead: bytes
+ * are sent as they are and text must not hold a character above U+00FF.
+ * A chunk is valid only until the next one is asked for.
  */
-export async function* lobChunks(param: LobParam, size: number): AsyncGenerator<Buffer> {
-  yield* rechunk(param.kind === "blob" ? blobPieces(param.source) : clobPieces(param.source), size);
+export async function* lobChunks(
+  param: LobParam,
+  size: number,
+  charset: TextCharset = "utf-8",
+): AsyncGenerator<Buffer> {
+  const pieces =
+    param.kind === "blob"
+      ? blobPieces(param.source)
+      : charset === "iso-8859-1"
+        ? latin1ClobPieces(param.source)
+        : clobPieces(param.source);
+  yield* rechunk(pieces, size);
 }
 
 async function* rechunk(pieces: AsyncIterable<Buffer>, size: number): AsyncGenerator<Buffer> {
@@ -232,6 +249,29 @@ async function* clobPieces(source: BlobSource | ClobSource): AsyncGenerator<Buff
   checkUtf8(decoder);
 }
 
+/** clobPieces() for charset "iso-8859-1": one byte per character, so nothing spans pieces. */
+async function* latin1ClobPieces(source: BlobSource | ClobSource): AsyncGenerator<Buffer> {
+  const pieces: Iterable<unknown> | AsyncIterable<unknown> =
+    typeof source === "string" || Buffer.isBuffer(source) ? [source] : source;
+  for await (const piece of pieces) {
+    if (typeof piece === "string") {
+      for (let at = 0; at < piece.length; at += TEXT_SLICE) {
+        const slice = piece.slice(at, at + TEXT_SLICE);
+        if (NOT_LATIN1.test(slice)) {
+          throw new LobParamError(CLOB_NOT_LATIN1);
+        }
+        yield Buffer.from(slice, "latin1");
+      }
+    } else if (piece instanceof Uint8Array) {
+      yield asBuffer(piece);
+    } else {
+      throw new LobParamError(
+        `a clob() stream yielded a ${describe(piece)}; only string, Buffer and Uint8Array chunks are accepted`,
+      );
+    }
+  }
+}
+
 /** UTF-8 of `text`, a slice at a time, never splitting a surrogate pair. */
 function* encodeText(text: string): Generator<Buffer> {
   for (let at = 0; at < text.length; ) {
@@ -260,6 +300,9 @@ function checkUtf8(decoder: TextDecoder, bytes?: Buffer): void {
     throw new LobParamError("clob() content is not valid UTF-8", { cause: error });
   }
 }
+
+export const CLOB_NOT_LATIN1 =
+  'clob() text has a character above U+00FF, which charset "iso-8859-1" cannot encode';
 
 const LONE_SURROGATE_REFUSED = "clob() text holds a lone surrogate, which has no UTF-8 encoding";
 

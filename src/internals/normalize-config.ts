@@ -1,3 +1,4 @@
+import { assertValidCharset } from "../protocol/charset.js";
 import { assertValidCredentials } from "../protocol/protocol.js";
 import type {
   ClientConfig,
@@ -172,7 +173,7 @@ export function assertValidQueryOptions(options: QueryOptions | undefined): void
 }
 
 export function normalizeConfig(options: ClientOptions): ClientConfig {
-  const { readTimeout, maxLobBytes, maxReplyBytes, fetchSize, timezone } = options;
+  const { readTimeout, maxLobBytes, maxReplyBytes, fetchSize, timezone, charset } = options;
   const password = options.password ?? "";
 
   assertValidCredentials({ database: options.database, user: options.user, password });
@@ -182,6 +183,7 @@ export function normalizeConfig(options: ClientOptions): ClientConfig {
   assertValidMaxReplyBytes(maxReplyBytes);
   assertValidFetchSize(fetchSize);
   assertValidTimezone(timezone);
+  assertValidCharset(charset);
   assertValidTransactionOptions(options);
 
   return {
@@ -196,6 +198,7 @@ export function normalizeConfig(options: ClientOptions): ClientConfig {
     ...(maxReplyBytes !== undefined && { maxReplyBytes }),
     ...(fetchSize !== undefined && { fetchSize }),
     ...(timezone !== undefined && { timezone }),
+    ...(charset !== undefined && { charset }),
     ...pickTransactionOptions(options),
     maxConnectionRetryCount: options.maxConnectionRetryCount,
     ssl: options.ssl,

@@ -180,10 +180,10 @@
     {
       "id": "text-non-ascii-iso88591-database",
       "area": "select",
-      "expectedDefect": {
+      "intentional": {
         "issue": "#238",
         "steps": [1, 3, 5],
-        "reason": "cubrid-client always decodes CHAR/VARCHAR bytes as UTF-8. The CUBRID Docker images create testdb with charset iso88591, so the server stores the UTF-8 bytes that both drivers send (steps 2 and 4 agree on HEX and LENGTH) as iso88591 characters, and JDBC decodes them in that column charset. A byte that is not UTF-8, such as CHR(233), becomes U+FFFD in cubrid-client. Recorded, not fixed, by #118."
+        "reason": "Both drivers run in their default mode and send UTF-8, which the iso88591 testdb of the Docker images stores as is (steps 2 and 4 agree on HEX and LENGTH). cubrid-client's default charset \"utf-8\" reads every text value as UTF-8, so its own text round-trips and CHR(233), a byte that is not UTF-8, is U+FFFD. JDBC decodes in the column charset and reads its own text back as mojibake. Keeping the 1.x default is the decision of #238 (docs/TYPES.md#text-and-character-sets); charset \"iso-8859-1\" matches JDBC, see text-latin1-charset-option."
       },
       "setup": ["CREATE TABLE jp_text (id INT PRIMARY KEY, s VARCHAR(40))"],
       "cleanup": ["DROP TABLE IF EXISTS jp_text"],
@@ -203,6 +203,31 @@
           "params": [{ "t": "int", "v": 1 }, { "t": "string", "v": "caf\u00e9" }]
         },
         { "op": "query", "sql": "SELECT s, HEX(s) AS h FROM jp_text" }
+      ]
+    },
+    {
+      "id": "text-latin1-charset-option",
+      "area": "select",
+      "charset": "iso-8859-1",
+      "setup": ["CREATE TABLE jp_text_latin1 (id INT PRIMARY KEY, s VARCHAR(40))"],
+      "cleanup": ["DROP TABLE IF EXISTS jp_text_latin1"],
+      "steps": [
+        { "op": "query", "sql": "SELECT CHR(233) AS e, HEX(CHR(233)) AS h, CHARSET('x') AS cs" },
+        {
+          "op": "query",
+          "sql": "SELECT 'caf\u00e9' AS lit, HEX('caf\u00e9') AS h, LENGTH('caf\u00e9') AS l"
+        },
+        {
+          "op": "execPrepared",
+          "sql": "INSERT INTO jp_text_latin1 VALUES (?, ?)",
+          "params": [{ "t": "int", "v": 1 }, { "t": "string", "v": "caf\u00e9 \u00ff" }]
+        },
+        { "op": "query", "sql": "SELECT s, HEX(s) AS h, LENGTH(s) AS l FROM jp_text_latin1" },
+        {
+          "op": "queryPrepared",
+          "sql": "SELECT ? AS p",
+          "params": [{ "t": "string", "v": "\u00e9" }]
+        }
       ]
     },
     {

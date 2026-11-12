@@ -138,6 +138,24 @@ an open transaction was rolled back by the server. Raise `maxReplyBytes` if the
 row is expected, or select its large columns in separate statements. BLOB and
 CLOB columns never cause it; they are bounded by `maxLobBytes`.
 
+### Text reads as mojibake or U+FFFD
+
+Check the database charset with `SELECT CHARSET('x')` and the
+[`charset`](API_REFERENCE.md#clientoptions) option (#238); see
+[text and character sets](TYPES.md#text-and-character-sets).
+
+- **`CHR(233)` or text written by another client reads as U+FFFD**, on an
+  `iso88591` database with the default `charset`: those are Latin-1 bytes, and the
+  default reads UTF-8. Use `charset: "iso-8859-1"` if every client writes Latin-1;
+  text this client wrote with the default then reads as mojibake, so pick one.
+- **A `CHARSET utf8` column reads as `'cafÃ©'`** on an `iso88591` database with
+  the default `charset`: the server converted the UTF-8 bytes from the session's
+  iso88591. `charset: "iso-8859-1"` reads and writes such a column correctly.
+- **`QueryError` with `above U+00FF ... cannot encode`**: `charset: "iso-8859-1"`
+  cannot send that character. Nothing was sent.
+- **Text stored as an empty or cut string, or a `utf8 text is not valid UTF-8`
+  cause**: `charset: "iso-8859-1"` against a `utf8` database. Use the default.
+
 ### `QueryError` with `CUBRID LOB read failed (-1020)`
 
 The server no longer has the file behind a BLOB or CLOB value. There are two usual

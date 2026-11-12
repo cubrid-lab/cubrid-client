@@ -36,7 +36,7 @@ import {
   writeLobWrite,
   writePrepare,
 } from "../src/protocol/protocol.js";
-import { blob, clob } from "../src/types/lob.js";
+import { blob, clob, lobChunks } from "../src/types/lob.js";
 import { ZonedDateTime } from "../src/types/zoned-date-time.js";
 import { CAPTURED_FRAMES, type CapturedFrame } from "./fixtures/collection-frames.js";
 import { EXECUTE_ARRAY_FRAMES, PREPARED_FRAMES } from "./fixtures/dml-frames.js";
@@ -1772,4 +1772,126 @@ test("a stream source given twice to one statement is refused before anything is
   // A Buffer is not read once, so it may appear twice.
   const bytes = Buffer.from("a");
   assert.equal(encodePreparedParams([blob(bytes), blob(bytes)]).lobs?.length, 2);
+});
+
+// ---------------------------------------------------------------------------
+// Text charsets, from a reply captured on the iso88591 testdb (#238)
+// ---------------------------------------------------------------------------
+
+/** The captured reply with each `[from, to]` hex pair replaced; each `from` must occur once. */
+function latin1TextWith(...edits: Array<[string, string]>): Buffer {
+  let hex = CAPTURED_FRAMES.latin1Text.hex;
+  for (const [from, to] of edits) {
+    assert.equal(hex.split(from).length, 2, from);
+    hex = hex.replace(from, to);
+  }
+  return Buffer.from(hex, "hex");
+}
+
+/** Column u8: its type (VARCHAR, charset 5) and its cell (C3 A9 and the NUL). */
+const U8_TYPE = "8502000000000004";
+const U8_CELL = "00000003c3a900";
+
+test("the column charset sits in the low bits of the literal first type byte", () => {
+  const reply = Buffer.from(CAPTURED_FRAMES.latin1Text.hex, "hex");
+  // VARCHAR iso88591 (3), VARCHAR utf8 (5), SET (16) OF VARCHAR iso88591, CHAR iso88591.
+  for (const type of ["830200003fffffff", "8502000000000004", "a302000000000000", "830100"]) {
+    assert.ok(reply.includes(Buffer.from(type, "hex")), type);
+  }
+  const { columns } = parsePrepareAndExecute(reply, 7);
+  assert.deepEqual(
+    columns.map((c) => [c.name, c.type, c.elementType, c.charset]),
+    [
+      ["l1", 2, undefined, 3],
+      ["u8", 2, undefined, 5],
+      ["st", 16, 2, 3],
+      ["t", 1, undefined, 3],
+    ],
+  );
+});
+
+test("utf-8 decodes every text value as UTF-8 and ignores the column charset", () => {
+  const { rows } = parsePrepareAndExecute(
+    Buffer.from(CAPTURED_FRAMES.latin1Text.hex, "hex"),
+    7,
+    false,
+    "utf-8",
+  );
+  // E9 alone is not UTF-8: the unchanged 1.x result is U+FFFD.
+  assert.deepEqual(rows, [{ l1: "�", u8: "é", st: ["�"], t: "after" }]);
+});
+
+test("iso-8859-1 decodes each value in the charset its column reports", () => {
+  const decode = (reply: Buffer) => parsePrepareAndExecute(reply, 7, false, "iso-8859-1").rows[0];
+  assert.deepEqual(decode(Buffer.from(CAPTURED_FRAMES.latin1Text.hex, "hex")), {
+    l1: "\u00e9",
+    u8: "\u00e9",
+    st: ["\u00e9"],
+    t: "after",
+  });
+  // EUC-KR (charset 4): C7 D1 is U+D55C.
+  const eucKr = latin1TextWith([U8_TYPE, "8402000000000004"], [U8_CELL, "00000003c7d100"]);
+  assert.equal(decode(eucKr)?.u8, "\ud55c");
+});
+
+test("iso-8859-1 refuses a utf8 or euckr value its charset cannot decode, never U+FFFD", () => {
+  const decode = (reply: Buffer) => parsePrepareAndExecute(reply, 7, false, "iso-8859-1");
+  for (const reply of [
+    latin1TextWith([U8_CELL, "00000003e9ff00"]),
+    latin1TextWith([U8_TYPE, "8402000000000004"], [U8_CELL, "00000003ff0100"]),
+    // Bytes the WHATWG euc-kr decoder (windows-949) accepts but EUC-KR does not:
+    // 81 41 is a UHC extension pair, 80 80 would become two C1 controls.
+    latin1TextWith([U8_TYPE, "8402000000000004"], [U8_CELL, "00000003814100"]),
+    latin1TextWith([U8_TYPE, "8402000000000004"], [U8_CELL, "00000003808000"]),
+  ]) {
+    assert.throws(
+      () => decode(reply),
+      (error: Error) =>
+        error instanceof UnsupportedValueError &&
+        /column "u8" \(wire type 2, 3 bytes\)/.test(error.message),
+    );
+  }
+  // The utf-8 mode keeps its 1.x replacement.
+  const reply = latin1TextWith([U8_CELL, "00000003e9ff00"]);
+  assert.equal(parsePrepareAndExecute(reply, 7).rows[0]?.u8, "\ufffd\ufffd");
+});
+
+test("iso-8859-1 sends SQL text and string binds as Latin-1 and refuses text above U+00FF", () => {
+  const latin1Sql = writePrepare("SELECT '\u00e9'", Buffer.alloc(4), "iso-8859-1").payload;
+  // int32 length 11 (10 bytes and the NUL), then the Latin-1 bytes.
+  assert.ok(latin1Sql.includes(Buffer.from("0000000b53454c4543542027e92700", "hex")));
+  const utf8Sql = writePrepare("SELECT '\u00e9'", Buffer.alloc(4)).payload;
+  assert.ok(utf8Sql.includes(Buffer.from("0000000c53454c4543542027c3a92700", "hex")));
+
+  // CHAR (1) bind: type, then int32 length 3, E9 FF and the NUL.
+  assert.equal(
+    encodePreparedParams(["\u00e9\u00ff"], "iso-8859-1").bytes.toString("hex"),
+    "000000010100000003e9ff00",
+  );
+  assert.equal(encodePreparedParams(["\u00e9"]).bytes.toString("hex"), "000000010100000003c3a900");
+
+  for (const call of [
+    () => writePrepare("SELECT '\u2603'", Buffer.alloc(4), "iso-8859-1"),
+    () => encodePreparedParams(["a\u0100"], "iso-8859-1"),
+  ]) {
+    assert.throws(call, /above U\+00FF at offset \d+, which charset "iso-8859-1" cannot encode/);
+  }
+});
+
+test("iso-8859-1 clob() content: text as Latin-1, bytes as they are, nothing above U+00FF", async () => {
+  const chunks = async (source: Parameters<typeof clob>[0]) => {
+    const out: Buffer[] = [];
+    for await (const chunk of lobChunks(clob(source), 4, "iso-8859-1"))
+      out.push(Buffer.from(chunk));
+    return out.map((chunk) => chunk.toString("hex"));
+  };
+  assert.deepEqual(await chunks("h\u00e9\u00ff!x"), ["68e9ff21", "78"]);
+  // Not UTF-8, which the default refuses: in ISO-8859-1 every byte is a character.
+  assert.deepEqual(await chunks(Buffer.from("ffa1", "hex")), ["ffa1"]);
+  await assert.rejects(chunks("\u0100"), /character above U\+00FF/);
+  await assert.rejects(async () => {
+    for await (const _ of lobChunks(clob(Buffer.from("ffa1", "hex")), 4)) {
+      // drain
+    }
+  }, /not valid UTF-8/);
 });

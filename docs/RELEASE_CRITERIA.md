@@ -34,9 +34,8 @@ Test counts, coverage percentages, a pushed tag or a green ordinary PR run are
 
 - Claim compatibility only for the CUBRID versions in criterion 1 and the Node
   lines in criterion 8, and only for behavior those runs exercise.
-- A difference recorded as a defect or limitation in the JDBC corpus, such as
-  [#238](https://github.com/cubrid-lab/cubrid-client/issues/238), must appear in
-  the release notes while it is open.
+- A difference recorded as a defect or limitation in the JDBC corpus must appear
+  in the release notes while it is open.
 - Node 18 and 20 stay supported throughout 1.x
   ([ADR 0006](adr/0006-node-18-support-through-1x.md)).
 

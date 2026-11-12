@@ -4,6 +4,7 @@
  * All numeric values are read in big-endian byte order.
  */
 
+import type { TextCharset } from "./charset.js";
 import {
   SIZE_BYTE,
   SIZE_CAS_INFO,
@@ -21,11 +22,13 @@ export class PacketReader {
   /**
    * @param utcDates decode DATE, TIME, TIMESTAMP and DATETIME fields as UTC
    * instead of in the process's local time zone (`ClientOptions.timezone`).
+   * @param charset the `ClientOptions.charset` text is decoded with.
    */
   constructor(
     data: Buffer,
     offset = 0,
     private readonly utcDates = false,
+    readonly charset: TextCharset = "utf-8",
   ) {
     this.buf = data;
     this.offset = offset;
@@ -89,20 +92,37 @@ export class PacketReader {
     return data;
   }
 
-  /** Read `length` bytes and return as a UTF-8 string, stripping trailing null. */
+  /**
+   * Read `length` bytes as a UTF-8 string, stripping trailing null, whatever
+   * the charset option: server messages, the version and numeric text.
+   */
   parseNullTermString(length: number): string {
+    return this.parseNullTermBytes(length).toString("utf-8");
+  }
+
+  /**
+   * Read `length` bytes as text in the charset option, stripping trailing
+   * null: names the server echoes from SQL text, such as column labels.
+   */
+  parseClientString(length: number): string {
+    return this.parseNullTermBytes(length).toString(
+      this.charset === "iso-8859-1" ? "latin1" : "utf-8",
+    );
+  }
+
+  /** Read `length` bytes, stripping trailing null byte(s), without copying them. */
+  parseNullTermBytes(length: number): Buffer {
     if (length <= 0) {
-      return "";
+      return Buffer.alloc(0);
     }
     this.assertAvailable(length);
     const raw = this.buf.subarray(this.offset, this.offset + length);
     this.offset += length;
-    // Strip trailing null byte(s)
     let end = raw.length;
     while (end > 0 && raw[end - 1] === 0) {
       end--;
     }
-    return raw.subarray(0, end).toString("utf-8");
+    return raw.subarray(0, end);
   }
 
   /**
@@ -117,6 +137,7 @@ export class PacketReader {
       this.buf.subarray(this.offset, this.offset + length),
       0,
       this.utcDates,
+      this.charset,
     );
     this.offset += length;
     return reader;

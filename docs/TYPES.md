@@ -10,7 +10,7 @@ convert a runtime value.
 
 | CUBRID wire type(s) | Current JavaScript value | Status / limitation |
 | --- | --- | --- |
-| CHAR, VARCHAR/STRING, NCHAR, VARNCHAR, ENUM | `string` | Decoded as UTF-8 null-terminated text whatever the column charset. In a non-UTF-8 database (`iso88591` in the Docker images) this differs from JDBC; see [the recorded difference](LEGACY_PARITY.md#recorded-defect-text-in-a-non-utf-8-database) |
+| CHAR, VARCHAR/STRING, NCHAR, VARNCHAR, ENUM | `string` | Null-terminated text. By default decoded as UTF-8 whatever the column charset; with `charset: "iso-8859-1"` in the charset the column reports. See [text and character sets](#text-and-character-sets) |
 | JSON | `string` | Raw JSON text, not parsed. This driver declares CAS protocol 7, and below protocol 8 the server sends JSON columns as VARCHAR (wire type 2), so wire type 34 does not arrive. Checked on 10.2, 11.0, 11.2 and 11.4; see [JSON columns](#json-columns) |
 | SHORT, INTEGER | `number` | Parsed signed 16-bit / 32-bit integers |
 | BIGINT | `bigint` | Lossless signed 64-bit value; corrected by [#126](https://github.com/cubrid-lab/cubrid-client/pull/126); `JSON.stringify` needs explicit bigint conversion |
@@ -19,7 +19,7 @@ convert a runtime value.
 | DATE, TIME, TIMESTAMP, DATETIME | `Date` | Fields read in the zone set by the [`timezone`](API_REFERENCE.md#clientoptions) option: the **local Node.js process zone** by default, or UTC with `timezone: "utc"`. See [date and time values](#date-and-time-values). The zero date `0000-00-00` of DATE, DATETIME and TIMESTAMP has no `Date`, so the query rejects; see [zero dates](#zero-dates) |
 | BIT, VARBIT | `Buffer` | Binary bytes; verify bit-length/bit-order semantics per server version. An empty `X''` returns an empty `Buffer`, distinct from SQL NULL |
 | BLOB | `Buffer` | Complete content, loaded by the query. See [BLOB and CLOB columns](#blob-and-clob-columns) |
-| CLOB | `string` | Complete content decoded as UTF-8, loaded by the query. See [BLOB and CLOB columns](#blob-and-clob-columns) |
+| CLOB | `string` | Complete content decoded as UTF-8, or as ISO-8859-1 with `charset: "iso-8859-1"`, loaded by the query. See [BLOB and CLOB columns](#blob-and-clob-columns) |
 | SET, MULTISET, SEQUENCE | Array (`CollectionValue`) | See [collection columns](#collection-columns) |
 | TIMESTAMPTZ, TIMESTAMPLTZ, DATETIMETZ, DATETIMELTZ (29-32) | `ZonedDateTime` | Wall-clock fields and the server's zone text, never a `Date`. See [timezone-aware values](#timezone-aware-values). The zero date rejects the query |
 | OBJECT/OID (19), RESULTSET (20), JSON (34), and unknown codes | Query rejects, including for a zero-byte value | Never coerced to `null`; see [values that cannot be decoded](#values-that-cannot-be-decoded) |
@@ -91,6 +91,54 @@ fields with a zone, such as `TIMESTAMPTZ'0000-00-00 00:00:00 +00:00'`) rejects t
 same way, with the cause `Zero date 0000-00-00 cannot be represented as a
 ZonedDateTime`. OBJECT/OID decoding is not part of this contract; see the
 [independent protocol fixture plan](https://github.com/cubrid-lab/cubrid-client/issues/117).
+
+## Text and character sets
+
+A CUBRID database has a charset, and so can each column: `CHARSET('x')` names the
+database's. The Docker `cubrid/cubrid` images create `testdb` as `iso88591` on 10.2,
+11.0, 11.2 and 11.4. The server stores the bytes a client sends and returns them as
+stored, and it reports each column's charset in its result metadata (protocol 7:
+the low three bits of the type byte, `3` iso88591, `5` utf8, `4` euckr). The
+[`charset`](API_REFERENCE.md#clientoptions) option chooses how this client uses
+them (#238):
+
+| | `"utf-8"` (default, the 1.x behavior) | `"iso-8859-1"` |
+| --- | --- | --- |
+| SQL text, string parameters, `clob()` text | Sent as UTF-8 | Sent as ISO-8859-1. A character above U+00FF rejects with a `QueryError` before the statement is sent; the message gives its offset, never the text. In `clob()` it rejects with a `TypeError`: before anything is sent for a `string`, during the upload for a stream, as content that is not UTF-8 does in the default |
+| CHAR, VARCHAR, NCHAR, ENUM, collection elements | Read as UTF-8, whatever the column charset. Bytes that are not UTF-8 become U+FFFD | Read in the column's charset: utf8 as UTF-8, euckr as EUC-KR (KS X 1001 pairs only, not the windows-949 extensions; needs a Node.js build with full ICU, the default), iso88591, ASCII and binary as ISO-8859-1. Bytes invalid in a utf8 or euckr column reject the query with an `UnsupportedValueError` cause |
+| Column names | UTF-8 | ISO-8859-1 |
+| CLOB content | UTF-8, invalid bytes rejected | ISO-8859-1 |
+| Server error messages, `database`, `user`, `password` | UTF-8 | UTF-8 |
+
+**Which to use.** On a `utf8` database, keep the default. On an `iso88591`
+database:
+
+- The default sends UTF-8 bytes, which the server stores as they are, so whatever
+  this client writes reads back unchanged. But the server sees each byte as one
+  Latin-1 character: `LENGTH('café')` is 5 and `HEX('café')` is `636166C3A9`.
+  Text another client stored as Latin-1 is not readable: `CHR(233)` reads as
+  U+FFFD. A column declared with another charset, such as `CHARSET utf8`, is
+  converted by the server from the session's iso88591, so it reads back as
+  mojibake (`'cafÃ©'`).
+- `charset: "iso-8859-1"` makes the server and the client agree: `'café'` is
+  stored as `636166E9`, `LENGTH` is 4, `CHR(233)` is `é`, and a `CHARSET utf8`
+  column reads back as written. Only characters up to U+00FF can be sent. This
+  is the official JDBC driver with `charset=iso-8859-1`.
+- Switching an existing application to `"iso-8859-1"` changes how the text it
+  already stored reads: UTF-8 bytes stored by the default read as Latin-1
+  characters (`'café'` becomes `'cafÃ©'`). Choose one per database.
+
+The official JDBC driver with its default `charset=utf-8` sends UTF-8 and reads in
+the column charset, so on an `iso88591` database its own `'café'` reads back as
+`'cafÃ©'`. That difference from this client's default is
+[recorded as intentional](LEGACY_PARITY.md#intentional-difference-text-in-a-non-utf-8-database).
+
+**Never use `"iso-8859-1"` against a `utf8` database.** The server reads the
+Latin-1 bytes as UTF-8, and on 11.4 it stored `'é'`, sent as a literal or as a
+bound string, as an empty string without an error. The client cannot tell which
+charset a database has without a query of its own, so it does not check. Set the
+option from `SELECT CHARSET('x')`. See
+[troubleshooting](TROUBLESHOOTING.md#text-reads-as-mojibake-or-u-fffd).
 
 ## Date and time values
 
@@ -238,9 +286,11 @@ the query again.
   makes a temporary file, and in autocommit mode the server deletes it before the
   reply arrives, so the query rejects with -1020. Run it in a transaction. A LOB
   stored in a table is not affected.
-- **A CLOB must be valid UTF-8.** The driver has no charset option, and the server
-  stores CLOB bytes without converting them. Other bytes reject with an
-  `UnsupportedValueError` rather than being silently replaced. `CLOB_TO_CHAR(c)`
+- **A CLOB must be valid UTF-8** in the default `charset`. The server stores CLOB
+  bytes without converting them. Other bytes reject with an
+  `UnsupportedValueError` rather than being silently replaced. With
+  `charset: "iso-8859-1"` a CLOB is read as ISO-8859-1, where every byte is a
+  character, so nothing is refused. `CLOB_TO_CHAR(c)`
   returns such a value through the ordinary text path, which substitutes U+FFFD for
   invalid bytes.
 - **BLOB and CLOB collection elements** still reject the query.
@@ -268,15 +318,18 @@ await db.executePrepared("INSERT INTO docs (id, body, notes) VALUES (?, ?, ?)", 
 
 | Source | `blob()` | `clob()` |
 | --- | --- | --- |
-| `Buffer` | The bytes | UTF-8 bytes, checked |
+| `Buffer` | The bytes | UTF-8 bytes, checked (with `charset: "iso-8859-1"`: the bytes) |
 | `Uint8Array` | The bytes | Refused |
-| `string` | Refused | Encoded as UTF-8 |
+| `string` | Refused | Encoded as UTF-8 (with `charset: "iso-8859-1"`: as ISO-8859-1) |
 | `AsyncIterable` or `Readable` | Chunks of `Buffer` or `Uint8Array` | Chunks of `string`, `Buffer` or `Uint8Array`, mixed as you like |
 | Empty | An empty BLOB, not NULL | An empty CLOB, not NULL |
 
-**Encoding.** A CLOB is UTF-8: the driver has no charset option, and the server
-stores the bytes without converting them, which is also what
-[reading a CLOB](#blob-and-clob-columns) expects. Strings are encoded about 128 KiB
+**Encoding.** A CLOB is UTF-8 in the default `charset`, and the server stores the
+bytes without converting them, which is also what
+[reading a CLOB](#blob-and-clob-columns) expects. With `charset: "iso-8859-1"` it
+is ISO-8859-1 instead: a `string` holding a character above U+00FF rejects the
+statement with a `TypeError`, and bytes are sent as they are. The rest of this
+paragraph describes the default. Strings are encoded about 128 KiB
 at a time. A high surrogate at the end of one stream chunk is joined with the low
 surrogate that starts the next, so splitting text anywhere is safe. A lone
 surrogate, `Buffer` bytes that are not UTF-8, or a stream that ends inside a
@@ -454,7 +507,7 @@ rendering SQL literals.
 | `number`, any other finite value | DOUBLE | The exact IEEE-754 value |
 | `number`, `NaN` or an infinity | Refused | The broker would store it |
 | `bigint` | BIGINT, or NUMERIC past 64 bits | Plain digits; more than 38 digits is refused |
-| `string` | CHAR | UTF-8; NUL and Ctrl-Z are refused, as on the literal path |
+| `string` | CHAR | UTF-8, or ISO-8859-1 with `charset: "iso-8859-1"`; NUL and Ctrl-Z are refused, as on the literal path |
 | `Date` | DATETIME | **UTC components**, as on the literal path. Years outside 0001 to 9999 and an invalid `Date` are refused |
 | `Buffer` | VARBIT | An empty `Buffer` is refused: the broker reads it as SQL NULL |
 | `blob()`, `clob()` | BLOB, CLOB handle | Uploaded first. See [writing BLOB and CLOB](#writing-blob-and-clob) |

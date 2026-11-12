@@ -5724,3 +5724,103 @@ test("a transaction refuses blob() with a TypeError, and transaction() wraps it"
 
   assert.ok(!sentCodes(fakeCAS).includes(CASFunctionCode.PREPARE_AND_EXECUTE));
 });
+
+// ---------------------------------------------------------------------------
+// The charset option (#238)
+// ---------------------------------------------------------------------------
+
+/** The captured frames are protocol 7. */
+const PROTO_7 = { _protoVersion: 7 } as const;
+
+test("charset: anything but utf-8 or iso-8859-1 is refused, by the adapter and the client", () => {
+  for (const charset of ["latin1", "UTF-8", "euc-kr", ""]) {
+    const config = { ...DEFAULT_CONFIG, charset } as unknown as ClientConfig;
+    assert.throws(() => new NativeCubridAdapter(config), RangeError);
+    assert.throws(
+      () => createClient({ host: "h", database: "d", user: "u", charset } as never),
+      /charset must be "utf-8" or "iso-8859-1"/,
+    );
+  }
+});
+
+test("charset: utf-8 and unset decode the captured Latin-1 reply the same, as UTF-8", async () => {
+  for (const config of [DEFAULT_CONFIG, { ...DEFAULT_CONFIG, charset: "utf-8" as const }]) {
+    const { adapter, fakeCAS } = createAdapterWithFakeCAS(config, PROTO_7);
+    fakeCAS.queueResponse(Buffer.from(CAPTURED_FRAMES.latin1Text.hex, "hex"));
+    assert.deepEqual(await adapter.query(CAPTURED_FRAMES.latin1Text.sql), [
+      { l1: "�", u8: "é", st: ["�"], t: "after" },
+    ]);
+  }
+});
+
+test("charset iso-8859-1: the captured reply decodes each column in its charset", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(
+    { ...DEFAULT_CONFIG, charset: "iso-8859-1" },
+    PROTO_7,
+  );
+  fakeCAS.queueResponse(Buffer.from(CAPTURED_FRAMES.latin1Text.hex, "hex"));
+  assert.deepEqual(await adapter.query(CAPTURED_FRAMES.latin1Text.sql), [
+    { l1: "é", u8: "é", st: ["é"], t: "after" },
+  ]);
+});
+
+test("charset iso-8859-1: SQL text and string binds are sent as Latin-1", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(
+    { ...DEFAULT_CONFIG, charset: "iso-8859-1" },
+    PROTO_7,
+  );
+  fakeCAS.queueResponse(Buffer.from(CAPTURED_FRAMES.latin1Text.hex, "hex"));
+  await adapter.query("SELECT 'é' AS l1, ? AS u8, 1 AS st, 2 AS t", ["ÿ"]);
+  // The literal path renders the value into the SQL text: E9 and FF, no C3.
+  const sent = fakeCAS.sentPayloads[0]!;
+  assert.ok(sent.includes(Buffer.from("SELECT '\u00e9' AS l1, '\u00ff' AS u8", "latin1")));
+  assert.ok(!sent.includes(0xc3));
+});
+
+test("charset iso-8859-1: text above U+00FF is refused before anything is sent", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(
+    { ...DEFAULT_CONFIG, charset: "iso-8859-1" },
+    PROTO_7,
+  );
+  const calls: Array<() => Promise<unknown>> = [
+    () => adapter.query("SELECT '☃'"),
+    () => adapter.query("SELECT ?", ["☃"]),
+    () => adapter.queryPrepared("SELECT ?", ["a☃"]),
+    () => adapter.executeMany("INSERT INTO t VALUES (?)", [["☃"]]),
+  ];
+  for (const call of calls) {
+    await assert.rejects(call, (error: Error) => {
+      assert.ok(error instanceof QueryError);
+      const cause = String(error.cause);
+      assert.match(cause, /above U\+00FF at offset \d+, which charset "iso-8859-1" cannot encode/);
+      assert.ok(!cause.includes("☃"));
+      return true;
+    });
+  }
+  assert.deepEqual(fakeCAS.sentPayloads, []);
+});
+
+test("charset iso-8859-1: a CLOB is read and written as Latin-1", async () => {
+  const read = lobAdapter({ charset: "iso-8859-1" });
+  read.fakeCAS.queueResponse(lobSelectReply(0n, 2n));
+  // Not UTF-8, which the default mode refuses; every byte is a Latin-1 character.
+  read.fakeCAS.queueResponse(lobReadReply(Buffer.from("ffa1", "hex")));
+  assert.equal((await read.adapter.query(SELECT_LOBS))[0]!.c, "ÿ¡");
+
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(
+    { ...DEFAULT_CONFIG, charset: "iso-8859-1" },
+    PROTO_7,
+  );
+  queueLobUpload(fakeCAS, [3], LOB_WRITE_FRAMES.newClobReply);
+  fakeCAS.queueResponse(preparedReply(UPDATE_ONE));
+  await adapter.executePrepared(UPDATE_LOB, [clob("héÿ"), 1]);
+  assert.equal(lobWrites(fakeCAS)[0]!.data.toString("hex"), "68e9ff");
+
+  // A string above U+00FF is refused before PREPARE, as a TypeError.
+  const refused = createAdapterWithFakeCAS({ ...DEFAULT_CONFIG, charset: "iso-8859-1" }, PROTO_7);
+  await assert.rejects(
+    () => refused.adapter.executePrepared(UPDATE_LOB, [clob("\u2603"), 1]),
+    (error: Error) => error instanceof TypeError && /above U\+00FF/.test(error.message),
+  );
+  assert.deepEqual(refused.fakeCAS.sentPayloads, []);
+});
