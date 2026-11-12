@@ -1,6 +1,6 @@
 import type { PreparedQueryParam } from "./lob.js";
 import type { QueryParams } from "./query.js";
-import type { QueryResult, QueryResultRow } from "./result.js";
+import type { ArrayQueryResult, QueryResult, QueryResultRow } from "./result.js";
 
 /**
  * TLS/SSL options for connecting to an SSL-enabled CUBRID broker (`SSL=ON`).
@@ -256,6 +256,27 @@ export interface QueryOptions {
   readTimeout?: number;
 }
 
+/**
+ * {@link QueryOptions} of a statement whose rows are arrays: `query()`,
+ * `queryResult()` and their `Prepared` forms then return each row as an array
+ * of its values in select-list order, so `SELECT t1.id, t2.id` keeps both `id`
+ * values. `queryResult()` reports the names in `columns`, one per value. See
+ * {@link ArrayQueryResult}.
+ *
+ * The overloads that accept it exist on the client, the pool, a pool
+ * connection, a transaction and a transaction scope. A custom
+ * `connectionFactory` connection receives `rowMode` in its options; when its
+ * rows are not arrays, the query rejects with a `QueryError`.
+ */
+export interface ArrayRowOptions extends QueryOptions {
+  rowMode: "array";
+}
+
+/** {@link StreamOptions} of a `stream()` that yields each row as an array, as {@link ArrayRowOptions}. */
+export interface ArrayStreamOptions extends StreamOptions {
+  rowMode: "array";
+}
+
 /** Options of `execute()` and `executePrepared()`. */
 export interface ExecuteOptions extends QueryOptions {
   /**
@@ -324,6 +345,34 @@ export interface Streamable {
     params?: QueryParams,
     options?: StreamOptions,
   ): AsyncIterable<T>;
+}
+
+/**
+ * The array-row overloads of the statement methods (see {@link ArrayRowOptions}),
+ * on the transaction client `transaction()` passes in. This describes values the
+ * client hands out; do not implement it in your own classes.
+ */
+export interface ArrayRowQueryable {
+  query<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayRowOptions,
+  ): Promise<T[]>;
+  queryResult<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayRowOptions,
+  ): Promise<ArrayQueryResult<T>>;
+  queryPrepared<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: readonly PreparedQueryParam[] | undefined,
+    options: ArrayRowOptions,
+  ): Promise<T[]>;
+  queryResultPrepared<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: readonly PreparedQueryParam[] | undefined,
+    options: ArrayRowOptions,
+  ): Promise<ArrayQueryResult<T>>;
 }
 
 /**
@@ -452,7 +501,48 @@ export interface TransactionScope
   extends ResultTransactionClient,
     ExecutableTransactionClient,
     PreparedTransactionClient,
-    BatchTransactionClient {}
+    BatchTransactionClient {
+  query<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayRowOptions,
+  ): Promise<T[]>;
+  query<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+    options?: QueryOptions,
+  ): Promise<T[]>;
+  queryResult<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayRowOptions,
+  ): Promise<ArrayQueryResult<T>>;
+  queryResult<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+    options?: QueryOptions,
+  ): Promise<QueryResult<T>>;
+  queryPrepared<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: readonly PreparedQueryParam[] | undefined,
+    options: ArrayRowOptions,
+  ): Promise<T[]>;
+  queryPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: readonly PreparedQueryParam[],
+    options?: QueryOptions,
+  ): Promise<T[]>;
+  queryResultPrepared<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: readonly PreparedQueryParam[] | undefined,
+    options: ArrayRowOptions,
+  ): Promise<ArrayQueryResult<T>>;
+  queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: readonly PreparedQueryParam[],
+    options?: QueryOptions,
+  ): Promise<QueryResult<T>>;
+}
 
 export interface ConnectionLike {
   connect(): Promise<void>;

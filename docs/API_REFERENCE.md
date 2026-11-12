@@ -29,6 +29,7 @@ Complete reference for every public export of `cubrid-client`.
   - [Streamable](#streamable)
   - [StreamOptions](#streamoptions)
   - [QueryOptions](#queryoptions)
+  - [ArrayRowOptions and ArrayStreamOptions](#arrayrowoptions-and-arraystreamoptions)
   - [ExecuteOptions](#executeoptions)
   - [PreparedQueryable](#preparedqueryable)
   - [PreparedTransactionClient](#preparedtransactionclient)
@@ -46,6 +47,8 @@ Complete reference for every public export of `cubrid-client`.
   - [PreparedQueryParam](#preparedqueryparam)
   - [QueryResultRow](#queryresultrow)
   - [QueryResult](#queryresult)
+  - [ArrayQueryResult](#arrayqueryresult)
+  - [ArrayRowQueryable](#arrayrowqueryable)
   - [ColumnInfo](#columninfo)
   - [Schema introspection types](#schema-introspection-types)
   - [PoolOptions, PoolStats and PoolConnection](#pooloptions-poolstats-and-poolconnection)
@@ -183,7 +186,7 @@ async queryResult<T extends QueryResultRow = QueryResultRow>(
 ): Promise<QueryResult<T>>
 ```
 
-**Returns:** a [`QueryResult<T>`](#queryresult): `rows` is exactly what `query<T>()` returns, and `columns` describes every select-list column in order. `query()` itself is unchanged and still returns `T[]`.
+**Returns:** a [`QueryResult<T>`](#queryresult): `rows` is exactly what `query<T>()` returns, and `columns` describes every select-list column in order. `query()` itself is unchanged and still returns `T[]`. With `rowMode: "array"` it returns an [`ArrayQueryResult<T>`](#arrayqueryresult) instead; see [Array rows](#array-rows-rowmode-array).
 
 **Throws:** [`QueryError`](#queryerror) if execution fails or a value is [refused](TYPES.md#sending-javascript-parameters), or the number of values differs from the SQL's `?` markers, before anything is sent, including when a custom `connectionFactory` connection has no `queryResult()` method.
 
@@ -197,6 +200,48 @@ const { rows, columns } = await db.queryResult(
 //   { name: "note", type: "VARCHAR", precision: 100, scale: 0, nullable: true },
 // ]
 ```
+
+#### Array rows: `rowMode: "array"`
+
+A row object holds one value per column **name**, so `SELECT t1.id, t2.id` keeps only the second `id` (see [QueryResult](#queryresult)). Pass `{ rowMode: "array" }` as the options to get each row as an array of its values in select-list order instead. Every column keeps its own value, whatever its name: repeated, differing only in case, or `__proto__`.
+
+```ts
+const { rows, columns } = await db.queryResult(
+  "SELECT t1.id, t2.id, t1.label FROM t1 LEFT JOIN t2 ON t2.t1_id = t1.id",
+  undefined,
+  { rowMode: "array" },
+);
+// columns.map((c) => c.name): ["id", "id", "label"]
+// rows: [[1, 10, "one"], [3, null, null]]
+
+const pairs = await db.query<[number, number | null]>(
+  "SELECT t1.id, t2.id FROM t1 LEFT JOIN t2 ON t2.t1_id = t1.id",
+  [],
+  { rowMode: "array", signal: AbortSignal.timeout(5000) },
+);
+```
+
+| Method | `rowMode: "array"` returns |
+|--------|----------------------------|
+| `query<T>()`, `queryPrepared<T>()` | `Promise<T[]>`, `T` an array type, `unknown[]` by default |
+| `queryResult<T>()`, `queryResultPrepared<T>()` | `Promise<ArrayQueryResult<T>>`: `columns[i]` describes index `i` of every row |
+| `stream<T>()` | `AsyncGenerator<T>` yielding one array per row |
+
+- **Where.** On `CubridClient`, `CubridPool`, a pool connection, the `tx` of `transaction()` (client and pool), a [transaction scope](#begintransactionscopeoptions), `CubridTransaction` and `NativeCubridAdapter`. `execute()`, `executePrepared()` and `executeMany()` return no rows and do not declare it; at runtime they check its value like any other option and otherwise ignore it. It is a per-statement option: there is no client-wide setting, because the row type of every `query<T>()` would then depend on how the client was created.
+- **Object mode is the default and is unchanged.** Leave `rowMode` out for rows keyed by name. Any other value than `"object"` or `"array"` rejects with a `TypeError` before anything is sent.
+- **Values are the same as in object mode**: the same types, NULL as `null`, BLOB as `Buffer` and CLOB as `string`, loaded under `maxLobBytes`. In array mode **every** LOB column is read and counts towards the limit, including one whose name repeats; in object mode the LOB of a column that a later same-named column replaces is not read.
+- **Streams** yield arrays and report no column names. When you need them, use `queryResult()` with `rowMode: "array"`, or alias the columns.
+- **Types.** `T` describes a row, for example `[number, string | null]` or `readonly [number]`, and as with object rows it is not checked at runtime. `query<MyRowObject>(sql, params, { rowMode: "array" })` does not compile.
+- **Custom connections.** A `connectionFactory` connection receives `rowMode` in its options. When it returns rows that are not arrays, the statement rejects with `Underlying connection does not support rowMode "array".` as its cause: a `QueryError`, or a `TransactionError` inside a transaction. A result with no rows cannot be wrong and is returned.
+
+**TypeScript limits.** Array mode is typed by an overload placed before the existing signature, which is unchanged, so 1.x code compiles and resolves as before:
+
+- Pass the options as a literal or as a value typed [`ArrayRowOptions`](#arrayrowoptions-and-arraystreamoptions) (or written `as const`). In an untyped variable, `rowMode` widens to `string`: `{ rowMode: "array" }` alone does not compile, but with another option, such as `{ rowMode: "array", readTimeout: 5000 }`, it matches the object signature, and the rows, arrays at runtime, are typed as objects.
+- `rowMode: "object"` written out does not compile; leave it out. It is accepted at runtime.
+- A value typed `{ rowMode?: "object" | "array" }` matches the object signature, so its rows are typed as objects even when they are arrays. Choose the mode where you call.
+- Through a union with an interface you can implement, such as `CubridClient | TransactionClient` or `Queryable`, only object mode is offered.
+
+**In 1.x without array mode,** alias the columns: `SELECT t1.id AS t1_id, t2.id AS t2_id`. See the [migration notes](API_STABILITY.md#array-rows).
 
 #### `execute(sql, params?)`
 
@@ -427,9 +472,9 @@ stream<T extends QueryResultRow = QueryResultRow>(
 |-----------|------|---------|-------------|
 | `sql` | `string` | — | SQL statement. Use `?` for parameter placeholders. |
 | `params` | [`QueryParams`](#queryparams) | `undefined` | Positional parameter values |
-| `options` | [`StreamOptions`](#streamoptions) | `undefined` | `fetchSize`, `signal` and `consumerTimeout` |
+| `options` | [`StreamOptions`](#streamoptions) | `undefined` | `fetchSize`, `signal` and `consumerTimeout`, and `rowMode: "array"` to read each row as an array ([Array rows](#array-rows-rowmode-array)) |
 
-**Throws:** `RangeError` at once for an invalid option. Everything else rejects the read that met it: [`QueryError`](#queryerror) for a failed statement or FETCH, or when a value is [refused](TYPES.md#sending-javascript-parameters), or the number of values differs from the SQL's `?` markers, before anything is sent, [`ReadTimeoutError`](#readtimeouterror) after `readTimeout`, and `signal.reason`, unchanged, after an abort. Rows that arrived before a failure are delivered first.
+**Throws:** `RangeError` or `TypeError` at once for an invalid option. Everything else rejects the read that met it: [`QueryError`](#queryerror) for a failed statement or FETCH, or when a value is [refused](TYPES.md#sending-javascript-parameters), or the number of values differs from the SQL's `?` markers, before anything is sent, [`ReadTimeoutError`](#readtimeouterror) after `readTimeout`, and `signal.reason`, unchanged, after an abort. Rows that arrived before a failure are delivered first.
 
 ```ts
 for await (const row of db.stream<{ id: number }>("SELECT id FROM orders", [], {
@@ -1630,6 +1675,8 @@ interface ConnectionLike {
 
 `queryResult`, `execute` and `stream` are optional so existing custom adapters keep compiling. The optional `queryPrepared`, `queryResultPrepared` and `executePrepared` take `readonly PreparedQueryParam[]`, as on [`PreparedQueryable`](#preparedqueryable); a custom connection that does not upload LOBs should refuse a [`LobParam`](#lobparam-blobsource-and-clobsource). The client passes [`QueryOptions`](#queryoptions) as the last argument of each statement method; an implementation that declares fewer parameters still compiles, and then ignores them. Calling `queryResult()`, `execute()` or `executeMany()` on a client or transaction fails when its connection does not provide it, and so does the first read of `stream()`. `executeMany()` never falls back to one statement per set.
 
+The options may carry `rowMode: "array"` ([Array rows](#array-rows-rowmode-array)). A connection that supports it returns each row as an array of its values in select-list order, from `query`, `queryResult`, their prepared forms and `stream`. One that ignores it and returns objects makes the statement fail, unless the result has no rows. `ConnectionLike` itself does not change.
+
 ### Queryable
 
 Interface for any object that can execute queries.
@@ -1729,6 +1776,21 @@ interface QueryOptions {
 |-------|------|---------|-------------|
 | `signal` | `AbortSignal` | `undefined` | Cancels the statement. Rejects with `signal.reason`; once the statement was sent its connection is discarded and its outcome is unknown |
 | `readTimeout` | `number` | The client's [`readTimeout`](#clientoptions) | Inactivity limit for this statement and its follow-up requests, with the client option's semantics. `0` means none for this statement. From 0 to 2147483647 |
+
+### ArrayRowOptions and ArrayStreamOptions
+
+The options that select [array rows](#array-rows-rowmode-array): a [`QueryOptions`](#queryoptions) or [`StreamOptions`](#streamoptions) with `rowMode: "array"`.
+
+```ts
+interface ArrayRowOptions extends QueryOptions {
+  rowMode: "array";
+}
+interface ArrayStreamOptions extends StreamOptions {
+  rowMode: "array";
+}
+```
+
+`QueryOptions` and `StreamOptions` do not declare `rowMode`; leaving it out gives object rows.
 
 ### ExecuteOptions
 
@@ -2024,8 +2086,25 @@ interface QueryResult<T extends QueryResultRow = QueryResultRow> {
 ```
 
 - `columns` has one entry for every select-list column, in order. A column that holds only NULL, or a query that returns no rows, still reports its type.
-- **Duplicate column names.** `SELECT a.id, b.id` gives two entries named `id` in `columns`. Each row object is keyed by name exactly as `query()` returns it, so only one value per name survives and the **last** column with that name wins. Alias the columns (`a.id AS a_id`) when you need every value; the repeated names in `columns` tell you when a collision happened.
+- **Duplicate column names.** `SELECT a.id, b.id` gives two entries named `id` in `columns`. Each row object is keyed by name exactly as `query()` returns it, so only one value per name survives: the **last** column with that name wins, and its key keeps the position of the first. Names are compared exactly, so `Id` and `id` are two keys. Alias the columns (`a.id AS a_id`) or use [`rowMode: "array"`](#array-rows-rowmode-array) when you need every value; the repeated names in `columns` tell you when a collision happened.
 - A statement without a result set (INSERT, UPDATE, DELETE, DDL) returns `rows: []` and `columns: []`.
+
+### ArrayQueryResult
+
+Rows as arrays together with the columns that produced them, as returned by `queryResult()` and `queryResultPrepared()` with `rowMode: "array"`. See [Array rows](#array-rows-rowmode-array).
+
+```ts
+interface ArrayQueryResult<T extends readonly unknown[] = unknown[]> {
+  rows: T[];
+  columns: ColumnInfo[];
+}
+```
+
+Every row holds one value per select-list column, in order, and `columns[i]` describes index `i` of every row. A statement without a result set returns `rows: []` and `columns: []`.
+
+### ArrayRowQueryable
+
+The array-row overloads of `query()`, `queryResult()`, `queryPrepared()` and `queryResultPrepared()`, taking [`ArrayRowOptions`](#arrayrowoptions-and-arraystreamoptions). It is part of the type of the `tx` that `transaction()` passes in, listed first so an options value typed `ArrayRowOptions` selects it. It describes values the client hands out: do not implement it.
 
 ### ColumnInfo
 
@@ -2139,7 +2218,11 @@ interface PoolConnection
     Executable,
     PreparedQueryable,
     BatchExecutable,
-    Streamable {}
+    Streamable {
+  // Plus, before each inherited signature, the overload of
+  // query, queryResult, queryPrepared, queryResultPrepared and stream
+  // that takes rowMode: "array" (see "Array rows").
+}
 
 interface PoolConnectionOptions {
   signal?: AbortSignal;

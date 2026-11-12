@@ -27,6 +27,7 @@ import {
   assertValidTimezone,
   assertValidTransactionOptions,
   pickTransactionOptions,
+  wantsArrayRows,
 } from "../internals/normalize-config.js";
 import { SESSION_STATE, type SessionState } from "../internals/session-state.js";
 import { assertEncodable, assertValidCharset, type TextCharset } from "../protocol/charset.js";
@@ -55,6 +56,7 @@ import {
   assertValidCredentials,
   bindLobHandles,
   type ColumnMeta,
+  type DecodedRow,
   encodePreparedParams,
   findPlaceholders,
   interpolateParams,
@@ -76,8 +78,9 @@ import {
   parsePrepare,
   parsePrepareAndExecute,
   parseSimpleResponse,
+  type RowShape,
   readQueryHandle,
-  setColumn,
+  setCell,
   setLobHandleSize,
   UnsupportedValueError,
   writeCloseReqHandle,
@@ -95,6 +98,8 @@ import {
   writePrepareAndExecute,
 } from "../protocol/protocol.js";
 import type {
+  ArrayRowOptions,
+  ArrayStreamOptions,
   ClientConfig,
   ExecuteManyResult,
   ExecuteOptions,
@@ -114,7 +119,7 @@ import {
   refuseLobParams,
 } from "../types/lob.js";
 import type { QueryParams } from "../types/query.js";
-import type { ColumnInfo, QueryResult, QueryResultRow } from "../types/result.js";
+import type { ArrayQueryResult, ColumnInfo, QueryResult, QueryResultRow } from "../types/result.js";
 import type { DriverAdapter } from "./base.js";
 import { StreamCursor } from "./stream-cursor.js";
 
@@ -322,30 +327,48 @@ export class NativeCubridAdapter implements DriverAdapter {
   }
 
   /**
-   * See {@link QueryOptions} for `signal` and a per-statement `readTimeout`. An
-   * invalid option rejects before anything is queued or sent.
+   * See {@link QueryOptions} for `signal` and a per-statement `readTimeout`, and
+   * {@link ArrayRowOptions} for `rowMode`. An invalid option rejects before
+   * anything is queued or sent.
    */
-  async query<T extends QueryResultRow = QueryResultRow>(
+  query<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayRowOptions,
+  ): Promise<T[]>;
+  query<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
     options?: QueryOptions,
-  ): Promise<T[]> {
-    return (await this.queryResult<T>(sql, params, options)).rows;
+  ): Promise<T[]>;
+  async query(sql: string, params?: QueryParams, options?: QueryOptions): Promise<unknown[]> {
+    return (await this.queryResult(sql, params, options)).rows;
   }
 
-  async queryResult<T extends QueryResultRow = QueryResultRow>(
+  queryResult<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayRowOptions,
+  ): Promise<ArrayQueryResult<T>>;
+  queryResult<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
     options?: QueryOptions,
-  ): Promise<QueryResult<T>> {
+  ): Promise<QueryResult<T>>;
+  async queryResult(
+    sql: string,
+    params?: QueryParams,
+    options?: QueryOptions,
+  ): Promise<QueryResult | ArrayQueryResult> {
     assertValidQueryOptions(options);
     const values = literalOrRefuse(sql, params, QUERY_FAILED, this.charset);
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
+    const shape = rowShape(options);
     return this.inTurn(
       "query",
       QUERY_FAILED,
-      () => this.queryNow<T>(sql, values, issued, undefined),
+      () => this.queryNow(sql, values, issued, undefined, shape),
       options,
     );
   }
@@ -355,24 +378,43 @@ export class NativeCubridAdapter implements DriverAdapter {
    * contract. The statement is issued by the first read, like any other statement
    * in the queue, and keeps its turn until it has released its query handle.
    */
+  stream<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayStreamOptions,
+  ): AsyncGenerator<T, void, undefined>;
   stream<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
     options?: StreamOptions,
-  ): AsyncGenerator<T, void, undefined> {
+  ): AsyncGenerator<T, void, undefined>;
+  /**
+   * The signature of {@link Streamable.stream}, so a union of this type with
+   * `Streamable` or `ConnectionLike` stays callable. Never chosen by a direct call.
+   */
+  stream<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+    options?: StreamOptions,
+  ): AsyncIterable<T>;
+  stream(
+    sql: string,
+    params?: QueryParams,
+    options?: StreamOptions,
+  ): AsyncGenerator<unknown, void, undefined> {
     assertValidStreamOptions(options);
     // Read once here, so the blob()/clob() refusal stays synchronous and checks
     // the same values that are sent.
     const values = params === undefined ? undefined : Array.from(params);
     refuseLobParams(values);
-    return this.streamRows<T>(sql, values, options);
+    return this.streamRows(sql, values, options);
   }
 
-  private async *streamRows<T extends QueryResultRow>(
+  private async *streamRows(
     sql: string,
     params: QueryParams | undefined,
     options: StreamOptions | undefined,
-  ): AsyncGenerator<T, void, undefined> {
+  ): AsyncGenerator<unknown, void, undefined> {
     const signal = options?.signal;
     signal?.throwIfAborted();
     const values = literalOrRefuse(sql, params, QUERY_FAILED, this.charset);
@@ -389,7 +431,7 @@ export class NativeCubridAdapter implements DriverAdapter {
       cursor.run(
         this.inTurn("query", QUERY_FAILED, async () => {
           if (cursor.begin()) {
-            await this.streamNow(cursor, sql, values, fetchSize, issued);
+            await this.streamNow(cursor, sql, values, fetchSize, issued, rowShape(options));
           }
         }),
       );
@@ -402,7 +444,7 @@ export class NativeCubridAdapter implements DriverAdapter {
 
         for (const row of rows) {
           cursor.assertNotCancelled();
-          yield row as T;
+          yield row;
           cursor.activityAt = Date.now();
         }
       }
@@ -435,27 +477,48 @@ export class NativeCubridAdapter implements DriverAdapter {
     );
   }
 
-  async queryPrepared<T extends QueryResultRow = QueryResultRow>(
+  queryPrepared<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: readonly PreparedQueryParam[] | undefined,
+    options: ArrayRowOptions,
+  ): Promise<T[]>;
+  queryPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
-  ): Promise<T[]> {
-    return (await this.queryResultPrepared<T>(sql, params, options)).rows;
+  ): Promise<T[]>;
+  async queryPrepared(
+    sql: string,
+    params?: readonly PreparedQueryParam[],
+    options?: QueryOptions,
+  ): Promise<unknown[]> {
+    return (await this.queryResultPrepared(sql, params, options)).rows;
   }
 
-  async queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
+  queryResultPrepared<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: readonly PreparedQueryParam[] | undefined,
+    options: ArrayRowOptions,
+  ): Promise<ArrayQueryResult<T>>;
+  queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
-  ): Promise<QueryResult<T>> {
+  ): Promise<QueryResult<T>>;
+  async queryResultPrepared(
+    sql: string,
+    params?: readonly PreparedQueryParam[],
+    options?: QueryOptions,
+  ): Promise<QueryResult | ArrayQueryResult> {
     assertValidQueryOptions(options);
     const binds = bindOrRefuse(sql, params, "Failed to execute CUBRID query.", this.charset);
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
+    const shape = rowShape(options);
     return this.inTurn(
       "query",
       QUERY_FAILED,
-      () => this.queryNow<T>(sql, undefined, issued, binds),
+      () => this.queryNow(sql, undefined, issued, binds, shape),
       options,
     );
   }
@@ -647,14 +710,15 @@ export class NativeCubridAdapter implements DriverAdapter {
     }
   }
 
-  private async queryNow<T extends QueryResultRow>(
+  private async queryNow(
     sql: string,
     params: QueryParams | undefined,
     issued: IssuedOn,
     binds: PreparedBinds | undefined,
-  ): Promise<QueryResult<T>> {
+    shape: RowShape,
+  ): Promise<DecodedResult> {
     try {
-      return await this.executeQuery<T>(sql, params, issued, binds);
+      return await this.executeQuery(sql, params, issued, binds, shape);
     } catch (error) {
       // If the first transactional statement lost its session before the
       // post-response bind, remember that failed generation. A ping/reconnect
@@ -672,15 +736,25 @@ export class NativeCubridAdapter implements DriverAdapter {
     params: QueryParams | undefined,
     fetchSize: number,
     issued: IssuedOn,
+    shape: RowShape,
   ): Promise<void> {
     try {
-      await this.runStatement(sql, params, issued, async (cas, result) => {
-        this.forgetInsertId();
+      await this.runStatement(
+        sql,
+        params,
+        issued,
+        async (cas, result) => {
+          this.forgetInsertId();
 
-        if (result.statementType === StatementType.SELECT) {
-          await this.streamWindows(cursor, cas, result, fetchSize);
-        }
-      });
+          if (result.statementType === StatementType.SELECT) {
+            await this.streamWindows(cursor, cas, result, fetchSize, shape);
+          }
+        },
+        false,
+        undefined,
+        false,
+        shape,
+      );
     } catch (error) {
       throw this.queryFailure(error);
     }
@@ -1142,11 +1216,7 @@ export class NativeCubridAdapter implements DriverAdapter {
   }
 
   /** Hands rows over and, while more can follow, waits for the consumer to ask for them. */
-  private async offerRows(
-    cursor: StreamCursor,
-    rows: Record<string, unknown>[],
-    more: boolean,
-  ): Promise<void> {
+  private async offerRows(cursor: StreamCursor, rows: DecodedRow[], more: boolean): Promise<void> {
     const offered = cursor.offer(rows, more);
 
     if (more) {
@@ -1179,8 +1249,9 @@ export class NativeCubridAdapter implements DriverAdapter {
   private async streamWindows(
     cursor: StreamCursor,
     cas: CASConnection,
-    result: PrepareAndExecuteResult,
+    result: PrepareAndExecuteResult<DecodedRow>,
     fetchSize: number,
+    shape: RowShape,
   ): Promise<void> {
     const generation = cas.connectionGeneration;
     const lobColumns = result.columns.some(mayHoldLob);
@@ -1200,11 +1271,11 @@ export class NativeCubridAdapter implements DriverAdapter {
             }
             // Detach the delivered row: decoded FETCH windows may remain referenced
             // by the query response while the consumer holds a large BLOB/CLOB.
-            const delivered = { ...row };
+            const delivered = Array.isArray(row) ? [...row] : { ...row };
             // Mark LOB activity before awaiting a read: a server error or abort
             // must still release the autocommit read transaction.
-            lobsRead = this.measureLobs([delivered], "row").total > 0 || lobsRead;
-            await this.loadRowLobs(cas, generation, delivered, cursor);
+            lobsRead = this.measureLobs([delivered], result.columns, "row").total > 0 || lobsRead;
+            await this.loadRowLobs(cas, generation, delivered, result.columns, cursor);
             await this.offerRows(cursor, [delivered], !lastWindow || index < rows.length - 1);
           }
         } else if (rows.length > 0) {
@@ -1215,7 +1286,7 @@ export class NativeCubridAdapter implements DriverAdapter {
           return;
         }
 
-        rows = await this.fetchWindow(cas, generation, result, fetched, fetchSize);
+        rows = await this.fetchWindow(cas, generation, result, fetched, fetchSize, shape);
         fetched += rows.length;
       }
     } catch (error) {
@@ -1229,16 +1300,17 @@ export class NativeCubridAdapter implements DriverAdapter {
     }
   }
 
-  private executeQuery<T extends QueryResultRow>(
+  private executeQuery(
     sql: string,
     params: QueryParams | undefined,
     issued: IssuedOn,
     binds: PreparedBinds | undefined,
-  ): Promise<QueryResult<T>> {
+    shape: RowShape,
+  ): Promise<DecodedResult> {
     const read = async (
       cas: CASConnection,
-      result: PrepareAndExecuteResult,
-    ): Promise<QueryResult<T>> => {
+      result: PrepareAndExecuteResult<DecodedRow>,
+    ): Promise<DecodedResult> => {
       // Any statement may generate a value that nobody reads, a SELECT too when it
       // calls a stored function that inserts, so a later execute() on this session
       // could not tell it from its own.
@@ -1253,7 +1325,7 @@ export class NativeCubridAdapter implements DriverAdapter {
 
       if (result.totalTupleCount > allRows.length) {
         try {
-          await this.fetchRemaining(cas, result, allRows);
+          await this.fetchRemaining(cas, result, allRows, shape);
         } catch (error) {
           // An autocommit SELECT stays IN_TRAN until its last row is fetched, so
           // a FETCH that fails partway leaves the session holding the table lock,
@@ -1270,13 +1342,14 @@ export class NativeCubridAdapter implements DriverAdapter {
       if (result.columns.some(mayHoldLob)) {
         // A prepared statement's transaction belongs to runStatement(), which
         // commits it only once everything succeeded.
-        await this.loadLobs(cas, generation, allRows, binds === undefined);
+        await this.loadLobs(cas, generation, allRows, result.columns, binds === undefined);
       }
 
-      return { rows: allRows as T[], columns: result.columns.map(toColumnInfo) };
+      // The rows have the shape `shape` asked parsing for.
+      return { rows: allRows, columns: result.columns.map(toColumnInfo) } as DecodedResult;
     };
 
-    return this.runStatement(sql, params, issued, read, false, binds);
+    return this.runStatement(sql, params, issued, read, false, binds, false, shape);
   }
 
   /**
@@ -1286,7 +1359,7 @@ export class NativeCubridAdapter implements DriverAdapter {
    */
   private async readExecuteResult(
     cas: CASConnection,
-    result: PrepareAndExecuteResult,
+    result: PrepareAndExecuteResult<DecodedRow>,
     sql: string,
     generatedKeys: boolean,
     generation: number,
@@ -1361,10 +1434,15 @@ export class NativeCubridAdapter implements DriverAdapter {
     sql: string,
     params: QueryParams | undefined,
     issued: IssuedOn,
-    use: (cas: CASConnection, result: PrepareAndExecuteResult, generation: number) => Promise<R>,
+    use: (
+      cas: CASConnection,
+      result: PrepareAndExecuteResult<DecodedRow>,
+      generation: number,
+    ) => Promise<R>,
     commitAfter = false,
     binds?: PreparedBinds,
     generatedKeys = false,
+    shape: RowShape = "object",
   ): Promise<R> {
     return this.runOnSession(
       sql,
@@ -1373,9 +1451,9 @@ export class NativeCubridAdapter implements DriverAdapter {
       commitAfter,
       binds !== undefined,
       async (cas, reply, generation) => {
-        const result: PrepareAndExecuteResult = binds
-          ? await this.executeHandle(cas, reply, binds, generation, generatedKeys)
-          : parsePrepareAndExecute(reply, cas.protoVersion, this.utcDates, this.charset);
+        const result = binds
+          ? await this.executeHandle(cas, reply, binds, generation, generatedKeys, shape)
+          : parsePrepareAndExecute(reply, cas.protoVersion, this.utcDates, this.charset, shape);
         return use(cas, result, generation);
       },
       false,
@@ -1512,7 +1590,8 @@ export class NativeCubridAdapter implements DriverAdapter {
     binds: PreparedBinds,
     generation: number,
     generatedKeys: boolean,
-  ): Promise<PrepareAndExecuteResult> {
+    shape: RowShape,
+  ): Promise<PrepareAndExecuteResult<DecodedRow>> {
     const statement = parsePrepare(prepareReply, this.charset);
     if (statement.bindCount !== binds.count) {
       throw new Error(
@@ -1523,7 +1602,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     const ready = binds.lobs ? await this.uploadLobs(cas, generation, binds) : binds;
     const { header, payload } = writeExecute(statement, ready, cas.casInfo, generatedKeys);
     const reply = await this.exchangeOnSession(cas, generation, header, payload);
-    return parseExecute(reply, statement, cas.protoVersion, this.utcDates, this.charset);
+    return parseExecute(reply, statement, cas.protoVersion, this.utcDates, this.charset, shape);
   }
 
   /**
@@ -1937,14 +2016,22 @@ export class NativeCubridAdapter implements DriverAdapter {
 
   private async fetchRemaining(
     cas: CASConnection,
-    result: PrepareAndExecuteResult,
-    allRows: Record<string, unknown>[],
+    result: PrepareAndExecuteResult<DecodedRow>,
+    allRows: DecodedRow[],
+    shape: RowShape,
   ): Promise<void> {
     const generation = cas.connectionGeneration;
     const fetchSize = this.config.fetchSize ?? DEFAULT_FETCH_SIZE;
 
     while (allRows.length < result.totalTupleCount) {
-      const rows = await this.fetchWindow(cas, generation, result, allRows.length, fetchSize);
+      const rows = await this.fetchWindow(
+        cas,
+        generation,
+        result,
+        allRows.length,
+        fetchSize,
+        shape,
+      );
       allRows.push(...rows);
     }
   }
@@ -1953,10 +2040,11 @@ export class NativeCubridAdapter implements DriverAdapter {
   private async fetchWindow(
     cas: CASConnection,
     generation: number,
-    result: PrepareAndExecuteResult,
+    result: PrepareAndExecuteResult<DecodedRow>,
     fetched: number,
     fetchSize: number,
-  ): Promise<Record<string, unknown>[]> {
+    shape: RowShape,
+  ): Promise<DecodedRow[]> {
     const { header, payload } = writeFetch(result.queryHandle, fetched, fetchSize, cas.casInfo);
     // The handle exists only on this session, and FETCH is not a new request
     // that could be probed or moved to another one.
@@ -1964,7 +2052,13 @@ export class NativeCubridAdapter implements DriverAdapter {
     if (fetchPayload === null) {
       throw new ConnectionLostError("Connection lost during FETCH");
     }
-    const fetchResult = parseFetch(fetchPayload, result.columns, this.utcDates, this.charset);
+    const fetchResult = parseFetch(
+      fetchPayload,
+      result.columns,
+      this.utcDates,
+      this.charset,
+      shape,
+    );
 
     // Returning a partial result as success silently corrupts the query
     // contract. The execute response still promises more rows here.
@@ -1999,35 +2093,18 @@ export class NativeCubridAdapter implements DriverAdapter {
   private async loadLobs(
     cas: CASConnection,
     generation: number,
-    rows: Record<string, unknown>[],
+    rows: DecodedRow[],
+    columns: readonly ColumnMeta[],
     endsReadTransaction: boolean,
   ): Promise<void> {
-    const limit = this.config.maxLobBytes ?? DEFAULT_MAX_LOB_BYTES;
-    const cells: Array<{ row: Record<string, unknown>; name: string; lob: LobLocator }> = [];
-    let total = 0;
-
-    for (const row of rows) {
-      for (const [name, lob] of Object.entries(row)) {
-        if (!(lob instanceof LobLocator)) {
-          continue;
-        }
-        total += lob.size;
-        if (total > limit) {
-          throw new UnsupportedValueError(
-            `CUBRID column "${name}" takes this query's LOB content to ${total} bytes, ` +
-              `over the maxLobBytes limit of ${limit}`,
-          );
-        }
-        cells.push({ row, name, lob });
-      }
-    }
-
+    const { cells, total } = this.measureLobs(rows, columns, "query");
     let replyDamaged = false;
 
     try {
-      for (const { row, name, lob } of cells) {
-        setColumn(
+      for (const { row, index, name, lob } of cells) {
+        setCell(
           row,
+          index,
           name,
           decodeLob(name, lob, await this.readLob(cas, generation, name, lob), this.charset),
         );
@@ -2047,15 +2124,17 @@ export class NativeCubridAdapter implements DriverAdapter {
   private async loadRowLobs(
     cas: CASConnection,
     generation: number,
-    row: Record<string, unknown>,
+    row: DecodedRow,
+    columns: readonly ColumnMeta[],
     cursor?: StreamCursor,
   ): Promise<boolean> {
-    const { cells, total } = this.measureLobs([row], "row");
+    const { cells, total } = this.measureLobs([row], columns, "row");
 
-    for (const { name, lob } of cells) {
+    for (const { index, name, lob } of cells) {
       assertStreamWanted(cursor);
-      setColumn(
+      setCell(
         row,
+        index,
         name,
         decodeLob(name, lob, await this.readLob(cas, generation, name, lob, cursor), this.charset),
       );
@@ -2066,18 +2145,16 @@ export class NativeCubridAdapter implements DriverAdapter {
 
   /** Finds the LOB cells of `rows` and refuses them if their content is over the limit. */
   private measureLobs(
-    rows: Record<string, unknown>[],
+    rows: DecodedRow[],
+    columns: readonly ColumnMeta[],
     scope: "query" | "row",
-  ): {
-    cells: Array<{ row: Record<string, unknown>; name: string; lob: LobLocator }>;
-    total: number;
-  } {
+  ): { cells: LobCell[]; total: number } {
     const limit = this.config.maxLobBytes ?? DEFAULT_MAX_LOB_BYTES;
-    const cells: Array<{ row: Record<string, unknown>; name: string; lob: LobLocator }> = [];
+    const cells: LobCell[] = [];
     let total = 0;
 
     for (const row of rows) {
-      for (const [name, lob] of Object.entries(row)) {
+      for (const { index, name, value: lob } of rowCells(row, columns)) {
         if (!(lob instanceof LobLocator)) {
           continue;
         }
@@ -2088,7 +2165,7 @@ export class NativeCubridAdapter implements DriverAdapter {
               `over the maxLobBytes limit of ${limit}`,
           );
         }
-        cells.push({ row, name, lob });
+        cells.push({ row, index, name, lob });
       }
     }
 
@@ -2305,6 +2382,37 @@ function destroySource(param: LobParam): void {
   if (isStreamSource(param.source) && typeof source.destroy === "function") {
     (source.destroy as () => void).call(source);
   }
+}
+
+/** Rows of either shape with their columns: a QueryResult or an ArrayQueryResult. */
+type DecodedResult = QueryResult | ArrayQueryResult;
+
+/** The row shape valid options ask for. */
+function rowShape(options: QueryOptions | StreamOptions | undefined): RowShape {
+  return wantsArrayRows(options) ? "array" : "object";
+}
+
+/** A LOB locator in a decoded row: its position for an array row, its name for both. */
+interface LobCell {
+  row: DecodedRow;
+  index: number;
+  name: string;
+  lob: LobLocator;
+}
+
+/**
+ * The cells of a decoded row. An object row yields its own keys, in their order,
+ * so a column that a later same-named one replaced is not there and its LOB is
+ * never read. An array row yields every column, named by its metadata.
+ */
+function rowCells(
+  row: DecodedRow,
+  columns: readonly ColumnMeta[],
+): Array<{ index: number; name: string; value: unknown }> {
+  if (Array.isArray(row)) {
+    return row.map((value, index) => ({ index, name: columns[index]?.name ?? "", value }));
+  }
+  return Object.entries(row).map(([name, value]) => ({ index: -1, name, value }));
 }
 
 function toColumnInfo(column: ColumnMeta): ColumnInfo {

@@ -5,9 +5,15 @@ import {
   toError,
   withTransactionOutcome,
 } from "../internals/map-error.js";
-import { assertValidQueryOptions } from "../internals/normalize-config.js";
+import {
+  assertValidQueryOptions,
+  checkedResult,
+  checkedRows,
+} from "../internals/normalize-config.js";
 import { unknownOutcomeProbe } from "../internals/session-state.js";
 import type {
+  ArrayRowOptions,
+  ArrayRowQueryable,
   BatchTransactionClient,
   ConnectionLike,
   ExecutableTransactionClient,
@@ -20,11 +26,12 @@ import type {
 } from "../types/client.js";
 import { LobParamError, type PreparedQueryParam, refuseLobParams } from "../types/lob.js";
 import type { QueryParams } from "../types/query.js";
-import type { QueryResult, QueryResultRow } from "../types/result.js";
+import type { ArrayQueryResult, QueryResult, QueryResultRow } from "../types/result.js";
 import type { ConnectionSource, ConnectionVerdict } from "./connection-source.js";
 
 export class CubridTransaction
   implements
+    ArrayRowQueryable,
     ResultTransactionClient,
     ExecutableTransactionClient,
     PreparedTransactionClient,
@@ -32,28 +39,44 @@ export class CubridTransaction
 {
   constructor(private readonly connection: ConnectionLike) {}
 
+  query<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayRowOptions,
+  ): Promise<T[]>;
   query<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
     options?: QueryOptions,
-  ): Promise<T[]> {
-    return runStatement(options, "Transaction query failed.", () => {
+  ): Promise<T[]>;
+  query(sql: string, params?: QueryParams, options?: QueryOptions): Promise<unknown[]> {
+    return runStatement(options, "Transaction query failed.", async () => {
       refuseLobParams(params);
-      return this.connection.query<T>(sql, params, options);
+      return checkedRows(options, await this.connection.query(sql, params, options));
     });
   }
 
+  queryResult<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayRowOptions,
+  ): Promise<ArrayQueryResult<T>>;
   queryResult<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
     options?: QueryOptions,
-  ): Promise<QueryResult<T>> {
-    return runStatement(options, "Transaction query failed.", () => {
+  ): Promise<QueryResult<T>>;
+  queryResult(
+    sql: string,
+    params?: QueryParams,
+    options?: QueryOptions,
+  ): Promise<QueryResult | ArrayQueryResult> {
+    return runStatement(options, "Transaction query failed.", async () => {
       refuseLobParams(params);
       if (!this.connection.queryResult) {
         throw new Error("Underlying connection does not support queryResult.");
       }
-      return this.connection.queryResult<T>(sql, params, options);
+      return checkedResult(options, await this.connection.queryResult(sql, params, options));
     });
   }
 
@@ -67,29 +90,52 @@ export class CubridTransaction
     });
   }
 
+  queryPrepared<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: readonly PreparedQueryParam[] | undefined,
+    options: ArrayRowOptions,
+  ): Promise<T[]>;
   queryPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
-  ): Promise<T[]> {
-    return runStatement(options, "Transaction query failed.", () => {
+  ): Promise<T[]>;
+  queryPrepared(
+    sql: string,
+    params?: readonly PreparedQueryParam[],
+    options?: QueryOptions,
+  ): Promise<unknown[]> {
+    return runStatement(options, "Transaction query failed.", async () => {
       if (!this.connection.queryPrepared) {
         throw new Error("Underlying connection does not support queryPrepared.");
       }
-      return this.connection.queryPrepared<T>(sql, params, options);
+      return checkedRows(options, await this.connection.queryPrepared(sql, params, options));
     });
   }
 
+  queryResultPrepared<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: readonly PreparedQueryParam[] | undefined,
+    options: ArrayRowOptions,
+  ): Promise<ArrayQueryResult<T>>;
   queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
-  ): Promise<QueryResult<T>> {
-    return runStatement(options, "Transaction query failed.", () => {
+  ): Promise<QueryResult<T>>;
+  queryResultPrepared(
+    sql: string,
+    params?: readonly PreparedQueryParam[],
+    options?: QueryOptions,
+  ): Promise<QueryResult | ArrayQueryResult> {
+    return runStatement(options, "Transaction query failed.", async () => {
       if (!this.connection.queryResultPrepared) {
         throw new Error("Underlying connection does not support queryResultPrepared.");
       }
-      return this.connection.queryResultPrepared<T>(sql, params, options);
+      return checkedResult(
+        options,
+        await this.connection.queryResultPrepared(sql, params, options),
+      );
     });
   }
 
@@ -268,20 +314,36 @@ export class CallbackTransaction extends CubridTransaction {
    */
   protected endOutcome: boolean | undefined = false;
 
+  override query<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayRowOptions,
+  ): Promise<T[]>;
   override query<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
     options?: QueryOptions,
-  ): Promise<T[]> {
-    return this.track(() => super.query<T>(sql, params, options));
+  ): Promise<T[]>;
+  override query(sql: string, params?: QueryParams, options?: QueryOptions): Promise<unknown[]> {
+    return this.track(() => super.query(sql, params, options));
   }
 
+  override queryResult<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayRowOptions,
+  ): Promise<ArrayQueryResult<T>>;
   override queryResult<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
     options?: QueryOptions,
-  ): Promise<QueryResult<T>> {
-    return this.track(() => super.queryResult<T>(sql, params, options));
+  ): Promise<QueryResult<T>>;
+  override queryResult(
+    sql: string,
+    params?: QueryParams,
+    options?: QueryOptions,
+  ): Promise<QueryResult | ArrayQueryResult> {
+    return this.track(() => super.queryResult(sql, params, options));
   }
 
   override execute(
@@ -292,20 +354,40 @@ export class CallbackTransaction extends CubridTransaction {
     return this.track(() => super.execute(sql, params, options));
   }
 
+  override queryPrepared<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: readonly PreparedQueryParam[] | undefined,
+    options: ArrayRowOptions,
+  ): Promise<T[]>;
   override queryPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
-  ): Promise<T[]> {
-    return this.track(() => super.queryPrepared<T>(sql, params, options));
+  ): Promise<T[]>;
+  override queryPrepared(
+    sql: string,
+    params?: readonly PreparedQueryParam[],
+    options?: QueryOptions,
+  ): Promise<unknown[]> {
+    return this.track(() => super.queryPrepared(sql, params, options));
   }
 
+  override queryResultPrepared<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: readonly PreparedQueryParam[] | undefined,
+    options: ArrayRowOptions,
+  ): Promise<ArrayQueryResult<T>>;
   override queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
-  ): Promise<QueryResult<T>> {
-    return this.track(() => super.queryResultPrepared<T>(sql, params, options));
+  ): Promise<QueryResult<T>>;
+  override queryResultPrepared(
+    sql: string,
+    params?: readonly PreparedQueryParam[],
+    options?: QueryOptions,
+  ): Promise<QueryResult | ArrayQueryResult> {
+    return this.track(() => super.queryResultPrepared(sql, params, options));
   }
 
   override executePrepared(

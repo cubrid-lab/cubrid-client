@@ -4,6 +4,7 @@ import { mapError, toError, withTransactionOutcome } from "../internals/map-erro
 import { pickTransactionOptions } from "../internals/normalize-config.js";
 import { unknownOutcomeProbe } from "../internals/session-state.js";
 import type {
+  ArrayRowQueryable,
   BatchTransactionClient,
   ClientConfig,
   ConnectionFactory,
@@ -71,7 +72,8 @@ export function factorySource(config: ClientConfig, factory: ConnectionFactory):
   };
 }
 
-export type TransactionHandle = ResultTransactionClient &
+export type TransactionHandle = ArrayRowQueryable &
+  ResultTransactionClient &
   ExecutableTransactionClient &
   PreparedTransactionClient &
   BatchTransactionClient;

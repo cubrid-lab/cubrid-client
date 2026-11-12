@@ -2,15 +2,22 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { NotSentError } from "../errors/internal-errors.js";
 import { isAbortReason, mapError } from "../internals/map-error.js";
 import {
+  ARRAY_ROWS_UNSUPPORTED,
   assertValidQueryOptions,
   assertValidStreamOptions,
   assertValidTimezone,
   assertValidTransactionOptions,
+  checkedResult,
+  checkedRows,
   pickTransactionOptions,
+  wantsArrayRows,
 } from "../internals/normalize-config.js";
 import { assertValidCharset } from "../protocol/charset.js";
 import { assertValidCredentials } from "../protocol/protocol.js";
 import type {
+  ArrayRowOptions,
+  ArrayRowQueryable,
+  ArrayStreamOptions,
   BatchExecutable,
   BatchTransactionClient,
   ClientConfig,
@@ -35,7 +42,7 @@ import type {
 } from "../types/client.js";
 import { type PreparedQueryParam, refuseLobParams } from "../types/lob.js";
 import type { QueryParams } from "../types/query.js";
-import type { QueryResult, QueryResultRow } from "../types/result.js";
+import type { ArrayQueryResult, QueryResult, QueryResultRow } from "../types/result.js";
 import type {
   SchemaColumn,
   SchemaIndex,
@@ -144,38 +151,56 @@ export class CubridClient
 
   /**
    * Run a statement and return its rows. See {@link QueryOptions} for `signal`
-   * and a per-statement `readTimeout`.
+   * and a per-statement `readTimeout`. With `rowMode: "array"` each row is an
+   * array of its values in select-list order; see {@link ArrayRowOptions}.
    *
    * @throws RangeError or TypeError (as a rejection, before anything is sent)
    * when an option is invalid.
    */
+  query<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayRowOptions,
+  ): Promise<T[]>;
   query<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
     options?: QueryOptions,
-  ): Promise<T[]> {
+  ): Promise<T[]>;
+  query(sql: string, params?: QueryParams, options?: QueryOptions): Promise<unknown[]> {
     return runStatement(
       options,
       "Query failed.",
       () => this.literalConnection(params),
-      (connection) => connection.query<T>(sql, params, options),
+      async (connection) => checkedRows(options, await connection.query(sql, params, options)),
     );
   }
 
+  /** {@link query} with the columns of the result. See {@link QueryResult}. */
+  queryResult<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayRowOptions,
+  ): Promise<ArrayQueryResult<T>>;
   queryResult<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
     options?: QueryOptions,
-  ): Promise<QueryResult<T>> {
+  ): Promise<QueryResult<T>>;
+  queryResult(
+    sql: string,
+    params?: QueryParams,
+    options?: QueryOptions,
+  ): Promise<QueryResult | ArrayQueryResult> {
     return runStatement(
       options,
       "Query failed.",
       () => this.literalConnection(params),
-      (connection) => {
+      async (connection) => {
         if (!connection.queryResult) {
           throw new Error("Underlying connection does not support queryResult.");
         }
-        return connection.queryResult<T>(sql, params, options);
+        return checkedResult(options, await connection.queryResult(sql, params, options));
       },
     );
   }
@@ -194,38 +219,58 @@ export class CubridClient
     );
   }
 
+  queryPrepared<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: readonly PreparedQueryParam[] | undefined,
+    options: ArrayRowOptions,
+  ): Promise<T[]>;
   queryPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
-  ): Promise<T[]> {
+  ): Promise<T[]>;
+  queryPrepared(
+    sql: string,
+    params?: readonly PreparedQueryParam[],
+    options?: QueryOptions,
+  ): Promise<unknown[]> {
     return runStatement(
       options,
       "Query failed.",
       () => this.getSharedConnection(),
-      (connection) => {
+      async (connection) => {
         if (!connection.queryPrepared) {
           throw new Error("Underlying connection does not support queryPrepared.");
         }
-        return connection.queryPrepared<T>(sql, params, options);
+        return checkedRows(options, await connection.queryPrepared(sql, params, options));
       },
     );
   }
 
+  queryResultPrepared<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: readonly PreparedQueryParam[] | undefined,
+    options: ArrayRowOptions,
+  ): Promise<ArrayQueryResult<T>>;
   queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
-  ): Promise<QueryResult<T>> {
+  ): Promise<QueryResult<T>>;
+  queryResultPrepared(
+    sql: string,
+    params?: readonly PreparedQueryParam[],
+    options?: QueryOptions,
+  ): Promise<QueryResult | ArrayQueryResult> {
     return runStatement(
       options,
       "Query failed.",
       () => this.getSharedConnection(),
-      (connection) => {
+      async (connection) => {
         if (!connection.queryResultPrepared) {
           throw new Error("Underlying connection does not support queryResultPrepared.");
         }
-        return connection.queryResultPrepared<T>(sql, params, options);
+        return checkedResult(options, await connection.queryResultPrepared(sql, params, options));
       },
     );
   }
@@ -290,24 +335,45 @@ export class CubridClient
    * Statements issued on this client meanwhile wait, so one awaited inside the loop
    * can never run: it rejects with `kind: "stream-busy"` after
    * {@link StreamOptions.consumerTimeout}. Use `transaction()`, which has its own
-   * connection, or another client. See `docs/API_REFERENCE.md`.
+   * connection, or another client. With `rowMode: "array"` each row is an array
+   * of its values in select-list order. See `docs/API_REFERENCE.md`.
    *
-   * @throws RangeError at once when an option is invalid.
+   * @throws RangeError or TypeError at once when an option is invalid.
+   */
+  stream<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayStreamOptions,
+  ): AsyncGenerator<T, void, undefined>;
+  stream<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+    options?: StreamOptions,
+  ): AsyncGenerator<T, void, undefined>;
+  /**
+   * The signature of {@link Streamable.stream}, so a union of this type with
+   * `Streamable` or `ConnectionLike` stays callable. Never chosen by a direct call.
    */
   stream<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
     options?: StreamOptions,
-  ): AsyncGenerator<T, void, undefined> {
+  ): AsyncIterable<T>;
+  stream(
+    sql: string,
+    params?: QueryParams,
+    options?: StreamOptions,
+  ): AsyncGenerator<unknown, void, undefined> {
     assertValidStreamOptions(options);
     refuseLobParams(params);
-    return streamRows<T>(() => this.getSharedConnection(), sql, params, options);
+    return streamRows(() => this.getSharedConnection(), sql, params, options);
   }
 
   async transaction<T>(
     callback: TransactionCallback<
       T,
-      ResultTransactionClient &
+      ArrayRowQueryable &
+        ResultTransactionClient &
         ExecutableTransactionClient &
         PreparedTransactionClient &
         BatchTransactionClient
@@ -759,12 +825,13 @@ async function runStatement<R>(
  * of `connect` or of a read is a QueryError; the reason of the caller's own
  * abort is passed on unchanged. A stream left early is closed on its connection.
  */
-export async function* streamRows<T extends QueryResultRow>(
+export async function* streamRows<T>(
   connect: () => Promise<ConnectionLike>,
   sql: string,
   params: QueryParams | undefined,
   options: StreamOptions | undefined,
 ): AsyncGenerator<T, void, undefined> {
+  const arrays = wantsArrayRows(options);
   // An abort is the caller's own decision, so its reason stays as it is.
   const failure = (error: unknown): unknown =>
     options?.signal?.aborted && error === options.signal.reason
@@ -777,7 +844,7 @@ export async function* streamRows<T extends QueryResultRow>(
     if (!connection.stream) {
       throw new Error("Underlying connection does not support stream.");
     }
-    rows = connection.stream<T>(sql, params, options)[Symbol.asyncIterator]();
+    rows = (connection.stream(sql, params, options) as AsyncIterable<T>)[Symbol.asyncIterator]();
   } catch (error) {
     throw failure(error);
   }
@@ -796,6 +863,9 @@ export async function* streamRows<T extends QueryResultRow>(
       if (next.done) {
         exhausted = true;
         return;
+      }
+      if (arrays && !Array.isArray(next.value)) {
+        throw failure(new Error(ARRAY_ROWS_UNSUPPORTED));
       }
       yield next.value;
     }

@@ -8156,3 +8156,184 @@ describe("Integration: outcomeUnknown on uncertain outcomes (#254)", { skip: !av
     }
   });
 });
+
+describe('Integration: rowMode "array" keeps every column (#255)', { skip: !available }, () => {
+  const A = "rm255_a";
+  const B = "rm255_b";
+  const L = "rm255_lob";
+  const JOIN = `SELECT a.id, b.id, a.label FROM ${A} a LEFT JOIN ${B} b ON b.a_id = a.id ORDER BY a.id`;
+  const ARRAY = { rowMode: "array" } as const;
+
+  async function withTables(run: (client: ReturnType<typeof createClient>) => Promise<void>) {
+    const client = createClient(TEST_CONFIG);
+    try {
+      for (const table of [A, B, L]) {
+        await client.query(`DROP TABLE IF EXISTS ${table}`);
+      }
+      await client.query(`CREATE TABLE ${A} (id INT NOT NULL PRIMARY KEY, label VARCHAR(20))`);
+      await client.query(`CREATE TABLE ${B} (id INT NOT NULL PRIMARY KEY, a_id INT)`);
+      await client.query(`CREATE TABLE ${L} (id INT NOT NULL PRIMARY KEY, b BLOB, c CLOB)`);
+      await client.query(`INSERT INTO ${A} VALUES (1, 'one'), (2, 'two'), (3, NULL)`);
+      await client.query(`INSERT INTO ${B} VALUES (10, 1), (20, 2)`);
+      await run(client);
+    } finally {
+      for (const table of [A, B, L]) {
+        await client.query(`DROP TABLE IF EXISTS ${table}`).catch(() => {});
+      }
+      await client.close();
+    }
+  }
+
+  test("SELECT t1.id, t2.id returns both values in array mode; object mode keeps the last", async () => {
+    await withTables(async (client) => {
+      const arrays = await client.query(JOIN, undefined, ARRAY);
+      assert.deepEqual(arrays, [
+        [1, 10, "one"],
+        [2, 20, "two"],
+        [3, null, null],
+      ]);
+
+      const result = await client.queryResult(JOIN, undefined, ARRAY);
+      assert.deepEqual(result.rows, arrays);
+      assert.deepEqual(
+        result.columns.map((column) => [column.name, column.nullable]),
+        [
+          ["id", false],
+          ["id", false],
+          ["label", true],
+        ],
+      );
+
+      // The documented 1.x object shape: one `id` key, holding the last column's value.
+      assert.deepEqual(await client.query(JOIN), [
+        { id: 10, label: "one" },
+        { id: 20, label: "two" },
+        { id: null, label: null },
+      ]);
+      // The 1.x workaround: distinct aliases.
+      assert.deepEqual(
+        await client.query(
+          `SELECT a.id AS a_id, b.id AS b_id FROM ${A} a LEFT JOIN ${B} b ON b.a_id = a.id ORDER BY a.id`,
+        ),
+        [
+          { a_id: 1, b_id: 10 },
+          { a_id: 2, b_id: 20 },
+          { a_id: 3, b_id: null },
+        ],
+      );
+    });
+  });
+
+  test("case-variant, repeated expression and __proto__ names each keep their value, in order", async () => {
+    await withTables(async (client) => {
+      const cases = await client.queryResult(
+        `SELECT 1 AS "Id", 2 AS "ID", 3 AS id, '' , '', 7 AS "__proto__", NULL AS "__proto__"`,
+        undefined,
+        ARRAY,
+      );
+      assert.deepEqual(
+        cases.columns.map((column) => column.name),
+        ["Id", "ID", "id", "''", "''", "__proto__", "__proto__"],
+      );
+      assert.deepEqual(cases.rows, [[1, 2, 3, "", "", 7, null]]);
+      assert.equal(Object.getPrototypeOf(cases.rows[0]), Array.prototype);
+
+      // The server refuses an empty alias, so an empty column name cannot reach a row.
+      await assert.rejects(client.query(`SELECT 1 AS ""`, undefined, ARRAY), QueryError);
+
+      // Order follows the select list, not the table.
+      assert.deepEqual(
+        await client.query(`SELECT label, id, label FROM ${A} WHERE id = 1`, undefined, ARRAY),
+        [["one", 1, "one"]],
+      );
+    });
+  });
+
+  test("the prepared path returns the same arrays", async () => {
+    await withTables(async (client) => {
+      const sql = `SELECT a.id, b.id, ? FROM ${A} a LEFT JOIN ${B} b ON b.a_id = a.id WHERE a.id >= ? ORDER BY a.id`;
+      assert.deepEqual(await client.queryPrepared(sql, ["x", 2], ARRAY), [
+        [2, 20, "x"],
+        [3, null, "x"],
+      ]);
+      const result = await client.queryResultPrepared(sql, [null, 3], ARRAY);
+      assert.deepEqual(result.rows, [[3, null, null]]);
+      assert.equal(result.columns.length, 3);
+      await client.transaction(async (tx) => {
+        assert.deepEqual(await tx.queryPrepared(sql, ["t", 3], ARRAY), [[3, null, "t"]]);
+        assert.deepEqual((await tx.queryResult(JOIN, undefined, ARRAY)).rows.length, 3);
+      });
+    });
+  });
+
+  test("BLOB and CLOB columns of the same name are each read", async () => {
+    await withTables(async (client) => {
+      await client.query(`INSERT INTO ${L} VALUES (1, X'0a0b', 'text'), (2, NULL, NULL)`);
+      const sql = `SELECT id, b AS v, c AS v FROM ${L} ORDER BY id`;
+
+      const result = await client.queryResult(sql, undefined, ARRAY);
+      assert.deepEqual(
+        result.columns.map((column) => [column.name, column.type]),
+        [
+          ["id", "INT"],
+          ["v", "BLOB"],
+          ["v", "CLOB"],
+        ],
+      );
+      assert.deepEqual(result.rows, [
+        [1, Buffer.from([10, 11]), "text"],
+        [2, null, null],
+      ]);
+      assert.deepEqual(await client.query(sql), [
+        { id: 1, v: "text" },
+        { id: 2, v: null },
+      ]);
+
+      const streamed: unknown[][] = [];
+      for await (const row of client.stream(sql, undefined, ARRAY)) {
+        streamed.push(row);
+      }
+      assert.deepEqual(streamed, result.rows);
+      // The session is still usable and in autocommit.
+      assert.deepEqual(await client.query("SELECT 1 AS one", undefined, ARRAY), [[1]]);
+    });
+  });
+
+  test("stream and a multi-FETCH result keep arrays across windows", async () => {
+    await withTables(async (client) => {
+      const values = Array.from({ length: 1500 }, (_, i) => `(${i + 100}, 'row-${i}')`);
+      await client.query(`INSERT INTO ${A} VALUES ${values.join(", ")}`);
+      const sql = `SELECT a.id, a.label, a.id FROM ${A} a WHERE a.id >= 100 ORDER BY a.id`;
+
+      const rows = await client.query<[number, string, number]>(sql, undefined, ARRAY);
+      assert.equal(rows.length, 1500);
+      assert.deepEqual(rows[1499], [1599, "row-1499", 1599]);
+      assert.ok(rows.every((row, i) => row[0] === i + 100 && row[2] === i + 100));
+
+      let count = 0;
+      for await (const row of client.stream<[number, string, number]>(sql, undefined, {
+        rowMode: "array",
+        fetchSize: 50,
+      })) {
+        assert.deepEqual(row, rows[count]);
+        count += 1;
+      }
+      assert.equal(count, 1500);
+
+      const pool = createPool({ ...TEST_CONFIG, max: 1 });
+      try {
+        assert.deepEqual((await pool.query(sql, undefined, ARRAY)).length, 1500);
+        await pool.connection(async (leased) => {
+          let first: unknown;
+          for await (const row of leased.stream(sql, undefined, ARRAY)) {
+            first = row;
+            break;
+          }
+          assert.deepEqual(first, [100, "row-0", 100]);
+        });
+      } finally {
+        await pool.close();
+      }
+    });
+  });
+});

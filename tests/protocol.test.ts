@@ -2597,3 +2597,104 @@ test("assertSingleStatement refuses a second statement, in either backslash mode
     assert.throws(() => assertSingleStatement(sql), /one statement/, sql);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Row shape: object rows keyed by name, array rows by position (#255)
+// ---------------------------------------------------------------------------
+
+function intCell(value: number): { type: number; data: Buffer } {
+  const data = Buffer.alloc(4);
+  data.writeInt32BE(value, 0);
+  return { type: CUBRIDDataType.INT, data };
+}
+
+function textCell(value: string): { type: number; data: Buffer } {
+  return { type: CUBRIDDataType.STRING, data: Buffer.from(`${value}\0`, "utf-8") };
+}
+
+const NULL_CELL = { type: CUBRIDDataType.INT, data: null };
+
+/** `SELECT t1.id, t2.id, '' , "Id", __proto__`-like columns. */
+const SHAPE_COLUMNS = [
+  { name: "id", type: CUBRIDDataType.INT },
+  { name: "id", type: CUBRIDDataType.INT },
+  { name: "", type: CUBRIDDataType.STRING },
+  { name: "", type: CUBRIDDataType.STRING },
+  { name: "Id", type: CUBRIDDataType.INT },
+  { name: "ID", type: CUBRIDDataType.INT },
+  { name: "__proto__", type: CUBRIDDataType.INT },
+];
+
+const SHAPE_ROWS = [
+  [intCell(1), intCell(2), textCell("a"), textCell("b"), intCell(3), intCell(4), intCell(5)],
+  [intCell(6), NULL_CELL, NULL_CELL, textCell("c"), NULL_CELL, intCell(7), NULL_CELL],
+];
+
+test("array rows keep every value of duplicate, empty and case-variant names, in order", () => {
+  const reply = buildSelectResponseForTypes(SHAPE_COLUMNS, SHAPE_ROWS);
+
+  const result = parsePrepareAndExecute(reply, 1, false, "utf-8", "array");
+
+  assert.deepEqual(result.rows, [
+    [1, 2, "a", "b", 3, 4, 5],
+    [6, null, null, "c", null, 7, null],
+  ]);
+  for (const row of result.rows) {
+    assert.ok(Array.isArray(row));
+    assert.equal(Object.getPrototypeOf(row), Array.prototype);
+  }
+  assert.deepEqual(
+    result.columns.map((column) => column.name),
+    ["id", "id", "", "", "Id", "ID", "__proto__"],
+  );
+});
+
+test("object rows keep the documented last-same-name-wins shape", () => {
+  const reply = buildSelectResponseForTypes(SHAPE_COLUMNS, SHAPE_ROWS);
+
+  const defaulted = parsePrepareAndExecute(reply, 1);
+  const explicit = parsePrepareAndExecute(reply, 1, false, "utf-8", "object");
+
+  assert.deepEqual(explicit.rows, defaulted.rows);
+  const [first, second] = defaulted.rows;
+  // A repeated name keeps the position of its first column and the value of its last.
+  assert.deepEqual(Object.keys(first!), ["id", "", "Id", "ID", "__proto__"]);
+  assert.equal(first!.id, 2);
+  assert.equal(first![""], "b");
+  assert.equal(first!.Id, 3);
+  assert.equal(first!.ID, 4);
+  assert.equal(Object.getOwnPropertyDescriptor(first, "__proto__")?.value, 5);
+  assert.equal(Object.getPrototypeOf(first), Object.prototype);
+  assert.equal(second!.id, null);
+  assert.equal(Object.getOwnPropertyDescriptor(second, "__proto__")?.value, null);
+  assert.equal(Object.getPrototypeOf(second), Object.prototype);
+});
+
+test("parseFetch decodes array rows in select-list order", () => {
+  const columns: ColumnMeta[] = parsePrepareAndExecute(
+    buildSelectResponseForTypes(SHAPE_COLUMNS, []),
+    1,
+  ).columns;
+  const parts: Buffer[] = [Buffer.alloc(4), Buffer.alloc(4)];
+  parts[1]!.writeInt32BE(1, 0);
+  const position = Buffer.alloc(4);
+  position.writeInt32BE(3, 0);
+  parts.push(position, Buffer.alloc(8));
+  for (const { data } of SHAPE_ROWS[0]!) {
+    const size = Buffer.alloc(4);
+    size.writeInt32BE(data?.length ?? -1, 0);
+    parts.push(size, data ?? Buffer.alloc(0));
+  }
+  const reply = Buffer.concat(parts);
+
+  assert.deepEqual(parseFetch(reply, columns, false, "utf-8", "array").rows, [
+    [1, 2, "a", "b", 3, 4, 5],
+  ]);
+  assert.deepEqual(Object.keys(parseFetch(reply, columns).rows[0]!), [
+    "id",
+    "",
+    "Id",
+    "ID",
+    "__proto__",
+  ]);
+});

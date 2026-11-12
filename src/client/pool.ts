@@ -9,11 +9,16 @@ import {
   assertValidQueryOptions,
   assertValidStreamOptions,
   assertValidTransactionOptions,
+  checkedResult,
+  checkedRows,
   normalizeConfig,
   pickTransactionOptions,
 } from "../internals/normalize-config.js";
 import { type SessionState, sessionStateReader } from "../internals/session-state.js";
 import type {
+  ArrayRowOptions,
+  ArrayRowQueryable,
+  ArrayStreamOptions,
   BatchExecutable,
   BatchTransactionClient,
   ClientConfig,
@@ -46,7 +51,7 @@ import type {
   PoolStats,
 } from "../types/pool.js";
 import type { QueryParams } from "../types/query.js";
-import type { QueryResult, QueryResultRow } from "../types/result.js";
+import type { ArrayQueryResult, QueryResult, QueryResultRow } from "../types/result.js";
 import type {
   SchemaColumn,
   SchemaIndex,
@@ -253,26 +258,42 @@ class PoolStatements implements PoolConnection {
     return this.run(options, failureMessage, run);
   }
 
+  query<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayRowOptions,
+  ): Promise<T[]>;
   query<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
     options?: QueryOptions,
-  ): Promise<T[]> {
-    return this.runLiteral(params, options, "Query failed.", (connection) =>
-      connection.query<T>(sql, params, options),
+  ): Promise<T[]>;
+  query(sql: string, params?: QueryParams, options?: QueryOptions): Promise<unknown[]> {
+    return this.runLiteral(params, options, "Query failed.", async (connection) =>
+      checkedRows(options, await connection.query(sql, params, options)),
     );
   }
 
+  queryResult<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayRowOptions,
+  ): Promise<ArrayQueryResult<T>>;
   queryResult<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
     options?: QueryOptions,
-  ): Promise<QueryResult<T>> {
-    return this.runLiteral(params, options, "Query failed.", (connection) => {
+  ): Promise<QueryResult<T>>;
+  queryResult(
+    sql: string,
+    params?: QueryParams,
+    options?: QueryOptions,
+  ): Promise<QueryResult | ArrayQueryResult> {
+    return this.runLiteral(params, options, "Query failed.", async (connection) => {
       if (!connection.queryResult) {
         throw new Error("Underlying connection does not support queryResult.");
       }
-      return connection.queryResult<T>(sql, params, options);
+      return checkedResult(options, await connection.queryResult(sql, params, options));
     });
   }
 
@@ -285,29 +306,49 @@ class PoolStatements implements PoolConnection {
     });
   }
 
+  queryPrepared<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: readonly PreparedQueryParam[] | undefined,
+    options: ArrayRowOptions,
+  ): Promise<T[]>;
   queryPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
-  ): Promise<T[]> {
-    return this.run(options, "Query failed.", (connection) => {
+  ): Promise<T[]>;
+  queryPrepared(
+    sql: string,
+    params?: readonly PreparedQueryParam[],
+    options?: QueryOptions,
+  ): Promise<unknown[]> {
+    return this.run(options, "Query failed.", async (connection) => {
       if (!connection.queryPrepared) {
         throw new Error("Underlying connection does not support queryPrepared.");
       }
-      return connection.queryPrepared<T>(sql, params, options);
+      return checkedRows(options, await connection.queryPrepared(sql, params, options));
     });
   }
 
+  queryResultPrepared<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: readonly PreparedQueryParam[] | undefined,
+    options: ArrayRowOptions,
+  ): Promise<ArrayQueryResult<T>>;
   queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
-  ): Promise<QueryResult<T>> {
-    return this.run(options, "Query failed.", (connection) => {
+  ): Promise<QueryResult<T>>;
+  queryResultPrepared(
+    sql: string,
+    params?: readonly PreparedQueryParam[],
+    options?: QueryOptions,
+  ): Promise<QueryResult | ArrayQueryResult> {
+    return this.run(options, "Query failed.", async (connection) => {
       if (!connection.queryResultPrepared) {
         throw new Error("Underlying connection does not support queryResultPrepared.");
       }
-      return connection.queryResultPrepared<T>(sql, params, options);
+      return checkedResult(options, await connection.queryResultPrepared(sql, params, options));
     });
   }
 
@@ -337,14 +378,24 @@ class PoolStatements implements PoolConnection {
     });
   }
 
+  stream<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayStreamOptions,
+  ): AsyncGenerator<T, void, undefined>;
   stream<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
     options?: StreamOptions,
-  ): AsyncGenerator<T, void, undefined> {
+  ): AsyncGenerator<T, void, undefined>;
+  stream(
+    sql: string,
+    params?: QueryParams,
+    options?: StreamOptions,
+  ): AsyncGenerator<unknown, void, undefined> {
     assertValidStreamOptions(options);
     refuseLobParams(params);
-    return this.openStream<T>(sql, params, options);
+    return this.openStream(sql, params, options);
   }
 }
 
@@ -503,41 +554,80 @@ export class CubridPool
     this.fillMin();
   }
 
-  /** Run a statement on a leased connection and return its rows. See {@link QueryOptions}. */
+  /**
+   * Run a statement on a leased connection and return its rows. See
+   * {@link QueryOptions}, and {@link ArrayRowOptions} for `rowMode: "array"`.
+   */
+  query<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayRowOptions,
+  ): Promise<T[]>;
   query<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
     options?: QueryOptions,
-  ): Promise<T[]> {
-    return this.statements.query<T>(sql, params, options);
+  ): Promise<T[]>;
+  query(sql: string, params?: QueryParams, options?: QueryOptions): Promise<unknown[]> {
+    return this.statements.query(sql, params, options);
   }
 
+  queryResult<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayRowOptions,
+  ): Promise<ArrayQueryResult<T>>;
   queryResult<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
     options?: QueryOptions,
-  ): Promise<QueryResult<T>> {
-    return this.statements.queryResult<T>(sql, params, options);
+  ): Promise<QueryResult<T>>;
+  queryResult(
+    sql: string,
+    params?: QueryParams,
+    options?: QueryOptions,
+  ): Promise<QueryResult | ArrayQueryResult> {
+    return this.statements.queryResult(sql, params, options);
   }
 
   execute(sql: string, params?: QueryParams, options?: ExecuteOptions): Promise<ExecuteResult> {
     return this.statements.execute(sql, params, options);
   }
 
+  queryPrepared<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: readonly PreparedQueryParam[] | undefined,
+    options: ArrayRowOptions,
+  ): Promise<T[]>;
   queryPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
-  ): Promise<T[]> {
-    return this.statements.queryPrepared<T>(sql, params, options);
+  ): Promise<T[]>;
+  queryPrepared(
+    sql: string,
+    params?: readonly PreparedQueryParam[],
+    options?: QueryOptions,
+  ): Promise<unknown[]> {
+    return this.statements.queryPrepared(sql, params, options);
   }
 
+  queryResultPrepared<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: readonly PreparedQueryParam[] | undefined,
+    options: ArrayRowOptions,
+  ): Promise<ArrayQueryResult<T>>;
   queryResultPrepared<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: readonly PreparedQueryParam[],
     options?: QueryOptions,
-  ): Promise<QueryResult<T>> {
-    return this.statements.queryResultPrepared<T>(sql, params, options);
+  ): Promise<QueryResult<T>>;
+  queryResultPrepared(
+    sql: string,
+    params?: readonly PreparedQueryParam[],
+    options?: QueryOptions,
+  ): Promise<QueryResult | ArrayQueryResult> {
+    return this.statements.queryResultPrepared(sql, params, options);
   }
 
   executePrepared(
@@ -562,14 +652,33 @@ export class CubridPool
    * connection from the first read until it ends, so a statement awaited inside
    * the loop runs on another connection of the pool, or waits for one.
    *
-   * @throws RangeError at once when an option is invalid.
+   * @throws RangeError or TypeError at once when an option is invalid.
+   */
+  stream<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayStreamOptions,
+  ): AsyncGenerator<T, void, undefined>;
+  stream<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+    options?: StreamOptions,
+  ): AsyncGenerator<T, void, undefined>;
+  /**
+   * The signature of {@link Streamable.stream}, so a union of this type with
+   * `Streamable` or `ConnectionLike` stays callable. Never chosen by a direct call.
    */
   stream<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
     options?: StreamOptions,
-  ): AsyncGenerator<T, void, undefined> {
-    return this.statements.stream<T>(sql, params, options);
+  ): AsyncIterable<T>;
+  stream(
+    sql: string,
+    params?: QueryParams,
+    options?: StreamOptions,
+  ): AsyncGenerator<unknown, void, undefined> {
+    return this.statements.stream(sql, params, options);
   }
 
   /**
@@ -629,7 +738,8 @@ export class CubridPool
   transaction<T>(
     callback: TransactionCallback<
       T,
-      ResultTransactionClient &
+      ArrayRowQueryable &
+        ResultTransactionClient &
         ExecutableTransactionClient &
         PreparedTransactionClient &
         BatchTransactionClient
