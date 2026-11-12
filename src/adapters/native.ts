@@ -120,6 +120,7 @@ import {
 } from "../types/lob.js";
 import type { QueryParams } from "../types/query.js";
 import type { ArrayQueryResult, ColumnInfo, QueryResult, QueryResultRow } from "../types/result.js";
+import { isZonedParam } from "../types/zoned-param.js";
 import type { DriverAdapter } from "./base.js";
 import { StreamCursor } from "./stream-cursor.js";
 
@@ -189,7 +190,8 @@ function needsBackslashMode(params: QueryParams): boolean {
       typeof value === "number" ||
       typeof value === "bigint" ||
       value instanceof Date ||
-      Buffer.isBuffer(value)
+      Buffer.isBuffer(value) ||
+      isZonedParam(value)
     ) {
       return false;
     }

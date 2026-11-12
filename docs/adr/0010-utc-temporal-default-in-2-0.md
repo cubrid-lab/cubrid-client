@@ -73,8 +73,9 @@ A value without a zone cannot fully encode an instant, in either mode:
   zone-aware types, so in a non-UTC session the TIMESTAMP fields move by the
   session offset and `WHERE ts = ?` no longer finds rows written today. The
   encoding therefore stays DATETIME (changing it, even in a MAJOR, would move
-  TIMESTAMP columns and needs its own decision), and callers write
-  `FROM_TZ(?, '+00:00')` for a zone-aware column
+  TIMESTAMP columns and needs its own decision), and callers send
+  `zoned(date)` ([#281](https://github.com/cubrid-lab/cubrid-client/issues/281))
+  or write `FROM_TZ(?, '+00:00')` for a zone-aware column
   ([TYPES](../TYPES.md#a-date-in-a-zone-aware-column)).
 
 The internal `encodeBindParams()` helper in `src/protocol/protocol.ts` still
@@ -110,7 +111,10 @@ cleanup, not as part of this decision.
    classified on their own:
    - a `Date` written to a zone-aware column takes the session zone (Context;
      [#273](https://github.com/cubrid-lab/cubrid-client/issues/273): documented
-     with the `FROM_TZ(?, '+00:00')` opt-in, encoding unchanged);
+     with the `FROM_TZ(?, '+00:00')` opt-in, encoding unchanged; the
+     `zoned(date)` parameter of
+     [#281](https://github.com/cubrid-lab/cubrid-client/issues/281) is the
+     additive opt-in);
    - the unused local-field `encodeBindParams()` helper.
 
 ### Breaking change versus bug fix
@@ -119,7 +123,7 @@ cleanup, not as part of this decision.
 | --- | --- | --- |
 | Default `timezone` from `"local"` to `"utc"` | **Breaking default change.** Every DATE/TIME/TIMESTAMP/DATETIME `Date` changes instant on a non-UTC host; the code still compiles | 2.0 MAJOR only, with notice in a prior 1.x release |
 | README and `docs/TYPES.md` warnings, this ADR, characterization tests | Documentation | Any 1.x |
-| A `Date` sent to a zone-aware column labelled with the session zone instead of UTC | **Bug fix candidate**: the stored instant is wrong whenever the session zone is not UTC. [#273](https://github.com/cubrid-lab/cubrid-client/issues/273) found no encoding that keeps TIMESTAMP columns unchanged, so the encoding stays and the opt-in `FROM_TZ(?, '+00:00')` is documented. A zoned parameter type (for example accepting `ZonedDateTime`) would be an additive MINOR | Documentation in 1.x; a zoned parameter type is its own issue |
+| A `Date` sent to a zone-aware column labelled with the session zone instead of UTC | **Bug fix candidate**: the stored instant is wrong whenever the session zone is not UTC. [#273](https://github.com/cubrid-lab/cubrid-client/issues/273) found no encoding that keeps TIMESTAMP columns unchanged, so the encoding stays and the opt-in `FROM_TZ(?, '+00:00')` is documented. The zoned parameter `zoned(date)` ([#281](https://github.com/cubrid-lab/cubrid-client/issues/281)) is the additive MINOR opt-in | Documentation in 1.x; `zoned()` in a 1.x MINOR |
 | Align or remove `encodeBindParams()` | Internal cleanup; no public behavior | Any |
 | Refusing or warning on local-mode DST gaps and overlaps | Not proposed. In `"local"` mode it would change 1.x results; `"utc"` has neither | None |
 

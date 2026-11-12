@@ -1,6 +1,29 @@
 import { Readable } from 'node:stream';
 
-type QueryParam = string | number | boolean | bigint | Date | Buffer | null;
+/**
+ * A `Date` parameter sent with its zone, made by {@link zoned}: a DATETIMETZ of
+ * its UTC fields at `+00:00`, so a TIMESTAMPTZ, TIMESTAMPLTZ, DATETIMETZ or
+ * DATETIMELTZ column keeps its instant whatever the session zone (#281).
+ */
+interface ZonedParam {
+    readonly kind: "zoned";
+    /** Milliseconds since the epoch, read from the `Date` when zoned() was called. */
+    readonly time: number;
+}
+/**
+ * Sends `date` as the instant it is: a DATETIMETZ of its UTC fields with the
+ * zone `+00:00`, on every method that takes parameters. A plain `Date` is a
+ * zone-less DATETIME, to which a zone-aware column attaches the session zone.
+ * Use it for zone-aware columns only: a TIMESTAMP column stores the instant in
+ * the session zone instead of the UTC fields a plain `Date` gives.
+ *
+ * The time is read now, so changing the `Date` afterwards changes nothing.
+ * A value that is not a valid `Date`, or whose UTC year is outside 1 to 9999,
+ * is refused with a TypeError.
+ */
+declare function zoned(date: Date): ZonedParam;
+
+type QueryParam = string | number | boolean | bigint | Date | Buffer | ZonedParam | null;
 type QueryParams = readonly QueryParam[];
 
 /** Content for {@link blob}: bytes, or a stream of byte chunks read once. */
@@ -1834,4 +1857,4 @@ declare function buildWhere(conditions: Record<string, unknown>): {
     params: unknown[];
 };
 
-export { type ArrayQueryResult, type ArrayRowOptions, type ArrayRowQueryable, type ArrayStreamOptions, type BatchExecutable, type BatchTransactionClient, type BlobSource, type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type ClobSource, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridPool, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteManyFailure, type ExecuteManyResult, type ExecuteManySetFailure, type ExecuteOptions, type ExecuteResult, type IsolationLevel, type LobParam, LockTimeoutError, NativeCubridAdapter, type PoolConnection, type PoolConnectionOptions, type PoolOptions, type PoolStats, type PreparedQueryParam, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryOptions, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type StreamOptions, type Streamable, type TransactionCallback, type TransactionClient, TransactionError, type TransactionOptions, type TransactionScope, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, blob, buildWhere, clob, createClient, createPool, escapeIdentifier, parseConnectionString };
+export { type ArrayQueryResult, type ArrayRowOptions, type ArrayRowQueryable, type ArrayStreamOptions, type BatchExecutable, type BatchTransactionClient, type BlobSource, type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type ClobSource, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridPool, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteManyFailure, type ExecuteManyResult, type ExecuteManySetFailure, type ExecuteOptions, type ExecuteResult, type IsolationLevel, type LobParam, LockTimeoutError, NativeCubridAdapter, type PoolConnection, type PoolConnectionOptions, type PoolOptions, type PoolStats, type PreparedQueryParam, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryOptions, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type StreamOptions, type Streamable, type TransactionCallback, type TransactionClient, TransactionError, type TransactionOptions, type TransactionScope, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, type ZonedParam, blob, buildWhere, clob, createClient, createPool, escapeIdentifier, parseConnectionString, zoned };

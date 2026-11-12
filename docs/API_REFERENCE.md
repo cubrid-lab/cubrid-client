@@ -42,6 +42,7 @@ Complete reference for every public export of `cubrid-client`.
   - [ResultTransactionClient](#resulttransactionclient)
   - [QueryParam](#queryparam)
   - [QueryParams](#queryparams)
+  - [zoned() and ZonedParam](#zoned-and-zonedparam)
   - [blob() and clob()](#blob-and-clob)
   - [LobParam, BlobSource and ClobSource](#lobparam-blobsource-and-clobsource)
   - [PreparedQueryParam](#preparedqueryparam)
@@ -1950,6 +1951,7 @@ type QueryParam =
   | bigint
   | Date
   | Buffer
+  | ZonedParam
   | null;
 ```
 
@@ -1960,6 +1962,7 @@ type QueryParam =
 | `boolean` | `SMALLINT` (0 or 1) | `true` |
 | `bigint` | `BIGINT` | `9007199254740993n` |
 | `Date` | `DATETIME` / `TIMESTAMP` | `new Date()` |
+| [`ZonedParam`](#zoned-and-zonedparam) | `DATETIMETZ` at `+00:00`, for zone-aware columns | `zoned(new Date())` |
 | `Buffer` | `BIT VARYING` (also stored into a `BLOB` column) | `Buffer.from("data")` |
 | `null` | `NULL` | `null` |
 
@@ -2001,6 +2004,33 @@ Array of query parameter values.
 ```ts
 type QueryParams = readonly QueryParam[];
 ```
+
+### zoned() and ZonedParam
+
+Send a `Date` as the instant it is, so a TIMESTAMPTZ, TIMESTAMPLTZ, DATETIMETZ or DATETIMELTZ column keeps it whatever the session zone. A plain `Date` is a zone-less DATETIME of its UTC fields, to which such a column attaches the session zone.
+
+```ts
+function zoned(date: Date): ZonedParam;
+
+interface ZonedParam {
+  readonly kind: "zoned";
+  readonly time: number;
+}
+```
+
+```ts
+import { zoned } from "cubrid-client";
+
+await db.execute("INSERT INTO events (at) VALUES (?)", [zoned(new Date())]);
+const rows = await db.queryPrepared("SELECT id FROM events WHERE at = ?", [zoned(since)]);
+```
+
+- **Every method.** `query()`, `queryResult()`, `execute()` and `stream()` send `DATETIMETZ'YYYY-MM-DD HH:MM:SS.mmm +00:00'` of the UTC fields. The prepared methods and `executeMany()` send a DATETIMETZ bind of the same fields and zone. On a client, a transaction, a transaction scope and a pool.
+- **Reads back.** A DATETIMETZ or TIMESTAMPTZ column as a [`ZonedDateTime`](TYPES.md#timezone-aware-values) with zone `+00:00` (TIMESTAMPTZ drops the milliseconds); a `*LTZ` column as the same instant in the session zone.
+- **Zone-aware columns only.** A TIMESTAMP column stores the instant in the session zone, where a plain `Date` stores its UTC fields. DATE, TIME and DATETIME columns store the UTC fields either way.
+- **Validation.** `zoned()` throws a `TypeError` at once for a value that is not a `Date`, an invalid `Date`, or a UTC year outside 0001 to 9999. It reads the time when called: changing the `Date` afterwards changes nothing.
+- **Shape.** A `ZonedParam` is frozen, and only `zoned()` makes one: an object of the same shape built by hand is refused like any other object. A value from the ESM build is accepted by the CommonJS build and back. A custom [`ConnectionLike`](#connectionlike) receives it as it is, an object whose `kind` is `"zoned"`, and should refuse it if it cannot send it.
+- **Versions.** Measured on CUBRID 10.2 and 11.4; 11.0 and 11.2 were not measured. See [sending the instant](TYPES.md#sending-the-instant-zoned).
 
 ### blob() and clob()
 

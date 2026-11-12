@@ -320,6 +320,12 @@ time, not the client's local time. If you need local-time semantics, convert
 the value yourself before passing it, or store an explicit UTC offset alongside
 it.
 
+A TIMESTAMPTZ, TIMESTAMPLTZ, DATETIMETZ or DATETIMELTZ column attaches the
+**session** zone to those fields. To keep the instant there, pass `zoned(date)`,
+which sends the UTC fields labelled `+00:00`; do not use it for a TIMESTAMP
+column, which then stores the instant in the session zone. See
+[sending the instant](docs/TYPES.md#sending-the-instant-zoned).
+
 ### How parameters are escaped
 
 Parameters are rendered into the SQL text client-side, with escaping that is

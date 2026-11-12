@@ -16,6 +16,7 @@ import { normalizeConfig } from "../src/internals/normalize-config.js";
 import { PacketReader } from "../src/protocol/packet-reader.js";
 import { encodePreparedParams, formatValue, interpolateParams } from "../src/protocol/protocol.js";
 import type { ClientOptions } from "../src/types/client.js";
+import { isZonedParam, zoned } from "../src/types/zoned-param.js";
 import {
   FIXTURE_ZONES,
   LA_DST,
@@ -302,7 +303,7 @@ test("#250: DST gap and overlap in America/Los_Angeles: local guesses, utc keeps
 // #273: a Date written to a TIMESTAMPTZ, DATETIMETZ or *LTZ column gets the
 // session zone attached to its UTC fields. No single encoding fixes that without
 // changing TIMESTAMP columns, so the encoding stays a zone-less DATETIME and the
-// caller opts in with FROM_TZ(?, '+00:00') (docs/TYPES.md). Live evidence is in
+// caller opts in with zoned() (#281) or FROM_TZ(?, '+00:00') (docs/TYPES.md). Live evidence is in
 // the #273 block of tests/integration.test.ts.
 
 test("#273: a Date is a DATETIME of its UTC fields on the literal and the prepared path, under every TZ", () => {
@@ -332,4 +333,127 @@ test("#273: FROM_TZ(?, '+00:00') labels the UTC fields of a Date as UTC on the l
       );
     });
   }
+});
+
+// #281: zoned(date) sends a Date as the instant it is, a DATETIMETZ of its UTC
+// fields at +00:00, so a zone-aware column keeps it in any session zone. Live
+// evidence is in the #281 block of tests/integration.test.ts.
+
+test("#281: zoned() is a DATETIMETZ of the UTC fields at +00:00 on the literal path, under every TZ", () => {
+  for (const zone of ZONES) {
+    withTZ(zone, () => {
+      const param = zoned(SENT);
+      assert.equal(formatValue(param, true), "DATETIMETZ'2025-06-14 23:30:45.678 +00:00'", zone);
+      assert.equal(formatValue(param, false), "DATETIMETZ'2025-06-14 23:30:45.678 +00:00'", zone);
+      assert.equal(
+        interpolateParams("INSERT INTO t (at, d) VALUES (?, ?)", [param, SENT], true),
+        "INSERT INTO t (at, d) VALUES (DATETIMETZ'2025-06-14 23:30:45.678 +00:00', " +
+          "DATETIME'2025-06-14 23:30:45.678')",
+        zone,
+      );
+    });
+  }
+});
+
+test("#281: zoned() is a DATETIMETZ bind of the UTC fields and the zone text without a NUL", () => {
+  // JDBC UOutputBuffer.addDatetimetz; CAS net_arg_get_datetimetz reads the
+  // zone length as the value length less the 14 bytes of the fields.
+  const preparedHex =
+    "00000001" + // type length
+    "1f" + // CUBRIDDataType.DATETIMETZ, 31
+    "00000014" + // value length, 14 + 6
+    shorts(...STORED.datetime).toString("hex") +
+    Buffer.from("+00:00", "latin1").toString("hex");
+  for (const zone of ZONES) {
+    withTZ(zone, () => {
+      const binds = encodePreparedParams([zoned(SENT)]);
+      assert.equal(binds.count, 1, zone);
+      assert.equal(binds.bytes.toString("hex"), preparedHex, zone);
+    });
+  }
+  // A plain Date next to it keeps its DATETIME bind.
+  const mixed = encodePreparedParams([SENT, zoned(SENT), null]);
+  assert.equal(mixed.count, 3);
+  assert.equal(
+    mixed.bytes.toString("hex"),
+    "0000000116" +
+      "0000000e" +
+      shorts(...STORED.datetime).toString("hex") +
+      preparedHex +
+      "0000000100" + // CUBRIDDataType.NULL
+      "00000000",
+  );
+});
+
+test("#281: zoned() reads the time when called, is frozen, and keeps the epoch and the year range ends", () => {
+  const date = new Date(SENT.getTime());
+  const param = zoned(date);
+  date.setTime(0);
+  assert.equal(formatValue(param, true), "DATETIMETZ'2025-06-14 23:30:45.678 +00:00'");
+  assert.ok(Object.isFrozen(param));
+  assert.deepEqual({ ...param }, { kind: "zoned", time: SENT.getTime() });
+  assert.equal(formatValue(zoned(new Date(0)), true), "DATETIMETZ'1970-01-01 00:00:00.000 +00:00'");
+  assert.equal(
+    formatValue(zoned(new Date("9999-12-31T23:59:59.999Z")), true),
+    "DATETIMETZ'9999-12-31 23:59:59.999 +00:00'",
+  );
+  // The year is not zero-padded, as for a plain Date; the server reads it.
+  assert.equal(
+    formatValue(zoned(new Date("0001-01-01T00:00:00.000Z")), true),
+    "DATETIMETZ'1-01-01 00:00:00.000 +00:00'",
+  );
+  assert.equal(
+    encodePreparedParams([zoned(new Date("0001-01-01T00:00:00.000Z"))]).bytes.toString("hex"),
+    `000000011f00000014${shorts(1, 1, 1, 0, 0, 0, 0).toString("hex")}2b30303a3030`,
+  );
+});
+
+test("#281: zoned() refuses what is not a valid Date in the DATETIMETZ years", () => {
+  const notDates: unknown[] = [undefined, null, "2025-06-14", SENT.getTime(), {}, zoned(SENT)];
+  for (const value of notDates) {
+    assert.throws(() => zoned(value as Date), {
+      name: "TypeError",
+      message: "zoned() takes a Date",
+    });
+  }
+  assert.throws(() => zoned(new Date(Number.NaN)), {
+    name: "TypeError",
+    message: "zoned() takes a valid Date, not an invalid one",
+  });
+  for (const iso of ["0000-12-31T23:59:59.999Z", "+010000-01-01T00:00:00.000Z"]) {
+    assert.throws(() => zoned(new Date(iso)), {
+      name: "TypeError",
+      message: "zoned() takes a Date whose UTC year is from 0001 to 9999",
+    });
+  }
+});
+
+test("#281: only a value zoned() made is a zoned parameter, recognized across builds by a registered symbol", () => {
+  // A look-alike without the brand stays an unsupported object on both paths.
+  const lookAlike = { kind: "zoned", time: SENT.getTime() };
+  assert.equal(isZonedParam(lookAlike), false);
+  assert.throws(() => formatValue(lookAlike, true), /unsupported parameter type: object/);
+  assert.throws(() => encodePreparedParams([lookAlike]), /unsupported prepared parameter type/);
+  // The ESM and CommonJS builds share the brand through the symbol registry.
+  const otherBuild = Object.defineProperty(
+    { kind: "zoned", time: SENT.getTime() },
+    Symbol.for("cubrid-client.ZonedParam"),
+    { value: true },
+  );
+  assert.equal(isZonedParam(otherBuild), true);
+  // A branded value with a time zoned() would refuse is refused on both paths.
+  for (const time of [Number.NaN, Date.UTC(10000, 0, 1)]) {
+    const forged = Object.defineProperty(
+      { kind: "zoned", time },
+      Symbol.for("cubrid-client.ZonedParam"),
+      { value: true },
+    );
+    assert.throws(() => formatValue(forged, true), /DATETIMETZ years 0001 to 9999/);
+    assert.throws(() => encodePreparedParams([forged]), /DATETIMETZ years 0001 to 9999/);
+  }
+});
+
+test("#281: the package exports zoned()", async () => {
+  const entry = await import("../src/index.js");
+  assert.equal(entry.zoned, zoned);
 });

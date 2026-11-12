@@ -79,6 +79,8 @@ export type {
 } from "./types/schema.js";
 export type { ZonedDateTimeFields, ZonedDateTimeType } from "./types/zoned-date-time.js";
 export { ZonedDateTime } from "./types/zoned-date-time.js";
+export type { ZonedParam } from "./types/zoned-param.js";
+export { zoned } from "./types/zoned-param.js";
 export type { ConnectionConfig } from "./utils/connection-string.js";
 export { parseConnectionString } from "./utils/connection-string.js";
 export { buildWhere, escapeIdentifier } from "./utils/query.js";
