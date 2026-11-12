@@ -698,15 +698,30 @@ const indexes = await db.getIndexes("athlete", { schema: "dba" });
 
 #### `close()`
 
-Closes the shared connection after statements and multi-query schema inspections started before it have finished. After calling `close()`, the client can no longer execute queries: a `query()`, `queryResult()`, `execute()`, `ping()`, `getServerVersion()`, `getTables()`, `getColumns()`, `getPrimaryKey()`, `getIndexes()`, `transaction()`, `beginTransactionScope()`, `beginTransaction()`, `commit()` or `rollback()` issued after `close()` is called, even in the same tick, rejects with an error whose `cause` is `Client is closed.`, and no connection is opened. A `transaction()` already started runs to its end on its own connection. A [`TransactionScope`](#transactionscope) not yet ended is discarded: its connection is closed, concurrently with the shared one and without waiting for its running statements, and the server rolls its work back; later calls on it reject. `close()` resolves once those connections are closed, including the one of a `beginTransactionScope()` still opening. If no connection was opened, closing it is a no-op.
+Closes the shared connection after statements and multi-query schema inspections started before it have finished. After calling `close()`, the client can no longer execute queries: a `query()`, `queryResult()`, `execute()`, `ping()`, `getServerVersion()`, `getTables()`, `getColumns()`, `getPrimaryKey()`, `getIndexes()`, `transaction()`, `beginTransactionScope()`, `beginTransaction()`, `commit()` or `rollback()` issued after `close()` is called, even in the same tick, rejects with an error whose `cause` is `Client is closed.`, and no connection is opened. A [`TransactionScope`](#transactionscope) not yet ended is discarded: its connection is closed, concurrently with the shared one and without waiting for its running statements, and the server rolls its work back; later calls on it reject. `close()` resolves once those connections are closed, including the one of a `beginTransactionScope()` still opening. If no connection was opened, closing it is a no-op.
+
+`transaction()` calls made before `close()` are tracked from the moment they are called (#246):
+
+| When `close()` is called, the `transaction()` is | Outcome | `close()` |
+|------|---------|-----------|
+| Opening its connection (`connectionFactory` running) | Nothing is sent on the connection once it opens: it is closed, the callback never runs, and `transaction()` rejects with a `TransactionError` whose `cause` is `Client is closed.` | Waits for that connection to open and close |
+| Applying its options or sending BEGIN | The callback never runs. The transaction is rolled back, its connection closed, and `transaction()` rejects as above | Waits for the rollback and the connection close |
+| Running its callback, including a statement in flight | The callback runs to its end on its own connection, which stays usable; it commits or rolls back as it would have | Waits for the callback, its COMMIT or ROLLBACK and its connection close |
+| In an explicit `tx.commit()` or `tx.rollback()` | Completes | Waits for it and the connection close |
+
+So `close()` never resolves before such a transaction's outcome is decided, and no COMMIT is sent after it resolves. A callback's failure, rollback failure (`rollbackError`) and close failure (`closeError`) reach the `transaction()` caller, not `close()`. Callbacks are waited for alongside the shared connection's close and the scope discards, never before them, because a callback statement may be waiting for a lock that one of them holds.
+
+Calling `close()` again, while it runs or after, returns the same promise. A failed `close()` is therefore not retried: it rejects again with the same error, and [`destroy()`](#destroy) is the way to release what is left. Once `destroy()` has run, `close()` resolves.
+
+A `close()` awaited inside a running `transaction()` callback closes the shared connection and the scopes as usual but waits for no `transaction()` callback: it would wait for its own, and two callbacks closing the client would wait for each other. Those callbacks, its own included, then commit or roll back after that `close()` resolved, each on its own connection. A `close()` called outside every callback, even later, still waits for all of them, and so does one made from a timer or promise chain a callback started, once that callback has returned. While the callback is still running, such a call counts as inside it.
 
 ```ts
-async close(): Promise<void>
+close(): Promise<void>
 ```
 
 **Throws:** [`ConnectionError`](#connectionerror) if closing fails.
 
-`close()` is graceful: with no `readTimeout`, a server that never answers the running statement makes it wait forever. Use [`destroy()`](#destroy) to stop waiting.
+`close()` is graceful: with no `readTimeout`, a server that never answers the running statement makes it wait forever, and so does a `transaction()` callback that never returns or a `connectionFactory` that never settles. Use [`destroy()`](#destroy) to stop waiting: a running `close()` then resolves at once. No COMMIT is sent after `destroy()`, so the callbacks it was waiting for fail; a COMMIT already in flight has an unknown outcome.
 
 ##### Example
 

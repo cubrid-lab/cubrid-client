@@ -591,7 +591,7 @@ Rolls back the active transaction on the shared connection.
 
 ### `client.close(): Promise<void>`
 
-Closes the shared connection and discards (rolls back) any `beginTransactionScope()` handle not yet ended. Safe to call multiple times.
+Closes the shared connection and discards (rolls back) any `beginTransactionScope()` handle not yet ended. It waits for `transaction()` callbacks already running to commit or roll back, and refuses those that have not started. Safe to call multiple times: every call returns the same promise. See [`close()`](docs/API_REFERENCE.md#close).
 
 ### `client.destroy(): Promise<void>`
 
