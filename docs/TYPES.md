@@ -142,6 +142,20 @@ option from `SELECT CHARSET('x')`. See
 
 ## Date and time values
 
+> **Warning: the 1.x default reads in the local zone.** A `Date` parameter is
+> sent as its UTC fields, but by default (`timezone: "local"`) the fields are
+> read back in the Node.js process zone, so a `Date` written and read on a host
+> that is not on UTC comes back as a different instant (9 hours early under
+> `TZ=Asia/Seoul`, 7 or 8 hours late under `TZ=America/Los_Angeles`). Opt in to
+> UTC reads:
+>
+> ```ts
+> const db = createClient({ host: "localhost", database: "demodb", user: "dba", timezone: "utc" });
+> ```
+>
+> The default stays `"local"` for all of 1.x. Changing it to `"utc"` in 2.0 is
+> proposed in [ADR 0010](adr/0010-utc-temporal-default-in-2-0.md).
+
 DATE, TIME, TIMESTAMP and DATETIME store wall-clock fields and no zone, while a
 JavaScript `Date` is an instant, so the client has to pick a zone to read the
 fields in. The [`timezone`](API_REFERENCE.md#clientoptions) client option picks it:
@@ -160,9 +174,21 @@ fields in. The [`timezone`](API_REFERENCE.md#clientoptions) client option picks 
 - The server does not send impossible calendar fields such as February 30, and the
   zero date rejects the query in both modes (see [zero dates](#zero-dates)).
 - The zone-aware types below are not affected by the option.
+- A value without a zone names wall-clock fields, not an instant. A DATE written
+  from `new Date(2025, 5, 15)` under `TZ=Asia/Seoul` stores 2025-06-14, because
+  local midnight there is 15:00 UTC the day before; build date-only values with
+  `Date.UTC(...)`. A server session on a zone with daylight saving time stores a
+  TIMESTAMP in that zone, so the two instants of a repeated hour read back as the
+  same fields, and a time in a skipped hour is refused (`Invalid utime`).
+- A `Date` written to a TIMESTAMPTZ, DATETIMETZ or `*LTZ` column gets the
+  **session** zone attached to its UTC fields, so it is the same instant only
+  while the session zone is UTC. The session starts in the server's zone (the
+  `timezone` server parameter, by default the zone of the server host). Write an
+  explicit literal such as `DATETIMETZ'2025-06-14 23:30:45.678 +00:00'` otherwise.
 
 `"local"` stays the default in 1.x so existing code reads the same values;
-`"utc"` is a candidate default for 2.0.
+`"utc"` is proposed as the 2.0 default in
+[ADR 0010](adr/0010-utc-temporal-default-in-2-0.md).
 
 ## Timezone-aware values
 

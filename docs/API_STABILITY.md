@@ -142,6 +142,16 @@ The `stream-busy` limit is part of the contract. A statement waits as long as th
 consumer keeps reading, and a consumer that stops cannot make a statement wait for
 ever: `consumerTimeout` can be raised but not disabled.
 
+### Date and time zone default
+
+`timezone` defaults to `"local"` for every 1.x release: DATE, TIME, TIMESTAMP and
+DATETIME are read in the Node.js process zone, while `Date` parameters are written
+as UTC fields. Changing the default to `"utc"` changes the instant every such value
+decodes to on a host that is not on UTC, without a type change, so it is a MAJOR
+change. It is proposed for 2.0 in
+[ADR 0010](adr/0010-utc-temporal-default-in-2-0.md), with `"local"` kept as an
+explicit setting; set `timezone` explicitly now to be unaffected.
+
 For the complete 1.x line, Node.js 18 and 20 are retained even though they are upstream EOL. [ADR 0006](adr/0006-node-18-support-through-1x.md) records the explicit Node 18 release commitment and independent Node 18 **packed-package** test requirement. A higher Node minimum is reserved for a possible, separately reviewed 2.0 MAJOR, not a 1.x development-tooling update.
 
 ## Node.js, TypeScript and distribution

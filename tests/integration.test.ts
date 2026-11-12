@@ -43,6 +43,14 @@ import { blob, clob } from "../src/types/lob.js";
 import type { QueryParam, QueryParams } from "../src/types/query.js";
 import { ZonedDateTime } from "../src/types/zoned-date-time.js";
 import { buildWhere, escapeIdentifier } from "../src/utils/query.js";
+import {
+  FIXTURE_ZONES,
+  LA_DST,
+  LOCAL_DECODED,
+  LOCAL_MIDNIGHT_SENT,
+  SENT,
+  UTC_DECODED,
+} from "./fixtures/temporal-zones.js";
 
 const TEST_CONFIG = {
   host: "127.0.0.1",
@@ -7881,6 +7889,140 @@ describe("Integration: maxReplyBytes (#251)", { skip: !available }, () => {
       await client.query(`DELETE FROM ${TABLE} WHERE id = 200`).catch(() => undefined);
       await client.close();
       await big.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #250: the fixtures of tests/fixtures/temporal-zones.ts against a live server,
+// for the 1.x default and for the proposed 2.0 default (docs/adr/0010).
+// ---------------------------------------------------------------------------
+
+describe("Integration: temporal values under TZ=UTC, Asia/Seoul and America/Los_Angeles (#250)", {
+  skip: !available,
+}, () => {
+  const TABLE = "cc_tz_250";
+
+  /** Run `run` under each fixture zone, restoring the process TZ afterwards. */
+  async function eachZone(run: (zone: (typeof FIXTURE_ZONES)[number]) => Promise<void>) {
+    const previous = process.env.TZ;
+    try {
+      for (const zone of FIXTURE_ZONES) {
+        process.env.TZ = zone;
+        await run(zone);
+      }
+    } finally {
+      if (previous === undefined) {
+        delete process.env.TZ;
+      } else {
+        process.env.TZ = previous;
+      }
+    }
+  }
+
+  test("a Date written to DATE, TIME, TIMESTAMP and DATETIME reads back as the fixtures", async () => {
+    const local = createClient(TEST_CONFIG);
+    const utc = createClient({ ...TEST_CONFIG, timezone: "utc" });
+    try {
+      await local.query(`DROP TABLE IF EXISTS ${TABLE}`);
+      await local.query(
+        `CREATE TABLE ${TABLE} (id INT, d DATE, t TIME, ts TIMESTAMP, dt DATETIME)`,
+      );
+      // The literal path and the prepared path both send the UTC fields.
+      await local.query(`INSERT INTO ${TABLE} VALUES (1, ?, ?, ?, ?)`, [SENT, SENT, SENT, SENT]);
+      await local.executePrepared(`INSERT INTO ${TABLE} VALUES (2, ?, ?, ?, ?)`, [
+        SENT,
+        SENT,
+        SENT,
+        SENT,
+      ]);
+      const read = async (client: typeof local) => {
+        const rows = await client.query(`SELECT d, t, ts, dt FROM ${TABLE} ORDER BY id`);
+        assert.equal(rows.length, 2);
+        return rows.map((row) => ({
+          datetime: (row.dt as Date).toISOString(),
+          timestamp: (row.ts as Date).toISOString(),
+          date: (row.d as Date).toISOString(),
+          time: (row.t as Date).toISOString(),
+        }));
+      };
+
+      await eachZone(async (zone) => {
+        // 1.x default: a different instant per process TZ.
+        assert.deepEqual(await read(local), [LOCAL_DECODED[zone], LOCAL_DECODED[zone]], zone);
+        // Proposed 2.0 default: the same instants everywhere, and DATETIME is SENT again.
+        const fromUtc = await read(utc);
+        assert.deepEqual(fromUtc, [UTC_DECODED, UTC_DECODED], zone);
+        assert.equal(fromUtc[0]?.datetime, SENT.toISOString(), zone);
+      });
+    } finally {
+      await local.query(`DROP TABLE IF EXISTS ${TABLE}`).catch(() => undefined);
+      await local.close();
+      await utc.close();
+    }
+  });
+
+  test("a local-midnight Date names the day before in a DATE column east of UTC", async () => {
+    const client = createClient(TEST_CONFIG);
+    try {
+      await eachZone(async (zone) => {
+        const [row] = await client.query<{ ymd: number }>(
+          "SELECT YEAR(d) * 10000 + MONTH(d) * 100 + DAY(d) AS ymd " +
+            "FROM (SELECT CAST(? AS DATE) AS d FROM db_root) x",
+          [new Date(2025, 5, 15)],
+        );
+        assert.equal(row?.ymd, LOCAL_MIDNIGHT_SENT[zone].storedDay, zone);
+      });
+    } finally {
+      await client.close();
+    }
+  });
+
+  test("a TIMESTAMP in a DST overlap cannot tell its two instants apart", async () => {
+    const adapter = new NativeCubridAdapter({ ...TEST_CONFIG, timezone: "utc" });
+    try {
+      // In a transaction the broker keeps the session, and so its time zone.
+      await adapter.beginTransaction();
+      await adapter.query("SET TIME ZONE 'America/Los_Angeles'");
+      const [pdt, pst] = LA_DST.overlap.instants.map(
+        (iso) => `TIMESTAMPTZ'${iso.slice(0, 10)} ${iso.slice(11, 19)} +00:00'`,
+      );
+      const [row] = await adapter.query(
+        `SELECT CAST(${pdt} AS TIMESTAMP) AS a, CAST(${pst} AS TIMESTAMP) AS b, ` +
+          `UNIX_TIMESTAMP(${pdt}) AS ua, UNIX_TIMESTAMP(${pst}) AS ub FROM db_root`,
+      );
+      // Two instants an hour apart ...
+      assert.equal(Number(row?.ub) - Number(row?.ua), 3600);
+      // ... are the same session wall-clock fields, so the same Date in either mode.
+      assert.equal((row?.a as Date | undefined)?.toISOString(), LA_DST.overlap.utcIso);
+      assert.equal((row?.b as Date | undefined)?.toISOString(), LA_DST.overlap.utcIso);
+      await adapter.rollback();
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  test("a Date written to a zone-aware column takes the session zone, not UTC", async () => {
+    const adapter = new NativeCubridAdapter({ ...TEST_CONFIG, timezone: "utc" });
+    try {
+      await adapter.beginTransaction();
+      await adapter.query("SET TIME ZONE 'Asia/Seoul'");
+      const [row] = await adapter.query(
+        "SELECT CAST(? AS DATETIMETZ) AS tz, UNIX_TIMESTAMP(CAST(? AS DATETIMETZ)) AS u FROM db_root",
+        [SENT, SENT],
+      );
+      const tz = row?.tz as ZonedDateTime;
+      assert.ok(tz instanceof ZonedDateTime);
+      // The UTC fields of SENT, labelled with the session zone: nine hours early.
+      assert.deepEqual(
+        [tz.year, tz.month, tz.day, tz.hour, tz.minute, tz.second, tz.millisecond],
+        [2025, 6, 14, 23, 30, 45, 678],
+      );
+      assert.match(tz.zone, /^Asia\/Seoul/);
+      assert.equal(Number(row?.u) * 1000, Math.floor(SENT.getTime() / 1000) * 1000 - 9 * 3_600_000);
+      await adapter.rollback();
+    } finally {
+      await adapter.close();
     }
   });
 });
