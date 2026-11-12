@@ -11,6 +11,7 @@ Complete reference for every public export of `cubrid-client`.
 - [createPool()](#createpool)
 - [CubridPool](#cubridpool)
 - [CubridTransaction](#cubridtransaction)
+- [Query helpers: escapeIdentifier() and buildWhere()](#query-helpers-escapeidentifier-and-buildwhere)
 - [Error Classes](#error-classes)
   - [ConnectionError](#connectionerror)
   - [QueryError](#queryerror)
@@ -1030,6 +1031,53 @@ Rolls back the transaction. Called automatically by `CubridClient.transaction()`
 ```ts
 rollback(): Promise<void>
 ```
+
+---
+
+## Query helpers: escapeIdentifier() and buildWhere()
+
+```ts
+function escapeIdentifier(name: string): string;
+function buildWhere(conditions: Record<string, unknown>): { clause: string; params: unknown[] };
+```
+
+`escapeIdentifier()` quotes `name` as one identifier. A name without `]` is
+wrapped in brackets as is, whatever else it contains:
+
+| Name | Result |
+|------|--------|
+| `users` | `[users]` |
+| `` a`b `` | ``[a`b]`` |
+| `a"b`, `a b`, `a\b` | `[a"b]`, `[a b]`, `[a\b]` |
+
+A CUBRID bracket identifier ends at the first `]` and has no escape (`[a]]b]` is a
+syntax error), so a name that contains `]` is wrapped in backticks instead, with
+each backtick in it doubled: `a]b` becomes `` `a]b` `` and ``a]`b`` becomes
+``` `a]``b` ```. Brackets and backticks mean the same thing whatever the server's
+`ansi_quotes` and `no_backslash_escapes` are; double quotes are not used because
+they quote a string when `ansi_quotes=no`.
+
+Whether the server accepts a name with `]` depends on its version. CUBRID 10.2
+accepts it. CUBRID 11.4 refuses `[` and `]` in every identifier, however it is
+quoted, with a [`QueryError`](#queryerror) (code `-493`), so such a column cannot
+exist there.
+
+`buildWhere()` returns a `WHERE` clause that matches every entry of `conditions`,
+joined with `AND`, and the values to pass with it. Each key is quoted with
+`escapeIdentifier()`. A `null` value becomes `IS NULL` and adds no value; any
+other value becomes `= ?` and is appended to `params`. An empty object returns an
+empty clause.
+
+```ts
+const { clause, params } = buildWhere({ status: "active", deleted_at: null });
+// clause: "WHERE [status] = ? AND [deleted_at] IS NULL", params: ["active"]
+await client.query(`SELECT * FROM users ${clause}`, params as QueryParam[]);
+```
+
+The values are always passed as parameters, never written into the SQL text.
+The client does not count a `?` inside a quoted name as a marker, so a key cannot
+move a value to another marker. The broker does count it, though, and refuses the
+statement (code `-1007`), so a key with `?` cannot be used.
 
 ---
 
