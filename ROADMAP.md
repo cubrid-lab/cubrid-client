@@ -77,7 +77,10 @@ changes, including increasing the Node.js minimum. A build-tool upgrade
 Reading DATE, TIME, TIMESTAMP and DATETIME as UTC by default (`timezone: "utc"`)
 is a 2.0 candidate ([ADR 0010](docs/adr/0010-utc-temporal-default-in-2-0.md),
 [#250](https://github.com/cubrid-lab/cubrid-client/issues/250)); every 1.x release
-keeps the `"local"` default.
+keeps the `"local"` default. Replacing the `*Prepared` method variants with one
+`binding` option and moving the driver interface to `cubrid-client/driver` is a
+2.0 proposal ([ADR 0011](docs/adr/0011-v2-binding-option-and-driver-subpath.md),
+[#249](https://github.com/cubrid-lab/cubrid-client/issues/249)); 1.x keeps both.
 
 See the [TypeScript type mapping](docs/TYPES.md),
 [verified support matrix](docs/SUPPORT_MATRIX.md) and
