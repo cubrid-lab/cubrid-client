@@ -4,8 +4,14 @@
 
 | Version | Status |
 |---------|--------|
-| 0.3.x   | ✅ Supported |
-| < 0.3   | ❌ Not Supported |
+| 1.4.x   | ✅ Supported |
+| < 1.4   | ❌ Not Supported: upgrade, see the [literal-parameter advisory](docs/advisories/literal-parameters-1.4.0.md) |
+
+## Advisories
+
+- [Literal parameters before 1.4.0](docs/advisories/literal-parameters-1.4.0.md):
+  0.2.0 to 1.3.0 can drop a `WHERE` clause when a negative number follows a
+  minus sign in `query()`/`execute()` parameters. Fixed in 1.4.0.
 
 ## Reporting a Vulnerability
 

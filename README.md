@@ -47,6 +47,11 @@ CUBRID compatibility; review the version support evidence and release notes.
 
 ## Installation
 
+> **Upgrade from 0.x–1.3.x:** versions before 1.4.0 can drop a `WHERE` clause
+> when a negative number follows a minus sign in a `query()`/`execute()`
+> parameter (`bal-?` with `-1`). See the
+> [upgrade advisory](docs/advisories/literal-parameters-1.4.0.md).
+
 ```bash
 npm install cubrid-client
 ```

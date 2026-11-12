@@ -10,5 +10,6 @@ Each `vX.Y.Z.md` describes the **code in the immutable version tag**, not featur
 | v1.1.0 | Existing published Release | [v1.1.0.md](v1.1.0.md) |
 | v1.2.0 | Existing published Release | [v1.2.0.md](v1.2.0.md) |
 | v1.3.0 | Existing published Release | [v1.3.0.md](v1.3.0.md) |
+| v1.4.0 | Existing published Release | [v1.4.0.md](v1.4.0.md) |
 
 The synchronization workflow updates descriptions **only for existing GitHub Releases**. It never changes tags, creates a missing GitHub Release, or republishes npm packages.
