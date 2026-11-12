@@ -3,6 +3,7 @@ import { createServer, type Socket as NetSocket, type Server } from "node:net";
 import test from "node:test";
 import { TLSSocket } from "node:tls";
 
+import { ConnectionLostError } from "../src/errors/internal-errors.js";
 import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { CASConnection, type CASConnectionConfig } from "../src/protocol/connection.js";
 import {
@@ -360,6 +361,100 @@ test("readTimeout over TLS spares a slow frame that keeps arriving", {
 
     assert.deepEqual(response, Buffer.alloc(2, 0xab));
     await cas.close();
+  } finally {
+    await closeServer(server);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// destroy() (#245)
+// ---------------------------------------------------------------------------
+
+/** Settles with the time `promise` took and its error, never rejecting. */
+async function timed(promise: Promise<unknown>): Promise<{ error: unknown; ms: number }> {
+  const started = Date.now();
+  try {
+    await promise;
+    return { error: undefined, ms: Date.now() - started };
+  } catch (error) {
+    return { error, ms: Date.now() - started };
+  }
+}
+
+test("destroy() stops a TLS handshake the server never answers, before the handshake limit", {
+  timeout: 15000,
+}, async () => {
+  let accepted = false;
+  const server = createServer((socket: NetSocket) => {
+    accepted = true;
+    socket.on("error", () => {});
+    // The plaintext redirect int, then silence where SSL_accept would answer.
+    socket.once("data", () => socket.write(int32(0)));
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const addr = server.address();
+  const port = typeof addr === "object" && addr !== null ? addr.port : 0;
+
+  try {
+    // No readTimeout: only the 10-second handshake limit would end this.
+    const cas = new CASConnection({
+      ...DEFAULT_CONFIG,
+      port,
+      ssl: true,
+      rejectUnauthorized: false,
+    });
+    const connecting = timed(cas.connect());
+    while (!accepted) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    cas.destroy();
+
+    const { error, ms } = await connecting;
+    assert.ok(error instanceof ConnectionLostError, String(error));
+    assert.ok(ms < 5000, `connect settled after ${ms}ms`);
+    assert.equal(cas.isConnected, false);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test("destroy() settles a request in flight over TLS, and the queue behind it", {
+  timeout: 15000,
+}, async () => {
+  let requests = 0;
+  const { server, port } = await createMockSslBroker({
+    onRequest: () => {
+      requests += 1;
+    },
+  });
+
+  try {
+    const cas = new CASConnection({
+      ...DEFAULT_CONFIG,
+      port,
+      ssl: true,
+      rejectUnauthorized: false,
+    });
+    await cas.connect();
+    const inFlight = timed(cas.sendAndRecv(Buffer.alloc(8), Buffer.from([1])));
+    const queued = timed(cas.sendAndRecv(Buffer.alloc(8), Buffer.from([1])));
+    while (requests === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    cas.destroy();
+
+    const first = await inFlight;
+    assert.ok(first.error instanceof ConnectionLostError, String(first.error));
+    assert.match((first.error as Error).message, /outcome of a request in flight is unknown/);
+    assert.ok(first.ms < 5000);
+    const second = await queued;
+    assert.match((second.error as Error).message, /before this request was sent/);
+    await cas.close();
+    assert.equal(requests, 1);
+    assert.equal(cas.failedExchanges, 1);
   } finally {
     await closeServer(server);
   }

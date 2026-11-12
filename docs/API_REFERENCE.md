@@ -682,6 +682,8 @@ async close(): Promise<void>
 
 **Throws:** [`ConnectionError`](#connectionerror) if closing fails.
 
+`close()` is graceful: with no `readTimeout`, a server that never answers the running statement makes it wait forever. Use [`destroy()`](#destroy) to stop waiting.
+
 ##### Example
 
 ```ts
@@ -692,6 +694,37 @@ try {
   console.log(rows);
 } finally {
   await db.close(); // Always close when done
+}
+```
+
+#### `destroy()`
+
+```ts
+async destroy(): Promise<void>
+```
+
+Tears down every connection of the client at once, without waiting for anything on them and without sending CON_CLOSE: the shared connection, the connections of [`TransactionScope`](#transactionscope) handles and of running `transaction()` callbacks, including one still connecting, in a broker or TLS handshake or between connect retries. It closes the client as `close()` does, in the same tick, and resolves at once. It never rejects.
+
+| What | Outcome |
+|------|---------|
+| The statement in flight | Rejects with kind `connection-lost` (a `QueryError`, `TransactionError` or `ConnectionError` as for any lost connection). Its outcome on the server is unknown; it is never retried |
+| Statements queued behind it, on that connection | Reject with kind `connection-lost` without being sent |
+| A running `close()` | Resolves |
+| An open `stream()` | Its next read rejects with kind `connection-lost` |
+| A `TransactionScope` not ended | Discarded; later calls on it reject |
+| A `transaction()` callback | Its statements reject; no COMMIT is sent, so it rejects with a `TransactionError` |
+| Later `destroy()` and `close()` | Resolve |
+| Any later statement | Rejects with `cause` `Client is closed.` |
+
+A destroyed connection never opens another session, so no reply that arrives late can answer another request. The server ends each session and rolls back its open transaction once it notices the client is gone; while it is still executing a statement, that can be only when the statement finishes, so locks may be held until then. A connection from a custom `connectionFactory` without a `destroy()` method is closed instead, without waiting for its `close()`. A connection is reached only once the factory has returned it; an async factory still running is destroyed when it returns. See [Destroying a client](CONNECTION.md#destroying-a-client) and [Connection limits](CONNECTION.md#connection-limits).
+
+```ts
+const closing = db.close();
+const timer = setTimeout(() => void db.destroy(), 5000); // give up after 5 s
+try {
+  await closing;
+} finally {
+  clearTimeout(timer);
 }
 ```
 
@@ -849,6 +882,9 @@ closed, including one still being opened. Calling it again returns the same
 promise. Awaiting `close()` inside a `connection()` or `transaction()` callback
 does not wait for that callback's own lease; its connection closes when the
 callback ends.
+
+`CubridPool` has no `destroy()` in this release: `close()` waits for running
+statements, so bound them with `readTimeout` or a `signal`.
 
 ### Logging
 
@@ -1246,7 +1282,7 @@ interface ClientOptions {
 | `database` | `string` | — | Database name to connect to. At most 31 bytes in UTF-8 |
 | `user` | `string` | — | Database user (e.g., `"dba"`). At most 31 bytes in UTF-8 |
 | `password` | `string` | `""` | Database password. At most 31 bytes in UTF-8 |
-| `connectionTimeout` | `number` | `undefined` | Connection timeout in milliseconds |
+| `connectionTimeout` | `number` | `10000` | Limit of each TCP connect, to the broker and to the CAS it redirects to, in milliseconds. `0` leaves it to the operating system (about 2 minutes on Linux). It does not bound the handshake or any later request. Unset meant no limit before this release. See [Connection limits](CONNECTION.md#connection-limits) |
 | `readTimeout` | `number` | `undefined` | Milliseconds of server inactivity before a request fails with [`ReadTimeoutError`](#readtimeouterror) and the connection is discarded. `undefined` or `0` means no timeout for requests; the connect handshake then still gives up after 10 seconds of inactivity. Other values must be between 1 and 2147483647, or `createClient()` throws a `RangeError`. See [Read timeout](CONNECTION.md#read-timeout) |
 | `maxLobBytes` | `number` | `67108864` (64 MiB) | Largest total of BLOB and CLOB content, in bytes, one query may load. A query over it rejects with a `QueryError` before any content is read, and the connection stays usable. Must be a positive integer, or `createClient()` throws a `RangeError`. See [BLOB and CLOB columns](TYPES.md#blob-and-clob-columns) |
 | `fetchSize` | `number` | `100` | Rows requested in each FETCH by `query()`, `queryResult()` and `stream()`. **CUBRID 10.2, 11.0, 11.2 and 11.4 ignore this number** and answer every FETCH with about 16 KiB of rows, or one row when a row is larger, so on those servers it changes neither round trips nor memory. Must be an integer from 1 to 2147483647, or `createClient()` throws a `RangeError` |
@@ -1363,8 +1399,11 @@ interface ConnectionLike {
   commit(): Promise<void>;
   rollback(): Promise<void>;
   close(): Promise<void>;
+  destroy?(): void;
 }
 ```
+
+`destroy` is optional. It must tear the connection down at once, without waiting for the request in flight, make every pending and later call reject, and leave `close()` resolving; it is synchronous and idempotent. `CubridClient.destroy()` calls it, and on a connection without it calls `close()` without waiting. `NativeCubridAdapter` implements it.
 
 `setTransactionOptions` is optional too, but it decides whether settings work. The client calls it on a new connection before anything else when `isolationLevel` or `lockTimeout` is in effect, and only then. Without it such a client or transaction fails rather than running without the setting. An implementation must keep the setting on every session it opens, and `NativeCubridAdapter` does. Options it is not given keep their value. The built-in adapter rejects the call inside a transaction, because changing the level there would change the running transaction.
 

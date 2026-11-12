@@ -536,7 +536,7 @@ Creates a client instance. Connection is established lazily on first query.
 | `database` | `string` | *(required)* | Database name. At most 31 bytes in UTF-8, no NUL; see [Credential length](docs/CONNECTION.md#credential-length) |
 | `user` | `string` | *(required)* | Database user. At most 31 bytes in UTF-8, no NUL |
 | `password` | `string` | `""` | Password. At most 31 bytes in UTF-8, no NUL |
-| `connectionTimeout` | `number` | — | Connection timeout (ms) |
+| `connectionTimeout` | `number` | `10000` | Limit of each TCP connect (ms); `0` for the OS limit. See [Connection limits](docs/CONNECTION.md#connection-limits) |
 | `maxConnectionRetryCount` | `number` | `0` | Retries after a failed TCP connect to the broker (see [Connection retries](docs/CONNECTION.md#connection-retries)) |
 | `readTimeout` | `number` | — | Fail a query after this many ms with no activity from the server (see [Read timeout](docs/CONNECTION.md#read-timeout)). Unset means no timeout for queries; the connect handshake still gives up after 10 s |
 | `fetchSize` | `number` | `100` | Rows requested per FETCH. CUBRID 10.2 to 11.4 ignore it and send about 16 KiB per reply (see [`fetchSize`](docs/API_REFERENCE.md#clientoptions)) |
@@ -586,6 +586,10 @@ Rolls back the active transaction on the shared connection.
 ### `client.close(): Promise<void>`
 
 Closes the shared connection and discards (rolls back) any `beginTransactionScope()` handle not yet ended. Safe to call multiple times.
+
+### `client.destroy(): Promise<void>`
+
+Tears down every connection of the client at once, without waiting for the statement in flight: it rejects with kind `connection-lost` and an unknown outcome, and queued statements reject without being sent. Nothing is retried. Use it when `close()` would wait too long. See [Destroying a client](docs/CONNECTION.md#destroying-a-client).
 
 > 📖 Full API documentation: [docs/API_REFERENCE.md](docs/API_REFERENCE.md)
 

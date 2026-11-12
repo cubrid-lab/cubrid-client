@@ -39,6 +39,15 @@ const RETRY_BASE_DELAY_MS = 100;
 const RETRY_MAX_DELAY_MS = 2000;
 /** Handshake inactivity limit when `readTimeout` is unset. Later requests are not limited by it. */
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
+/** Limit of each TCP connect when `connectionTimeout` is unset. 0 disables it. */
+export const DEFAULT_CONNECTION_TIMEOUT_MS = 10_000;
+/** Idle time before the first TCP keepalive probe. Not a read timeout. */
+export const KEEP_ALIVE_INITIAL_DELAY_MS = 60_000;
+
+/** What destroy() rejects with: an operation that was running, and one still waiting. */
+const DESTROYED_IN_FLIGHT =
+  "The connection was destroyed; the outcome of a request in flight is unknown";
+const DESTROYED_BEFORE_SENT = "The connection was destroyed before this request was sent";
 
 /** CAS_INFO[0] once no transaction is open. Any other value means one is. */
 const CAS_INFO_STATUS_OUT_TRAN = 0;
@@ -58,6 +67,11 @@ export interface CASConnectionConfig {
   database: string;
   user: string;
   password: string;
+  /**
+   * Limit of each TCP connect, to the broker and to the CAS it redirects to, in
+   * milliseconds. Undefined: 10 seconds. 0: no limit beyond the operating
+   * system's. Retried by `maxConnectionRetryCount`.
+   */
   connectionTimeout?: number;
   /**
    * Retries after a failed first attempt to open a TCP connection to the broker
@@ -143,6 +157,15 @@ export class CASConnection {
    */
   private settingUp = false;
 
+  /** Set by destroy(); nothing runs on this connection again. */
+  private destroyed = false;
+
+  /** Every socket this connection opened that has not closed, handshake ones included. */
+  private readonly sockets = new Set<Socket>();
+
+  /** Rejects each operation waiting on the socket or a timer when destroy() runs. */
+  private readonly onDestroy = new Set<(error: Error) => void>();
+
   /**
    * Per-instance FIFO serialization queue. Public entry points that mutate
    * shared socket / buffer / CAS_INFO state (connect, sendAndRecv, close) are
@@ -215,7 +238,7 @@ export class CASConnection {
     const scope = this.scope;
     const signal = scope?.signal;
     if (!scope || !signal) {
-      return pending;
+      return this.untilDestroyed(pending);
     }
     // Abandoned on abort, so a later failure of it must not go unhandled.
     pending.catch(() => undefined);
@@ -227,7 +250,7 @@ export class CASConnection {
         signal.addEventListener("abort", onAbort, { once: true });
       });
       try {
-        return await Promise.race([pending, aborted]);
+        return await Promise.race([this.untilDestroyed(pending), aborted]);
       } catch (error) {
         if (!signal.aborted) {
           throw error;
@@ -256,9 +279,22 @@ export class CASConnection {
           throw error;
         }
 
-        await new Promise((resolve) =>
-          setTimeout(resolve, Math.min(RETRY_BASE_DELAY_MS * 2 ** attempt, RETRY_MAX_DELAY_MS)),
-        );
+        // destroy() clears the timer too, so nothing keeps the process alive.
+        let timer: NodeJS.Timeout | undefined;
+        const clear = (): void => clearTimeout(timer);
+        this.onDestroy.add(clear);
+        try {
+          await this.untilDestroyed(
+            new Promise((resolve) => {
+              timer = setTimeout(
+                resolve,
+                Math.min(RETRY_BASE_DELAY_MS * 2 ** attempt, RETRY_MAX_DELAY_MS),
+              );
+            }),
+          );
+        } finally {
+          this.onDestroy.delete(clear);
+        }
       }
     }
   }
@@ -268,8 +304,9 @@ export class CASConnection {
       return;
     }
 
-    // An aborted statement opens no connection.
+    // An aborted statement opens no connection, and neither does a destroyed one.
     this.throwIfAborted();
+    this.throwIfDestroyed(DESTROYED_BEFORE_SENT);
 
     // Built first, so credentials the broker would not read intact open no socket.
     const openDatabase = writeOpenDatabase(
@@ -321,6 +358,8 @@ export class CASConnection {
       const responseBody = await this.readFrame(this.socket);
 
       const result: OpenDatabaseResult = parseOpenDatabase(responseBody);
+      // A reply that arrived as destroy() ran must not open a session.
+      this.throwIfDestroyed(DESTROYED_IN_FLIGHT);
       this._casInfo = result.casInfo;
       this._protoVersion = result.protoVersion;
       this._sessionId = result.sessionId;
@@ -382,8 +421,9 @@ export class CASConnection {
       response.copy(this._casInfo, 0, 0, SIZE_CAS_INFO);
       parseCheckCas(response.subarray(SIZE_CAS_INFO));
     } catch (error) {
-      // mapError() must still see a read timeout at the top, and an abort is the caller's own.
-      if (error instanceof ReadTimeoutError || this.isAbortReason(error)) {
+      // mapError() must still see a read timeout or a lost connection at the top,
+      // and an abort is the caller's own.
+      if (error instanceof ReadTimeoutError || this.isAbortReason(error) || this.destroyed) {
         throw error;
       }
       throw new Error("The session settings could not be applied, so nothing was sent", {
@@ -426,6 +466,7 @@ export class CASConnection {
    * Both buffers are written as a single TCP send.
    */
   async send(header: Buffer, payload: Buffer): Promise<void> {
+    this.throwIfDestroyed(DESTROYED_IN_FLIGHT);
     if (!this.socket || !this.connected) {
       throw new ConnectionLostError("CASConnection is not connected");
     }
@@ -444,6 +485,7 @@ export class CASConnection {
    * Returns the body (CAS_INFO + payload) without the DATA_LENGTH prefix.
    */
   async recv(): Promise<Buffer> {
+    this.throwIfDestroyed(DESTROYED_IN_FLIGHT);
     if (!this.socket || !this.connected) {
       throw new ConnectionLostError("CASConnection is not connected");
     }
@@ -485,7 +527,7 @@ export class CASConnection {
       }
 
       return this.exchangeUnlocked(header, payload);
-    });
+    }, true);
   }
 
   /**
@@ -505,7 +547,7 @@ export class CASConnection {
       }
 
       return this.exchangeUnlocked(header, payload, false);
-    });
+    }, true);
   }
 
   /** Unlocked exchange body. MUST only be called from within the queue. */
@@ -564,9 +606,13 @@ export class CASConnection {
    */
   async discardSession(): Promise<void> {
     return this.enqueue(async () => {
+      // Nothing is left to discard, and a destroyed connection is never reused.
+      if (this.destroyed) {
+        return;
+      }
       this._failedExchanges += 1;
       this.retireSocket();
-    });
+    }, true);
   }
 
   /**
@@ -593,7 +639,12 @@ export class CASConnection {
         }
       }
 
+      // destroy() during the hook has already torn the socket down.
       const socket = this.socket;
+      if (!socket) {
+        return;
+      }
+      this.sockets.delete(socket);
       this.socket = null;
       this.connected = false;
       this.socketDead = false;
@@ -601,7 +652,46 @@ export class CASConnection {
 
       socket.removeAllListeners();
       socket.destroy();
-    });
+    }, true);
+  }
+
+  /**
+   * Tear the connection down now, without waiting for the request in flight or
+   * the queue: every socket closes at once, the TLS handshake and broker sockets
+   * of a connect in progress included, and nothing is sent first.
+   *
+   * The request in flight rejects with a ConnectionLostError; its outcome on the
+   * server is unknown and it counts in `failedExchanges`. Every operation queued
+   * behind it rejects with a ConnectionLostError without sending anything, and so
+   * does every later one: a destroyed connection never opens another session, so
+   * no late reply can be read and nothing is replayed. close() still resolves.
+   * Synchronous and idempotent.
+   */
+  destroy(): void {
+    if (this.destroyed) {
+      return;
+    }
+    this.destroyed = true;
+    this.connected = false;
+    this.settingUp = false;
+    this.socket = null;
+    this.receiveBuffer = Buffer.alloc(0);
+
+    for (const socket of this.sockets) {
+      socket.destroy();
+    }
+    this.sockets.clear();
+
+    const interrupts = [...this.onDestroy];
+    this.onDestroy.clear();
+    for (const interrupt of interrupts) {
+      interrupt(new ConnectionLostError(DESTROYED_IN_FLIGHT));
+    }
+  }
+
+  /** Whether destroy() has run. */
+  get isDestroyed(): boolean {
+    return this.destroyed;
   }
 
   /**
@@ -739,9 +829,13 @@ export class CASConnection {
    * queue tail always resolves (rejections are swallowed) so one failing
    * operation cannot deadlock or poison the queue.
    */
-  private enqueue<T>(fn: () => Promise<T>): Promise<T> {
+  private enqueue<T>(fn: () => Promise<T>, afterDestroy = false): Promise<T> {
     const scope = this.scope;
     const step = async (): Promise<T> => {
+      // Queued before destroy() and never started: nothing of it was sent.
+      if (!afterDestroy) {
+        this.throwIfDestroyed(DESTROYED_BEFORE_SENT);
+      }
       this.activeScope = scope;
       try {
         return await fn();
@@ -758,11 +852,16 @@ export class CASConnection {
   }
 
   private createSocket(host: string, port: number): Promise<Socket> {
-    return new Promise<Socket>((resolve, reject) => {
+    // Node.js revives a destroyed socket on connect(), so none may be started.
+    if (this.destroyed) {
+      return Promise.reject(new ConnectionLostError(DESTROYED_IN_FLIGHT));
+    }
+    const connecting = new Promise<Socket>((resolve, reject) => {
       const socket = new Socket();
-      const timeout = this.config.connectionTimeout;
+      this.track(socket);
+      const timeout = this.config.connectionTimeout ?? DEFAULT_CONNECTION_TIMEOUT_MS;
 
-      if (timeout && timeout > 0) {
+      if (timeout > 0) {
         socket.setTimeout(timeout);
       }
 
@@ -780,12 +879,55 @@ export class CASConnection {
         socket.removeAllListeners("error");
         socket.removeAllListeners("timeout");
         socket.setTimeout(0); // Disable timeout after successful connect
+        // Each request is one write that waits for its reply, so Nagle's
+        // algorithm only delays it. Keepalive lets the OS notice a vanished
+        // peer on an idle socket; it does not bound a read.
+        socket.setNoDelay(true);
+        socket.setKeepAlive(true, KEEP_ALIVE_INITIAL_DELAY_MS);
 
         // Track remote socket closure (broker may close after auto-commit)
         this.trackSocketDeath(socket);
         resolve(socket);
       });
     });
+
+    return this.untilDestroyed(connecting);
+  }
+
+  /** Lets destroy() reach `socket` until it closes, whoever holds it meanwhile. */
+  private track(socket: Socket): void {
+    if (this.destroyed) {
+      socket.destroy();
+      return;
+    }
+    this.sockets.add(socket);
+    socket.once("close", () => {
+      this.sockets.delete(socket);
+    });
+  }
+
+  /**
+   * Settle as `operation` does, or reject at once when destroy() runs first. An
+   * abandoned `operation` that rejects later is handled here, never unhandled.
+   */
+  private untilDestroyed<T>(operation: Promise<T>): Promise<T> {
+    if (this.destroyed) {
+      operation.catch(() => undefined);
+      return Promise.reject(new ConnectionLostError(DESTROYED_IN_FLIGHT));
+    }
+
+    return new Promise<T>((resolve, reject) => {
+      this.onDestroy.add(reject);
+      operation.then(resolve, reject).finally(() => {
+        this.onDestroy.delete(reject);
+      });
+    });
+  }
+
+  private throwIfDestroyed(message: string): void {
+    if (this.destroyed) {
+      throw new ConnectionLostError(message);
+    }
   }
 
   /**
@@ -825,6 +967,7 @@ export class CASConnection {
       servername: this.config.servername,
       minVersion: "TLSv1.2",
     });
+    this.track(tlsSocket);
 
     const handshake = new Promise<TLSSocket>((resolve, reject) => {
       const onError = (err: Error): void => {
@@ -833,8 +976,15 @@ export class CASConnection {
         reject(new Error(`TLS handshake failed: ${err.message}`));
       };
 
+      // A socket destroyed by a timeout emits no error, and the wait must still end.
+      const onClose = (): void => {
+        tlsSocket.removeListener("secureConnect", onSecure);
+        reject(new ConnectionLostError("TLS handshake failed: the connection closed"));
+      };
+
       const onSecure = (): void => {
         tlsSocket.removeListener("error", onError);
+        tlsSocket.removeListener("close", onClose);
 
         // Re-wire dead-socket tracking onto the TLS socket.
         this.trackSocketDeath(tlsSocket);
@@ -842,6 +992,7 @@ export class CASConnection {
       };
 
       tlsSocket.once("error", onError);
+      tlsSocket.once("close", onClose);
       tlsSocket.once("secureConnect", onSecure);
     });
 
@@ -918,7 +1069,7 @@ export class CASConnection {
     const signal = scope?.signal;
 
     if (readTimeout === undefined && !signal) {
-      return operation;
+      return this.untilDestroyed(operation);
     }
 
     let onTimeout = (): void => {};
@@ -951,7 +1102,7 @@ export class CASConnection {
 
     try {
       return await Promise.race([
-        operation.finally(() => {
+        this.untilDestroyed(operation).finally(() => {
           settled = true;
         }),
         interrupted,
