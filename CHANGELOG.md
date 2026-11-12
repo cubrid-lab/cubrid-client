@@ -10,24 +10,20 @@ user-visible behavior and known limitations, not just completed implementation.
 
 ### Features
 
-* accept zoned(date) so a Date keeps its instant in zone-aware columns ([#281](https://github.com/cubrid-lab/cubrid-client/issues/281)) ([5c202e8](https://github.com/cubrid-lab/cubrid-client/commit/5c202e864f559791650bf63da6e594acc5d0fbe7))
 * add a connection pool with createPool() ([#92](https://github.com/cubrid-lab/cubrid-client/issues/92)) ([#260](https://github.com/cubrid-lab/cubrid-client/issues/260)) ([bb1f935](https://github.com/cubrid-lab/cubrid-client/commit/bb1f93598dc5c3722a1c5fa0601fe871a113fbd3))
 * add beginTransactionScope() so unrelated queries cannot join manual transactions ([#232](https://github.com/cubrid-lab/cubrid-client/issues/232)) ([a9992a2](https://github.com/cubrid-lab/cubrid-client/commit/a9992a24434c64c7a2faf95c4542ece82c256595)), closes [#112](https://github.com/cubrid-lab/cubrid-client/issues/112)
-* add executeMany() for batch execution over EXECUTE_ARRAY ([bd9be9a](https://github.com/cubrid-lab/cubrid-client/commit/bd9be9a33df4d53cc982ac31b8acbdcba0207de5)), closes [#86](https://github.com/cubrid-lab/cubrid-client/issues/86)
 * add timezone option to decode date and time values as UTC ([#233](https://github.com/cubrid-lab/cubrid-client/issues/233)) ([6a4708a](https://github.com/cubrid-lab/cubrid-client/commit/6a4708a5d780dbd5efa823d41a478d22913c564f))
 * add zoned(date) so a Date keeps its instant in zone-aware columns ([#281](https://github.com/cubrid-lab/cubrid-client/issues/281)) ([#284](https://github.com/cubrid-lab/cubrid-client/issues/284)) ([5c202e8](https://github.com/cubrid-lab/cubrid-client/commit/5c202e864f559791650bf63da6e594acc5d0fbe7))
 * cancel one query with an AbortSignal or a per-query readTimeout ([#241](https://github.com/cubrid-lab/cubrid-client/issues/241)) ([c9a532e](https://github.com/cubrid-lab/cubrid-client/commit/c9a532e948e9ffe31429f295cead0f0dd09cfd7e))
 * execute one statement for many parameter sets with executeMany ([#86](https://github.com/cubrid-lab/cubrid-client/issues/86)) ([#256](https://github.com/cubrid-lab/cubrid-client/issues/256)) ([bd9be9a](https://github.com/cubrid-lab/cubrid-client/commit/bd9be9a33df4d53cc982ac31b8acbdcba0207de5))
 * expose outcomeUnknown on errors whose on-wire outcome is uncertain ([#254](https://github.com/cubrid-lab/cubrid-client/issues/254)) ([#274](https://github.com/cubrid-lab/cubrid-client/issues/274)) ([92ea3d4](https://github.com/cubrid-lab/cubrid-client/commit/92ea3d4319e26ff42661f4dc048daa26314eecdb))
 * preserve duplicate result column names with opt-in array row mode ([#255](https://github.com/cubrid-lab/cubrid-client/issues/255)) ([#276](https://github.com/cubrid-lab/cubrid-client/issues/276)) ([85980bd](https://github.com/cubrid-lab/cubrid-client/commit/85980bd0616a2a23424f4026ebfa25566268c081))
-* write BLOB and CLOB values through LOB_NEW and LOB_WRITE ([4642bf1](https://github.com/cubrid-lab/cubrid-client/commit/4642bf1875c05e4404c4c1a045d6aa6e23dbedbb))
 * write BLOB and CLOB values through LOB_NEW and LOB_WRITE ([#103](https://github.com/cubrid-lab/cubrid-client/issues/103)) ([#257](https://github.com/cubrid-lab/cubrid-client/issues/257)) ([4642bf1](https://github.com/cubrid-lab/cubrid-client/commit/4642bf1875c05e4404c4c1a045d6aa6e23dbedbb))
 
 
 ### Bug Fixes
 
 * add an opt-in charset option to read text in the column charset ([#238](https://github.com/cubrid-lab/cubrid-client/issues/238)) ([#266](https://github.com/cubrid-lab/cubrid-client/issues/266)) ([133e6ff](https://github.com/cubrid-lab/cubrid-client/commit/133e6ff9dc43f9f90da85d84e3485787baa52746))
-* add maxReplyBytes and document the 1 GiB reply limit ([#251](https://github.com/cubrid-lab/cubrid-client/issues/251)) ([ad524d9](https://github.com/cubrid-lab/cubrid-client/commit/ad524d990187666a89f0a1f6449c7f7fa7234757))
 * add maxReplyBytes and retire the session on an over-limit reply ([#251](https://github.com/cubrid-lab/cubrid-client/issues/251)) ([#263](https://github.com/cubrid-lab/cubrid-client/issues/263)) ([ad524d9](https://github.com/cubrid-lab/cubrid-client/commit/ad524d990187666a89f0a1f6449c7f7fa7234757))
 * add out-of-band destroy() and bound connection stalls ([#245](https://github.com/cubrid-lab/cubrid-client/issues/245)) ([#262](https://github.com/cubrid-lab/cubrid-client/issues/262)) ([6fc417a](https://github.com/cubrid-lab/cubrid-client/commit/6fc417a184056d2bd7182b0ceabfb7dfb502ac5f))
 * consolidate case-colliding pull request templates ([8a7004c](https://github.com/cubrid-lab/cubrid-client/commit/8a7004c43ba4edc6f2508fc5dad0c9433400b87c))
@@ -39,15 +35,12 @@ user-visible behavior and known limitations, not just completed implementation.
 * never report a stale or guessed lastInsertId, and add generatedKeys ([#247](https://github.com/cubrid-lab/cubrid-client/issues/247)) ([#271](https://github.com/cubrid-lab/cubrid-client/issues/271)) ([ee58d6b](https://github.com/cubrid-lab/cubrid-client/commit/ee58d6bf5cb1fabc2957bc1ff82b820ba1a2c259))
 * parenthesize negative literals and lex literal SQL as CUBRID does ([#242](https://github.com/cubrid-lab/cubrid-client/issues/242), [#243](https://github.com/cubrid-lab/cubrid-client/issues/243)) ([#258](https://github.com/cubrid-lab/cubrid-client/issues/258)) ([2168586](https://github.com/cubrid-lab/cubrid-client/commit/216858692d6bec6100f2f9d5c34ef966b171553c))
 * quote identifiers containing ] with backticks in escapeIdentifier ([#259](https://github.com/cubrid-lab/cubrid-client/issues/259)) ([#270](https://github.com/cubrid-lab/cubrid-client/issues/270)) ([7757f72](https://github.com/cubrid-lab/cubrid-client/commit/7757f72cf6dab075a3d7fe2d36f8918a29835084))
-* quote identifiers with ] in backticks in escapeIdentifier ([#259](https://github.com/cubrid-lab/cubrid-client/issues/259)) ([7757f72](https://github.com/cubrid-lab/cubrid-client/commit/7757f72cf6dab075a3d7fe2d36f8918a29835084))
 * reject OpenDatabase credentials over 31 bytes instead of truncating ([#252](https://github.com/cubrid-lab/cubrid-client/issues/252)) ([#261](https://github.com/cubrid-lab/cubrid-client/issues/261)) ([176585e](https://github.com/cubrid-lab/cubrid-client/commit/176585e78db2f8a6f3cd2b626e93391e69d9187a))
-* track transaction() callbacks across CubridClient.close() ([#246](https://github.com/cubrid-lab/cubrid-client/issues/246)) ([ef75bc0](https://github.com/cubrid-lab/cubrid-client/commit/ef75bc07a69591fb74dc3743563f4c70f397f36a))
 
 
 ### Performance Improvements
 
 * count CAS exchanges per call and keep eager handle release ([#248](https://github.com/cubrid-lab/cubrid-client/issues/248)) ([#277](https://github.com/cubrid-lab/cubrid-client/issues/277)) ([2d26d80](https://github.com/cubrid-lab/cubrid-client/commit/2d26d808066aca44c5b689dec36b423720e33438))
-* count CAS round trips per call and keep eager handle release ([#248](https://github.com/cubrid-lab/cubrid-client/issues/248)) ([2d26d80](https://github.com/cubrid-lab/cubrid-client/commit/2d26d808066aca44c5b689dec36b423720e33438))
 
 ## [1.3.0](https://github.com/cubrid-lab/cubrid-client/compare/v1.2.0...v1.3.0) (2026-11-07)
 
