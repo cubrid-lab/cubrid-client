@@ -917,10 +917,22 @@ callbacks and `transaction()` callbacks already running finish, and then their
 connections are closed. A `beginTransactionScope()` handle nobody ended is
 discarded meanwhile, as `CubridClient.close()` does: its connection is closed and
 the server rolls its work back. `close()` resolves when every connection is
-closed, including one still being opened. Calling it again returns the same
-promise. Awaiting `close()` inside a `connection()` or `transaction()` callback
-does not wait for that callback's own lease; its connection closes when the
-callback ends.
+closed, including one still being opened. Calling it again, outside every
+callback, returns the same promise, which also waits for the callbacks that were
+running when `close()` was first called.
+
+A `close()` awaited inside a running `connection()` or `transaction()` callback
+closes idle and stream connections, discards scopes and waits for statements as
+usual, but waits for no `connection()` or `transaction()` callback: it would wait
+for its own, and two callbacks closing the pool would wait for each other (#268).
+Those callbacks, its own included, then finish after that `close()` resolved,
+each on its own connection, which closes when its callback ends (a
+`transaction()` commits or rolls back first). A callback nested in another
+counts as inside both. A `close()` called outside every callback, even later,
+still waits for all of them, and so does one made from a timer or promise chain
+a callback started, once that callback has returned. While the callback is still
+running, such a call counts as inside it. This is the rule of
+[`CubridClient.close()`](#close).
 
 `CubridPool` has no `destroy()` in this release: `close()` waits for running
 statements, so bound them with `readTimeout` or a `signal`.

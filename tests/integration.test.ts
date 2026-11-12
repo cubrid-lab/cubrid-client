@@ -6944,6 +6944,54 @@ describe("Integration: connection pool (#92)", { skip: !available }, () => {
   });
 });
 
+describe("Integration: pool close() inside transaction() callbacks (#268)", {
+  skip: !available,
+}, () => {
+  const table = "cc268_pool_close";
+
+  test("two callbacks that each await close() both commit, and close() from outside waits", async () => {
+    const setup = createClient(TEST_CONFIG);
+    await setup.query(`DROP TABLE IF EXISTS ${table}`);
+    await setup.query(`CREATE TABLE ${table} (val VARCHAR(20))`);
+    try {
+      const pool = createPool({ ...TEST_CONFIG, max: 2 });
+      let running = 0;
+      let bothRunning!: () => void;
+      const together = new Promise<void>((resolve) => {
+        bothRunning = resolve;
+      });
+      const run = (val: string) =>
+        pool.transaction(async (tx) => {
+          await tx.execute(`INSERT INTO ${table} (val) VALUES (?)`, [val]);
+          running += 1;
+          if (running === 2) {
+            bothRunning();
+          }
+          await together;
+          await pool.close();
+          // The session is still this callback's after close() resolved.
+          await tx.execute(`INSERT INTO ${table} (val) VALUES (?)`, [`${val} after`]);
+          return val;
+        });
+      const transactions = Promise.all([run("a"), run("b")]);
+      await together;
+      const outside = pool.close();
+
+      assert.deepEqual(await transactions, ["a", "b"]);
+      await outside;
+      assert.deepEqual(pool.stats(), { total: 0, idle: 0, active: 0, pending: 0, waiting: 0 });
+      const rows = await setup.query<{ val: string }>(`SELECT val FROM ${table} ORDER BY val`);
+      assert.deepEqual(
+        rows.map((row) => row.val),
+        ["a", "a after", "b", "b after"],
+      );
+    } finally {
+      await setup.query(`DROP TABLE IF EXISTS ${table}`);
+      await setup.close();
+    }
+  });
+});
+
 // #252: the CAS writes a NUL into byte 31 of each 32-byte OpenDatabase field
 // (src/broker/cas.c), so 31 bytes is the longest database, user or password it
 // reads intact. Before the fix a 32-byte value was cut to its first 31 bytes, on

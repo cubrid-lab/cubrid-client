@@ -1066,6 +1066,141 @@ test("pool: close() awaited inside a transaction or connection() callback does n
   assert.equal(second.connections[0]!.closed, true);
 });
 
+test("pool: two transaction() callbacks that each await close() both resolve (#268)", async () => {
+  const { pool, connections } = setup();
+  const bothRunning = deferred();
+  let running = 0;
+  const run = (name: string) =>
+    pool.transaction(async (tx) => {
+      await tx.query(name);
+      running += 1;
+      if (running === 2) {
+        bothRunning.resolve();
+      }
+      await bothRunning.promise;
+      await pool.close();
+      return name;
+    });
+
+  const results = await Promise.all([run("A"), run("B")]);
+  assert.deepEqual(results, ["A", "B"]);
+  assert.equal(connections.length, 2);
+  for (const connection of connections) {
+    assert.deepEqual(connection.calls.slice(-2), ["commit", "close"]);
+  }
+  await pool.close();
+});
+
+test("pool: close() inside connection() and transaction() callbacks, nested or not, waits for none (#268)", async () => {
+  const { pool, connections } = setup();
+  const bothRunning = deferred();
+  let running = 0;
+  const arrive = async (): Promise<void> => {
+    running += 1;
+    if (running === 2) {
+      bothRunning.resolve();
+    }
+    await bothRunning.promise;
+  };
+
+  const leased = pool.connection(async (connection) => {
+    await connection.query("C");
+    // A transaction inside the connection() callback: both enclose this close().
+    return pool.transaction(async (tx) => {
+      await tx.query("NESTED");
+      await arrive();
+      await pool.close();
+      return "nested";
+    });
+  });
+  const transaction = pool.transaction(async (tx) => {
+    await tx.query("T");
+    await arrive();
+    await pool.close();
+    return "transaction";
+  });
+
+  assert.deepEqual(await Promise.all([leased, transaction]), ["nested", "transaction"]);
+  assert.equal(connections.length, 3);
+  assert.ok(connections.every((connection) => connection.closed));
+});
+
+test("pool: close() from outside still waits for a callback that closed the pool from inside (#268)", async () => {
+  const { pool, connections } = setup();
+  const closedInside = deferred();
+  const finish = deferred();
+  const transaction = pool.transaction(async (tx) => {
+    await tx.query("T");
+    await pool.close();
+    closedInside.resolve();
+    await finish.promise;
+    return "done";
+  });
+
+  await closedInside.promise;
+  const outside = pool.close();
+  assert.equal(await isSettled(outside), false);
+
+  finish.resolve();
+  assert.equal(await transaction, "done");
+  await outside;
+  assert.deepEqual(connections[0]!.calls.slice(-2), ["commit", "close"]);
+  assert.equal(pool.close(), outside);
+});
+
+test("pool: close() from a timer a callback set counts as inside it only while it runs (#268)", async () => {
+  // The timer fires while the connection() callback is still running: inside.
+  const first = setup();
+  const fired = deferred();
+  const finish = deferred();
+  let insideClose: Promise<void> | undefined;
+  const leased = first.pool.connection(async (connection) => {
+    await connection.query("C");
+    setImmediate(() => {
+      insideClose = first.pool.close();
+      fired.resolve();
+    });
+    await finish.promise;
+  });
+  await fired.promise;
+  await insideClose;
+  assert.equal(first.connections[0]!.closed, false);
+  finish.resolve();
+  await leased;
+  assert.equal(first.connections[0]!.closed, true);
+
+  // The timer fires after the transaction() callback returned, while COMMIT runs.
+  const commitGate = deferred();
+  const second = setup(
+    {},
+    {
+      prepare: (connection) => {
+        const commit = connection.commit.bind(connection);
+        connection.commit = async () => {
+          await commitGate.promise;
+          await commit();
+        };
+      },
+    },
+  );
+  const timerFired = deferred();
+  let timedClose: Promise<void> | undefined;
+  const transaction = second.pool.transaction(async (tx) => {
+    await tx.query("T");
+    setImmediate(() => {
+      timedClose = second.pool.close();
+      timerFired.resolve();
+    });
+  });
+  await timerFired.promise;
+  assert.ok(timedClose);
+  assert.equal(await isSettled(timedClose), false);
+  commitGate.resolve();
+  await transaction;
+  await timedClose;
+  assert.deepEqual(second.connections[0]!.calls.slice(-2), ["commit", "close"]);
+});
+
 test("pool: executePrepared() hands blob() and clob() values to the connection as they are", async () => {
   const { pool, connections, destroyed } = setup();
   const content = blob(Buffer.from([1, 2, 3]));
