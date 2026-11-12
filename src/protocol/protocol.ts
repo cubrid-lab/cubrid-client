@@ -9,8 +9,10 @@
  * returns a parsed result structure.
  */
 
+import { TextDecoder } from "node:util";
 import { CasReplyError } from "../errors/internal-errors.js";
 import {
+  CLOB_NOT_LATIN1,
   isLobParam,
   isSourceConsumed,
   isStreamSource,
@@ -19,6 +21,13 @@ import {
   STREAM_REUSED,
 } from "../types/lob.js";
 import { ZonedDateTime } from "../types/zoned-date-time.js";
+import {
+  assertEncodable,
+  CAS_CHARSET_EUC_KR,
+  CAS_CHARSET_UTF8,
+  NOT_LATIN1,
+  type TextCharset,
+} from "./charset.js";
 import {
   CAS_MAGIC,
   CAS_MAGIC_SSL,
@@ -52,6 +61,8 @@ import { PacketWriter } from "./packet-writer.js";
 
 /** Bits of the first metadata type byte that name a collection kind. */
 const COLLECTION_KIND_MASK = 0x60;
+/** Bits of the first metadata type byte that hold the charset code (protocol V7). */
+const CHARSET_MASK = 0x07;
 const COLLECTION_KIND_BY_FLAG: Readonly<Record<number, CUBRIDDataType>> = {
   32: CUBRIDDataType.SET,
   64: CUBRIDDataType.MULTISET,
@@ -117,6 +128,11 @@ export interface ColumnMeta {
    * and each cell states the element type its values actually use.
    */
   elementType?: CUBRIDDataType;
+  /**
+   * Charset code of the column's text, or of a collection's elements, from the
+   * low bits of its protocol V7 type; undefined for a one-byte type.
+   */
+  charset?: number;
   scale: number;
   precision: number;
   name: string;
@@ -263,11 +279,12 @@ export function writePrepareAndExecute(
   sql: string,
   autoCommit: boolean,
   casInfo: Buffer,
+  charset: TextCharset = "utf-8",
 ): { header: Buffer; payload: Buffer } {
   const w = new PacketWriter(512);
   w.writeByte(CASFunctionCode.PREPARE_AND_EXECUTE);
   w.addInt(3); // arg count
-  w.writeNullTermString(sql);
+  w.writeNullTermString(sql, charset, "SQL text");
   w.addByte(PREPARE_NORMAL);
   w.addByte(autoCommit ? 1 : 0);
   w.addByte(EXECUTE_QUERY_ALL);
@@ -307,9 +324,10 @@ export function parsePrepareAndExecute(
   data: Buffer,
   protoVersion: number,
   utcDates = false,
+  charset: TextCharset = "utf-8",
 ): PrepareAndExecuteResult {
   assertReplySize(data);
-  const reader = new PacketReader(data, 0, utcDates);
+  const reader = new PacketReader(data, 0, utcDates, charset);
   const responseCode = reader.parseInt();
 
   if (responseCode < 0) {
@@ -424,12 +442,16 @@ export function readQueryHandle(data: Buffer): number | null {
  * Build PREPARE request payload. The autocommit byte is always 0: the caller
  * ends the transaction itself, so CAS_INFO stays IN_TRAN while the handle lives.
  */
-export function writePrepare(sql: string, casInfo: Buffer): { header: Buffer; payload: Buffer } {
+export function writePrepare(
+  sql: string,
+  casInfo: Buffer,
+  charset: TextCharset = "utf-8",
+): { header: Buffer; payload: Buffer } {
   assertPreparableSql(sql);
 
   const w = new PacketWriter(512);
   w.writeByte(CASFunctionCode.PREPARE);
-  w.writeNullTermString(sql);
+  w.writeNullTermString(sql, charset, "SQL text");
   w.addByte(PREPARE_NORMAL);
   w.addByte(0); // autocommit
 
@@ -460,9 +482,9 @@ export function assertSingleStatement(sql: string): void {
 }
 
 /** Parse PREPARE response. */
-export function parsePrepare(data: Buffer): PrepareResult {
+export function parsePrepare(data: Buffer, charset: TextCharset = "utf-8"): PrepareResult {
   assertReplySize(data);
-  const reader = new PacketReader(data);
+  const reader = new PacketReader(data, 0, false, charset);
   const responseCode = reader.parseInt();
 
   if (responseCode < 0) {
@@ -520,9 +542,10 @@ export function parseExecute(
   statement: PrepareResult,
   protoVersion: number,
   utcDates = false,
+  charset: TextCharset = "utf-8",
 ): PrepareAndExecuteResult {
   assertReplySize(data);
-  const reader = new PacketReader(data, 0, utcDates);
+  const reader = new PacketReader(data, 0, utcDates, charset);
   const responseCode = reader.parseInt();
 
   if (responseCode < 0) {
@@ -679,9 +702,14 @@ export interface FetchResult {
 /**
  * Parse FETCH response.
  */
-export function parseFetch(data: Buffer, columns: ColumnMeta[], utcDates = false): FetchResult {
+export function parseFetch(
+  data: Buffer,
+  columns: ColumnMeta[],
+  utcDates = false,
+  charset: TextCharset = "utf-8",
+): FetchResult {
   assertReplySize(data);
-  const reader = new PacketReader(data, 0, utcDates);
+  const reader = new PacketReader(data, 0, utcDates, charset);
   const responseCode = reader.parseInt();
 
   if (responseCode < 0) {
@@ -1270,7 +1298,10 @@ const MAX_DATETIME_YEAR = 9999;
  * every value the server would store wrongly or the literal path would refuse.
  * Messages never contain the value.
  */
-export function encodePreparedParams(params: readonly unknown[]): PreparedBinds {
+export function encodePreparedParams(
+  params: readonly unknown[],
+  charset: TextCharset = "utf-8",
+): PreparedBinds {
   const w = new PacketWriter(256);
   const lobs: Array<{ offset: number; param: LobParam }> = [];
   const streams = new Set<unknown>();
@@ -1287,10 +1318,20 @@ export function encodePreparedParams(params: readonly unknown[]): PreparedBinds 
         }
         streams.add(param.source);
       }
+      // Refused here, before PREPARE, when the text is already known; a stream
+      // is checked as it is uploaded.
+      if (
+        charset === "iso-8859-1" &&
+        param.kind === "clob" &&
+        typeof param.source === "string" &&
+        NOT_LATIN1.test(param.source)
+      ) {
+        throw new LobParamError(CLOB_NOT_LATIN1);
+      }
       lobs.push({ offset: w.length, param });
       continue;
     }
-    writePreparedParam(w, param);
+    writePreparedParam(w, param, charset);
   }
   const bytes = Buffer.from(w.toBuffer());
   return lobs.length === 0
@@ -1298,7 +1339,7 @@ export function encodePreparedParams(params: readonly unknown[]): PreparedBinds 
     : { count: params.length, bytes, lobs };
 }
 
-function writePreparedParam(w: PacketWriter, value: unknown): void {
+function writePreparedParam(w: PacketWriter, value: unknown, charset: TextCharset): void {
   if (value === null || value === undefined) {
     w.addByte(CUBRIDDataType.NULL);
     w.addNull();
@@ -1325,7 +1366,7 @@ function writePreparedParam(w: PacketWriter, value: unknown): void {
   if (typeof value === "string") {
     assertStorableText(value);
     w.addByte(CUBRIDDataType.CHAR);
-    w.writeNullTermString(value);
+    w.writeNullTermString(value, charset, "string parameter");
     return;
   }
 
@@ -1654,10 +1695,14 @@ function formatNumeric(value: number | bigint, negative: boolean): string {
  * Checks every value of a literal statement without rendering it, so a refused
  * value fails before anything is sent. Both backslash modes refuse the same values.
  */
-export function assertLiteralParams(params: readonly unknown[]): void {
+export function assertLiteralParams(
+  params: readonly unknown[],
+  charset: TextCharset = "utf-8",
+): void {
   for (const value of params) {
     if (typeof value === "string") {
       assertStorableText(value);
+      assertEncodable(value, charset, "string parameter");
     } else {
       formatValue(value, true);
     }
@@ -1748,6 +1793,7 @@ function formatDatetime(date: Date): string {
 function parseColumnType(reader: PacketReader): {
   type: CUBRIDDataType;
   elementType?: CUBRIDDataType;
+  charset?: number;
 } {
   const first = reader.parseUByte();
   if ((first & 0x80) === 0) {
@@ -1755,33 +1801,36 @@ function parseColumnType(reader: PacketReader): {
   }
 
   const wireType = reader.parseUByte() as CUBRIDDataType;
+  const charset = first & CHARSET_MASK;
   const kind = COLLECTION_KIND_BY_FLAG[first & COLLECTION_KIND_MASK];
-  return kind === undefined ? { type: wireType } : { type: kind, elementType: wireType };
+  return kind === undefined
+    ? { type: wireType, charset }
+    : { type: kind, elementType: wireType, charset };
 }
 
 function parseColumnMetadata(reader: PacketReader, count: number): ColumnMeta[] {
   const columns: ColumnMeta[] = [];
 
   for (let i = 0; i < count; i++) {
-    const { type, elementType } = parseColumnType(reader);
+    const { type, elementType, charset } = parseColumnType(reader);
 
     const scale = reader.parseShort();
     const precision = reader.parseInt();
 
     const nameLen = reader.parseInt();
-    const name = reader.parseNullTermString(nameLen);
+    const name = reader.parseClientString(nameLen);
 
     const realNameLen = reader.parseInt();
-    const realName = reader.parseNullTermString(realNameLen);
+    const realName = reader.parseClientString(realNameLen);
 
     const tableNameLen = reader.parseInt();
-    const tableName = reader.parseNullTermString(tableNameLen);
+    const tableName = reader.parseClientString(tableNameLen);
 
     // The wire byte is is_non_null: zero permits NULL, nonzero means NOT NULL.
     const isNullable = reader.parseByte() === 0;
 
     const defaultLen = reader.parseInt();
-    const defaultValue = reader.parseNullTermString(defaultLen);
+    const defaultValue = reader.parseClientString(defaultLen);
 
     const isAutoIncrement = reader.parseByte() === 1;
     const isUniqueKey = reader.parseByte() === 1;
@@ -1794,6 +1843,7 @@ function parseColumnMetadata(reader: PacketReader, count: number): ColumnMeta[] 
     columns.push({
       type,
       ...(elementType === undefined ? {} : { elementType }),
+      ...(charset === undefined ? {} : { charset }),
       scale,
       precision,
       name,
@@ -1856,6 +1906,7 @@ function parseRowData(
       let size = reader.parseInt();
       const column = columns[c]!;
       let colType = column.type;
+      let charset = column.charset;
       const hasTypeHeader = isCallType || colType === CUBRIDDataType.NULL;
 
       // CAS writes SQL NULL as -1, and a collection cell always has its header.
@@ -1873,7 +1924,7 @@ function parseRowData(
       // is what a bound `SELECT ?` returns: its column has no type at PREPARE.
       if (hasTypeHeader) {
         const headerStart = reader.position;
-        colType = parseColumnType(reader).type;
+        ({ type: colType, charset } = parseColumnType(reader));
         size -= reader.position - headerStart;
         if (size < 0) {
           throw new Error(
@@ -1890,7 +1941,7 @@ function parseRowData(
 
       const valueStart = reader.position;
       try {
-        const value = readValue(reader, colType, size);
+        const value = readValue(reader, colType, size, charset);
         // A value that disagrees with its cell length would turn the bytes of
         // the following columns into the wrong values.
         assertExactLength(reader.position - valueStart, size);
@@ -1920,14 +1971,20 @@ function parseRowData(
   }
 }
 
-function readValue(reader: PacketReader, colType: CUBRIDDataType, size: number): unknown {
+/** `charset` is the code the column or cell reports for its text, if any. */
+function readValue(
+  reader: PacketReader,
+  colType: CUBRIDDataType,
+  size: number,
+  charset?: number,
+): unknown {
   switch (colType) {
     case CUBRIDDataType.CHAR:
     case CUBRIDDataType.STRING:
     case CUBRIDDataType.NCHAR:
     case CUBRIDDataType.VARNCHAR:
     case CUBRIDDataType.ENUM:
-      return reader.parseNullTermString(size);
+      return decodeText(reader.parseNullTermBytes(size), reader.charset, charset);
 
     case CUBRIDDataType.SHORT:
       return reader.parseShort();
@@ -1980,7 +2037,7 @@ function readValue(reader: PacketReader, colType: CUBRIDDataType, size: number):
     case CUBRIDDataType.SET:
     case CUBRIDDataType.MULTISET:
     case CUBRIDDataType.SEQUENCE:
-      return readCollection(reader, size);
+      return readCollection(reader, size, charset);
 
     case CUBRIDDataType.NULL:
     default:
@@ -1990,6 +2047,61 @@ function readValue(reader: PacketReader, colType: CUBRIDDataType, size: number):
         `Unsupported CUBRID CAS value type ${colType} (${size} bytes)`,
       );
   }
+}
+
+/** Created on first use: a Node.js build without full ICU cannot construct it. */
+let eucKrDecoder: TextDecoder | undefined;
+const UTF8_TEXT_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+/**
+ * Decode a text value. With charset "utf-8" every value is UTF-8 and the
+ * column charset is ignored, the 1.x contract: an invalid sequence becomes
+ * U+FFFD. With "iso-8859-1" the value is decoded in the charset its column or
+ * cell reports, and bytes that charset cannot decode are refused, not replaced.
+ * ASCII, binary, ISO-8859-1 and an unreported charset map each byte to the
+ * code point of the same value.
+ */
+function decodeText(bytes: Buffer, client: TextCharset, charset: number | undefined): string {
+  if (client === "utf-8") {
+    return bytes.toString("utf-8");
+  }
+  if (charset === CAS_CHARSET_UTF8) {
+    try {
+      return UTF8_TEXT_DECODER.decode(bytes);
+    } catch (error) {
+      throw new UnsupportedValueError("utf8 text is not valid UTF-8", { cause: error });
+    }
+  }
+  if (charset === CAS_CHARSET_EUC_KR) {
+    // The WHATWG decoder is really windows-949: it also accepts its extension
+    // pairs and maps bytes such as 80 to C1 controls, so EUC-KR is checked first.
+    if (!isEucKr(bytes)) {
+      throw new UnsupportedValueError("euckr text is not valid EUC-KR");
+    }
+    try {
+      eucKrDecoder ??= new TextDecoder("euc-kr", { fatal: true });
+      return eucKrDecoder.decode(bytes);
+    } catch (error) {
+      throw new UnsupportedValueError(
+        "euckr text is not valid EUC-KR, or this Node.js build cannot decode EUC-KR",
+        { cause: error },
+      );
+    }
+  }
+  return bytes.toString("latin1");
+}
+
+/** ASCII bytes, and pairs of bytes A1 to FE (KS X 1001), nothing else. */
+function isEucKr(bytes: Buffer): boolean {
+  for (let i = 0; i < bytes.length; i++) {
+    const lead = bytes[i]!;
+    if (lead < 0x80) continue;
+    const trail = bytes[++i];
+    if (lead < 0xa1 || lead > 0xfe || trail === undefined || trail < 0xa1 || trail > 0xfe) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -2170,7 +2282,7 @@ function assertExactLength(consumed: number, declared: number): void {
  * a structural failure wins and a complete collection reports the first
  * unsupported element.
  */
-function readCollection(reader: PacketReader, size: number): unknown[] {
+function readCollection(reader: PacketReader, size: number, charset?: number): unknown[] {
   const cell = reader.subReader(size);
   if (size < COLLECTION_HEADER_SIZE) {
     throw new Error(`Malformed CAS packet: collection cell of ${size} bytes has no header`);
@@ -2193,7 +2305,7 @@ function readCollection(reader: PacketReader, size: number): unknown[] {
       throw new Error(`Malformed CAS packet: collection element ${i} has no length`);
     }
     try {
-      values.push(readCollectionElement(cell, elementType, cell.parseInt()));
+      values.push(readCollectionElement(cell, elementType, cell.parseInt(), charset));
     } catch (error) {
       if (!(error instanceof UnsupportedValueError)) {
         throw error;
@@ -2212,6 +2324,7 @@ function readCollectionElement(
   cell: PacketReader,
   elementType: CUBRIDDataType,
   length: number,
+  charset: number | undefined,
 ): unknown {
   if (length === -1) {
     return null;
@@ -2234,7 +2347,7 @@ function readCollectionElement(
     throw new UnsupportedValueError(`Unsupported CUBRID collection element type ${elementType}`);
   }
 
-  const value = readValue(element, elementType, length);
+  const value = readValue(element, elementType, length, charset);
   assertExactLength(length - element.remaining, length);
   return value;
 }

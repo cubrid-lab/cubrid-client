@@ -47,7 +47,14 @@ export interface CaseSpec {
   cleanup?: string[];
   steps?: StepSpec[];
   unverified?: string;
+  /**
+   * Both runners use this charset for the case, JDBC as its `charset` URL
+   * property, cubrid-client as `ClientOptions.charset`. Default: utf-8.
+   */
+  charset?: "iso-8859-1";
   knownLimitation?: Declaration & { issue: string };
+  /** A difference by design, with the issue or ADR that records the decision. */
+  intentional?: Declaration & { issue: string };
   expectedDefect?: Declaration & { issue: string | null };
 }
 
@@ -274,7 +281,19 @@ export async function runTs(corpus: Corpus, target: Target): Promise<RunnerOutpu
     const cases: CaseResult[] = [];
     for (const spec of corpus.cases) {
       const started = Date.now();
-      cases.push(await runCase(spec, a, b));
+      if (spec.charset === undefined || spec.unverified !== undefined) {
+        cases.push(await runCase(spec, a, b));
+      } else {
+        // Its own pair of connections, so the charset applies to this case only.
+        const charsetOptions = { ...options, charset: spec.charset };
+        const ca: Session = { client: createClient(charsetOptions) };
+        const cb: Session = { client: createClient(charsetOptions) };
+        try {
+          cases.push(await runCase(spec, ca, cb));
+        } finally {
+          await Promise.allSettled([ca.client.close(), cb.client.close()]);
+        }
+      }
       process.stderr.write(
         `ts   ${spec.id.padEnd(40)} ${String(Date.now() - started).padStart(6)} ms\n`,
       );

@@ -5,6 +5,7 @@
  * Most fields follow the CAS convention: int32 length prefix → value bytes.
  */
 
+import { encodeText, type TextCharset } from "./charset.js";
 import {
   SIZE_BYTE,
   SIZE_CAS_INFO,
@@ -89,9 +90,13 @@ export class PacketWriter {
     this.offset += length;
   }
 
-  /** Write a null-terminated string with int32 length prefix. */
-  writeNullTermString(value: string): void {
-    const encoded = Buffer.from(value, "utf-8");
+  /**
+   * Write a null-terminated string with int32 length prefix, encoded in
+   * `charset` (see `ClientOptions.charset`). `what` names the text in the error
+   * for a character that charset cannot encode.
+   */
+  writeNullTermString(value: string, charset: TextCharset = "utf-8", what = "text"): void {
+    const encoded = encodeText(value, charset, what);
     this.writeInt(encoded.length + 1); // length includes the trailing 0x00
     this.writeBytes(encoded);
     this.writeByte(0); // null terminator

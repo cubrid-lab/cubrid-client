@@ -210,6 +210,23 @@ The four brokers sent the same layout, with protocol version 7:
 - **A mixed-type collection** is sent as a NULL cell, or a NULL element when
   nested, the same bytes as a genuine NULL.
 
+## Text charset in the type byte
+
+With protocol 7 every column type is two bytes, and the low three bits of the
+first are the charset of the column's text, or of a collection's elements
+([`net_buf_cp_cas_type_and_charset`, `cas_net_buf.c`](https://github.com/CUBRID/cubrid/blob/v11.4.6/src/broker/cas_net_buf.c),
+the same in v10.2.18, v11.0.16 and v11.2.9; the value is `db_domain_codeset()` of
+the column's domain in `cas_execute.c`). The codes are CUBRID's `INTL_CODESET`, also
+used by JDBC's `UJCIUtil.getJavaCharsetName` (11.3.2.0053): `0` ASCII, `2` binary,
+`3` iso88591, `4` euckr, `5` utf8. A cell that states its own type, such as a
+bound `SELECT ?`, carries the same two bytes with the value's charset. The CAS
+sends the stored bytes without converting them.
+
+The `latin1Text` frame in `tests/fixtures/collection-frames.ts`, captured from the
+iso88591 `testdb` of 10.2 and 11.4 (identical), has `83 02` for `CHR(233)` (cell
+`e9 00`), `85 02` for the same character cast to utf8 (cell `c3 a9 00`), `a3 02`
+for a SET of it and `83 01` for a CHAR literal (#238).
+
 ## NULL and zero-byte cells
 
 - **SQL NULL** is cell length `-1` with no bytes

@@ -28,6 +28,7 @@ import {
   pickTransactionOptions,
 } from "../internals/normalize-config.js";
 import { SESSION_STATE, type SessionState } from "../internals/session-state.js";
+import { assertEncodable, assertValidCharset, type TextCharset } from "../protocol/charset.js";
 import {
   CASConnection,
   type CASConnectionConfig,
@@ -149,7 +150,10 @@ function assertStreamWanted(cursor?: StreamCursor): void {
   if (cursor.isStopped) throw STREAM_STOPPED;
 }
 
-/** Fatal so a CLOB that is not UTF-8 is refused, not silently given U+FFFD. */
+/**
+ * Fatal so a CLOB that is not UTF-8 is refused, not silently given U+FFFD. With
+ * charset "iso-8859-1" every byte is a character and nothing is refused.
+ */
 const CLOB_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /** The connection a query was issued on, and its failure count at that moment. */
@@ -269,6 +273,9 @@ export class NativeCubridAdapter implements DriverAdapter {
   /** See ClientOptions.timezone. */
   private readonly utcDates: boolean;
 
+  /** See ClientOptions.charset. */
+  private readonly charset: TextCharset;
+
   constructor(private readonly config: ClientConfig) {
     assertValidCredentials(config);
     assertValidRetryCount(config.maxConnectionRetryCount);
@@ -276,9 +283,11 @@ export class NativeCubridAdapter implements DriverAdapter {
     assertValidMaxReplyBytes(config.maxReplyBytes);
     assertValidFetchSize(config.fetchSize);
     assertValidTimezone(config.timezone);
+    assertValidCharset(config.charset);
     assertValidTransactionOptions(config);
     this.transactionOptions = pickTransactionOptions(config);
     this.utcDates = config.timezone === "utc";
+    this.charset = config.charset ?? "utf-8";
   }
 
   async connect(): Promise<void> {
@@ -309,7 +318,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     options?: QueryOptions,
   ): Promise<QueryResult<T>> {
     assertValidQueryOptions(options);
-    const values = literalOrRefuse(sql, params, QUERY_FAILED);
+    const values = literalOrRefuse(sql, params, QUERY_FAILED, this.charset);
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
     return this.inTurn(
@@ -345,7 +354,7 @@ export class NativeCubridAdapter implements DriverAdapter {
   ): AsyncGenerator<T, void, undefined> {
     const signal = options?.signal;
     signal?.throwIfAborted();
-    const values = literalOrRefuse(sql, params, QUERY_FAILED);
+    const values = literalOrRefuse(sql, params, QUERY_FAILED, this.charset);
 
     const cursor = new StreamCursor(options?.consumerTimeout ?? DEFAULT_CONSUMER_TIMEOUT_MS);
     const fetchSize = options?.fetchSize ?? this.config.fetchSize ?? DEFAULT_FETCH_SIZE;
@@ -385,7 +394,12 @@ export class NativeCubridAdapter implements DriverAdapter {
 
   async execute(sql: string, params?: QueryParams, options?: QueryOptions): Promise<ExecuteResult> {
     assertValidQueryOptions(options);
-    const values = literalOrRefuse(sql, params, "Failed to execute CUBRID statement.");
+    const values = literalOrRefuse(
+      sql,
+      params,
+      "Failed to execute CUBRID statement.",
+      this.charset,
+    );
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
     return this.inTurn(
@@ -410,7 +424,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     options?: QueryOptions,
   ): Promise<QueryResult<T>> {
     assertValidQueryOptions(options);
-    const binds = bindOrRefuse(sql, params, "Failed to execute CUBRID query.");
+    const binds = bindOrRefuse(sql, params, "Failed to execute CUBRID query.", this.charset);
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
     return this.inTurn(
@@ -427,7 +441,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     options?: QueryOptions,
   ): Promise<ExecuteResult> {
     assertValidQueryOptions(options);
-    const binds = bindOrRefuse(sql, params, "Failed to execute CUBRID statement.");
+    const binds = bindOrRefuse(sql, params, "Failed to execute CUBRID statement.", this.charset);
     const cas = this.getOrCreateCAS();
     const issued: IssuedOn = { cas, failedExchanges: cas.failedExchanges };
     return this.inTurn(
@@ -452,7 +466,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     options?: QueryOptions,
   ): Promise<ExecuteManyResult> {
     assertValidQueryOptions(options);
-    const sets = bindManyOrRefuse(sql, paramSets);
+    const sets = bindManyOrRefuse(sql, paramSets, this.charset);
     if (sets.length === 0) {
       options?.signal?.throwIfAborted();
       return { affectedRows: 0, results: [] };
@@ -510,7 +524,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     sets: readonly PreparedBinds[],
     generation: number,
   ): Promise<ExecuteManyResult> {
-    const statement = parsePrepare(prepareReply);
+    const statement = parsePrepare(prepareReply, this.charset);
     if (statement.statementType === StatementType.SELECT) {
       throw new Error("executeMany() cannot run a SELECT: it reports affected rows, not rows");
     }
@@ -1277,7 +1291,7 @@ export class NativeCubridAdapter implements DriverAdapter {
       async (cas, reply, generation) => {
         const result: PrepareAndExecuteResult = binds
           ? await this.executeHandle(cas, reply, binds, generation)
-          : parsePrepareAndExecute(reply, cas.protoVersion, this.utcDates);
+          : parsePrepareAndExecute(reply, cas.protoVersion, this.utcDates, this.charset);
         return use(cas, result);
       },
     );
@@ -1341,8 +1355,13 @@ export class NativeCubridAdapter implements DriverAdapter {
 
     const deferCommit = (commitAfter || prepared) && this.autoCommit;
     const { header, payload } = prepared
-      ? writePrepare(sql, cas.casInfo)
-      : writePrepareAndExecute(resolvedSql, this.autoCommit && !deferCommit, cas.casInfo);
+      ? writePrepare(sql, cas.casInfo, this.charset)
+      : writePrepareAndExecute(
+          resolvedSql,
+          this.autoCommit && !deferCommit,
+          cas.casInfo,
+          this.charset,
+        );
 
     // Before the first statement a ping may truthfully report OUT_TRAN.
     if (!this.autoCommit && this.transactionGeneration === null) {
@@ -1405,7 +1424,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     binds: PreparedBinds,
     generation: number,
   ): Promise<PrepareAndExecuteResult> {
-    const statement = parsePrepare(prepareReply);
+    const statement = parsePrepare(prepareReply, this.charset);
     if (statement.bindCount !== binds.count) {
       throw new Error(
         `Parameter count mismatch: the statement has ${statement.bindCount} markers, got ${binds.count} values`,
@@ -1415,7 +1434,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     const ready = binds.lobs ? await this.uploadLobs(cas, generation, binds) : binds;
     const { header, payload } = writeExecute(statement, ready, cas.casInfo);
     const reply = await this.exchangeOnSession(cas, generation, header, payload);
-    return parseExecute(reply, statement, cas.protoVersion, this.utcDates);
+    return parseExecute(reply, statement, cas.protoVersion, this.utcDates, this.charset);
   }
 
   /**
@@ -1450,7 +1469,7 @@ export class NativeCubridAdapter implements DriverAdapter {
   ): Promise<Buffer> {
     consumeSource(param.source);
     const type = param.kind === "blob" ? CUBRIDDataType.BLOB : CUBRIDDataType.CLOB;
-    const chunks = lobChunks(param, LOB_WRITE_CHUNK_SIZE);
+    const chunks = lobChunks(param, LOB_WRITE_CHUNK_SIZE, this.charset);
     let handle: Buffer;
     let offset = 0;
     try {
@@ -1836,7 +1855,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     if (fetchPayload === null) {
       throw new ConnectionLostError("Connection lost during FETCH");
     }
-    const fetchResult = parseFetch(fetchPayload, result.columns, this.utcDates);
+    const fetchResult = parseFetch(fetchPayload, result.columns, this.utcDates, this.charset);
 
     // Returning a partial result as success silently corrupts the query
     // contract. The execute response still promises more rows here.
@@ -1898,7 +1917,11 @@ export class NativeCubridAdapter implements DriverAdapter {
 
     try {
       for (const { row, name, lob } of cells) {
-        setColumn(row, name, decodeLob(name, lob, await this.readLob(cas, generation, name, lob)));
+        setColumn(
+          row,
+          name,
+          decodeLob(name, lob, await this.readLob(cas, generation, name, lob), this.charset),
+        );
       }
     } catch (error) {
       replyDamaged = error instanceof MalformedReplyError;
@@ -1925,7 +1948,7 @@ export class NativeCubridAdapter implements DriverAdapter {
       setColumn(
         row,
         name,
-        decodeLob(name, lob, await this.readLob(cas, generation, name, lob, cursor)),
+        decodeLob(name, lob, await this.readLob(cas, generation, name, lob, cursor), this.charset),
       );
     }
 
@@ -2067,14 +2090,18 @@ function literalOrRefuse(
   sql: string,
   params: QueryParams | undefined,
   message: string,
+  charset: TextCharset,
 ): QueryParams | undefined {
-  if (params === undefined) {
-    return undefined;
+  const values = params === undefined ? undefined : Array.from(params);
+  if (values !== undefined) {
+    refuseLobParams(values);
   }
-  const values = Array.from(params);
-  refuseLobParams(values);
   try {
-    assertLiteralParams(values);
+    assertEncodable(sql, charset, "SQL text");
+    if (values === undefined) {
+      return undefined;
+    }
+    assertLiteralParams(values, charset);
     const markers = findPlaceholders(sql);
     if (markers !== undefined) {
       assertParameterCount(markers.length, values.length);
@@ -2095,10 +2122,12 @@ function bindOrRefuse(
   sql: string,
   params: readonly PreparedQueryParam[] | undefined,
   message: string,
+  charset: TextCharset,
 ): PreparedBinds {
   try {
     assertPreparableSql(sql);
-    return encodePreparedParams(params ?? []);
+    assertEncodable(sql, charset, "SQL text");
+    return encodePreparedParams(params ?? [], charset);
   } catch (error) {
     throw mapError("query", error, message);
   }
@@ -2108,13 +2137,18 @@ function bindOrRefuse(
  * bindOrRefuse() for executeMany(): every set is checked and encoded before
  * anything is sent, and all sets must have the same number of values.
  */
-function bindManyOrRefuse(sql: string, paramSets: readonly QueryParams[]): PreparedBinds[] {
+function bindManyOrRefuse(
+  sql: string,
+  paramSets: readonly QueryParams[],
+  charset: TextCharset,
+): PreparedBinds[] {
   try {
     if (!Array.isArray(paramSets)) {
       throw new TypeError("paramSets must be an array of parameter arrays");
     }
     assertPreparableSql(sql);
     assertSingleStatement(sql);
+    assertEncodable(sql, charset, "SQL text");
 
     // Array.from() visits holes, which map() would skip.
     const sets = Array.from(paramSets, (params, index) => {
@@ -2127,7 +2161,7 @@ function bindManyOrRefuse(sql: string, paramSets: readonly QueryParams[]): Prepa
             "send; use executePrepared() for each row",
         );
       }
-      return encodePreparedParams(params);
+      return encodePreparedParams(params, charset);
     });
     const mismatch = sets.findIndex((set) => set.count !== sets[0]!.count);
     if (mismatch !== -1) {
@@ -2173,9 +2207,17 @@ function toColumnInfo(column: ColumnMeta): ColumnInfo {
   };
 }
 
-function decodeLob(name: string, lob: LobLocator, content: Buffer): Buffer | string {
+function decodeLob(
+  name: string,
+  lob: LobLocator,
+  content: Buffer,
+  charset: TextCharset,
+): Buffer | string {
   if (lob.type === CUBRIDDataType.BLOB) {
     return content;
+  }
+  if (charset === "iso-8859-1") {
+    return content.toString("latin1");
   }
 
   try {

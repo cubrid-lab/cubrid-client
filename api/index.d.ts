@@ -7,7 +7,9 @@ type QueryParams = readonly QueryParam[];
 type BlobSource = Buffer | Uint8Array | AsyncIterable<Buffer | Uint8Array> | Readable;
 /**
  * Content for {@link clob}: text, UTF-8 bytes, or a stream of either read once.
- * Bytes must be valid UTF-8 and text must not hold a lone surrogate.
+ * Bytes must be valid UTF-8 and text must not hold a lone surrogate. With
+ * `ClientOptions.charset` "iso-8859-1" the bytes are ISO-8859-1 instead, sent as
+ * they are, and text must not hold a character above U+00FF.
  */
 type ClobSource = string | Buffer | AsyncIterable<string | Buffer | Uint8Array> | Readable;
 /**
@@ -33,6 +35,8 @@ declare function blob(source: BlobSource): LobParam;
  * encoded, a Buffer must already be UTF-8, and an AsyncIterable or Readable may
  * yield either and is read once. Content that is not valid UTF-8 or text with a
  * lone surrogate fails the statement with a TypeError, and nothing is stored.
+ * With `ClientOptions.charset` "iso-8859-1" it is stored as ISO-8859-1: see
+ * {@link ClobSource}.
  */
 declare function clob(source: ClobSource): LobParam;
 
@@ -219,6 +223,8 @@ interface ClientConfig {
     fetchSize?: number | undefined;
     /** See {@link ClientOptions.timezone}. */
     timezone?: "local" | "utc" | undefined;
+    /** See {@link ClientOptions.charset}. */
+    charset?: "utf-8" | "iso-8859-1" | undefined;
     /** See {@link ClientOptions.isolationLevel}. */
     isolationLevel?: IsolationLevel | undefined;
     /** See {@link ClientOptions.lockTimeout}. */
@@ -308,6 +314,32 @@ interface ClientOptions {
      * `ZonedDateTime`. `"utc"` is a candidate default for 2.0.
      */
     timezone?: "local" | "utc";
+    /**
+     * How text is encoded to the server and decoded from it (#238):
+     *
+     * - `"utf-8"` (default, the 1.x behavior): UTF-8 on the wire in both
+     *   directions, whatever charset the database or column declares. SQL text,
+     *   string parameters and `clob()` content are sent as UTF-8, and every text
+     *   value, column name and CLOB is read as UTF-8. On an `iso88591` database,
+     *   such as the Docker images' `testdb`, the server keeps those bytes as they
+     *   are, so text written by this client reads back unchanged, but `LENGTH()`
+     *   counts bytes and text written in Latin-1 by another client is not
+     *   readable: its bytes that are not UTF-8 become U+FFFD.
+     * - `"iso-8859-1"`: for a database created with charset `iso88591`. SQL text,
+     *   string parameters and `clob()` text are sent as ISO-8859-1, and a
+     *   character above U+00FF is refused, for a `clob()` stream during its
+     *   upload and otherwise before anything is sent. Each text value
+     *   (CHAR, VARCHAR, NCHAR, ENUM, collection elements) is read in the charset
+     *   its column reports: `utf8` as UTF-8, `euckr` as EUC-KR, and `iso88591`,
+     *   ASCII and binary as ISO-8859-1. Bytes invalid in that charset fail the
+     *   query with an `UnsupportedValueError` cause instead of being replaced.
+     *   Column names and CLOB content are read as ISO-8859-1. This matches the
+     *   official JDBC driver with `charset=iso-8859-1`.
+     *
+     * Server error messages and the `database`, `user` and `password` fields
+     * stay UTF-8 in both. See `docs/TYPES.md#text-and-character-sets`.
+     */
+    charset?: "utf-8" | "iso-8859-1";
     maxConnectionRetryCount?: number;
     ssl?: boolean | ClientSSLOptions;
     /**
@@ -620,6 +652,8 @@ declare class NativeCubridAdapter implements DriverAdapter {
     private refusalTimer;
     /** See ClientOptions.timezone. */
     private readonly utcDates;
+    /** See ClientOptions.charset. */
+    private readonly charset;
     constructor(config: ClientConfig);
     connect(): Promise<void>;
     /**

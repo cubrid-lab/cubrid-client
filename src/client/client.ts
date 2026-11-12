@@ -6,6 +6,7 @@ import {
   assertValidTransactionOptions,
   pickTransactionOptions,
 } from "../internals/normalize-config.js";
+import { assertValidCharset } from "../protocol/charset.js";
 import { assertValidCredentials } from "../protocol/protocol.js";
 import type {
   BatchExecutable,
@@ -73,6 +74,7 @@ export class CubridClient
     assertValidCredentials(config);
     assertValidTransactionOptions(config);
     assertValidTimezone(config.timezone);
+    assertValidCharset(config.charset);
     const source = factorySource(config, connectionFactory);
     this.source = {
       ...source,

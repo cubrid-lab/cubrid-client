@@ -105,6 +105,7 @@ shapes. It is a bounded regression lane, not a claim of full parity.
 | equivalent | Same values, counts, codes and side effects, carried by equivalent representations (`Integer`/`number`, `String`/`string`, `byte[]`/`Buffer`, `Object[]`/`Array`, ...) |
 | intentional | Same values, carried by a representation listed with its reason: `Long`/`bigint`, `BigDecimal`/decimal `string`, `java.sql.Date`/`Time`/`CUBRIDTimestamp` to `Date` ([#113](https://github.com/cubrid-lab/cubrid-client/issues/113)), `CUBRIDBlob`/`Buffer` and `CUBRIDClob`/`string` (content loaded by the query) |
 | limitation | A difference declared with its local issue (none in this run) |
+| intentional difference | Different values by a documented design decision, declared as `intentional` with the issue or ADR that records it and limited to its steps (`intentional-difference` in `report.json`) |
 | defect | A difference without a declaration fails the run. A verified defect recorded in the corpus (`expectedDefect`, limited to its steps) is reported, not fixed here |
 | unverified | Declared as not run, with the reason |
 
@@ -151,6 +152,12 @@ The three cases that are equivalent on 10.2 and 11.0 but intentional on 11.2
 and 11.4 select `COUNT(*)`, which those servers type as INTEGER and the newer
 ones as BIGINT. Both drivers agree on each server.
 
+¹ Re-run for [#238](https://github.com/cubrid-lab/cubrid-client/issues/238) on
+10.2.18.9024 and 11.4.6.1963 with the same JDBC driver and JDK: 35 cases, 33
+executed, no unexpected difference. The two text cases are as shown; every other
+case kept its classification above.
+² Recorded before #238 and not re-run on 11.0 and 11.2.
+
 | Case | Area | 10.2 | 11.0 | 11.2 | 11.4 |
 | --- | --- | --- | --- | --- | --- |
 | `connect-server-version` | connection | equivalent | equivalent | equivalent | equivalent |
@@ -166,7 +173,8 @@ ones as BIGINT. Both drivers agree on each server.
 | `null-and-empty-literals` | null-empty | equivalent | equivalent | equivalent | equivalent |
 | `null-and-empty-stored` | null-empty | equivalent | equivalent | intentional | intentional |
 | `bit-strings` | null-empty | equivalent | equivalent | equivalent | equivalent |
-| `text-non-ascii-iso88591-database` | select | defect (recorded) | defect (recorded) | defect (recorded) | defect (recorded) |
+| `text-non-ascii-iso88591-database` | select | intentional difference¹ | defect (recorded)² | defect (recorded)² | intentional difference¹ |
+| `text-latin1-charset-option` | select | equivalent¹ | not run² | not run² | equivalent¹ |
 | `temporal-literals` | temporal | intentional | intentional | intentional | intentional |
 | `temporal-boundaries` | temporal | intentional | intentional | intentional | intentional |
 | `collections-literal` | collection | equivalent | equivalent | equivalent | equivalent |
@@ -196,19 +204,25 @@ a string bound to an INT column fails with `-494` on both; a unique violation
 inside a transaction (`-670`) leaves the earlier and later statements to commit
 on both; the 8192-row result has the same row checksum.
 
-### Recorded defect: text in a non-UTF-8 database
+### Intentional difference: text in a non-UTF-8 database
 
-`text-non-ascii-iso88591-database` (steps 1, 3 and 5) differs on all four
-servers. The Docker images create `testdb` with charset `iso88591`. Both
-drivers send UTF-8 SQL text, so the server stores `café` as the bytes
+`text-non-ascii-iso88591-database` (steps 1, 3 and 5) runs both drivers in
+their default mode. The Docker images create `testdb` with charset `iso88591`.
+Both drivers send UTF-8 SQL text, so the server stores `café` as the bytes
 `63 61 66 C3 A9` and reports `LENGTH('café')` as 5 (steps 2 and 4 agree).
 JDBC decodes those bytes in the column charset and returns `cafÃ©`;
-`cubrid-client` always decodes UTF-8 and returns `café`. For a byte that is not
-UTF-8, `CHR(233)` (`E9`), JDBC returns `é` and `cubrid-client` returns `U+FFFD`,
-so a latin-1 value written by another client cannot be read back. The driver
-ignores the server's column charset. Tracked in
-[#238](https://github.com/cubrid-lab/cubrid-client/issues/238); the case
-records the difference and does not fix it.
+`cubrid-client`'s default `charset: "utf-8"` decodes UTF-8 and returns `café`.
+For a byte that is not UTF-8, `CHR(233)` (`E9`), JDBC returns `é` and
+`cubrid-client` returns `U+FFFD`. [#238](https://github.com/cubrid-lab/cubrid-client/issues/238)
+kept that default, the 1.x behavior, so text this client stored keeps reading
+back, and added `charset: "iso-8859-1"` for an `iso88591` database
+([text and character sets](TYPES.md#text-and-character-sets)).
+
+`text-latin1-charset-option` runs both with that charset, JDBC as
+`charset=iso-8859-1` on its own connections: `CHR(233)` is `é`, `'café'` is
+stored as `636166E9` with `LENGTH` 4, a bound `'café ÿ'` reads back as itself,
+and a bound `SELECT ?` returns `é`. It is equivalent on 10.2 and 11.4. A case can
+set `charset`, which both runners apply to that case only.
 
 ### Not covered
 

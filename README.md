@@ -230,7 +230,7 @@ await db.executePrepared("INSERT INTO docs (id, body, notes) VALUES (?, ?, ?)", 
 ]);
 ```
 
-A CLOB is stored as UTF-8. A stream source is read once; an empty `blob()` is an
+A CLOB is stored as UTF-8 (ISO-8859-1 with `charset: "iso-8859-1"`). A stream source is read once; an empty `blob()` is an
 empty BLOB, not NULL. A plain `Buffer` still binds as `BIT VARYING`. Supported on
 CUBRID 10.2 to 11.4; see [writing BLOB and CLOB](docs/TYPES.md#writing-blob-and-clob).
 
@@ -545,6 +545,7 @@ Creates a client instance. Connection is established lazily on first query.
 | `readTimeout` | `number` | — | Fail a query after this many ms with no activity from the server (see [Read timeout](docs/CONNECTION.md#read-timeout)). Unset means no timeout for queries; the connect handshake still gives up after 10 s |
 | `fetchSize` | `number` | `100` | Rows requested per FETCH. CUBRID 10.2 to 11.4 ignore it and send about 16 KiB per reply (see [`fetchSize`](docs/API_REFERENCE.md#clientoptions)) |
 | `timezone` | `"local" \| "utc"` | `"local"` | Zone DATE/TIME/TIMESTAMP/DATETIME values are decoded in. `"utc"` makes them independent of the process `TZ` and symmetric with `Date` parameters (see [Date and time values](docs/TYPES.md#date-and-time-values)) |
+| `charset` | `"utf-8" \| "iso-8859-1"` | `"utf-8"` | How text is sent and read. The default is UTF-8 whatever the database charset; `"iso-8859-1"` matches an `iso88591` database, such as the Docker images' `testdb`, and reads each column in its own charset (see [Text and character sets](docs/TYPES.md#text-and-character-sets)) |
 | `maxLobBytes` | `number` | 64 MiB | Most BLOB and CLOB content one query may load, in bytes. A query over it rejects (see [BLOB and CLOB columns](docs/TYPES.md#blob-and-clob-columns)) |
 | `maxReplyBytes` | `number` | 1 GiB | Largest single reply from the server, in bytes, and so the largest row. A longer reply rejects and closes the connection (see [Reply size limit](docs/CONNECTION.md#reply-size-limit)) |
 | `isolationLevel` | `"read committed" \| "repeatable read" \| "serializable"` | Server default | Isolation level of every session this client opens, restored after a reconnect (see [Isolation Level and Lock Timeout](docs/CONNECTION.md#isolation-level-and-lock-timeout)) |

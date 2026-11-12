@@ -46,6 +46,7 @@ await db.close();
 | `readTimeout` | `number` | No | — | Milliseconds of server inactivity before a request fails. See [Read timeout](#read-timeout) |
 | `maxReplyBytes` | `number` | No | `1073741824` (1 GiB) | Largest single reply accepted from the server, in bytes. See [Reply size limit](#reply-size-limit) |
 | `maxConnectionRetryCount` | `number` | No | — | Retries after a failed TCP connect (default `0`). See [Connection retries](#connection-retries) |
+| `charset` | `"utf-8" \| "iso-8859-1"` | No | `"utf-8"` | How text is sent and read. Keep the default on a `utf8` database; on an `iso88591` database see [Database charset](#database-charset) |
 | `logger` | `unknown` | No | — | Receives redacted diagnostics (connection created, operation timing and failures). See [Logging](#logging) |
 | `connectionFactory` | `ConnectionFactory` | No | — | Custom factory for creating connections (advanced) |
 
@@ -83,6 +84,28 @@ const db = createClient({
   maxConnectionRetryCount: 3,
 });
 ```
+
+## Database charset
+
+The [`charset`](API_REFERENCE.md#clientoptions) option must match how your
+applications use the database's charset, which `SELECT CHARSET('x')` names. The
+Docker `cubrid/cubrid` images create `testdb` as `iso88591`.
+
+```ts
+// An iso88591 database that other clients fill with Latin-1 text.
+const db = createClient({ host, database: "testdb", user: "dba", charset: "iso-8859-1" });
+```
+
+- `"utf-8"` (default): UTF-8 both ways, whatever the database charset. On an
+  `iso88591` database this client's own text round-trips, `LENGTH()` counts
+  bytes, and Latin-1 text from other clients reads as U+FFFD.
+- `"iso-8859-1"`: for an `iso88591` database. Text is sent as ISO-8859-1, only
+  characters up to U+00FF, and each column is read in its own charset.
+- Never use `"iso-8859-1"` with a `utf8` database: the server can store the
+  Latin-1 bytes as empty or cut strings.
+
+Every connection a client opens, its pool and its transactions use the same
+setting. See [Text and character sets](TYPES.md#text-and-character-sets).
 
 ## Logging
 
