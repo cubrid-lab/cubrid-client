@@ -38,16 +38,13 @@ import { ZONED_FRAMES } from "./fixtures/zoned-frames.js";
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** A port nothing listens on: bind an ephemeral port, then release it. */
-function closedPort(): Promise<number> {
-  return new Promise((resolve) => {
-    const server = createServer();
-    server.listen(0, "127.0.0.1", () => {
-      const { port } = server.address() as { port: number };
-      server.close(() => resolve(port));
-    });
-  });
-}
+/**
+ * A port nothing listens on, so a connect is refused at once. A released
+ * ephemeral port is not safe: tests run in parallel and another server can
+ * bind it, turning the refusal into a connect that hangs until
+ * connectionTimeout. Port 1 is privileged, so no unprivileged test can bind it.
+ */
+const REFUSED_PORT = 1;
 
 const DEFAULT_CONFIG: ClientConfig = {
   host: "127.0.0.1",
@@ -561,7 +558,7 @@ test("NativeCubridAdapter connect creates CAS lazily if not set", async () => {
 
 test("NativeCubridAdapter connect passes maxConnectionRetryCount to the CAS and keeps the cause", async () => {
   // The redirect target is closed, so each attempt reaches the broker once and fails.
-  const redirect = await closedPort();
+  const redirect = REFUSED_PORT;
   let connections = 0;
   const broker = createServer((socket) => {
     connections += 1;
