@@ -38,3 +38,21 @@ Status: review checklist, **not** an accepted API change. This document compleme
 ## Decision record
 
 Mark each gate **passed**, **failed**, or **not tested**, with a commit SHA and CI/run link. Do not claim that this checklist or the v2 mock establishes production readiness. Issue #300 tracks the independent consumer and runtime evidence.
+
+## Drizzle integration: defer breaking interface changes to 2.0
+
+Review snapshot: 2026-11-17, `cubrid-lab/drizzle-cubrid` main. The adapter declares `cubrid-client >=1.4.0 <2.0.0`; the default entry point still extends Drizzle's MySQL classes, while `drizzle-cubrid/native` is an experimental CUBRID-specific preview. Its documented live integration target is CUBRID 11.4. This is **not** a claim of full compatibility across every ORM feature or CUBRID version.
+
+| Proposed interface change | 1.x disposition | 2.0 design requirement |
+| --- | --- | --- |
+| Replace `queryPrepared()` / `executePrepared()` with `binding` options | Preserve published methods; additive bridge only after evidence | Adapt both legacy and native Drizzle sessions to one statement contract; preserve explicit prepared semantics and errors |
+| Remove client-level `beginTransaction()`, `commit()`, `rollback()` | Keep compatibility and documented deprecations | Migrate any remaining Drizzle fallback to scoped `transaction(callback)` or explicit transaction scope; never silently use a shared connection |
+| Reshape `ConnectionLike` and move SPI exports to `/driver` | Preserve root exports; optional additive subpath | Verify packed ESM/CJS imports and TypeScript structural compatibility for Drizzle, custom adapters and pools |
+| Change binding or timezone defaults | Keep 1.x defaults | Require live type, date/time, charset and query behavior evidence plus migration guidance |
+| Replace MySQL-derived Drizzle dialect classes | No change to `cubrid-client` API required | Track in `drizzle-cubrid` native-dialect work; avoid coupling it to the driver 2.0 release without a proven dependency |
+
+**Separate correctness fixes from API migration.** Do **not** postpone data-integrity or security defects merely because 2.0 will change the interface. Existing [cubrid-client #297](https://github.com/cubrid-lab/cubrid-client/issues/297) (concurrent generated keys), [drizzle-cubrid #216](https://github.com/cubrid-lab/drizzle-cubrid/issues/216) (BIT bytes) and [drizzle-cubrid #237](https://github.com/cubrid-lab/drizzle-cubrid/issues/237) (CHAR IN comparisons) require independent triage and compatible fixes where possible.
+
+Before declaring 2.0 integration ready, test both Drizzle entry points against the proposed driver with pinned dependency versions: ordinary and prepared SELECT/DML, positional rows with repeated labels, `$returningId()` under concurrent pool inserts, transaction rollback and savepoints, UTC temporal round trips, collections and binary values, and ESM/CJS consumer imports. Record the test environment and explicitly mark unsupported features rather than inferring parity from compilation.
+
+Related design: [ADR 0011](adr/0011-v2-binding-option-and-driver-subpath.md), [v2 API design](design/v2-api.md), [compatibility evidence issue #300](https://github.com/cubrid-lab/cubrid-client/issues/300).
