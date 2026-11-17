@@ -45,13 +45,33 @@ export function validateCuratedNote(version, note, knownVersions = Object.keys(p
   if (upgradeIndex > 0) errors.push("Upgrade notes must appear before change sections");
   if (!sections.some((h) => changeHeadings.has(h))) errors.push("No user-facing change section");
 
+  // A correct heading and comparison link are not a substitute for a short
+  // explanation of user impact. Check the exact versioned document, not the
+  // release-please PR description.
+  const firstSection = lines.findIndex((line) => line.startsWith("### "));
+  const summary = lines.slice(1, firstSection).join(" ").trim().replace(/\s+/g, " ");
+  if (!summary || summary.startsWith("- ") || summary.startsWith("* "))
+    errors.push("Missing introductory user-impact summary");
+  if (summary.length > 900)
+    errors.push("Introductory summary is too long; put detail in change entries");
+
+
   let current = "";
   let count = 0;
+  const seenChanges = new Set();
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (line.startsWith("### ")) current = line;
+    if (line.startsWith("* ") && changeHeadings.has(current))
+      errors.push("Raw generated release bullet at line " + (i + 1));
     if (line.startsWith("- ") && changeHeadings.has(current)) {
       count++;
+      if (/^- \*\*(?:feat|fix|docs|test|ci|chore):/i.test(line))
+        errors.push("Uncurated conventional-commit bullet at line " + (i + 1));
+      const canonicalChange = line.trim().replace(/\s+/g, " ").toLowerCase();
+      if (seenChanges.has(canonicalChange))
+        errors.push("Duplicate change entry at line " + (i + 1));
+      seenChanges.add(canonicalChange);
       if (!credit.test(line)) errors.push("Change missing credited author at line " + (i + 1));
       if (i + 1 < lines.length && /^[ \t]{2,}\S/.test(lines[i + 1]))
         errors.push("Hard-wrapped change entry at line " + (i + 1));
