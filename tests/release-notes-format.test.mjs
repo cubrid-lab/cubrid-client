@@ -108,3 +108,24 @@ test("newly released versions are accepted without hardcoded version changes", (
   const versions = ["0.1.0", "0.2.0", "1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0"];
   assert.deepEqual(validateCuratedNote("1.4.0", next, versions), []);
 });
+
+test("rejects release notes that start directly with a section", () => {
+  const withoutSummary = sample.replace("Selected CUBRID driver corrections.\n", "");
+  assert.match(validateCuratedNote("1.2.0", withoutSummary).join(" "), /introductory user-impact summary/);
+});
+
+test("rejects an uncurated generated entry before publishing", () => {
+  const generated = sample.replace(
+    "- Correct a wire type ([#126](https://github.com/cubrid-lab/cubrid-client/pull/126)) by @yeongseon",
+    "* fix: correct a wire type ([#126](https://github.com/cubrid-lab/cubrid-client/pull/126)) by @yeongseon",
+  );
+  assert.match(validateCuratedNote("1.2.0", generated).join(" "), /Raw generated release bullet/);
+});
+
+test("rejects exact duplicate change entries", () => {
+  const entry = "- Correct a wire type ([#126](https://github.com/cubrid-lab/cubrid-client/pull/126)) by @yeongseon";
+  assert.match(
+    validateCuratedNote("1.2.0", sample.replace(entry, entry + "\n" + entry)).join(" "),
+    /Duplicate change entry/,
+  );
+});
