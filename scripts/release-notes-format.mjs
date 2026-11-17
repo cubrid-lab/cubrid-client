@@ -55,7 +55,6 @@ export function validateCuratedNote(version, note, knownVersions = Object.keys(p
   if (summary.length > 900)
     errors.push("Introductory summary is too long; put detail in change entries");
 
-
   let current = "";
   let count = 0;
   const seenChanges = new Set();
