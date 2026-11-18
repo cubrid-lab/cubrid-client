@@ -17,8 +17,8 @@ Nothing in this audit changed a GitHub Release, a tag or an npm artifact.
 | v0.1.0 | Pass | Yes | Pass (two bullets without a commit link) | None | No |
 | v0.2.0 | Pass (no Release page by design) | n/a | Pass | None | n/a |
 | v1.0.0 | Pass | Yes | Pass | None | No |
-| v1.1.0 | **Exception**: npm `gitHead` is the parent of the tag commit | Yes | Pass; "patch-level" mislabels a minor version | Summary wording | **Yes** |
-| v1.2.0 | Pass (npm published 11.5 h after the Release, explained) | Yes | Three PR links resolve to pre-rewrite merge commits; user-facing PRs and the only external contributor omitted | Three entries added | **Yes** |
+| v1.1.0 | **Exception**: npm `gitHead` is the parent of the tag commit | Yes | Pass | None | No |
+| v1.2.0 | Pass (npm published 11.5 h after the Release, explained) | Yes | User-facing PRs and the only external contributor omitted | Three entries added | **Yes** |
 | v1.3.0 | Pass | Yes | Pass | None | No |
 | v1.4.0 | Pass | Yes | Pass; four Bug Fixes entries repeat Upgrade notes | Four entries merged into one | **Yes** |
 
@@ -36,7 +36,7 @@ Release metadata from `gh api repos/cubrid-lab/cubrid-client/releases`; npm meta
 | v1.3.0 | `b2d5bec` | `b2d5bec` | 2026-11-07 15:34:58 | 2026-11-07 15:36:52 | GitHub Actions, SLSA provenance | 437663054 |
 | v1.4.0 | `a92003e` | `a92003e` | 2026-11-12 09:11:14 | 2026-11-12 09:13:35 | GitHub Actions, SLSA provenance | 442711160 |
 
-`dist-tags.latest` is `1.4.0`. The heading date of each source note is the Release publication date in UTC.
+`dist-tags.latest` is `1.4.0`. The heading date of each source note is the Release publication date in UTC; v0.2.0, which has no Release, uses its tag and npm date (2026-03-13 UTC).
 
 **Exceptions**
 
@@ -50,7 +50,7 @@ Release metadata from `gh api repos/cubrid-lab/cubrid-client/releases`; npm meta
 
 Each body was fetched with `gh api repos/cubrid-lab/cubrid-client/releases/tags/<tag> --jq .body` and compared with `docs/releases/<tag>.md` at `fa2d582` after trimming trailing whitespace. All six were equal (sizes 1,170 / 1,232 / 1,235 / 2,679 / 4,198 / 8,239 bytes for v0.1.0 to v1.4.0).
 
-After this change, the v1.1.0, v1.2.0 and v1.4.0 sources **differ** from their public bodies until a body-only sync is separately approved (see [Proposed body-only sync](#proposed-body-only-sync)).
+After this change, the v1.2.0 and v1.4.0 sources **differ** from their public bodies until a body-only sync is separately approved (see [Proposed body-only sync](#proposed-body-only-sync)).
 
 ## 3. Facts and editorial quality
 
@@ -89,13 +89,16 @@ Editorial: concise; the migration caveat is appropriate.
 | --- | --- | --- |
 | Connection-string parsing and query helpers are **not** in v1.1.0 | `df67d44` is in `v1.1.0..v1.2.0` | Pass |
 | `6114499`, `4f842e2`, `45a18dd` by @yeongseon; `701cb35` by @sisyphus-dev-ai | all in `v1.0.0..v1.1.0`; GitHub authors match | Pass |
-| "A focused **patch-level** update" | the version is a semver **minor** release (1.0.0 to 1.1.0) | **Corrected** |
+| "A focused **patch-level** update" | `v1.0.0..v1.1.0` contains only `fix`, `docs` and `chore` commits, no `feat` | Pass |
+
+Observation only: the version number is a semver minor bump while the content is maintenance-level; the wording describes the content correctly and is not changed.
 
 ### v1.2.0
 
 | Claim | Evidence | Verdict |
 | --- | --- | --- |
-| TLS [#55](https://github.com/cubrid-lab/cubrid-client/pull/55), escaping [#52](https://github.com/cubrid-lab/cubrid-client/pull/52), TLS read fix [#58](https://github.com/cubrid-lab/cubrid-client/pull/58) | merged; the API merge commits (`0f6cba7`, `2c21c07`, `249e243`) predate the 2026-11-05 history rewrite and are not ancestors of the tag; the rewritten equivalents `f8082b1`, `4b7c27b`, `aa14d87` are in `v1.1.0..v1.2.0` | Pass, documented exception |
+| TLS [#55](https://github.com/cubrid-lab/cubrid-client/pull/55), escaping [#52](https://github.com/cubrid-lab/cubrid-client/pull/52), TLS read fix [#58](https://github.com/cubrid-lab/cubrid-client/pull/58) | merged; the `/pull/N` links resolve | Pass |
+| PR history rewrite (not a defect) | the `/pull/N` links resolve; only the API `merge_commit_sha` of six PRs predates the 2026-11-05 history rewrite and is not an ancestor of the tag: #16 (`7d8406e`), #21 (`0333e95`), #52 (`2c21c07`), #55 (`0f6cba7`), #56 (`e5453d9`), #58 (`249e243`). Their rewritten commits `9fb440a`, `65d06ad`, `4b7c27b`, `f8082b1`, `8888cd3`, `aa14d87` are in `v1.1.0..v1.2.0` | Pass, recorded |
 | `df67d44` connection string and helpers | `parseConnectionString`, `escapeIdentifier`, `buildWhere` exported | Pass |
 | [#122](https://github.com/cubrid-lab/cubrid-client/pull/122), #126, #127, #128, #130, #137, #140, #143, #145 | merged into the tag, author `yeongseon` | Pass |
 | String parameters use escaped literals; prepared binding is v1.3.0 | prepared binding is [#207](https://github.com/cubrid-lab/cubrid-client/pull/207) in `v1.2.0..v1.3.0` | Pass |
@@ -134,7 +137,6 @@ Kept on purpose: the Node runtime note, the literal-parameter and credential war
 
 | Note | Before | After |
 | --- | --- | --- |
-| v1.1.0 summary | `A focused patch-level update to SQL parameter formatting, ...` | `A focused maintenance update to SQL parameter formatting, ...` |
 | v1.2.0 Features | (none) | `Check connection health with ping() and survive EPIPE socket errors instead of crashing the process (#21) by @yeongseon` |
 | v1.2.0 Bug Fixes | (none) | `Reconnect when the broker releases the CAS process under KEEP_CONNECTION=AUTO (#16) by @paikend` |
 | v1.2.0 Bug Fixes | (none) | `Serialize concurrent requests on one connection, and clear a failed cached connection attempt so the next call retries (#56, 6f009cc) by @yeongseon` |
@@ -142,11 +144,11 @@ Kept on purpose: the Node runtime note, the literal-parameter and credential war
 
 ## Proposed body-only sync
 
-After this change is reviewed and merged, the v1.1.0, v1.2.0 and v1.4.0 Release bodies differ from their sources. Each needs its own **separately approved** body-only update; merging this change does not authorize it. For each tag:
+After this change is reviewed and merged, the v1.2.0 and v1.4.0 Release bodies differ from their sources. Each needs its own **separately approved** body-only update; merging this change does not authorize it. For each tag:
 
 1. **Backup**: `gh api repos/cubrid-lab/cubrid-client/releases/tags/<tag> > <tag>.before.json`; record `id`, `name`, `tag_name`, `draft`, `prerelease`, `published_at`, `target_commitish`, the asset count and the body SHA-256.
 2. **Concurrency check**: immediately before editing, re-fetch and confirm the body still equals the backup (no edit since); stop if it changed.
-3. **Body-only edit**: `gh release edit <tag> --notes-file docs/releases/<tag>.md`. Do not pass `--title`, `--tag`, `--target`, `--draft`, `--prerelease` or `--latest`, and do not touch npm.
+3. **Body-only edit**: `gh release edit <tag> --title "cubrid-client <tag>" --notes-file docs/releases/<tag>.md`, as in [RELEASE_PROCESS.md](RELEASE_PROCESS.md#github-release-note-formatting). `--title` only restates the existing title; do not pass `--tag`, `--target`, `--draft`, `--prerelease` or `--latest`, and do not touch npm.
 4. **Readback**: re-fetch; the body must equal the merged source (ignoring the trailing newline), and every field recorded in step 1 except the body must be unchanged.
 
 ## Reproduce
@@ -167,8 +169,7 @@ git diff 701cb35 c01cbdb   # v1.1.0: only the package.json version
 
 # 2. Source/public equality (on the commit being compared)
 for t in v0.1.0 v1.0.0 v1.1.0 v1.2.0 v1.3.0 v1.4.0; do
-  gh api repos/cubrid-lab/cubrid-client/releases/tags/$t --jq .body > /tmp/$t.public.md
-  diff <(sed -e '$a\' /tmp/$t.public.md) docs/releases/$t.md > /dev/null && echo "$t equal" || echo "$t differs"
+  cmp -s <(gh api repos/cubrid-lab/cubrid-client/releases/tags/$t --jq .body) <(cat docs/releases/$t.md; echo) && echo "$t equal" || echo "$t differs"
 done
 
 # 3. References: PR state/author and tag containment
