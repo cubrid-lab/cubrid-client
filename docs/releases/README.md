@@ -1,6 +1,6 @@
 # Curated release notes
 
-Each `vX.Y.Z.md` describes the **code in the immutable version tag**, not features merged afterwards. Use single-line Markdown bullets, verified `by @username` credits, and a Full Changelog link.
+Each `vX.Y.Z.md` describes the **code in the immutable version tag**, not features merged afterwards. Use single-line Markdown bullets, verified `by @username` credits, and a Full Changelog link. Start with a short prose summary of user impact (at most 900 characters, no lists) before the first section; curate generated output (no raw `* ` bullets, conventional-commit prefixes such as `fix:` or exact duplicate entries).
 
 | Version | GitHub Release status | Source |
 | --- | --- | --- |

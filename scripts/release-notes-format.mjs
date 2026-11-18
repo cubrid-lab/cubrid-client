@@ -49,9 +49,12 @@ export function validateCuratedNote(version, note, knownVersions = Object.keys(p
   // explanation of user impact. Check the exact versioned document, not the
   // release-please PR description.
   const firstSection = lines.findIndex((line) => line.startsWith("### "));
-  const summary = lines.slice(1, firstSection).join(" ").trim().replace(/\s+/g, " ");
+  const summaryLines = lines.slice(1, firstSection === -1 ? lines.length : firstSection);
+  const summary = summaryLines.join(" ").trim().replace(/\s+/g, " ");
   if (!summary || summary.startsWith("- ") || summary.startsWith("* "))
     errors.push("Missing introductory user-impact summary");
+  else if (summaryLines.some((line) => /^\s*[-*] /.test(line)))
+    errors.push("Introductory summary must be prose; put lists in sections");
   if (summary.length > 900)
     errors.push("Introductory summary is too long; put detail in change entries");
 
@@ -65,8 +68,14 @@ export function validateCuratedNote(version, note, knownVersions = Object.keys(p
       errors.push("Raw generated release bullet at line " + (i + 1));
     if (line.startsWith("- ") && changeHeadings.has(current)) {
       count++;
-      if (/^- \*\*(?:feat|fix|docs|test|ci|chore):/i.test(line))
+      if (
+        /^- (?:\*\*)?(?:feat|fix|docs|test|ci|chore|refactor|perf|build|style)(?:\([^)]*\))?!?(?:\*\*)?:/i.test(
+          line,
+        )
+      )
         errors.push("Uncurated conventional-commit bullet at line " + (i + 1));
+      // Exact (whitespace- and case-insensitive) repeats only; reworded
+      // repeats still need human review.
       const canonicalChange = line.trim().replace(/\s+/g, " ").toLowerCase();
       if (seenChanges.has(canonicalChange))
         errors.push("Duplicate change entry at line " + (i + 1));
