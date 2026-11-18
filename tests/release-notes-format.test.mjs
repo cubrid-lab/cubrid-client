@@ -108,3 +108,62 @@ test("newly released versions are accepted without hardcoded version changes", (
   const versions = ["0.1.0", "0.2.0", "1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0"];
   assert.deepEqual(validateCuratedNote("1.4.0", next, versions), []);
 });
+
+test("rejects release notes that start directly with a section", () => {
+  const withoutSummary = sample.replace("Selected CUBRID driver corrections.\n", "");
+  assert.match(
+    validateCuratedNote("1.2.0", withoutSummary).join(" "),
+    /introductory user-impact summary/,
+  );
+});
+
+test("rejects an uncurated generated entry before publishing", () => {
+  const generated = sample.replace(
+    "- Correct a wire type ([#126](https://github.com/cubrid-lab/cubrid-client/pull/126)) by @yeongseon",
+    "* fix: correct a wire type ([#126](https://github.com/cubrid-lab/cubrid-client/pull/126)) by @yeongseon",
+  );
+  assert.match(validateCuratedNote("1.2.0", generated).join(" "), /Raw generated release bullet/);
+});
+
+test("rejects exact duplicate change entries", () => {
+  const entry =
+    "- Correct a wire type ([#126](https://github.com/cubrid-lab/cubrid-client/pull/126)) by @yeongseon";
+  // Without a PR link, so only the duplicate rule (not the repeated-reference rule) can fire.
+  const plain = "- Correct a wire type by @yeongseon";
+  const errors = validateCuratedNote("1.2.0", sample.replace(entry, plain + "\n" + plain));
+  assert.match(errors.join(" "), /Duplicate change entry/);
+  assert.doesNotMatch(errors.join(" "), /Repeated pull-request reference/);
+});
+
+test("rejects uncurated conventional-commit entries in every common shape", () => {
+  const entry =
+    "- Correct a wire type ([#126](https://github.com/cubrid-lab/cubrid-client/pull/126)) by @yeongseon";
+  for (const prefix of ["**fix:**", "fix:", "feat(client):", "**refactor(protocol)!:**", "perf:"]) {
+    const note = sample.replace(entry, entry.replace("- Correct", "- " + prefix + " correct"));
+    assert.match(
+      validateCuratedNote("1.2.0", note).join(" "),
+      /Uncurated conventional-commit bullet/,
+      prefix,
+    );
+  }
+  assert.deepEqual(
+    validateCuratedNote(
+      "1.2.0",
+      sample.replace("Correct a wire type", "Fix a wire type in the fixed-point decoder"),
+    ),
+    [],
+  );
+});
+
+test("rejects an introductory summary that is too long or contains a list", () => {
+  const summary = "Selected CUBRID driver corrections.\n";
+  const long = sample.replace(summary, "Selected corrections. ".repeat(50) + "\n");
+  assert.match(validateCuratedNote("1.2.0", long).join(" "), /summary is too long/);
+  const listed = sample.replace(summary, summary + "\n- one\n- two\n");
+  assert.match(validateCuratedNote("1.2.0", listed).join(" "), /summary must be prose/);
+  const bulletOnly = sample.replace(summary, "- one\n");
+  assert.match(
+    validateCuratedNote("1.2.0", bulletOnly).join(" "),
+    /Missing introductory user-impact summary/,
+  );
+});
