@@ -142,6 +142,27 @@ The `stream-busy` limit is part of the contract. A statement waits as long as th
 consumer keeps reading, and a consumer that stops cannot make a statement wait for
 ever: `consumerTimeout` can be raised but not disabled.
 
+### Streams in transactions and typed-bind streams
+
+`stream()` on the `tx` of `transaction()`, on a `TransactionScope` and on
+`CubridTransaction`, and `StreamOptions.binding`
+([#307](https://github.com/cubrid-lab/cubrid-client/issues/307)), are a
+backward-compatible MINOR feature. The new exported interface
+`StreamTransactionClient` is added to the callback type of `transaction()` and to
+`TransactionScope`; callbacks written against the older types are still accepted.
+`binding` defaults to `"literal"`, so a stream without it sends the same requests
+as before. It follows [ADR 0011](adr/0011-v2-binding-option-and-driver-subpath.md):
+the option, not a `streamPrepared()` method, and `ConnectionLike` does not change.
+The client removes `binding` before calling a connection, and a custom connection
+cannot run a `"prepared"` stream: its first read fails rather than falling back to
+literals.
+
+The transaction rules are part of the contract: statements of the transaction wait
+behind an open stream and are refused with `stream-busy` after `consumerTimeout`;
+`commit()` while a stream is open is refused and the transaction rolled back, and a
+`transaction()` callback that returns with a stream still open is that commit;
+`rollback()` closes the stream first.
+
 ### Date and time zone default
 
 `timezone` defaults to `"local"` for every 1.x release: DATE, TIME, TIMESTAMP and

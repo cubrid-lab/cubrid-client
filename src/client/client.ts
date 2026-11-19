@@ -2,7 +2,6 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { NotSentError } from "../errors/internal-errors.js";
 import { isAbortReason, mapError } from "../internals/map-error.js";
 import {
-  ARRAY_ROWS_UNSUPPORTED,
   assertValidQueryOptions,
   assertValidStreamOptions,
   assertValidTimezone,
@@ -10,7 +9,6 @@ import {
   checkedResult,
   checkedRows,
   pickTransactionOptions,
-  wantsArrayRows,
 } from "../internals/normalize-config.js";
 import { assertValidCharset } from "../protocol/charset.js";
 import { assertValidCredentials } from "../protocol/protocol.js";
@@ -36,12 +34,13 @@ import type {
   ResultTransactionClient,
   Streamable,
   StreamOptions,
+  StreamTransactionClient,
   TimezoneAware,
   TransactionCallback,
   TransactionOptions,
   TransactionScope,
 } from "../types/client.js";
-import { type PreparedQueryParam, refuseLobParams } from "../types/lob.js";
+import { type PreparedQueryParam, refuseLobParams, refuseStreamLobParams } from "../types/lob.js";
 import type { QueryParams } from "../types/query.js";
 import type { ArrayQueryResult, QueryResult, QueryResultRow } from "../types/result.js";
 import type {
@@ -59,6 +58,7 @@ import {
   runTransaction,
 } from "./connection-source.js";
 import * as schema from "./schema.js";
+import { streamRows } from "./stream-rows.js";
 import type { ScopedTransaction } from "./transaction.js";
 
 export class CubridClient
@@ -354,7 +354,8 @@ export class CubridClient
    * can never run: it rejects with `kind: "stream-busy"` after
    * {@link StreamOptions.consumerTimeout}. Use `transaction()`, which has its own
    * connection, or another client. With `rowMode: "array"` each row is an array
-   * of its values in select-list order. See `docs/API_REFERENCE.md`.
+   * of its values in select-list order, and with `binding: "prepared"` the values are
+   * sent as typed binds, as by `queryPrepared()`. See `docs/API_REFERENCE.md`.
    *
    * @throws RangeError or TypeError at once when an option is invalid.
    */
@@ -383,7 +384,7 @@ export class CubridClient
     options?: StreamOptions,
   ): AsyncGenerator<unknown, void, undefined> {
     assertValidStreamOptions(options);
-    refuseLobParams(params);
+    refuseStreamLobParams(params);
     return streamRows(() => this.getSharedConnection(), sql, params, options);
   }
 
@@ -395,7 +396,8 @@ export class CubridClient
         ExecutableTransactionClient &
         PreparedTransactionClient &
         BatchTransactionClient &
-        TimezoneAware
+        TimezoneAware &
+        StreamTransactionClient
     >,
     options?: TransactionOptions,
   ): Promise<T> {
@@ -836,66 +838,5 @@ async function runStatement<R>(
       throw error;
     }
     throw mapError("query", error, failureMessage);
-  }
-}
-
-/**
- * Reads the rows of `stream()` from the connection `connect` gives. A failure
- * of `connect` or of a read is a QueryError; the reason of the caller's own
- * abort is passed on unchanged. A stream left early is closed on its connection.
- */
-export async function* streamRows<T>(
-  connect: () => Promise<ConnectionLike>,
-  sql: string,
-  params: QueryParams | undefined,
-  options: StreamOptions | undefined,
-): AsyncGenerator<T, void, undefined> {
-  const arrays = wantsArrayRows(options);
-  // An abort is the caller's own decision, so its reason stays as it is.
-  const failure = (error: unknown): unknown =>
-    options?.signal?.aborted && error === options.signal.reason
-      ? error
-      : mapError("query", error, "Query failed.");
-
-  let rows: AsyncIterator<T>;
-  try {
-    const connection = await connect();
-    if (!connection.stream) {
-      throw new Error("Underlying connection does not support stream.");
-    }
-    rows = (connection.stream(sql, params, options) as AsyncIterable<T>)[Symbol.asyncIterator]();
-  } catch (error) {
-    throw failure(error);
-  }
-
-  let exhausted = false;
-  try {
-    for (;;) {
-      let next: IteratorResult<T>;
-      try {
-        next = await rows.next();
-      } catch (error) {
-        exhausted = true;
-        throw failure(error);
-      }
-
-      if (next.done) {
-        exhausted = true;
-        return;
-      }
-      if (arrays && !Array.isArray(next.value)) {
-        throw failure(new Error(ARRAY_ROWS_UNSUPPORTED));
-      }
-      yield next.value;
-    }
-  } finally {
-    if (!exhausted) {
-      try {
-        await rows.return?.();
-      } catch (error) {
-        // biome-ignore lint/correctness/noUnsafeFinally: a failed cleanup of an unfinished stream is the error the caller must see
-        throw failure(error);
-      }
-    }
   }
 }

@@ -12,6 +12,7 @@ import type {
   ExecutableTransactionClient,
   PreparedTransactionClient,
   ResultTransactionClient,
+  StreamTransactionClient,
   TimezoneAware,
   TransactionCallback,
   TransactionOptions,
@@ -81,7 +82,8 @@ export type TransactionHandle = ArrayRowQueryable &
   ExecutableTransactionClient &
   PreparedTransactionClient &
   BatchTransactionClient &
-  TimezoneAware;
+  TimezoneAware &
+  StreamTransactionClient;
 
 /**
  * The body of `transaction()`: begin, run the callback, commit or roll back,

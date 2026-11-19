@@ -16,13 +16,14 @@ import { CASFunctionCode, EndTranType } from "../src/protocol/constants.js";
 import { writePrepare, writePrepareAndExecute } from "../src/protocol/protocol.js";
 import type {
   ClientConfig,
+  ConnectionLike,
   ExecutableTransactionClient,
   QueryOptions,
   ResultTransactionClient,
   StreamOptions,
 } from "../src/types/client.js";
 import { blob, clob } from "../src/types/lob.js";
-import type { QueryParam } from "../src/types/query.js";
+import type { QueryParam, QueryParams } from "../src/types/query.js";
 import { CAPTURED_FRAMES } from "./fixtures/collection-frames.js";
 import {
   DML_FRAMES,
@@ -6594,4 +6595,251 @@ test("rowMode array: a stream's FETCH windows are arrays too", async () => {
     ["2", "20"],
   ]);
   assert.ok(sentCodes(fakeCAS).includes(CASFunctionCode.FETCH));
+});
+
+// ---------------------------------------------------------------------------
+// stream() with typed binds (#307)
+// ---------------------------------------------------------------------------
+
+/** The EXECUTE request a prepared statement sent, with its typed binds. */
+function executePayload(fakeCAS: FakeCASConnection): Buffer {
+  const payload = fakeCAS.sentPayloads.find((sent) => sent[0] === CASFunctionCode.EXECUTE);
+  assert.ok(payload, "an EXECUTE was sent");
+  return payload;
+}
+
+async function drainRows<T>(rows: AsyncIterable<T>): Promise<T[]> {
+  const all: T[] = [];
+  for await (const row of rows) {
+    all.push(row);
+  }
+  return all;
+}
+
+test("stream prepared: sends PREPARE and EXECUTE with the binds queryPrepared sends, then commits and releases", async () => {
+  const awaited = createPreparedAdapter();
+  queuePreparedSelect(awaited.fakeCAS);
+  await awaited.adapter.queryPrepared("SELECT ? AS v", [7]);
+
+  const streamed = createPreparedAdapter();
+  queuePreparedSelect(streamed.fakeCAS);
+  assert.deepEqual(
+    await drainRows(streamed.adapter.stream("SELECT ? AS v", [7], { binding: "prepared" })),
+    [{ v: 7 }],
+  );
+
+  assert.deepEqual(sentCodes(streamed.fakeCAS), [
+    CASFunctionCode.PREPARE,
+    CASFunctionCode.EXECUTE,
+    CASFunctionCode.END_TRAN,
+    CASFunctionCode.CLOSE_REQ_HANDLE,
+  ]);
+  // The SQL keeps its marker, and the value travels as the same typed bind.
+  const prepared = streamed.fakeCAS.sentPayloads.at(0)?.toString("latin1") ?? "";
+  assert.ok(prepared.includes("SELECT ? AS v"));
+  assert.ok(!prepared.includes("7"));
+  assert.deepEqual(executePayload(streamed.fakeCAS), executePayload(awaited.fakeCAS));
+  assert.deepEqual(endTranTypes(streamed.fakeCAS), [EndTranType.COMMIT]);
+  assert.deepEqual(streamed.fakeCAS.closedHandles, [1]);
+});
+
+test("stream prepared: null is a typed NULL bind, not the literal NULL rendered into the SQL", async () => {
+  const awaited = createPreparedAdapter();
+  awaited.fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.prepareUntypedMarker));
+  awaited.fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.executeUntypedNull));
+  await awaited.adapter.queryPrepared("SELECT ? AS v", [null]);
+
+  const streamed = createPreparedAdapter();
+  streamed.fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.prepareUntypedMarker));
+  streamed.fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.executeUntypedNull));
+  assert.deepEqual(
+    await drainRows(streamed.adapter.stream("SELECT ? AS v", [null], { binding: "prepared" })),
+    [{ v: null }],
+  );
+
+  const sql = streamed.fakeCAS.sentPayloads.at(0)?.toString("latin1") ?? "";
+  assert.ok(sql.includes("SELECT ? AS v") && !sql.includes("NULL"));
+  assert.deepEqual(executePayload(streamed.fakeCAS), executePayload(awaited.fakeCAS));
+});
+
+test("stream prepared: rowMode array yields arrays", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  queuePreparedSelect(fakeCAS);
+
+  assert.deepEqual(
+    await drainRows(
+      adapter.stream("SELECT ? AS v", [7], { binding: "prepared", rowMode: "array" }),
+    ),
+    [[7]],
+  );
+});
+
+test("stream prepared: inside a transaction it sends no END_TRAN of its own", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  await adapter.beginTransaction();
+  queuePreparedSelect(fakeCAS);
+
+  assert.deepEqual(await drainRows(adapter.stream("SELECT ? AS v", [7], { binding: "prepared" })), [
+    { v: 7 },
+  ]);
+  assert.deepEqual(sentCodes(fakeCAS), [
+    CASFunctionCode.PREPARE,
+    CASFunctionCode.EXECUTE,
+    CASFunctionCode.CLOSE_REQ_HANDLE,
+  ]);
+});
+
+test("stream prepared: the default stream still renders literals in one PREPARE_AND_EXECUTE", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  fakeCAS.queueResponse(buildDMLResponse(20, 1));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+  fakeCAS.queueResponse(buildDMLResponse(20, 1));
+
+  await drainRows(adapter.stream("INSERT INTO t VALUES (?)", [7]));
+  await drainRows(adapter.stream("INSERT INTO t VALUES (?)", [7], { binding: "literal" }));
+
+  assert.ok(!sentCodes(fakeCAS).includes(CASFunctionCode.PREPARE));
+  assert.ok(!sentCodes(fakeCAS).includes(CASFunctionCode.EXECUTE));
+  assert.ok((fakeCAS.sentPayloads.at(0)?.toString("latin1") ?? "").includes("VALUES (7)"));
+});
+
+test("stream prepared: a wrong value count fails the first read after PREPARE, and blob() is refused at once", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.prepareUntypedMarker));
+
+  await assert.rejects(
+    drainRows(adapter.stream("SELECT ? AS v", [7, 8], { binding: "prepared" })),
+    (error: QueryError) =>
+      error instanceof QueryError && /Parameter count mismatch/.test(String(error.cause)),
+  );
+  assert.throws(
+    () =>
+      adapter.stream("SELECT ? AS v", [blob(Buffer.from("x")) as never], { binding: "prepared" }),
+    (error: unknown) =>
+      error instanceof TypeError &&
+      /stream\(\) cannot send a blob\(\) or clob\(\)/.test(error.message),
+  );
+  assert.throws(
+    () => adapter.stream("SELECT 1", [], { binding: "typed" as unknown as "prepared" }),
+    TypeError,
+  );
+});
+
+test("stream prepared: a transaction sends typed binds through the client too", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  const client = new CubridClient(DEFAULT_CONFIG, () => adapter);
+  queuePreparedSelect(fakeCAS);
+
+  const rows = await client.transaction(async (tx) =>
+    drainRows(tx.stream("SELECT ? AS v", [7], { binding: "prepared" })),
+  );
+
+  assert.deepEqual(rows, [{ v: 7 }]);
+  assert.deepEqual(sentCodes(fakeCAS).slice(0, 2), [
+    CASFunctionCode.PREPARE,
+    CASFunctionCode.EXECUTE,
+  ]);
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.COMMIT]);
+  await client.close();
+});
+
+const TWO_PREPARED_ROWS = PREPARED_FRAMES.executeUntypedInt.replace(/^00000001/, "00000002");
+
+test("stream prepared: a break before the last row sends exactly one END_TRAN, the deferred COMMIT", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.prepareUntypedMarker));
+  fakeCAS.queueResponse(preparedReply(TWO_PREPARED_ROWS));
+
+  for await (const row of adapter.stream("SELECT ? AS v", [7], { binding: "prepared" })) {
+    assert.deepEqual(row, { v: 7 });
+    break;
+  }
+
+  assert.deepEqual(sentCodes(fakeCAS), [
+    CASFunctionCode.PREPARE,
+    CASFunctionCode.EXECUTE,
+    CASFunctionCode.END_TRAN,
+    CASFunctionCode.CLOSE_REQ_HANDLE,
+  ]);
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.COMMIT]);
+});
+
+test("stream prepared: a failed END_TRAN after a break is not thrown out of it and retires the session", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.prepareUntypedMarker));
+  fakeCAS.queueResponse(preparedReply(TWO_PREPARED_ROWS));
+  fakeCAS.queueExchangeFailure(new Error("socket lost at END_TRAN"));
+
+  for await (const row of adapter.stream("SELECT ? AS v", [7], { binding: "prepared" })) {
+    assert.ok(row);
+    break;
+  }
+
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.COMMIT]);
+  assert.equal(fakeCAS.isConnected, false);
+});
+
+test("stream prepared: a FETCH that fails is rolled back once, never committed", async () => {
+  const { adapter, fakeCAS } = createPreparedAdapter();
+  fakeCAS.queueResponse(preparedReply(PREPARED_FRAMES.prepareUntypedMarker));
+  fakeCAS.queueResponse(preparedReply(TWO_PREPARED_ROWS));
+  fakeCAS.queueResponse(buildErrorResponse(-495, "fetch rejected"));
+
+  const rows: unknown[] = [];
+  await assert.rejects(async () => {
+    for await (const row of adapter.stream("SELECT ? AS v", [7], { binding: "prepared" })) {
+      rows.push(row);
+    }
+  }, QueryError);
+
+  assert.deepEqual(rows, [{ v: 7 }]);
+  assert.ok(sentCodes(fakeCAS).includes(CASFunctionCode.FETCH));
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+  assert.deepEqual(fakeCAS.closedHandles, [1]);
+});
+
+test("stream prepared: a failed END_TRAN after the only window is not thrown, read to the end or left with break", async () => {
+  for (const leave of [false, true]) {
+    const { adapter, fakeCAS } = createPreparedAdapter();
+    queuePreparedSelect(fakeCAS);
+    fakeCAS.queueExchangeFailure(new Error("socket lost at END_TRAN"));
+
+    const rows: unknown[] = [];
+    for await (const row of adapter.stream("SELECT ? AS v", [7], { binding: "prepared" })) {
+      rows.push(row);
+      if (leave) {
+        break;
+      }
+    }
+
+    assert.deepEqual(rows, [{ v: 7 }]);
+    assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.COMMIT]);
+    assert.equal(fakeCAS.isConnected, false);
+  }
+});
+
+test("stream prepared: the client's prepared stream does not go through an overridden stream()", async () => {
+  class LiteralOnly extends NativeCubridAdapter {
+    override stream(sql: string, params?: QueryParams, options?: StreamOptions) {
+      // Rebuilds the options it knows, dropping everything else.
+      return super.stream(sql, params, { fetchSize: options?.fetchSize ?? 100 });
+    }
+  }
+  const adapter = new LiteralOnly(DEFAULT_CONFIG);
+  const fakeCAS = new FakeCASConnection({ _protoVersion: 7 });
+  (adapter as unknown as { cas: unknown }).cas = fakeCAS;
+  queuePreparedSelect(fakeCAS);
+  const client = new CubridClient(DEFAULT_CONFIG, () => adapter as unknown as ConnectionLike);
+
+  const rows: unknown[] = [];
+  for await (const row of client.stream("SELECT ? AS v", [7], { binding: "prepared" })) {
+    rows.push(row);
+  }
+
+  assert.deepEqual(rows, [{ v: 7 }]);
+  assert.deepEqual(sentCodes(fakeCAS).slice(0, 2), [
+    CASFunctionCode.PREPARE,
+    CASFunctionCode.EXECUTE,
+  ]);
+  await client.close();
 });

@@ -130,8 +130,21 @@ export class LobParamError extends TypeError {}
 export function refuseLobParams(params: unknown): void {
   if (Array.isArray(params) && params.some(isLobParam)) {
     throw new LobParamError(
-      "query(), queryResult(), execute() and stream() send values as SQL literals and cannot " +
+      "query(), queryResult() and execute() send values as SQL literals and cannot " +
         "send a blob() or clob() value; use queryPrepared(), queryResultPrepared() or executePrepared()",
+    );
+  }
+}
+
+/**
+ * Refuses a blob() or clob() value given to stream(), under either binding: the
+ * literal path cannot send one, and a prepared stream does not upload LOBs.
+ */
+export function refuseStreamLobParams(params: unknown): void {
+  if (Array.isArray(params) && params.some(isLobParam)) {
+    throw new LobParamError(
+      'stream() cannot send a blob() or clob() value, with binding "literal" or "prepared"; ' +
+        "compare LOB content with queryPrepared() or queryResultPrepared() instead",
     );
   }
 }

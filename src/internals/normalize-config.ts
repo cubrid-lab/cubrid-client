@@ -148,6 +148,10 @@ export function connectionTimezone(
 export function assertValidStreamOptions(options: StreamOptions | undefined): void {
   assertValidFetchSize(options?.fetchSize);
   assertValidRowMode(options);
+  const binding: unknown = options?.binding;
+  if (binding !== undefined && binding !== "literal" && binding !== "prepared") {
+    throw new TypeError('binding must be "literal" or "prepared".');
+  }
   const consumerTimeout = options?.consumerTimeout;
 
   if (

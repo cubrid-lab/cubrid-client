@@ -23,6 +23,7 @@ import type { PreparedQueryParam } from "../types/lob.js";
 import type { QueryParams } from "../types/query.js";
 import type { QueryResult, QueryResultRow } from "../types/result.js";
 import { connectionTimezone } from "./normalize-config.js";
+import { PREPARED_STREAM, preparedStreamOf } from "./prepared-stream.js";
 import { SESSION_STATE, sessionStateReader } from "./session-state.js";
 
 /** Values of all the sets of an `executeMany()`, without failing on a malformed argument. */
@@ -245,14 +246,20 @@ export function withLogging(factory: ConnectionFactory, logger: unknown): Connec
       wrapped.setTransactionOptions = (options) =>
         timed("setTransactionOptions", {}, () => setTransactionOptions(options));
     }
-    const stream = inner.stream?.bind(inner);
-    if (stream) {
-      wrapped.stream = <T extends QueryResultRow = QueryResultRow>(
+    const timedStream =
+      (
+        open: (
+          sql: string,
+          params: QueryParams | undefined,
+          options: StreamOptions | undefined,
+        ) => AsyncIterable<unknown>,
+      ) =>
+      <T extends QueryResultRow = QueryResultRow>(
         sql: string,
         params?: QueryParams,
         options?: StreamOptions,
       ): AsyncIterable<T> => {
-        const rows = stream<T>(sql, params, options);
+        const rows = open(sql, params, options) as AsyncIterable<T>;
         return (async function* (): AsyncGenerator<T, void, undefined> {
           const fields = { operation: "stream", paramCount: params?.length ?? 0 };
           const start = performance.now();
@@ -278,6 +285,18 @@ export function withLogging(factory: ConnectionFactory, logger: unknown): Connec
           }
         })();
       };
+    const stream = inner.stream?.bind(inner);
+    if (stream) {
+      wrapped.stream = timedStream(stream);
+    }
+    // Only when the inner connection binds streams on the server, as the client checks.
+    const preparedStream = preparedStreamOf(inner);
+    if (preparedStream) {
+      // Configurable, so the pool's proxy of this connection may wrap it.
+      Object.defineProperty(wrapped, PREPARED_STREAM, {
+        value: timedStream(preparedStream),
+        configurable: true,
+      });
     }
     const ping = inner.ping?.bind(inner);
     if (ping) {

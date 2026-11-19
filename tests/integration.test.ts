@@ -8892,3 +8892,282 @@ describe("Integration: zoned() keeps the instant of a Date (#281)", { skip: !ava
     }
   });
 });
+
+describe("Integration: stream() in a transaction, and with typed binds (#307)", {
+  skip: !available,
+}, () => {
+  const TABLE = "st307";
+  /** Several server replies of rows, which hold about 16 KiB each. */
+  const ROWS = 600;
+  const PADDING = "x".repeat(200);
+  const SELECT_ALL = `SELECT id, pad FROM ${TABLE} ORDER BY id`;
+
+  async function withTable(run: (client: ReturnType<typeof createClient>) => Promise<void>) {
+    const client = createClient(TEST_CONFIG);
+    try {
+      await client.query(`DROP TABLE IF EXISTS ${TABLE}`);
+      await client.query(`CREATE TABLE ${TABLE} (id INT PRIMARY KEY, v INT, pad VARCHAR(400))`);
+      await client.query(
+        `INSERT INTO ${TABLE} (id, v, pad) SELECT ROWNUM, ROWNUM * 10, '${PADDING}' ` +
+          `FROM db_attribute a, db_attribute b LIMIT ${ROWS}`,
+      );
+      await run(client);
+    } finally {
+      await client.query(`DROP TABLE IF EXISTS ${TABLE}`).catch(() => {});
+      await client.close();
+    }
+  }
+
+  async function count(client: ReturnType<typeof createClient>): Promise<number> {
+    const [row] = await client.query(`SELECT COUNT(*) AS n FROM ${TABLE}`);
+    return Number(row?.n);
+  }
+
+  test("the tx and a scope stream every row across replies and see their own uncommitted work", async () => {
+    await withTable(async (client) => {
+      const read = await client.transaction(async (tx) => {
+        await tx.execute(`INSERT INTO ${TABLE} (id, v, pad) VALUES (?, ?, ?)`, [
+          ROWS + 1,
+          0,
+          PADDING,
+        ]);
+        const ids: number[] = [];
+        for await (const row of tx.stream<{ id: number }>(SELECT_ALL)) {
+          ids.push(row.id);
+        }
+        return ids;
+      });
+      assert.equal(read.length, ROWS + 1);
+      assert.equal(read.at(-1), ROWS + 1);
+      assert.equal(await count(client), ROWS + 1);
+
+      const scope = await client.beginTransactionScope();
+      await scope.execute(`DELETE FROM ${TABLE} WHERE id > ?`, [ROWS]);
+      const arrays: unknown[][] = [];
+      for await (const row of scope.stream(SELECT_ALL, undefined, { rowMode: "array" })) {
+        arrays.push(row);
+      }
+      await scope.commit();
+      assert.equal(arrays.length, ROWS);
+      assert.deepEqual(arrays[0], [1, PADDING]);
+      assert.equal(await count(client), ROWS);
+    });
+  });
+
+  test("commit() with a stream still open is refused and rolls the transaction back", async () => {
+    await withTable(async (client) => {
+      const scope = await client.beginTransactionScope();
+      await scope.execute(`DELETE FROM ${TABLE} WHERE id = 1`);
+      const rows = scope.stream(SELECT_ALL);
+      assert.equal((await rows.next()).done, false);
+
+      await assert.rejects(scope.commit(), (error: TransactionError) => {
+        assert.ok(error instanceof TransactionError);
+        assert.match(String((error.cause as Error).message), /still open/);
+        return true;
+      });
+      await assert.rejects(() => rows.next(), TransactionError);
+      assert.equal(await count(client), ROWS);
+
+      // The same rule ends a transaction() callback that returns while its stream is open.
+      await assert.rejects(
+        client.transaction(async (tx) => {
+          await tx.execute(`DELETE FROM ${TABLE} WHERE id = 2`);
+          const open = tx.stream(SELECT_ALL);
+          await open.next();
+        }),
+        TransactionError,
+      );
+      assert.equal(await count(client), ROWS);
+    });
+  });
+
+  test("rollback() closes an open stream, and break or abort leave the transaction to commit", async () => {
+    await withTable(async (client) => {
+      const rolledBack = await client.beginTransactionScope();
+      await rolledBack.execute(`DELETE FROM ${TABLE} WHERE id = 1`);
+      const rows = rolledBack.stream(SELECT_ALL);
+      await rows.next();
+      await rolledBack.rollback();
+      await assert.rejects(() => rows.next(), TransactionError);
+      assert.equal(await count(client), ROWS);
+
+      const controller = new AbortController();
+      await client.transaction(async (tx) => {
+        for await (const row of tx.stream(SELECT_ALL)) {
+          assert.ok(row);
+          break;
+        }
+        await tx.execute(`DELETE FROM ${TABLE} WHERE id = 1`);
+
+        const aborted = tx.stream(SELECT_ALL, undefined, { signal: controller.signal });
+        await aborted.next();
+        controller.abort(new Error("enough"));
+        await assert.rejects(() => aborted.next(), /enough/);
+        await tx.execute(`DELETE FROM ${TABLE} WHERE id = 2`);
+      });
+      assert.equal(await count(client), ROWS - 2);
+    });
+  });
+
+  test("a statement awaited inside the loop is refused with stream-busy and the transaction rolls back", async () => {
+    await withTable(async (client) => {
+      await assert.rejects(
+        client.transaction(async (tx) => {
+          await tx.execute(`DELETE FROM ${TABLE} WHERE id = 1`);
+          for await (const row of tx.stream<{ id: number }>(SELECT_ALL, undefined, {
+            consumerTimeout: 50,
+          })) {
+            await tx.execute(`DELETE FROM ${TABLE} WHERE id = ?`, [row.id + 1]);
+          }
+        }),
+        (error: TransactionError) =>
+          error instanceof TransactionError && error.kind === "stream-busy",
+      );
+      assert.equal(await count(client), ROWS);
+    });
+  });
+
+  /** DDL from another session, which an unended read transaction would block. */
+  async function assertTableUnlocked(column: string): Promise<void> {
+    const other = createClient(TEST_CONFIG);
+    try {
+      await other.transaction(async (tx) => {
+        await tx.query("SET TRANSACTION LOCK TIMEOUT 3");
+        await tx.query(`ALTER TABLE ${TABLE} ADD COLUMN ${column} INT`);
+      });
+    } finally {
+      await other.close();
+    }
+  }
+
+  test('binding: "prepared": early break, a server error, an abort, a transaction and a pool lease', async () => {
+    await withTable(async (client) => {
+      const sql = `SELECT id, pad FROM ${TABLE} WHERE id > ? ORDER BY id`;
+
+      // Early break in autocommit: one END_TRAN ends the read, nothing is thrown.
+      for await (const row of client.stream(sql, [0], { binding: "prepared" })) {
+        assert.ok(row);
+        break;
+      }
+      await assertTableUnlocked("p1");
+
+      // A server error. CUBRID 11.4 evaluates this SELECT at EXECUTE, so the error
+      // rejects the first read; a failing FETCH is covered offline.
+      await assert.rejects(async () => {
+        for await (const row of client.stream(
+          `SELECT id, 10 / (id - 500) AS n FROM ${TABLE} WHERE id > ?`,
+          [0],
+          {
+            binding: "prepared",
+          },
+        )) {
+          assert.ok(row);
+        }
+      }, QueryError);
+      assert.equal(await count(client), ROWS);
+      await assertTableUnlocked("p2");
+
+      // An abort while the consumer is away releases the cursor; the session stays usable.
+      const controller = new AbortController();
+      const reason = new Error("stop");
+      const aborted = client.stream(sql, [0], { binding: "prepared", signal: controller.signal });
+      await aborted.next();
+      controller.abort(reason);
+      await assert.rejects(
+        () => aborted.next(),
+        (error) => error === reason,
+      );
+      assert.equal(await count(client), ROWS);
+      await assertTableUnlocked("p3");
+
+      // Inside transaction(): the stream reads the transaction's own uncommitted work.
+      const seen = await client.transaction(async (tx) => {
+        await tx.execute(`DELETE FROM ${TABLE} WHERE id = ?`, [1]);
+        let first: unknown;
+        for await (const row of tx.stream<{ id: number }>(sql, [0], { binding: "prepared" })) {
+          first = row.id;
+          break;
+        }
+        return first;
+      });
+      assert.equal(seen, 2);
+      assert.equal(await count(client), ROWS - 1);
+
+      // A pool lease: the stream holds it, and the session is reused once it closes.
+      const pool = createPool({ ...TEST_CONFIG, max: 1 });
+      try {
+        for await (const row of pool.stream(sql, [0], { binding: "prepared" })) {
+          assert.ok(row);
+          break;
+        }
+        const [after] = await pool.query(`SELECT COUNT(*) AS n FROM ${TABLE}`);
+        assert.equal(Number(after?.n), ROWS - 1);
+        assert.equal(pool.stats().total, 1);
+      } finally {
+        await pool.close();
+      }
+      await assertTableUnlocked("p4");
+    });
+  });
+
+  test('binding: "prepared" binds NULL as queryPrepared() does, where a literal NULL differs inside OR', async () => {
+    await withTable(async (client) => {
+      await client.execute(`UPDATE ${TABLE} SET v = NULL WHERE id = 2`);
+      const sql = `SELECT id FROM ${TABLE} WHERE id <= 3 AND NOT (v = ? OR id = 1) ORDER BY id`;
+      const drain = async (rows: AsyncIterable<{ id: number }>): Promise<number[]> => {
+        const ids: number[] = [];
+        for await (const row of rows) {
+          ids.push(row.id);
+        }
+        return ids;
+      };
+
+      // A bound NULL makes `v = ?` unknown, so NOT (...) is unknown and no row matches.
+      const bound = (await client.queryPrepared<{ id: number }>(sql, [null])).map(({ id }) => id);
+      assert.deepEqual(bound, []);
+      assert.deepEqual(await drain(client.stream(sql, [null], { binding: "prepared" })), bound);
+      const inTx = await client.transaction(async (tx) =>
+        drain(tx.stream(sql, [null], { binding: "prepared" })),
+      );
+      assert.deepEqual(inTx, bound);
+
+      // The literal NULL that stream() renders by default is false there instead.
+      assert.deepEqual(await drain(client.stream(sql, [null])), [2, 3]);
+
+      // An autocommit prepared stream left early ends its read transaction: DDL from
+      // another session does not wait for its lock.
+      for await (const row of client.stream(SELECT_ALL, [], { binding: "prepared" })) {
+        assert.ok(row);
+        break;
+      }
+      const other = createClient(TEST_CONFIG);
+      try {
+        await other.transaction(async (tx) => {
+          await tx.query("SET TRANSACTION LOCK TIMEOUT 3");
+          await tx.query(`ALTER TABLE ${TABLE} ADD COLUMN probe INT`);
+        });
+      } finally {
+        await other.close();
+      }
+
+      // Several replies of rows stream with typed binds too, as arrays.
+      const pool = createPool({ ...TEST_CONFIG, max: 1 });
+      try {
+        let streamed = 0;
+        await pool.transaction(async (tx) => {
+          for await (const row of tx.stream(`SELECT id, pad FROM ${TABLE} WHERE id > ?`, [0], {
+            binding: "prepared",
+            rowMode: "array",
+          })) {
+            assert.equal(row.length, 2);
+            streamed += 1;
+          }
+        });
+        assert.equal(streamed, ROWS);
+      } finally {
+        await pool.close();
+      }
+    });
+  });
+});

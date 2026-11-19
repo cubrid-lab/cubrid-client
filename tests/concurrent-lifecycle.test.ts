@@ -25,6 +25,7 @@ import { setFlagsFromString } from "node:v8";
 import { runInNewContext } from "node:vm";
 
 import { createClient } from "../src/client/create-client.js";
+import { createPool } from "../src/client/pool.js";
 import { ConnectionError } from "../src/errors/connection-error.js";
 import { QueryError } from "../src/errors/query-error.js";
 import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
@@ -2060,4 +2061,402 @@ test("fetchSize: a stream sends its option, and otherwise the client's, and othe
     await client.close();
     await cas.stop();
   }
+});
+
+// ---------------------------------------------------------------------------
+// stream() inside a transaction (#307)
+// ---------------------------------------------------------------------------
+
+function endTrans(cas: FakeCas): Array<number | undefined> {
+  return cas.of(CASFunctionCode.END_TRAN).map(({ tranType }) => tranType);
+}
+
+function isStillOpen(error: unknown): boolean {
+  assert.ok(error instanceof TransactionError);
+  assert.match(error.message, /Cannot commit while a stream\(\) of this transaction is still open/);
+  assert.equal(error.outcomeUnknown, false);
+  return true;
+}
+
+test("transaction stream: the tx and a scope read every row inside the transaction, as arrays too", {
+  timeout: 10000,
+}, async () => {
+  await withClient(async (client, cas) => {
+    const rows = await client.transaction(async (tx) => {
+      await tx.query("INSERT INTO items VALUES (1)");
+      const read: unknown[] = [];
+      for await (const row of tx.stream(STREAM_SELECT)) {
+        read.push(row);
+      }
+      // No END_TRAN while the transaction is open: the stream is part of it.
+      assert.deepEqual(endTrans(cas), []);
+      return read;
+    });
+    assert.deepEqual(rows, STREAM_ROWS);
+    assert.deepEqual(endTrans(cas), [EndTranType.COMMIT]);
+    // The stream's SELECT ran outside autocommit, in the transaction.
+    assert.equal(cas.of(CASFunctionCode.PREPARE_AND_EXECUTE).at(-1)?.autocommit, false);
+
+    const scope = await client.beginTransactionScope();
+    const arrays: unknown[][] = [];
+    for await (const row of scope.stream<[string, string]>(STREAM_SELECT, undefined, {
+      rowMode: "array",
+    })) {
+      arrays.push(row);
+    }
+    await scope.commit();
+    assert.deepEqual(
+      arrays,
+      STREAM_ROWS.map(({ id, owner }) => [id, owner]),
+    );
+    assert.deepEqual(endTrans(cas), [EndTranType.COMMIT, EndTranType.COMMIT]);
+    assert.equal(cas.refusedFetches, 0);
+  });
+});
+
+test("transaction stream: a statement issued meanwhile waits until the stream is drained", {
+  timeout: 10000,
+}, async () => {
+  await withClient(async (client, cas) => {
+    const scope = await client.beginTransactionScope();
+    const rows = scope.stream(STREAM_SELECT);
+    await readRows(rows, 1);
+
+    const other = scope.query(selectFor("other"));
+    await settle();
+    assert.equal(cas.of(CASFunctionCode.PREPARE_AND_EXECUTE).length, 1);
+
+    await readRows(rows, ROW_COUNT);
+    assert.deepEqual(await rows.next(), { done: true, value: undefined });
+    assert.deepEqual(await other, rowsOf("other"));
+    await scope.commit();
+
+    assert.deepEqual(ownerRuns(cas.requests), ["s", "other"]);
+    assert.deepEqual(endTrans(cas), [EndTranType.COMMIT]);
+    assert.equal(cas.refusedFetches, 0);
+  });
+});
+
+test("transaction stream: a statement awaited inside the loop is refused with stream-busy and sends nothing", {
+  timeout: 10000,
+}, async () => {
+  await withClient(async (client, cas) => {
+    await assert.rejects(
+      client.transaction(async (tx) => {
+        for await (const row of tx.stream(STREAM_SELECT, undefined, { consumerTimeout: 30 })) {
+          await tx.query(`SELECT ${String(row.id)} FROM items`);
+        }
+      }),
+      (error: TransactionError) => {
+        assert.ok(error instanceof TransactionError);
+        assert.equal(error.kind, "stream-busy");
+        return true;
+      },
+    );
+
+    assert.equal(cas.of(CASFunctionCode.PREPARE_AND_EXECUTE).length, 1);
+    assert.deepEqual(endTrans(cas), [EndTranType.ROLLBACK]);
+    assert.equal(cas.of(CASFunctionCode.CLOSE_REQ_HANDLE).length, 1);
+    assert.equal(cas.refusedFetches, 0);
+  });
+});
+
+test("transaction stream: a stream-busy refusal the callback handled leaves the transaction usable", {
+  timeout: 10000,
+}, async () => {
+  await withClient(async (client, cas) => {
+    await client.transaction(async (tx) => {
+      const rows = tx.stream(STREAM_SELECT, undefined, { consumerTimeout: 0 });
+      await readRows(rows, 1);
+      await assert.rejects(tx.query(selectFor("busy")), { kind: "stream-busy" });
+      await rows.return();
+      assert.deepEqual(await tx.query(selectFor("after")), rowsOf("after"));
+    });
+
+    assert.deepEqual(ownerRuns(cas.requests), ["s", "after"]);
+    assert.deepEqual(endTrans(cas), [EndTranType.COMMIT]);
+  });
+});
+
+test("transaction stream: commit() while a stream is open is refused, closes the stream and rolls back", {
+  timeout: 10000,
+}, async () => {
+  await withClient(async (client, cas) => {
+    const scope = await client.beginTransactionScope();
+    await scope.query("INSERT INTO items VALUES (1)");
+    const rows = scope.stream(STREAM_SELECT);
+    await readRows(rows, 1);
+
+    let refusal: unknown;
+    await assert.rejects(scope.commit(), (error: TransactionError) => {
+      assert.ok(error instanceof TransactionError);
+      assert.equal(error.message, "Failed to commit.");
+      refusal = error.cause;
+      return isStillOpen(error.cause);
+    });
+
+    // The cursor was closed before END_TRAN, which is a ROLLBACK, never a COMMIT.
+    assert.deepEqual(endTrans(cas), [EndTranType.ROLLBACK]);
+    const codes = cas.requests.map(({ code }) => code);
+    assert.ok(
+      codes.lastIndexOf(CASFunctionCode.CLOSE_REQ_HANDLE) < codes.indexOf(CASFunctionCode.END_TRAN),
+    );
+    assert.equal(cas.refusedFetches, 0);
+
+    // The consumer learns why its stream ended, and the scope is over.
+    await assert.rejects(
+      () => rows.next(),
+      (error) => error === refusal,
+    );
+    assert.deepEqual(await rows.next(), { done: true, value: undefined });
+    await assert.rejects(scope.query(selectFor("late")), TransactionError);
+  });
+});
+
+test("transaction stream: commit() awaited inside the loop is refused at once instead of waiting for the loop", {
+  timeout: 10000,
+}, async () => {
+  await withClient(async (client, cas) => {
+    await assert.rejects(
+      client.transaction(async (tx) => {
+        for await (const row of tx.stream(STREAM_SELECT)) {
+          assert.ok(row);
+          await tx.commit();
+        }
+      }),
+      (error: TransactionError) => {
+        assert.ok(error instanceof TransactionError);
+        return isStillOpen(error.cause);
+      },
+    );
+
+    assert.deepEqual(endTrans(cas), [EndTranType.ROLLBACK]);
+    assert.equal(cas.of(CASFunctionCode.CLOSE_REQ_HANDLE).length, 1);
+    assert.equal(cas.refusedFetches, 0);
+  });
+});
+
+test("transaction stream: rollback() closes an open stream first and then rolls back", {
+  timeout: 10000,
+}, async () => {
+  await withClient(async (client, cas) => {
+    const scope = await client.beginTransactionScope();
+    const rows = scope.stream(STREAM_SELECT);
+    await readRows(rows, 1);
+
+    await scope.rollback();
+
+    assert.deepEqual(endTrans(cas), [EndTranType.ROLLBACK]);
+    assert.equal(cas.of(CASFunctionCode.CLOSE_REQ_HANDLE).length, 1);
+    assert.equal(cas.refusedFetches, 0);
+    await assert.rejects(
+      () => rows.next(),
+      (error: TransactionError) =>
+        error instanceof TransactionError &&
+        /rolled back while this stream was open/.test(error.message),
+    );
+  });
+});
+
+test("transaction stream: a callback that returns while its stream is still being read rolls back and rejects", {
+  timeout: 10000,
+}, async () => {
+  await withClient(async (client, cas) => {
+    let consumer: Promise<unknown> | undefined;
+
+    await assert.rejects(
+      client.transaction(async (tx) => {
+        await tx.query("INSERT INTO items VALUES (1)");
+        const rows = tx.stream(STREAM_SELECT);
+        await readRows(rows, 1);
+        // Left reading in the background: the work is not done when the callback returns.
+        consumer = (async () => {
+          for await (const row of rows) {
+            assert.ok(row);
+            await settle(1);
+          }
+        })();
+        void consumer.catch(() => {});
+        return "returned early";
+      }),
+      (error: TransactionError) => error instanceof TransactionError && isStillOpen(error.cause),
+    );
+
+    await assert.rejects(consumer ?? Promise.resolve(), (error) => isStillOpen(error));
+    assert.deepEqual(endTrans(cas), [EndTranType.ROLLBACK]);
+    assert.equal(cas.refusedFetches, 0);
+  });
+});
+
+test("transaction stream: a stream created but never read does not block the commit, and is refused afterwards", {
+  timeout: 10000,
+}, async () => {
+  await withClient(async (client, cas) => {
+    let unread: AsyncGenerator<Record<string, unknown>, void, undefined> | undefined;
+    await client.transaction(async (tx) => {
+      unread = tx.stream(STREAM_SELECT);
+    });
+
+    assert.deepEqual(endTrans(cas), [EndTranType.COMMIT]);
+    assert.ok(unread);
+    const refused = unread;
+    await assert.rejects(() => refused.next(), /already been committed/);
+    assert.equal(cas.of(CASFunctionCode.PREPARE_AND_EXECUTE).length, 0);
+  });
+});
+
+test("transaction stream: a stream the callback starts reading just as it returns refuses the commit", {
+  timeout: 10000,
+}, async () => {
+  await withClient(async (client, cas) => {
+    let late: Promise<unknown> | undefined;
+    await assert.rejects(
+      client.transaction(async (tx) => {
+        await tx.query("INSERT INTO items VALUES (1)");
+        const rows = tx.stream(STREAM_SELECT);
+        // Read only once the callback has returned, before the client commits for it.
+        late = Promise.resolve().then(() => rows.next());
+        void late.catch(() => {});
+      }),
+      TransactionError,
+    );
+
+    await assert.rejects(late ?? Promise.resolve(), (error) => isStillOpen(error));
+    assert.deepEqual(endTrans(cas), [EndTranType.ROLLBACK]);
+  });
+});
+
+test("transaction stream: break closes the cursor and leaves the transaction to commit", {
+  timeout: 10000,
+}, async () => {
+  await withClient(async (client, cas) => {
+    await client.transaction(async (tx) => {
+      for await (const row of tx.stream(STREAM_SELECT)) {
+        assert.ok(row);
+        break;
+      }
+      assert.equal(cas.of(CASFunctionCode.CLOSE_REQ_HANDLE).length, 1);
+      assert.deepEqual(endTrans(cas), []);
+      assert.deepEqual(await tx.query(selectFor("next")), rowsOf("next"));
+    });
+
+    assert.deepEqual(endTrans(cas), [EndTranType.COMMIT]);
+    assert.equal(cas.refusedFetches, 0);
+  });
+});
+
+test("transaction stream: abort releases the cursor and the turn while the consumer is away", {
+  timeout: 10000,
+}, async () => {
+  await withClient(async (client, cas) => {
+    const controller = new AbortController();
+    const reason = new Error("no longer wanted");
+    const scope = await client.beginTransactionScope();
+    const rows = scope.stream(STREAM_SELECT, undefined, { signal: controller.signal });
+    await readRows(rows, 1);
+
+    const other = scope.query(selectFor("other"));
+    controller.abort(reason);
+
+    assert.deepEqual(await other, rowsOf("other"));
+    await assert.rejects(
+      () => rows.next(),
+      (error) => error === reason,
+    );
+    assert.deepEqual(await rows.next(), { done: true, value: undefined });
+
+    // The stream is over, so the commit goes through.
+    await scope.commit();
+    assert.deepEqual(ownerRuns(cas.requests), ["s", "other"]);
+    assert.deepEqual(endTrans(cas), [EndTranType.COMMIT]);
+    assert.equal(cas.refusedFetches, 0);
+  });
+});
+
+test("transaction stream: an already aborted signal sends nothing", {
+  timeout: 10000,
+}, async () => {
+  await withClient(async (client, cas) => {
+    const reason = new Error("aborted before");
+    await client.transaction(async (tx) => {
+      await assert.rejects(
+        () => tx.stream(STREAM_SELECT, undefined, { signal: AbortSignal.abort(reason) }).next(),
+        (error) => error === reason,
+      );
+    });
+    assert.equal(cas.of(CASFunctionCode.PREPARE_AND_EXECUTE).length, 0);
+    assert.deepEqual(endTrans(cas), [EndTranType.COMMIT]);
+  });
+});
+
+test("transaction stream: a pool transaction and scope stream on their lease, which the pool reuses", {
+  timeout: 10000,
+}, async () => {
+  const cas = new FakeCas();
+  const port = await cas.start();
+  const pool = createPool({ host: "127.0.0.1", port, database: "testdb", user: "dba", max: 1 });
+
+  try {
+    const read = await pool.transaction(async (tx) => {
+      const rows: unknown[] = [];
+      for await (const row of tx.stream(STREAM_SELECT)) {
+        rows.push(row);
+      }
+      return rows;
+    });
+    assert.deepEqual(read, STREAM_ROWS);
+
+    const scope = await pool.beginTransactionScope();
+    const rows = scope.stream(STREAM_SELECT);
+    await readRows(rows, 1);
+    await assert.rejects(scope.commit(), (error: TransactionError) => isStillOpen(error.cause));
+    await assert.rejects(
+      () => rows.next(),
+      (error) => isStillOpen(error),
+    );
+
+    assert.deepEqual(endTrans(cas), [EndTranType.COMMIT, EndTranType.ROLLBACK]);
+    assert.deepEqual(await pool.query(selectFor("after")), rowsOf("after"));
+    assert.equal(cas.refusedFetches, 0);
+  } finally {
+    await pool.close();
+    await cas.stop();
+  }
+});
+
+test("transaction stream: a -72 on a FETCH that the callback catches still fails the transaction, which only rolls back", {
+  timeout: 10000,
+}, async () => {
+  await withClient(async (client, cas) => {
+    const deadlock = errorReply(-72, "deadlock victim");
+    deadlock.writeInt32BE(-2, 0);
+    cas.fetchError = deadlock;
+    cas.failFetchOf = "s";
+
+    let caught: unknown;
+    await assert.rejects(
+      client.transaction(async (tx) => {
+        await tx.query("INSERT INTO items VALUES (1)");
+        try {
+          for await (const row of tx.stream(STREAM_SELECT)) {
+            assert.ok(row);
+          }
+        } catch (error) {
+          caught = error;
+        }
+        await tx.query("INSERT INTO items VALUES (2)");
+      }),
+      TransactionError,
+    );
+
+    assert.ok(caught instanceof TransactionError);
+    assert.equal(caught.code, -72);
+    // The server rolled the transaction back, so nothing after it was sent and
+    // nothing was committed: the only END_TRAN is the ROLLBACK.
+    assert.deepEqual(endTrans(cas), [EndTranType.ROLLBACK]);
+    assert.equal(
+      cas.of(CASFunctionCode.PREPARE_AND_EXECUTE).filter(({ sql }) => sql?.includes("(2)")).length,
+      0,
+    );
+  });
 });

@@ -14,6 +14,7 @@ import { type CubridPool, createPool } from "../src/client/pool.js";
 import { CubridTransaction } from "../src/client/transaction.js";
 import { QueryError } from "../src/errors/query-error.js";
 import { TransactionError } from "../src/errors/transaction-error.js";
+import { PREPARED_STREAM } from "../src/internals/prepared-stream.js";
 import type {
   ArrayRowOptions,
   ConnectionLike,
@@ -198,6 +199,134 @@ test("an invalid rowMode rejects before the connection is used", async () => {
   await client.close();
 });
 
+test("transaction stream: the tx, a scope and a CubridTransaction stream arrays from a custom connection", async () => {
+  const connection = new RowsConnection([[1, 2]]);
+  const client = clientOver(connection);
+
+  const inTx = await client.transaction(async (tx) =>
+    collect(tx.stream("SELECT 1", undefined, ARRAY)),
+  );
+  assert.deepEqual(inTx, [[1, 2]]);
+  const scope = await client.beginTransactionScope();
+  assert.deepEqual(await collect(scope.stream("SELECT 1", undefined, ARRAY)), [[1, 2]]);
+  await scope.commit();
+  const transaction = new CubridTransaction(connection);
+  assert.deepEqual(await collect(transaction.stream("SELECT 1", undefined, ARRAY)), [[1, 2]]);
+  assert.ok(connection.options.every((options) => options?.rowMode === "array"));
+
+  const objects = clientOver(new RowsConnection([{ id: 2 }]));
+  await objects.transaction(async (tx) => {
+    await assert.rejects(collect(tx.stream("SELECT 1", undefined, ARRAY)), refusedArrays);
+  });
+  await objects.close();
+  await client.close();
+});
+
+test("prepared stream: a custom connection cannot bind on the server, so it is refused, never sent as literals", async () => {
+  const connection = new RowsConnection([{ id: 1 }]);
+  const client = clientOver(connection);
+  const pool = poolOver(connection);
+  const unsupported = (error: unknown): boolean => {
+    assert.ok(error instanceof QueryError || error instanceof TransactionError);
+    assert.match((error.cause as Error).message, /cannot bind on the server/);
+    return true;
+  };
+  const prepared: StreamOptions = { binding: "prepared" };
+
+  for (const target of [client, pool]) {
+    await assert.rejects(collect(target.stream("SELECT ?", [1], prepared)), unsupported);
+  }
+  await pool.connection(async (leased) => {
+    await assert.rejects(collect(leased.stream("SELECT ?", [1], prepared)), unsupported);
+  });
+  await client.transaction(async (tx) => {
+    await assert.rejects(collect(tx.stream("SELECT ?", [1], prepared)), unsupported);
+  });
+  const scope = await client.beginTransactionScope();
+  await assert.rejects(collect(scope.stream("SELECT ?", [1], prepared)), unsupported);
+  await scope.rollback();
+  assert.deepEqual(connection.options, []);
+
+  // "literal" is the default, and the connection never sees the option.
+  assert.deepEqual(await collect(client.stream("SELECT 1", [], { binding: "literal" })), [
+    { id: 1 },
+  ]);
+  assert.deepEqual(connection.options, [{}]);
+
+  // An invalid value is refused before anything is used.
+  const invalid = { binding: "typed" } as unknown as StreamOptions;
+  assert.throws(() => client.stream("SELECT 1", undefined, invalid), TypeError);
+  await client.transaction(async (tx) => {
+    assert.throws(() => tx.stream("SELECT 1", undefined, invalid), TypeError);
+  });
+
+  await pool.close();
+  await client.close();
+});
+
+for (const logged of [false, true]) {
+  test(`prepared stream: a pool lease streams through the connection's prepared stream and tracks it${logged ? ", with a logger" : ""}`, async () => {
+    const connection = new RowsConnection([[1]]);
+    const received: unknown[] = [];
+    // As the built-in adapter has it: a method of the class, not an own property.
+    Object.setPrototypeOf(
+      connection,
+      Object.create(RowsConnection.prototype, {
+        [PREPARED_STREAM]: {
+          value: async function* (_sql: string, params: unknown, options: unknown) {
+            received.push([params, options]);
+            yield [7];
+            yield [8];
+          },
+        },
+      }),
+    );
+    // With a logger, the lease proxy wraps the logging wrapper's own prepared stream.
+    const pool = createPool({
+      host: "localhost",
+      database: "demodb",
+      user: "dba",
+      max: 1,
+      ...(logged && { logger: { debug() {}, info() {}, error() {} } }),
+      connectionFactory: () => connection,
+    });
+
+    assert.deepEqual(
+      await collect(pool.stream("SELECT ?", [7], { binding: "prepared", rowMode: "array" })),
+      [[7], [8]],
+    );
+    let kept: PoolConnection | undefined;
+    await pool.connection(async (leased) => {
+      kept = leased;
+      assert.deepEqual(await collect(leased.stream("SELECT ?", [7], { binding: "prepared" })), [
+        [7],
+        [8],
+      ]);
+    });
+    assert.deepEqual(received, [
+      [[7], { rowMode: "array" }],
+      [[7], {}],
+    ]);
+    // A finished prepared stream left the session reusable.
+    assert.equal(pool.stats().total, 1);
+    // A reference kept past its lease is refused like any other call.
+    assert.ok(kept);
+    await assert.rejects(
+      collect(kept.stream("SELECT ?", [7], { binding: "prepared" })),
+      /was released when its callback settled/,
+    );
+
+    // The lease counts a prepared stream left open as running, so its connection is
+    // not handed to the next caller.
+    await pool.connection(async (leased) => {
+      const open = leased.stream("SELECT ?", [7], { binding: "prepared" })[Symbol.asyncIterator]();
+      await open.next();
+    });
+    assert.equal(pool.stats().total, 0);
+    await pool.close();
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Compile-time checks. Never run: `npm run typecheck` compiles them.
 // ---------------------------------------------------------------------------
@@ -219,6 +348,7 @@ export async function typings(
   scopeOrTx: TransactionScope | ResultTransactionClient,
   poolOrLeased: CubridPool | PoolConnection,
   streamable: CubridClient | Streamable,
+  scopeOrTx2: TransactionScope | Streamable,
   connection: NativeCubridAdapter | ConnectionLike,
   options: QueryOptions,
   wide: QueryOptions & { rowMode?: "object" | "array" },
@@ -254,7 +384,22 @@ export async function typings(
   });
   await pool.transaction(async (tx) => {
     expectType<unknown[][]>(await tx.query("SELECT 1", undefined, ARRAY));
+    for await (const row of tx.stream<[number]>("SELECT 1", undefined, { rowMode: "array" })) {
+      assertEqual<Equal<typeof row, [number]>>();
+    }
   });
+  await client.transaction(async (tx) => {
+    for await (const row of tx.stream("SELECT 1", [], { rowMode: "array", binding: "prepared" })) {
+      assertEqual<Equal<typeof row, unknown[]>>();
+    }
+    for await (const row of tx.stream<Row>("SELECT 1")) {
+      assertEqual<Equal<typeof row, Row>>();
+    }
+  });
+  for await (const row of scope.stream("SELECT 1", undefined, { rowMode: "array" })) {
+    assertEqual<Equal<typeof row, unknown[]>>();
+  }
+  expectType<AsyncIterable<Row>>(scopeOrTx2.stream<Row>("SELECT 1"));
   // A 1.x callback typed with an older interface is still accepted.
   await client.transaction(async (tx: TransactionClient) => tx.query("SELECT 1"));
 

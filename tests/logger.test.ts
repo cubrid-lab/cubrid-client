@@ -11,6 +11,7 @@ import {
 } from "../src/errors/query-error.js";
 import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { TransactionError } from "../src/errors/transaction-error.js";
+import { PREPARED_STREAM } from "../src/internals/prepared-stream.js";
 import type { ClientLogger, ConnectionLike } from "../src/types/client.js";
 
 const PASSWORD = "s3cret-pw";
@@ -411,6 +412,64 @@ test("stream is exposed only when the connection supports it, and checks its opt
     () => client(logger, streamingConnection()).stream("SELECT 1", undefined, { fetchSize: 0 }),
     RangeError,
   );
+});
+
+test("a prepared stream is logged as a stream, and the connection never sees binding", async () => {
+  const { logger, entries } = recorder();
+  const received: unknown[] = [];
+  const connection = streamingConnection();
+  Object.defineProperty(connection, PREPARED_STREAM, {
+    value: async function* (_sql: string, _params: unknown, options: unknown) {
+      received.push(options);
+      yield { v: ROW_VALUE };
+    },
+  });
+  const db = client(logger, connection);
+
+  for await (const row of db.stream("SELECT ?", [PARAM], { binding: "prepared", fetchSize: 5 })) {
+    assert.deepEqual(row, { v: ROW_VALUE });
+  }
+
+  assert.deepEqual(received, [{ fetchSize: 5 }]);
+  assert.deepEqual(
+    streamEvents(entries).map(({ level, fields: { durationMs, ...fields } }) => [level, fields]),
+    [["debug", { operation: "stream", paramCount: 1, rowCount: 1 }]],
+  );
+  assert.equal(JSON.stringify(entries).includes(PARAM), false);
+});
+
+test("the logging wrapper forwards both the connection's timezone and its prepared stream", async () => {
+  const { logger } = recorder();
+  const connection = Object.assign(streamingConnection(), { timezone: "utc" as const });
+  Object.defineProperty(connection, PREPARED_STREAM, {
+    value: async function* () {
+      yield { v: ROW_VALUE };
+    },
+  });
+  const db = client(logger, connection);
+
+  await db.transaction(async (tx) => {
+    assert.equal(tx.timezone, "utc");
+    const rows: unknown[] = [];
+    for await (const row of tx.stream("SELECT ?", [PARAM], { binding: "prepared" })) {
+      rows.push(row);
+    }
+    assert.deepEqual(rows, [{ v: ROW_VALUE }]);
+  });
+  await db.close();
+});
+
+test("a prepared stream is refused on a connection that cannot bind, before any log entry", async () => {
+  const { logger, entries } = recorder();
+
+  await assert.rejects(
+    () =>
+      client(logger, streamingConnection())
+        .stream("SELECT ?", [PARAM], { binding: "prepared" })
+        .next(),
+    QueryError,
+  );
+  assert.deepEqual(streamEvents(entries), []);
 });
 
 test("logger reports setTransactionOptions and the wrapper keeps the method", async () => {

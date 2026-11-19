@@ -15,6 +15,7 @@ import {
   normalizeConfig,
   pickTransactionOptions,
 } from "../internals/normalize-config.js";
+import { PREPARED_STREAM } from "../internals/prepared-stream.js";
 import { type SessionState, sessionStateReader } from "../internals/session-state.js";
 import type {
   ArrayRowOptions,
@@ -40,12 +41,13 @@ import type {
   ResultTransactionClient,
   Streamable,
   StreamOptions,
+  StreamTransactionClient,
   TimezoneAware,
   TransactionCallback,
   TransactionOptions,
   TransactionScope,
 } from "../types/client.js";
-import { type PreparedQueryParam, refuseLobParams } from "../types/lob.js";
+import { type PreparedQueryParam, refuseLobParams, refuseStreamLobParams } from "../types/lob.js";
 import type {
   PoolConnection,
   PoolConnectionOptions,
@@ -61,7 +63,6 @@ import type {
   SchemaPrimaryKey,
   SchemaTable,
 } from "../types/schema.js";
-import { streamRows } from "./client.js";
 import {
   applyTransactionOptions,
   beginScope,
@@ -70,6 +71,7 @@ import {
   runTransaction,
 } from "./connection-source.js";
 import * as schema from "./schema.js";
+import { streamRows } from "./stream-rows.js";
 import type { ScopedTransaction } from "./transaction.js";
 
 /** Largest delay Node.js timers support. */
@@ -401,7 +403,7 @@ class PoolStatements implements PoolConnection {
     options?: StreamOptions,
   ): AsyncGenerator<unknown, void, undefined> {
     assertValidStreamOptions(options);
-    refuseLobParams(params);
+    refuseStreamLobParams(params);
     return this.openStream(sql, params, options);
   }
 }
@@ -464,13 +466,17 @@ function leasedConnection(lease: Lease): ConnectionLike {
   return new Proxy(target, {
     get(object, property) {
       const value: unknown = Reflect.get(object, property, object);
-      if (typeof value !== "function" || typeof property === "symbol") {
+      // A prepared stream is a stream of the lease like any other.
+      if (
+        typeof value !== "function" ||
+        (typeof property === "symbol" && property !== PREPARED_STREAM)
+      ) {
         return value;
       }
 
       return (...args: unknown[]): unknown => {
         if (lease.ended) {
-          return property === "stream"
+          return property === "stream" || property === PREPARED_STREAM
             ? (async function* refused() {
                 yield* [];
                 throw releasedError();
@@ -479,7 +485,7 @@ function leasedConnection(lease: Lease): ConnectionLike {
         }
 
         const result: unknown = value.apply(object, args);
-        if (property === "stream") {
+        if (property === "stream" || property === PREPARED_STREAM) {
           return trackStream(lease, result as AsyncIterable<unknown>);
         }
         if (!(result instanceof Promise)) {
@@ -770,7 +776,8 @@ export class CubridPool
         ExecutableTransactionClient &
         PreparedTransactionClient &
         BatchTransactionClient &
-        TimezoneAware
+        TimezoneAware &
+        StreamTransactionClient
     >,
     options?: TransactionOptions,
   ): Promise<T> {

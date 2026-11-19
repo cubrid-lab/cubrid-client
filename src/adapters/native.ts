@@ -29,6 +29,7 @@ import {
   pickTransactionOptions,
   wantsArrayRows,
 } from "../internals/normalize-config.js";
+import { PREPARED_STREAM } from "../internals/prepared-stream.js";
 import { SESSION_STATE, type SessionState } from "../internals/session-state.js";
 import { assertEncodable, assertValidCharset, type TextCharset } from "../protocol/charset.js";
 import {
@@ -119,6 +120,7 @@ import {
   lobChunks,
   type PreparedQueryParam,
   refuseLobParams,
+  refuseStreamLobParams,
 } from "../types/lob.js";
 import type { QueryParams } from "../types/query.js";
 import type { ArrayQueryResult, ColumnInfo, QueryResult, QueryResultRow } from "../types/result.js";
@@ -415,18 +417,37 @@ export class NativeCubridAdapter implements DriverAdapter {
     // Read once here, so the blob()/clob() refusal stays synchronous and checks
     // the same values that are sent.
     const values = params === undefined ? undefined : Array.from(params);
-    refuseLobParams(values);
-    return this.streamRows(sql, values, options);
+    refuseStreamLobParams(values);
+    return this.streamRows(sql, values, options, options?.binding === "prepared");
+  }
+
+  /**
+   * How the client asks this adapter for `stream()` with `binding: "prepared"`,
+   * having removed the option. See PREPARED_STREAM.
+   */
+  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: called by the client through the symbol
+  private [PREPARED_STREAM](
+    sql: string,
+    params: QueryParams | undefined,
+    options: StreamOptions | undefined,
+  ): AsyncGenerator<unknown, void, undefined> {
+    // Not through stream(), which a subclass may override and so run literals.
+    assertValidStreamOptions(options);
+    const values = params === undefined ? undefined : Array.from(params);
+    refuseStreamLobParams(values);
+    return this.streamRows(sql, values, options, true);
   }
 
   private async *streamRows(
     sql: string,
     params: QueryParams | undefined,
     options: StreamOptions | undefined,
+    prepared: boolean,
   ): AsyncGenerator<unknown, void, undefined> {
     const signal = options?.signal;
     signal?.throwIfAborted();
-    const values = literalOrRefuse(sql, params, QUERY_FAILED, this.charset);
+    const binds = prepared ? bindOrRefuse(sql, params, QUERY_FAILED, this.charset) : undefined;
+    const values = prepared ? undefined : literalOrRefuse(sql, params, QUERY_FAILED, this.charset);
 
     const cursor = new StreamCursor(options?.consumerTimeout ?? DEFAULT_CONSUMER_TIMEOUT_MS);
     const fetchSize = options?.fetchSize ?? this.config.fetchSize ?? DEFAULT_FETCH_SIZE;
@@ -440,7 +461,7 @@ export class NativeCubridAdapter implements DriverAdapter {
       cursor.run(
         this.inTurn("query", QUERY_FAILED, async () => {
           if (cursor.begin()) {
-            await this.streamNow(cursor, sql, values, fetchSize, issued, rowShape(options));
+            await this.streamNow(cursor, sql, values, binds, fetchSize, issued, rowShape(options));
           }
         }),
       );
@@ -743,10 +764,16 @@ export class NativeCubridAdapter implements DriverAdapter {
     cursor: StreamCursor,
     sql: string,
     params: QueryParams | undefined,
+    binds: PreparedBinds | undefined,
     fetchSize: number,
     issued: IssuedOn,
     shape: RowShape,
   ): Promise<void> {
+    /**
+     * A prepared autocommit SELECT whose rows were all delivered or that its
+     * consumer left early: only its deferred END_TRAN follows.
+     */
+    let windowsDone: CASConnection | undefined;
     try {
       await this.runStatement(
         sql,
@@ -756,15 +783,29 @@ export class NativeCubridAdapter implements DriverAdapter {
           this.forgetInsertId();
 
           if (result.statementType === StatementType.SELECT) {
-            await this.streamWindows(cursor, cas, result, fetchSize, shape);
+            // A prepared statement's autocommit transaction is ended by runOnSession().
+            await this.streamWindows(cursor, cas, result, fetchSize, shape, binds === undefined);
+            if (binds && this.autoCommit) {
+              windowsDone = cas;
+            }
           }
         },
         false,
-        undefined,
+        binds,
         false,
         shape,
       );
     } catch (error) {
+      // As endReadTransaction() does for a literal stream: the rows are delivered
+      // or no longer wanted and the statement only read, so a failed END_TRAN is
+      // not thrown at the consumer, whether it reads the last window or leaves with
+      // `break`. Nothing more goes on that session, so nothing inherits it.
+      if (windowsDone) {
+        if (windowsDone.isConnected) {
+          await windowsDone.discardSession(false);
+        }
+        return;
+      }
       throw this.queryFailure(error);
     }
   }
@@ -1261,6 +1302,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     result: PrepareAndExecuteResult<DecodedRow>,
     fetchSize: number,
     shape: RowShape,
+    endsReadTransaction: boolean,
   ): Promise<void> {
     const generation = cas.connectionGeneration;
     const lobColumns = result.columns.some(mayHoldLob);
@@ -1303,7 +1345,12 @@ export class NativeCubridAdapter implements DriverAdapter {
       replyDamaged = error instanceof MalformedReplyError;
       throw error;
     } finally {
-      if (this.autoCommit && !replyDamaged && (lobsRead || fetched < result.totalTupleCount)) {
+      if (
+        endsReadTransaction &&
+        this.autoCommit &&
+        !replyDamaged &&
+        (lobsRead || fetched < result.totalTupleCount)
+      ) {
         await this.endReadTransaction(cas, generation);
       }
     }

@@ -369,9 +369,12 @@ transaction.** With that guard:
 - **Inside a transaction.** No deferred END_TRAN; the cursor belongs to the
   caller's transaction. `commit()` and `rollback()` wait for the stream's turn,
   so awaiting them inside the loop rejects with `kind: "stream-busy"` after
-  `consumerTimeout`, as any statement does. In 1.x this applies to a stream on a
-  client inside the deprecated `beginTransaction()`; `transaction()` and scopes
-  have no `stream()` in 1.x or in this proposal.
+  `consumerTimeout`, as any statement does. This applies to a stream on a
+  client inside the deprecated `beginTransaction()`. The `tx` of `transaction()`
+  and scopes have `stream()` since #307, with their own rule: `commit()` while one
+  of their streams is open is refused and rolls back, and `rollback()` closes the
+  stream first, so neither waits behind it (see
+  [Streaming inside a transaction](../API_REFERENCE.md#streaming-inside-a-transaction)).
 - **Errors.** A PREPARE failure (syntax, unknown column) or an EXECUTE failure
   (conversion, constraint) rejects the **first read**, with the same error
   classes as `queryPrepared()`, and the deferred transaction is rolled back. A
