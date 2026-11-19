@@ -41,6 +41,15 @@ exact evidence, supported scope and unresolved **maintainer sign-off** needed
 before this candidate can be published. Its approval checklist is not
 automatically satisfied by a passing PR, version bump, or test count.
 
+## Provenance and package contents
+
+Before tagging, run the provenance checks in
+[PROVENANCE.md](PROVENANCE.md#rerun-before-a-release): `npm run build && npm run provenance:check`
+(offline; CI runs it on Node 22) and the manual similarity scan against node-cubrid.
+They confirm that the tarball holds only this repository's MIT code, the MIT
+`LICENSE` and no bundled dependency, and that no new code matches upstream
+driver code beyond the reviewed protocol-dictated runs.
+
 ## GitHub Release note formatting
 
 Write each paragraph as one logical Markdown source line, separated by a

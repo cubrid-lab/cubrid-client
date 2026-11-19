@@ -160,6 +160,12 @@ jobs:
         if: matrix.node-version == 22
         run: npm run api:check
 
+      # Offline: packs the build and checks what npm would publish (#295,
+      # docs/PROVENANCE.md). The upstream similarity scan is manual.
+      - name: Provenance and package contents check
+        if: matrix.node-version == 22
+        run: npm run provenance:check
+
       # A wrong BIGINT code must fail for an independent reason; this catches
       # the exact oracle-coupling problem that escaped the native v1.0 release.
       - name: Prove protocol fixture detects a mutated BIGINT wire code

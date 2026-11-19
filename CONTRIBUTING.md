@@ -9,6 +9,7 @@ and instructions for contributing to the project.
 
 - [Development Setup](#development-setup)
 - [Running Tests](#running-tests)
+- [Provenance and third-party code](#provenance-and-third-party-code)
 - [Public API compatibility](#public-api-compatibility)
 - [Code Style](#code-style)
 - [Pull Request Guidelines](#pull-request-guidelines)
@@ -138,6 +139,21 @@ build expectations from the same enum or parser being changed:
 See the [v1.0.0 release regression review](docs/RELEASE_REGRESSION_REVIEW.md)
 for the historical evidence and [#120](https://github.com/cubrid-lab/cubrid-client/issues/120)
 for the separate required production-ready release gate.
+
+---
+
+## Provenance and third-party code
+
+The native CAS driver is original code written for this repository; protocol
+facts (function codes, type codes, field order) come from the CUBRID sources and
+captured broker replies, not from another driver's code. Do not copy or adapt
+code from node-cubrid, CCI, JDBC or the CUBRID server: implement from the
+protocol and cite the source of the facts, as above. If third-party code must be
+included, keep its license and copyright notice, add it to a
+`THIRD_PARTY_NOTICES.md` shipped in the package and record it in
+[docs/PROVENANCE.md](docs/PROVENANCE.md). CI runs `npm run provenance:check`
+on the packed tarball; the upstream similarity scan and the release-time steps
+are in [PROVENANCE.md](docs/PROVENANCE.md#rerun-before-a-release).
 
 ---
 
