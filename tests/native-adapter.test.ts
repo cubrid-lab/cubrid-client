@@ -6715,7 +6715,9 @@ test("stream prepared: a wrong value count fails the first read after PREPARE, a
   assert.throws(
     () =>
       adapter.stream("SELECT ? AS v", [blob(Buffer.from("x")) as never], { binding: "prepared" }),
-    TypeError,
+    (error: unknown) =>
+      error instanceof TypeError &&
+      /stream\(\) cannot send a blob\(\) or clob\(\)/.test(error.message),
   );
   assert.throws(
     () => adapter.stream("SELECT 1", [], { binding: "typed" as unknown as "prepared" }),
