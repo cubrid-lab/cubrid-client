@@ -14,9 +14,11 @@ conditions are met alongside the MIT-licensed original code.
 - **No copied or adapted third-party code was found.** The CAS driver (`src/protocol/**`, `src/adapters/native.ts`)
   and the client layer are original TypeScript. They match other CUBRID drivers only where the protocol fixes the
   result: function and type codes, field order and widths, and method names such as `addInt`/`addByte` that
-  describe the CAS "length + value" encoding. No method body follows node-cubrid, CCI, JDBC or the CAS server.
+  describe the CAS "length + value" encoding. No method body follows node-cubrid, CCI, JDBC or the CAS server
+  beyond the protocol-dictated field order recorded as reviewed hits.
 - **No third-party notice is needed**, so there is no `THIRD_PARTY_NOTICES.md`. The package has no runtime
-  dependencies and bundles nothing but this repository's `src/`.
+  dependencies and bundles nothing but this repository's `src/` (checked on every esbuild module marker by
+  `npm run provenance:check`).
 - **Protocol facts** (function codes, `CCI_U_TYPE` codes, statement codes, handshake magic and field sizes) are
   short factual values taken from the CUBRID sources and checked against captured broker replies
   ([PROTOCOL_ORACLES.md](PROTOCOL_ORACLES.md)). Comments cite the source file of each fact.
@@ -34,7 +36,7 @@ conditions are met alongside the MIT-licensed original code.
 | [CUBRID/node-cubrid](https://github.com/CUBRID/node-cubrid) | `89733f0a9a8f` (2025-03-31, `develop`); its `src/` is byte-identical to npm `node-cubrid@11.0.0` | Mixed: `package.json` says MIT; `LICENSE` is BSD-3-Clause (Search Solution Corporation, 2008-2012) plus the MIT notice of node-mysql, "part of this software"; no per-file headers; GitHub reports `NOASSERTION` | Runtime dependency of 0.1.0/0.2.0; behaviour oracle of `tests/legacy-parity.test.ts`, which checks out the same commit in `live-cubrid.yml` and is never committed or shipped |
 | [CUBRID/cubrid-cci](https://github.com/CUBRID/cubrid-cci) | `bd45c0cda533` (2026-11-06) | Repository `LICENSE` BSD-3-Clause (CUBRID Corp.); some files differ, e.g. `src/cci/broker_cas_protocol.h` has an Apache-2.0 header | Protocol constants (`cas_cci.h`, `broker_cas_protocol.h`) |
 | [CUBRID/cubrid-jdbc](https://github.com/CUBRID/cubrid-jdbc) | `c09f10c72839` (2026-11-19) | BSD-3-Clause (`LICENSE`; per-file BSD headers, e.g. `jci/UOutputBuffer.java`) | Request layout cross-checks named in comments (`UStatement`, `UJCIUtil`); the pinned JAR runs the JDBC parity lane, downloaded to `.cache/` (ignored), never committed or shipped |
-| [CUBRID/cubrid](https://github.com/CUBRID/cubrid) (broker/CAS) | `ea2a214587d7` (2026-11-20), `src/broker`; fixtures cite `2d928e34b110` | Apache-2.0 repository; per file: `src/broker/cas_protocol.h` Apache-2.0, `src/broker/broker_cas_cci.h` BSD-3-Clause | Constants and server behaviour cited in comments (`cas.c`, `cas_protocol.h`, `broker_cas_cci.h`) |
+| [CUBRID/cubrid](https://github.com/CUBRID/cubrid) (broker/CAS) | `ea2a214587d7` (2026-11-20), `src/broker`; [PROTOCOL_ORACLES.md](PROTOCOL_ORACLES.md) cites `2d928e34b110` | Apache-2.0 repository; per file: `src/broker/cas_protocol.h` Apache-2.0, `src/broker/broker_cas_cci.h` BSD-3-Clause | Constants and server behaviour cited in comments (`cas.c`, `cas_protocol.h`, `broker_cas_cci.h`) |
 | cubrid-lab pycubrid, cubrid-go | not scanned | MIT, same organisation | Named in the `constants.ts` header as constant cross-checks |
 
 ## Method
@@ -42,26 +44,31 @@ conditions are met alongside the MIT-licensed original code.
 - **Token scan** (`scripts/check-provenance.mjs similarity`). Every `src/**/*.ts` file and every upstream
   JavaScript/TypeScript file is parsed with the TypeScript compiler and reduced to the leaf tokens of the syntax
   tree. Comments, whitespace, trailing commas and TypeScript-only syntax (annotations, interfaces, type aliases,
-  type arguments, `as` casts, access modifiers, type-only imports) are dropped, so a TypeScript port of JavaScript
-  code is compared as the JavaScript it compiles to; strings compare by value. Two comparisons: *identical* (same
+  type arguments, `as`/`satisfies`/`<T>` casts and their parentheses, access modifiers, `declare` members,
+  overload signatures, type-only imports) are dropped, so a TypeScript port of JavaScript code is compared as the
+  JavaScript it compiles to, apart from what the compiler rewrites (enums, constructor parameter properties);
+  strings compare by value. Two comparisons: *identical* (same
   tokens) and *same shape* (identifiers, strings and numbers replaced by placeholders, which finds renamed copies).
   It reports runs of at least 25 identical or 50 same-shape tokens. C, C++ and Java files are only lexed, which is
-  weak evidence across languages and was used as a second signal next to reading the code.
-- **Controls** (`tests/provenance-scan.test.mjs`, run by `npm test`): a source file and its compiler output tokenize
-  the same; a compiled copy with renamed classes, methods and fields is found as one run of more than 200 tokens;
+  weak evidence across languages and was used as a second signal next to reading the code. Every upstream
+  position of a matching 20-token window is followed, so repetitive code does not hide a longer run; the scan
+  finds leads for reading the code, not verdicts.
+- **Controls** (`tests/provenance-scan.test.mjs`, run by `npm test` and `npm run test:coverage`): every `src/` file
+  tokenizes as its `ts.transpileModule` output, except a listed set of files with enums or parameter properties;
+  snippets with each dropped construct do too; a compiled copy with renamed classes, methods and fields is found as one run of more than 200 tokens;
   a reviewed hit stays reviewed when moved and fails when changed or longer. During the audit, node-cubrid's
   `PacketReader.js` given type annotations and renamed identifiers was flagged with runs of 29 to 60 identical
   tokens throughout.
 - **Reviewed hits** are kept in `scripts/provenance-reviewed.json`, keyed by file, comparison, token count and the
   SHA-256 of the compared tokens, with the reason. Line numbers are hints only.
-- **History.** `git log --follow` for every file under `src/`: all were first added by Yeongseon Choe; commits
-  touching `src/` are by Yeongseon Choe (77), Gyeongjun Paik (1) and copilot-swe-agent (1). The CAS layer arrived
-  in one commit, `37525d0` ("Replace node-cubrid dependency with a fully native TypeScript implementation",
-  agent-assisted per its trailer), so history cannot show what was consulted; the scan of that tree is the
+- **History** (as of `e779e5d`). `git log --follow` for every file under `src/`: all were first added by a
+  maintainer, and every commit touching `src/` is by one of the two people named in `package.json`, except one
+  by the Copilot agent merged through a pull request. The CAS layer arrived in one commit, `37525d0` (body:
+  "Replace node-cubrid dependency with a fully native TypeScript implementation", agent-assisted per its trailer), so history cannot show what was consulted; the scan of that tree is the
   evidence. Trees scanned: working tree, `37525d0`, `v1.0.0` and `v0.2.0`.
 - **Text search** of commit messages, comments and the source for "port", "adapt", "copied", "derived", "based on",
   "node-mysql", "Apache", "copyright", "SPDX", "Search Solution": no description of copied code and no third-party
-  license header. Of the 199 string literals of 16 or more characters in `src/`, two occur anywhere upstream:
+  license header. Of the 211 string literals of 16 or more characters in `src/` (at `e779e5d`), two occur anywhere upstream:
   `"beginTransaction"` (a method name) and `"string parameter"`.
 - `tests/**` was scanned against node-cubrid's `src/` and `test/`: no run at the default thresholds.
 
@@ -98,6 +105,8 @@ above rather than on recorded intent; a later discovery of copied code would be 
 - `dist/index.{js,cjs}` import Node built-ins only (`util`, `net`, `tls`, `async_hooks`); the declarations import
   `node:stream`. The CJS file starts with esbuild's module interop helpers (`__defProp`, `__export`,
   `__toCommonJS`), generated by the bundler rather than taken from a third-party source file.
+- Every esbuild module marker (`// src/...`, one per bundled input file) in `dist/index.{js,cjs}` names a file
+  under `src/`; a bundled dependency or vendored file would appear as `// node_modules/...` or its own path.
 - No source maps are built (`tsup` runs without `--sourcemap`), so no `sourcesContent` is shipped. No dist file
   contains a `/*!`, `@license`, copyright or SPDX comment; neither did 0.1.0, 0.2.0 or 1.0.0.
 - 0.1.0 and 0.2.0 declared `node-cubrid` as a dependency; their `dist` contains none of its code.
@@ -129,7 +138,8 @@ node scripts/check-provenance.mjs similarity   # downloads node-cubrid@11.0.0 wi
 
 The pack check fails when a file is missing or unexpected, LICENSE is not the MIT text with a copyright line,
 `package.json` is not MIT or has any runtime, peer, optional or bundled dependency, a dist file imports anything but
-a Node built-in or carries a license comment, or a source map (if one is ever built) lists a file outside `src/`.
+a Node built-in or carries a license comment, an esbuild module marker in `dist/index.{js,cjs}` names a file
+outside `src/`, or a source map (if one is ever built) lists a file outside `src/`.
 If the repository gains a `THIRD_PARTY_NOTICES.md`, the check requires it in the package (add it to
 `package.json` `files`).
 
@@ -152,7 +162,7 @@ node scripts/check-provenance.mjs similarity --rev=<commit>   # scan an earlier 
 
 - **Copyright holder.** `LICENSE` names "CUBRID Lab", the organisation; `package.json` names an individual
   author and two contributors. CONTRIBUTING.md states no inbound license terms, CLA or copyright assignment, so
-  contributors keep the copyright in their contributions, presumably licensed under the project's MIT license.
+  contributors keep the copyright in their contributions; no inbound terms are stated.
   Stating inbound=outbound terms in CONTRIBUTING.md is optional and left to the maintainers.
 - **node-cubrid's license is inconsistent upstream** (MIT in `package.json`, BSD-3-Clause plus node-mysql's MIT in
   `LICENSE`). It does not matter here because no node-cubrid code is copied or shipped, but it would matter if

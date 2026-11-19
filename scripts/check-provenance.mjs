@@ -120,6 +120,15 @@ function checkPack() {
       for (const spec of new Set(specifiers)) {
         if (!BUILTINS.has(spec)) problems.push(`${file}: imports ${spec}, not a Node built-in`);
       }
+      if (/^dist\/index\.c?js$/.test(file)) {
+        const modules = bundledModules(code);
+        if (modules.length === 0) problems.push(`${file}: no esbuild module markers to check`);
+        for (const module of modules) {
+          if (!module.startsWith("src/") || module.includes("node_modules")) {
+            problems.push(`${file}: bundles ${module}, which is not repository source`);
+          }
+        }
+      }
       // esbuild keeps /*! */ and @license comments: a bundled third-party
       // file would bring its notice; this repository's source has none.
       if (/\/\*!|@license|@preserve|Copyright \(c\)|SPDX-License-Identifier/i.test(code)) {
@@ -140,6 +149,15 @@ function checkPack() {
     rmSync(tmp, { recursive: true, force: true });
   }
   return problems;
+}
+
+/**
+ * The input files esbuild bundled into `code`: it starts each module's code
+ * with a `// <path>` comment line, so a bundled dependency appears as
+ * `// node_modules/...` and any other file outside src/ under its own path.
+ */
+export function bundledModules(code) {
+  return [...code.matchAll(/^\/\/ (\S+\.(?:[cm]?[jt]sx?))$/gm)].map((m) => m[1]);
 }
 
 const TS_ONLY_KEYWORDS = new Set([
@@ -163,7 +181,24 @@ function typeOnly(node) {
     ((ts.isImportSpecifier(node) || ts.isExportSpecifier(node)) && node.isTypeOnly) ||
     ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) &&
       (node.isTypeOnly || node.importClause?.isTypeOnly)) ||
+    ((ts.isFunctionDeclaration(node) ||
+      ts.isMethodDeclaration(node) ||
+      ts.isConstructorDeclaration(node)) &&
+      !node.body) ||
+    (ts.canHaveModifiers(node) &&
+      (ts.getModifiers(node) ?? []).some((m) => m.kind === ts.SyntaxKind.DeclareKeyword)) ||
     TS_ONLY_KEYWORDS.has(node.kind)
+  );
+}
+
+/** `(x as T)` and `(<T>x)` compile to `x`: the parentheses go with the cast. */
+function castInParens(node) {
+  if (!ts.isParenthesizedExpression(node)) return false;
+  const inner = node.expression;
+  return (
+    ts.isAsExpression(inner) ||
+    ts.isSatisfiesExpression(inner) ||
+    ts.isTypeAssertionExpression(inner)
   );
 }
 
@@ -220,11 +255,7 @@ export function tokenize(text, fileName = "x.ts") {
       const prev = children[i - 1]?.kind;
       if (typeOnly(child) && !(ts.isTypeNode(child) && ts.isExpressionWithTypeArguments(child))) {
         skip.add(i);
-        if (ts.isImportSpecifier(child) || ts.isExportSpecifier(child)) {
-          // `{ a, type B }` compiles to `{ a }`: drop one adjacent comma.
-          if (children[i + 1]?.kind === ts.SyntaxKind.CommaToken) skip.add(i + 1);
-          else if (prev === ts.SyntaxKind.CommaToken) skip.add(i - 1);
-        } else if (
+        if (
           prev === ts.SyntaxKind.ColonToken ||
           prev === ts.SyntaxKind.AsKeyword ||
           prev === ts.SyntaxKind.SatisfiesKeyword
@@ -247,6 +278,15 @@ export function tokenize(text, fileName = "x.ts") {
       } else if (ts.isNonNullExpression(node) && child.kind === ts.SyntaxKind.ExclamationToken) {
         skip.add(i);
       } else if (
+        (castInParens(node) &&
+          (child.kind === ts.SyntaxKind.OpenParenToken ||
+            child.kind === ts.SyntaxKind.CloseParenToken)) ||
+        (ts.isTypeAssertionExpression(node) &&
+          (child.kind === ts.SyntaxKind.LessThanToken ||
+            child.kind === ts.SyntaxKind.GreaterThanToken))
+      ) {
+        skip.add(i);
+      } else if (
         child.kind === ts.SyntaxKind.CommaToken &&
         node.kind === ts.SyntaxKind.SyntaxList &&
         i === children.length - 1
@@ -254,6 +294,17 @@ export function tokenize(text, fileName = "x.ts") {
         // A trailing comma is formatting, not code.
         skip.add(i);
       }
+    }
+    if (node.kind === ts.SyntaxKind.SyntaxList && skip.size > 0) {
+      // `{ a, type B, }` compiles to `{ a }`: drop the commas a removed
+      // element leaves leading, trailing or doubled.
+      let last = null;
+      for (const [i, child] of children.entries()) {
+        if (skip.has(i)) continue;
+        if (child.kind === ts.SyntaxKind.CommaToken && (last === null || last.comma)) skip.add(i);
+        else last = { i, comma: child.kind === ts.SyntaxKind.CommaToken };
+      }
+      if (last?.comma) skip.add(last.i);
     }
     for (const [i, child] of children.entries()) {
       if (!skip.has(i)) visit(child);
@@ -326,7 +377,7 @@ export function findRuns(ours, theirs, field, min) {
         .join("\u0000");
       const list = index.get(key);
       if (!list) index.set(key, [[file, j]]);
-      else if (list.length < 64) list.push([file, j]);
+      else list.push([file, j]);
     }
   }
   const runs = [];

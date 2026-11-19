@@ -30,7 +30,7 @@ and an oracle never shares a builder with the code it checks
 | Command | Files | Where it runs | Result on `25c770d` |
 | --- | --- | --- | --- |
 | `npm test` | the offline `.ts` files (20 on `25c770d`; 21 with `frame-reader.test.ts`, #253), then `verify-npm-version.test.mjs` | `ci.yml` (Node 18–26), `release-validation.yml` | 1416 pass, 0 fail, 0 skipped; then 6 pass |
-| `npm run test:coverage` | the same 20 files under `c8` | `ci.yml` | same 1416 tests |
+| `npm run test:coverage` | the same 20 files under `c8`, then `verify-npm-version.test.mjs` and `provenance-scan.test.mjs` without coverage | `ci.yml` | same 1416 tests |
 | `npm run test:integration`, no broker | `integration.test.ts` | `ci.yml` `ci` job, step "Integration file, offline cases only": checks the file loads on Node 18–26; it is not live evidence | 1 pass (`connect fails with wrong port`); the 18 top-level suites are skipped |
 | `CUBRID_LIVE_REQUIRED=1 CUBRID_TEST_PORT=1 npm run test:integration` | `integration.test.ts` | `ci.yml` negative check | fails with "Live CUBRID integration was required but the broker was unreachable" |
 | `CUBRID_LIVE_REQUIRED=1 CUBRID_TEST_UTF8_DATABASE=testu8 npm run test:integration` | `integration.test.ts` | `live-cubrid.yml`, called by the `Live CUBRID` job in `ci.yml` and required by `CI gate` (11.4 on Node 22 for PRs; 10.2, 11.0, 11.2, 11.4 on `main`), and by `release-validation.yml` (all four) | CUBRID 11.4.6, broker on 127.0.0.1:33410: 309 pass, 0 fail, 0 skipped, 39 suites, 834 s |
@@ -39,7 +39,7 @@ and an oracle never shares a builder with the code it checks
 | `npm run test:jdbc-parity` | `tests/jdbc-parity/` | `jdbc-parity.yml` | not run here (needs Java and the pinned JAR) |
 | `npm run test:all` | every `tests/*.test.ts` | no workflow | fails offline by design: 1417 pass, 1 fail (`legacy-parity.test.ts`), 3 skipped (TLS) |
 | `node --test tests/api-public-surface.test.mjs`, `npm run api:check` | public API parser and `api/index.d.ts` | `ci.yml` (Node 22) | 3 pass; "Public API matches api/index.d.ts." |
-| `node --test tests/provenance-scan.test.mjs` (also in `npm test`), `npm run provenance:check` | controls of the provenance similarity scan; the packed tarball's contents ([PROVENANCE.md](PROVENANCE.md)) | `ci.yml` (Node 18–26 for the test; Node 22 for the pack check) | 4 pass; "provenance check passed" |
+| `node --test tests/provenance-scan.test.mjs` (also in `npm test` and `npm run test:coverage`, outside `c8`), `npm run provenance:check` | controls of the provenance similarity scan; the packed tarball's contents ([PROVENANCE.md](PROVENANCE.md)) | `ci.yml` (Node 18–26 for the test; Node 22 for the pack check) | 6 pass; "provenance check passed" |
 
 ## Required live CUBRID 11.4 lane (#264)
 
