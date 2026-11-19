@@ -7,6 +7,7 @@ import {
 } from "../internals/map-error.js";
 import {
   assertValidQueryOptions,
+  assertValidStreamOptions,
   checkedResult,
   checkedRows,
   connectionTimezone,
@@ -15,6 +16,7 @@ import { unknownOutcomeProbe } from "../internals/session-state.js";
 import type {
   ArrayRowOptions,
   ArrayRowQueryable,
+  ArrayStreamOptions,
   BatchTransactionClient,
   ConnectionLike,
   ExecutableTransactionClient,
@@ -24,12 +26,15 @@ import type {
   PreparedTransactionClient,
   QueryOptions,
   ResultTransactionClient,
+  StreamOptions,
+  StreamTransactionClient,
   TimezoneAware,
 } from "../types/client.js";
 import { LobParamError, type PreparedQueryParam, refuseLobParams } from "../types/lob.js";
 import type { QueryParams } from "../types/query.js";
 import type { ArrayQueryResult, QueryResult, QueryResultRow } from "../types/result.js";
 import type { ConnectionSource, ConnectionVerdict } from "./connection-source.js";
+import { streamRows } from "./stream-rows.js";
 
 export class CubridTransaction
   implements
@@ -38,7 +43,8 @@ export class CubridTransaction
     ExecutableTransactionClient,
     PreparedTransactionClient,
     BatchTransactionClient,
-    TimezoneAware
+    TimezoneAware,
+    StreamTransactionClient
 {
   /**
    * @param configuredTimezone reported by {@link timezone} when `connection` has no
@@ -191,6 +197,48 @@ export class CubridTransaction
     });
   }
 
+  /**
+   * `stream()` inside this transaction, on its connection. See the `stream()` of
+   * `CubridClient` and `docs/API_REFERENCE.md#streaming-inside-a-transaction`.
+   *
+   * @throws RangeError or TypeError at once when an option is invalid.
+   */
+  stream<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayStreamOptions,
+  ): AsyncGenerator<T, void, undefined>;
+  stream<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+    options?: StreamOptions,
+  ): AsyncGenerator<T, void, undefined>;
+  /**
+   * The signature of {@link Streamable.stream}, so a union of this type with
+   * `Streamable` or `ConnectionLike` stays callable. Never chosen by a direct call.
+   */
+  stream<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+    options?: StreamOptions,
+  ): AsyncIterable<T>;
+  stream(
+    sql: string,
+    params?: QueryParams,
+    options?: StreamOptions,
+  ): AsyncGenerator<unknown, void, undefined> {
+    assertValidStreamOptions(options);
+    refuseLobParams(params);
+    return streamRows(
+      async () => this.connection,
+      sql,
+      params,
+      options,
+      "transaction",
+      "Transaction query failed.",
+    );
+  }
+
   commit(): Promise<void> {
     return this.connection.commit();
   }
@@ -324,6 +372,12 @@ export class CallbackTransaction extends CubridTransaction {
   private committingForCallback = false;
   /** Set once every statement settled and the outcome is decided. */
   private decided = false;
+  /**
+   * Streams between their first read and their end. Ending the transaction
+   * aborts each one through its controller, which closes its cursor and ends its
+   * turn on the connection even while its consumer is not reading.
+   */
+  private readonly openStreams = new Set<AbortController>();
 
   /** Why the rollback failed, once one was attempted and rejected. */
   rollbackFailure: Error | undefined;
@@ -427,6 +481,31 @@ export class CallbackTransaction extends CubridTransaction {
     return this.track(() => super.executeMany(sql, paramSets, options));
   }
 
+  override stream<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayStreamOptions,
+  ): AsyncGenerator<T, void, undefined>;
+  override stream<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+    options?: StreamOptions,
+  ): AsyncGenerator<T, void, undefined>;
+  override stream<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+    options?: StreamOptions,
+  ): AsyncIterable<T>;
+  override stream(
+    sql: string,
+    params?: QueryParams,
+    options?: StreamOptions,
+  ): AsyncGenerator<unknown, void, undefined> {
+    assertValidStreamOptions(options);
+    refuseLobParams(params);
+    return this.trackStream(sql, params, options);
+  }
+
   override commit(): Promise<void> {
     return this.complete("commit");
   }
@@ -457,25 +536,67 @@ export class CallbackTransaction extends CubridTransaction {
     });
   }
 
+  /**
+   * The error a statement issued now is refused with, or undefined while the
+   * transaction is open.
+   */
+  private refusal(): TransactionError | undefined {
+    if (this.state === "open") {
+      return undefined;
+    }
+    const refused = new TransactionError(COMPLETED_MESSAGES[this.state], {
+      outcomeUnknown: false,
+    });
+
+    // Work the callback left running is still issuing statements while the client
+    // commits for it. This one is never sent, so committing would persist the
+    // rest of the work without it. An explicit commit() keeps the 1.x rule: the
+    // late statement is refused and the commit stands.
+    if (this.committingForCallback && this.state === "completing" && !this.decided) {
+      this.statements.add({
+        settled: Promise.resolve(),
+        failed: true,
+        reason: refused,
+        observed: false,
+      });
+    }
+    return refused;
+  }
+
+  /**
+   * Reads a stream of this transaction. Nothing happens before the first read,
+   * which is refused like any statement once the transaction is over. From then
+   * until the stream ends it is open, and complete() aborts it through its own
+   * controller, which follows the caller's signal too.
+   */
+  private async *trackStream(
+    sql: string,
+    params: QueryParams | undefined,
+    options: StreamOptions | undefined,
+  ): AsyncGenerator<unknown, void, undefined> {
+    const refused = this.refusal();
+    if (refused) {
+      throw refused;
+    }
+    const signal = options?.signal;
+    signal?.throwIfAborted();
+
+    const stop = new AbortController();
+    const follow = (): void => stop.abort(signal?.reason);
+    signal?.addEventListener("abort", follow, { once: true });
+    this.openStreams.add(stop);
+    try {
+      yield* super.stream(sql, params, { ...options, signal: stop.signal });
+    } finally {
+      signal?.removeEventListener("abort", follow);
+      this.openStreams.delete(stop);
+    }
+  }
+
   /** Runs one statement of this transaction, unless the transaction is over. */
   private track<R>(statement: () => Promise<R>): Promise<R> {
-    if (this.state !== "open") {
-      const refused = new TransactionError(COMPLETED_MESSAGES[this.state], {
-        outcomeUnknown: false,
-      });
-
-      // Work the callback left running is still issuing statements while the client
-      // commits for it. This one is never sent, so committing would persist the
-      // rest of the work without it. An explicit commit() keeps the 1.x rule: the
-      // late statement is refused and the commit stands.
-      if (this.committingForCallback && this.state === "completing" && !this.decided) {
-        this.statements.add({
-          settled: Promise.resolve(),
-          failed: true,
-          reason: refused,
-          observed: false,
-        });
-      }
+    const refused = this.refusal();
+    if (refused) {
       return Promise.reject(refused);
     }
 
@@ -530,7 +651,34 @@ export class CallbackTransaction extends CubridTransaction {
     }
 
     this.state = "completing";
-    this.completion = outcome === "commit" ? this.runCommit() : this.runRollback();
+
+    // A stream still open means the work reading it is not done, so a commit is
+    // refused, and the transaction rolled back, rather than persisting part of it.
+    // Either way each stream is closed first: aborting it releases its query handle
+    // and its turn, so END_TRAN is not left waiting behind a consumer that may be
+    // waiting for this very commit or rollback.
+    const streams = [...this.openStreams];
+    this.openStreams.clear();
+    const refusal =
+      outcome === "commit" && streams.length > 0
+        ? new TransactionError(
+            "Cannot commit while a stream() of this transaction is still open; the " +
+              "transaction was rolled back. Read the stream to its end, or break out " +
+              "of it, before commit() or before the transaction() callback returns.",
+            { outcomeUnknown: false },
+          )
+        : undefined;
+    for (const stop of streams) {
+      stop.abort(
+        refusal ??
+          new TransactionError(
+            "The transaction was rolled back while this stream was open; the stream was closed.",
+            { outcomeUnknown: false },
+          ),
+      );
+    }
+
+    this.completion = outcome === "commit" ? this.runCommit(refusal) : this.runRollback();
     // A callback may not await this. finish() and abort() still see the rejection,
     // but without a handler now it would be reported as unhandled before they run.
     this.completion.catch(() => {
@@ -550,9 +698,12 @@ export class CallbackTransaction extends CubridTransaction {
     this.decided = true;
   }
 
-  private async runCommit(): Promise<void> {
+  private async runCommit(refusal: TransactionError | undefined): Promise<void> {
     try {
       await this.settleStatements();
+      if (refusal) {
+        throw refusal;
+      }
 
       // Nobody observed this failure, so nobody decided it was acceptable, and
       // committing would persist the rest of the work without it. In issue order,

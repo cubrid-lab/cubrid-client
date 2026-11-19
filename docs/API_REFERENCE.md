@@ -39,6 +39,7 @@ Complete reference for every public export of `cubrid-client`.
   - [ExecuteManyResult](#executemanyresult)
   - [TransactionClient](#transactionclient-interface)
   - [TransactionCallback](#transactioncallback)
+  - [StreamTransactionClient](#streamtransactionclient)
   - [ResultTransactionClient](#resulttransactionclient)
   - [TimezoneAware](#timezoneaware)
   - [QueryParam](#queryparam)
@@ -500,7 +501,7 @@ stream<T extends QueryResultRow = QueryResultRow>(
 |-----------|------|---------|-------------|
 | `sql` | `string` | — | SQL statement. Use `?` for parameter placeholders. |
 | `params` | [`QueryParams`](#queryparams) | `undefined` | Positional parameter values |
-| `options` | [`StreamOptions`](#streamoptions) | `undefined` | `fetchSize`, `signal` and `consumerTimeout`, and `rowMode: "array"` to read each row as an array ([Array rows](#array-rows-rowmode-array)) |
+| `options` | [`StreamOptions`](#streamoptions) | `undefined` | `fetchSize`, `signal` and `consumerTimeout`, `rowMode: "array"` to read each row as an array ([Array rows](#array-rows-rowmode-array)), and `binding: "prepared"` to send `params` as typed binds ([Typed binds](#typed-binds-binding-prepared)) |
 
 **Throws:** `RangeError` or `TypeError` at once for an invalid option. Everything else rejects the read that met it: [`QueryError`](#queryerror) for a failed statement or FETCH, or when a value is [refused](TYPES.md#sending-javascript-parameters), or the number of values differs from the SQL's `?` markers, before anything is sent, [`ReadTimeoutError`](#readtimeouterror) after `readTimeout`, and `signal.reason`, unchanged, after an abort. Rows that arrived before a failure are delivered first.
 
@@ -546,7 +547,50 @@ That first loop can work on a small result, because the turn is released with th
 
 **While a stream is open** the server keeps a transaction open for it, in autocommit mode too. Its shared table lock blocks DDL on those tables, and the session keeps its CAS. Keep slow work out of the loop if other clients need them.
 
-`stream()` is not available on the `tx` of a `transaction()` callback. [`TransactionClient`](#transactionclient-interface) is unchanged.
+##### Typed binds: `binding: "prepared"`
+
+By default `stream()` renders `params` into the SQL text as SQL literals, as `query()` does, and sends one PREPARE_AND_EXECUTE. With `binding: "prepared"` it sends PREPARE with the `?` markers kept, then EXECUTE with each value as a typed bind, exactly as [`queryPrepared()`](#querypreparedtsql-params-queryresultpreparedtsql-params-executepreparedsql-params) does, and reads the rows the same way. The default does not change in 1.x, and `binding: "literal"` names it.
+
+```ts
+for await (const row of db.stream("SELECT id FROM orders WHERE NOT (coupon = ? OR id = ?)", [null, 1], {
+  binding: "prepared",
+})) {
+  await process(row);
+}
+```
+
+**Why it matters.** A literal and a bind are not the same SQL on CUBRID. With `null`, the literal path sends `coupon = NULL`, which CUBRID evaluates as false, so inside `NOT (... OR ...)` it matches rows that standard SQL excludes. A bound NULL makes `coupon = ?` unknown, as in standard SQL, so the streamed rows are the ones `queryPrepared()` returns for the same statement ([drizzle-cubrid#239](https://github.com/cubrid-lab/drizzle-cubrid/issues/239)). Other values convert as listed in [prepared binding](TYPES.md#prepared-binding).
+
+- `blob()` and `clob()` are refused with a `TypeError` before anything is sent, under both bindings: a SELECT has no use for an uploaded LOB.
+- Errors are those of `queryPrepared()`: bad SQL fails at PREPARE, a wrong value count or a refused value before EXECUTE, all on the first read.
+- In autocommit mode a prepared stream ends its own transaction once, after its last row or when it closes early: COMMIT, or ROLLBACK when a read failed. A failed COMMIT after a `break` is not thrown out of the `break`; the session is discarded instead, as for a literal stream. Inside a transaction it sends no END_TRAN of its own.
+- Only the built-in connection binds on the server. A custom `connectionFactory` connection fails the first read with a [`QueryError`](#queryerror) whose cause says it cannot bind, and it never receives `binding` or a literal fallback.
+- Typed binds cost one more request than a literal stream (PREPARE and EXECUTE instead of one PREPARE_AND_EXECUTE), and in autocommit mode the END_TRAN above, nothing per row.
+
+##### Streaming inside a transaction
+
+The `tx` of [`transaction()`](#transactiontcallback-options) and a [`beginTransactionScope()`](#begintransactionscopeoptions) handle have `stream()` too, with the same options, including `rowMode: "array"` and `binding: "prepared"`. The stream runs on the transaction's own connection and inside its transaction: it sees the transaction's uncommitted work, and its read locks are the transaction's.
+
+```ts
+await db.transaction(async (tx) => {
+  await tx.execute("UPDATE orders SET state = 'billing' WHERE state = 'open'");
+  for await (const order of tx.stream<{ id: number }>("SELECT id FROM orders WHERE state = 'billing'")) {
+    await bill(order.id);
+  }
+}); // Commits once the loop has ended.
+```
+
+The rules:
+
+- **Other statements of the transaction wait for the stream**, as on a shared connection: the stream holds the connection's turn until its last reply or until it closes. A statement awaited inside the loop is refused with `kind: "stream-busy"` after `consumerTimeout`, as a [`TransactionError`](#transactionerror), and nothing of it is sent, so the transaction is unaffected. Like any statement failure it makes `transaction()` roll back when the callback lets it propagate, and an [unobserved](#observed-and-unobserved-statement-failures) one refuses the commit. Waiting is safe inside a transaction because the statement behind the stream is part of the same transaction either way; run per-row statements after the loop, or collect the rows first.
+- **`commit()` while a stream is open is refused.** The stream is aborted first, which closes its cursor and ends its turn even if its consumer is not reading, then the transaction is rolled back and `commit()` rejects with a `TransactionError` (`outcomeUnknown: false`) saying a stream was still open. A scope reports it as the `cause` of `Failed to commit.`. The stream's next read rejects with the same error. Rows still unread mean the work that reads them is not finished, so the client does not commit part of it.
+- **`rollback()` closes an open stream first**, then rolls back. The stream's next read rejects with a `TransactionError` saying the transaction was rolled back.
+- **A `transaction()` callback that returns while one of its streams is still open** (for example one it left reading in the background) is the commit above: the transaction rolls back and `transaction()` rejects with a `TransactionError` whose `cause` is that refusal. A stream that was created but never read is not open: it sent nothing, does not stop the commit, and its first read after the transaction ended is refused, sending nothing.
+- **"Open"** means from the first read until the rows run out, the loop breaks or throws, `return()` is called, or the read fails. Code that drives the iterator by hand must call `return()` before committing.
+- **`break`, `return()` and a throw** close the cursor and release the turn; the transaction stays open, and its next statement and `commit()` proceed. **`signal`** does the same while the consumer is away, and the next read rejects with `signal.reason`.
+- [`close()`](#close) of the client or pool discards a scope with an open stream like any other scope: its connection closes and the stream's next read rejects.
+
+[`TransactionClient`](#transactionclient-interface) is unchanged; the transaction clients describe `stream()` with [`StreamTransactionClient`](#streamtransactionclient).
 
 #### `transaction<T>(callback, options?)`
 
@@ -559,7 +603,7 @@ async transaction<T>(
 ): Promise<T>
 ```
 
-The `tx` is also [`TimezoneAware`](#timezoneaware): `tx.timezone` reports the zone its connection decodes dates in.
+The callback's `tx` also has `executeMany()`, the `rowMode: "array"` overloads and [`stream()`](#streaming-inside-a-transaction). It is also [`TimezoneAware`](#timezoneaware): `tx.timezone` reports the zone its connection decodes dates in.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -1109,9 +1153,12 @@ The exported constructor stays available in 1.x for compatibility. An instance y
 ```ts
 class CubridTransaction
   implements
+    ArrayRowQueryable,
     ResultTransactionClient,
     ExecutableTransactionClient,
     PreparedTransactionClient,
+    BatchTransactionClient,
+    StreamTransactionClient,
     TimezoneAware {
   constructor(connection: ConnectionLike, configuredTimezone?: "local" | "utc");
   readonly timezone: "local" | "utc";
@@ -1157,6 +1204,12 @@ Same signatures and behavior as the [`CubridClient` methods](#querypreparedtsql-
 Same signature as [`CubridClient.executeMany()`](#executemanysql-paramsets-options), but runs within the transaction's isolated connection and never commits or rolls back on its own. When a set fails it rejects with a [`TransactionError`](#transactionerror) whose `batch` reports every set, and the sets that succeeded stay in the transaction until you commit or roll back.
 
 **Throws:** [`TransactionError`](#transactionerror) if a set fails or the statement is refused.
+
+#### `stream<T>(sql, params?, options?)`
+
+Same signature and options as [`CubridClient.stream()`](#streamtsql-params-options), but reads within the transaction's isolated connection. See [Streaming inside a transaction](#streaming-inside-a-transaction) for how it interacts with other statements, `commit()` and `rollback()`. An instance you construct yourself only forwards to its connection.
+
+**Throws:** `RangeError` or `TypeError` at once for an invalid option. A failed read rejects with a [`TransactionError`](#transactionerror), the read after the transaction ended without sending anything, and an abort with `signal.reason`, unchanged.
 
 #### `commit()`
 
@@ -1736,7 +1789,7 @@ interface ConnectionLike {
 
 `setTransactionOptions` is optional too, but it decides whether settings work. The client calls it on a new connection before anything else when `isolationLevel` or `lockTimeout` is in effect, and only then. Without it such a client or transaction fails rather than running without the setting. An implementation must keep the setting on every session it opens, and `NativeCubridAdapter` does. Options it is not given keep their value. The built-in adapter rejects the call inside a transaction, because changing the level there would change the running transaction.
 
-`queryResult`, `execute` and `stream` are optional so existing custom adapters keep compiling. The optional `queryPrepared`, `queryResultPrepared` and `executePrepared` take `readonly PreparedQueryParam[]`, as on [`PreparedQueryable`](#preparedqueryable); a custom connection that does not upload LOBs should refuse a [`LobParam`](#lobparam-blobsource-and-clobsource). The client passes [`QueryOptions`](#queryoptions) as the last argument of each statement method; an implementation that declares fewer parameters still compiles, and then ignores them. Calling `queryResult()`, `execute()` or `executeMany()` on a client or transaction fails when its connection does not provide it, and so does the first read of `stream()`. `executeMany()` never falls back to one statement per set.
+`queryResult`, `execute` and `stream` are optional so existing custom adapters keep compiling. The optional `queryPrepared`, `queryResultPrepared` and `executePrepared` take `readonly PreparedQueryParam[]`, as on [`PreparedQueryable`](#preparedqueryable); a custom connection that does not upload LOBs should refuse a [`LobParam`](#lobparam-blobsource-and-clobsource). The client passes [`QueryOptions`](#queryoptions) as the last argument of each statement method; an implementation that declares fewer parameters still compiles, and then ignores them. Calling `queryResult()`, `execute()` or `executeMany()` on a client or transaction fails when its connection does not provide it, and so does the first read of `stream()`. `executeMany()` never falls back to one statement per set. `ConnectionLike` has no way to stream with typed binds, so the first read of a `stream()` with `binding: "prepared"` fails on a custom connection rather than running it as literals, and the client removes `binding` from the options it passes to `stream`.
 
 The options may carry `rowMode: "array"` ([Array rows](#array-rows-rowmode-array)). A connection that supports it returns each row as an array of its values in select-list order, from `query`, `queryResult`, their prepared forms and `stream`. One that ignores it and returns objects makes the statement fail, unless the result has no rows. `ConnectionLike` itself does not change.
 
@@ -1794,7 +1847,7 @@ interface Executable {
 
 ### Streamable
 
-Interface for any object that can read a result row by row. `CubridClient` implements it. `TransactionClient` does not extend it.
+Interface for any object that can read a result row by row. `CubridClient`, `CubridPool`, `PoolConnection`, `CubridTransaction` and the transaction clients ([`StreamTransactionClient`](#streamtransactionclient)) implement it. `TransactionClient` does not extend it.
 
 ```ts
 interface Streamable {
@@ -1815,6 +1868,7 @@ interface StreamOptions {
   fetchSize?: number;
   signal?: AbortSignal;
   consumerTimeout?: number;
+  binding?: "literal" | "prepared";
 }
 ```
 
@@ -1823,6 +1877,7 @@ interface StreamOptions {
 | `fetchSize` | `number` | The client's [`fetchSize`](#clientoptions) | Rows requested in each FETCH, ignored by CUBRID 10.2 to 11.4 |
 | `signal` | `AbortSignal` | `undefined` | Stops the stream. The next read rejects with `signal.reason` |
 | `consumerTimeout` | `number` | `5000` | Milliseconds a statement issued on this connection waits while the consumer asks for no row, before it rejects with `kind: "stream-busy"`. A consumer that keeps reading is never timed out, however long the stream takes. `0` refuses such statements at once. An integer from 0 to 2147483647; this limit cannot be disabled |
+| `binding` | `"literal"` \| `"prepared"` | `"literal"` | How `params` travel: rendered as SQL literals, or sent as typed binds with PREPARE and EXECUTE as by `queryPrepared()`. See [Typed binds](#typed-binds-binding-prepared). Any other value throws a `TypeError` |
 
 ### QueryOptions
 
@@ -1979,6 +2034,25 @@ type TransactionCallback<
 > = (tx: Tx) => Promise<T>;
 ```
 
+### StreamTransactionClient
+
+`stream()` on the transaction clients the client hands out: the `tx` of `transaction()` and a [`TransactionScope`](#transactionscope). It describes values the client returns; do not implement it in your own classes. See [Streaming inside a transaction](#streaming-inside-a-transaction).
+
+```ts
+interface StreamTransactionClient extends TransactionClient, Streamable {
+  stream<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayStreamOptions,
+  ): AsyncGenerator<T, void, undefined>;
+  stream<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+    options?: StreamOptions,
+  ): AsyncGenerator<T, void, undefined>;
+}
+```
+
 ### ResultTransactionClient
 
 The transaction client that `transaction()` passes to its callback: a `TransactionClient` that can also return column metadata.
@@ -1987,7 +2061,7 @@ The transaction client that `transaction()` passes to its callback: a `Transacti
 interface ResultTransactionClient extends TransactionClient, ResultQueryable {}
 ```
 
-`CubridClient.transaction()` accepts a `TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient & BatchTransactionClient>`, so the callback's `tx` has `queryResult()`, `execute()`, the prepared methods and `executeMany()`; a callback written against `TransactionClient` is still accepted.
+`CubridClient.transaction()` accepts a `TransactionCallback<T, ArrayRowQueryable & ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient & BatchTransactionClient & StreamTransactionClient>`, so the callback's `tx` has `queryResult()`, `execute()`, the prepared methods, `executeMany()` and `stream()`; a callback written against `TransactionClient` is still accepted.
 
 ### TransactionScope
 
@@ -1999,7 +2073,8 @@ interface TransactionScope
     ExecutableTransactionClient,
     PreparedTransactionClient,
     BatchTransactionClient,
-    TimezoneAware {}
+    TimezoneAware,
+    StreamTransactionClient {}
 ```
 
 ### TimezoneAware

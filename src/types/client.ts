@@ -333,6 +333,17 @@ export interface StreamOptions {
    * the connection. This limit cannot be disabled. Default: 5000.
    */
   consumerTimeout?: number;
+  /**
+   * How `params` travel. `"literal"` (default, the 1.x behavior) renders them into
+   * the SQL text as SQL literals. `"prepared"` sends them as typed binds with
+   * PREPARE and EXECUTE, as `queryPrepared()` does, so they compare as they do
+   * there: a bound `null` is SQL NULL, and `col = ?` with it is unknown, where the
+   * literal `col = NULL` is false on CUBRID. `blob()` and `clob()` are refused on
+   * both. Only the built-in connection binds on the server: a custom
+   * `connectionFactory` connection fails the first read of a `"prepared"` stream
+   * rather than running it as literals. See ADR 0011.
+   */
+  binding?: "literal" | "prepared";
 }
 
 /**
@@ -340,6 +351,36 @@ export interface StreamOptions {
  * result in memory. See the `stream()` method of `CubridClient`.
  */
 export interface Streamable {
+  stream<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+    options?: StreamOptions,
+  ): AsyncIterable<T>;
+}
+
+/**
+ * `stream()` on the transaction clients the client hands out: the `tx` of a
+ * `transaction()` callback and the handle of `beginTransactionScope()`. The stream
+ * reads inside the transaction, and `commit()` or `rollback()` closes it first; a
+ * commit while it is open is refused and the transaction rolled back. See
+ * `docs/API_REFERENCE.md#streaming-inside-a-transaction`. This describes values the
+ * client hands out; do not implement it in your own classes.
+ */
+export interface StreamTransactionClient extends TransactionClient, Streamable {
+  stream<T extends readonly unknown[] = unknown[]>(
+    sql: string,
+    params: QueryParams | undefined,
+    options: ArrayStreamOptions,
+  ): AsyncGenerator<T, void, undefined>;
+  stream<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+    options?: StreamOptions,
+  ): AsyncGenerator<T, void, undefined>;
+  /**
+   * The signature of {@link Streamable.stream}, so a union of this type with
+   * `Streamable` or `ConnectionLike` stays callable. Never chosen by a direct call.
+   */
   stream<T extends QueryResultRow = QueryResultRow>(
     sql: string,
     params?: QueryParams,
@@ -512,7 +553,8 @@ export interface TransactionScope
     ExecutableTransactionClient,
     PreparedTransactionClient,
     BatchTransactionClient,
-    TimezoneAware {
+    TimezoneAware,
+    StreamTransactionClient {
   query<T extends readonly unknown[] = unknown[]>(
     sql: string,
     params: QueryParams | undefined,

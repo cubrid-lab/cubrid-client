@@ -152,7 +152,9 @@ Verified facts this decision relies on:
       before the 2.0 default is chosen.
 - [ ] Prepared streaming is verified on a live CUBRID server (cursor lifecycle,
       early stop, errors, abort, transactions, pool lease) before the 1.x MINOR
-      ships it.
+      ships it. #307 adds `StreamOptions.binding` for `stream()` alone, ahead of
+      the rest of the bridge, with live tests on 11.4 (`Integration: stream() in a
+      transaction, and with typed binds (#307)`); 10.2 to 11.2 are not yet run.
 - [ ] The packed package resolves `cubrid-client/driver` for ESM, CJS, and
       TypeScript with `moduleResolution` `node16`, `bundler` and `node10`, and
       `instanceof` holds across entry points.

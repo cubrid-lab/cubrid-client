@@ -659,7 +659,9 @@ method contracts.
 with its `?` markers in a PREPARE request and the values as typed binds in an
 EXECUTE request, so a value never becomes SQL text and no backslash probe is
 needed. They are opt-in: `query()`, `queryResult()` and `execute()` keep
-rendering SQL literals.
+rendering SQL literals. `stream()` binds the same way with
+[`binding: "prepared"`](API_REFERENCE.md#typed-binds-binding-prepared), and renders
+literals without it; `blob()` and `clob()` stay refused there.
 
 | JavaScript parameter | Bind type | Notes |
 | --- | --- | --- |

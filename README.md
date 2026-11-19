@@ -189,6 +189,20 @@ for await (const row of db.stream<{ id: number; name: string }>(
 
 An open stream holds its connection. Other statements on the same client wait until it ends, so **do not await `db.query()` inside the loop**: it rejects with `kind: "stream-busy"` after 5 seconds instead of hanging. Use `db.transaction()`, which has its own connection, or a second client. See [`stream()`](docs/API_REFERENCE.md#streamtsql-params-options) for cancellation, timeouts and LOB columns.
 
+`stream()` sends `params` as SQL literals by default. Pass `binding: "prepared"` to send them as typed binds, as `queryPrepared()` does; a literal `col = NULL` and a bound NULL do not compare the same on CUBRID ([Typed binds](docs/API_REFERENCE.md#typed-binds-binding-prepared)).
+
+The `tx` of `db.transaction()` and a `beginTransactionScope()` handle can stream too, inside their transaction. Finish or `break` out of the stream before the transaction ends: committing while a stream is still open is refused and rolls the transaction back ([Streaming inside a transaction](docs/API_REFERENCE.md#streaming-inside-a-transaction)).
+
+```ts
+await db.transaction(async (tx) => {
+  for await (const row of tx.stream("SELECT id FROM orders WHERE coupon = ?", [code], {
+    binding: "prepared",
+  })) {
+    await audit(row);
+  }
+});
+```
+
 ## Typed Queries
 
 Use TypeScript generics to get fully typed query results:

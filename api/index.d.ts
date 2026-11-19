@@ -483,12 +483,40 @@ interface StreamOptions {
      * the connection. This limit cannot be disabled. Default: 5000.
      */
     consumerTimeout?: number;
+    /**
+     * How `params` travel. `"literal"` (default, the 1.x behavior) renders them into
+     * the SQL text as SQL literals. `"prepared"` sends them as typed binds with
+     * PREPARE and EXECUTE, as `queryPrepared()` does, so they compare as they do
+     * there: a bound `null` is SQL NULL, and `col = ?` with it is unknown, where the
+     * literal `col = NULL` is false on CUBRID. `blob()` and `clob()` are refused on
+     * both. Only the built-in connection binds on the server: a custom
+     * `connectionFactory` connection fails the first read of a `"prepared"` stream
+     * rather than running it as literals. See ADR 0011.
+     */
+    binding?: "literal" | "prepared";
 }
 /**
  * Runs a statement and reads its rows one at a time, without holding the whole
  * result in memory. See the `stream()` method of `CubridClient`.
  */
 interface Streamable {
+    stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncIterable<T>;
+}
+/**
+ * `stream()` on the transaction clients the client hands out: the `tx` of a
+ * `transaction()` callback and the handle of `beginTransactionScope()`. The stream
+ * reads inside the transaction, and `commit()` or `rollback()` closes it first; a
+ * commit while it is open is refused and the transaction rolled back. See
+ * `docs/API_REFERENCE.md#streaming-inside-a-transaction`. This describes values the
+ * client hands out; do not implement it in your own classes.
+ */
+interface StreamTransactionClient extends TransactionClient, Streamable {
+    stream<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayStreamOptions): AsyncGenerator<T, void, undefined>;
+    stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncGenerator<T, void, undefined>;
+    /**
+     * The signature of {@link Streamable.stream}, so a union of this type with
+     * `Streamable` or `ConnectionLike` stays callable. Never chosen by a direct call.
+     */
     stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncIterable<T>;
 }
 /**
@@ -608,7 +636,7 @@ interface BatchTransactionClient extends TransactionClient, BatchExecutable {
  * This describes a value the client returns. Members may be added to it in a
  * minor release, so do not implement it in your own classes.
  */
-interface TransactionScope extends ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient, BatchTransactionClient, TimezoneAware {
+interface TransactionScope extends ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient, BatchTransactionClient, TimezoneAware, StreamTransactionClient {
     query<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayRowOptions): Promise<T[]>;
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
     queryResult<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayRowOptions): Promise<ArrayQueryResult<T>>;
@@ -672,6 +700,14 @@ interface ConnectionLike {
     destroy?(): void;
 }
 type ConnectionFactory = (config: ClientConfig) => ConnectionLike | Promise<ConnectionLike>;
+
+/**
+ * Key of the internal method through which a connection streams with typed
+ * binds, for `stream()` with `binding: "prepared"` (ADR 0011). It is a symbol,
+ * not a member of `ConnectionLike`, so it adds nothing to the public interface: a
+ * custom connection has none and such a stream is refused, never run as literals.
+ */
+declare const PREPARED_STREAM: unique symbol;
 
 /**
  * Key of the internal method through which a connection tells the pool whether
@@ -792,6 +828,11 @@ declare class NativeCubridAdapter implements DriverAdapter {
      * `Streamable` or `ConnectionLike` stays callable. Never chosen by a direct call.
      */
     stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncIterable<T>;
+    /**
+     * How the client asks this adapter for `stream()` with `binding: "prepared"`,
+     * having removed the option. See PREPARED_STREAM.
+     */
+    private [PREPARED_STREAM];
     private streamRows;
     execute(sql: string, params?: QueryParams, options?: ExecuteOptions): Promise<ExecuteResult>;
     queryPrepared<T extends readonly unknown[] = unknown[]>(sql: string, params: readonly PreparedQueryParam[] | undefined, options: ArrayRowOptions): Promise<T[]>;
@@ -1259,7 +1300,8 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
      * can never run: it rejects with `kind: "stream-busy"` after
      * {@link StreamOptions.consumerTimeout}. Use `transaction()`, which has its own
      * connection, or another client. With `rowMode: "array"` each row is an array
-     * of its values in select-list order. See `docs/API_REFERENCE.md`.
+     * of its values in select-list order, and with `binding: "prepared"` the values are
+     * sent as typed binds, as by `queryPrepared()`. See `docs/API_REFERENCE.md`.
      *
      * @throws RangeError or TypeError at once when an option is invalid.
      */
@@ -1270,7 +1312,7 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
      * `Streamable` or `ConnectionLike` stays callable. Never chosen by a direct call.
      */
     stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncIterable<T>;
-    transaction<T>(callback: TransactionCallback<T, ArrayRowQueryable & ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient & BatchTransactionClient & TimezoneAware>, options?: TransactionOptions): Promise<T>;
+    transaction<T>(callback: TransactionCallback<T, ArrayRowQueryable & ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient & BatchTransactionClient & TimezoneAware & StreamTransactionClient>, options?: TransactionOptions): Promise<T>;
     /**
      * Start a manual transaction on its own connection and return the handle that
      * owns it. Statements belong to the transaction only when sent through the
@@ -1565,7 +1607,7 @@ declare class CubridPool implements Queryable, ResultQueryable, Executable, Prep
      * `transaction()` of the client, on a leased connection. The connection goes
      * back to the pool only when the transaction ended cleanly.
      */
-    transaction<T>(callback: TransactionCallback<T, ArrayRowQueryable & ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient & BatchTransactionClient & TimezoneAware>, options?: TransactionOptions): Promise<T>;
+    transaction<T>(callback: TransactionCallback<T, ArrayRowQueryable & ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient & BatchTransactionClient & TimezoneAware & StreamTransactionClient>, options?: TransactionOptions): Promise<T>;
     /**
      * `beginTransactionScope()` of the client, on a leased connection held until
      * `commit()` or `rollback()`. `close()` discards a scope nobody ended.
@@ -1660,7 +1702,7 @@ declare class CubridPool implements Queryable, ResultQueryable, Executable, Prep
     private endpoint;
 }
 
-declare class CubridTransaction implements ArrayRowQueryable, ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient, BatchTransactionClient, TimezoneAware {
+declare class CubridTransaction implements ArrayRowQueryable, ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient, BatchTransactionClient, TimezoneAware, StreamTransactionClient {
     private readonly connection;
     private readonly configuredTimezone;
     /**
@@ -1692,6 +1734,19 @@ declare class CubridTransaction implements ArrayRowQueryable, ResultTransactionC
      * succeeded are still part of it, and the caller decides to roll back or not.
      */
     executeMany(sql: string, paramSets: readonly QueryParams[], options?: QueryOptions): Promise<ExecuteManyResult>;
+    /**
+     * `stream()` inside this transaction, on its connection. See the `stream()` of
+     * `CubridClient` and `docs/API_REFERENCE.md#streaming-inside-a-transaction`.
+     *
+     * @throws RangeError or TypeError at once when an option is invalid.
+     */
+    stream<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayStreamOptions): AsyncGenerator<T, void, undefined>;
+    stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncGenerator<T, void, undefined>;
+    /**
+     * The signature of {@link Streamable.stream}, so a union of this type with
+     * `Streamable` or `ConnectionLike` stays callable. Never chosen by a direct call.
+     */
+    stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncIterable<T>;
     commit(): Promise<void>;
     rollback(): Promise<void>;
 }
@@ -1912,4 +1967,4 @@ declare function buildWhere(conditions: Record<string, unknown>): {
     params: unknown[];
 };
 
-export { type ArrayQueryResult, type ArrayRowOptions, type ArrayRowQueryable, type ArrayStreamOptions, type BatchExecutable, type BatchTransactionClient, type BlobSource, type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type ClobSource, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridPool, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteManyFailure, type ExecuteManyResult, type ExecuteManySetFailure, type ExecuteOptions, type ExecuteResult, type IsolationLevel, type LobParam, LockTimeoutError, NativeCubridAdapter, type PoolConnection, type PoolConnectionOptions, type PoolOptions, type PoolStats, type PreparedQueryParam, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryOptions, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type StreamOptions, type Streamable, type TimezoneAware, type TransactionCallback, type TransactionClient, TransactionError, type TransactionOptions, type TransactionScope, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, type ZonedParam, blob, buildWhere, clob, createClient, createPool, escapeIdentifier, parseConnectionString, zoned };
+export { type ArrayQueryResult, type ArrayRowOptions, type ArrayRowQueryable, type ArrayStreamOptions, type BatchExecutable, type BatchTransactionClient, type BlobSource, type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type ClobSource, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridPool, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteManyFailure, type ExecuteManyResult, type ExecuteManySetFailure, type ExecuteOptions, type ExecuteResult, type IsolationLevel, type LobParam, LockTimeoutError, NativeCubridAdapter, type PoolConnection, type PoolConnectionOptions, type PoolOptions, type PoolStats, type PreparedQueryParam, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryOptions, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type StreamOptions, type StreamTransactionClient, type Streamable, type TimezoneAware, type TransactionCallback, type TransactionClient, TransactionError, type TransactionOptions, type TransactionScope, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, type ZonedParam, blob, buildWhere, clob, createClient, createPool, escapeIdentifier, parseConnectionString, zoned };
