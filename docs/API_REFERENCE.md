@@ -1403,7 +1403,7 @@ Failures detected by the client have a `kind` but no `code` or `origin`:
 | `pool-full` | A pool already had `maxWaitingClients` callers waiting. Nothing was sent |
 | `pool-closed` | The pool was closed before a connection could be lent. Nothing was sent |
 
-The two `connection-lost` server codes come with a reply, so `outcomeUnknown` is `false`: the server rolled the transaction back, that statement included, and nothing of it is committed. Retry the whole transaction once the server is back. After `-224` the `ROLLBACK` fails with `-224` too, so a [`CubridPool`](#cubridpool) closes that connection instead of lending it again.
+The two `connection-lost` server codes come as a reply from the CAS, so `outcomeUnknown` is `false`. After `-224` nothing of the transaction is committed: the database server never ran the request, `COMMIT` included (observed on 11.4). Retry the whole transaction once the server is back. After `-224` the `ROLLBACK` fails with `-224` too, so a [`CubridPool`](#cubridpool) closes that connection instead of lending it again.
 
 **Test `kind`, not the class, to tell why something failed.** The class says which call failed, and the same cause can reach different calls. When a [`CubridPool`](#cubridpool) cannot reach the broker, a `query()` that runs on an idle connection reconnects inside the statement and rejects with a `QueryError`, while one that needs a new connection rejects with a `ConnectionError` because opening it failed. Both have `kind: "connection-lost"`. In 1.x the class of each call's rejection is kept as it is, so that existing `instanceof` checks keep working.
 

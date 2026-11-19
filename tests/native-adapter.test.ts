@@ -2773,7 +2773,7 @@ test("a database server restart mid-transaction rejects transaction() as connect
   assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
 });
 
-test("after -224 the rollback fails too, so a pool does not reuse the connection", async () => {
+test("after -224 the rollback fails too and the session stays in-transaction", async () => {
   const { adapter, fakeCAS } = await beginWithOneInsert();
   fakeCAS.queueResponse(buildServerErrorResponse(-224));
   await assert.rejects(adapter.query("INSERT INTO t VALUES ('b')"), (error: unknown) => {
@@ -2786,6 +2786,19 @@ test("after -224 the rollback fails too, so a pool does not reuse the connection
 
   const state = (adapter as unknown as { [SESSION_STATE](): SessionState })[SESSION_STATE]();
   assert.equal(state.inTransaction, true);
+});
+
+test("a COMMIT answered with -224 rejects as connection-lost with a known outcome", async () => {
+  const { adapter, fakeCAS } = await beginWithOneInsert();
+  fakeCAS.queueResponse(buildServerErrorResponse(-224));
+
+  await assert.rejects(adapter.commit(), (error: unknown) => {
+    assert.ok(error instanceof TransactionError);
+    assert.equal(error.code, -224);
+    assert.equal(error.kind, "connection-lost");
+    assert.equal(error.outcomeUnknown, false);
+    return true;
+  });
 });
 
 // ---------------------------------------------------------------------------

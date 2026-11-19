@@ -14,8 +14,8 @@
  * - `authentication`: the broker refused the user or password.
  * - `connection-lost`: the connection went away, or the server process died or
  *   restarted and took the transaction with it. Without a `code`, the outcome of
- *   a request in flight is unknown. With `-111` or `-224` the server replied, so
- *   only the transaction is gone; see `outcomeUnknown`.
+ *   a request in flight is unknown. With `-111` or `-224` the CAS replied with a
+ *   database server error, so the request is not in doubt; see `outcomeUnknown`.
  * - `read-timeout`: the client gave up waiting, see `ReadTimeoutError`.
  * - `stream-busy`: the client refused a statement that waited behind a `stream()`
  *   whose consumer stopped asking for rows. Nothing was sent.
