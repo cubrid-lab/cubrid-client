@@ -22,6 +22,7 @@ import type {
 import type { PreparedQueryParam } from "../types/lob.js";
 import type { QueryParams } from "../types/query.js";
 import type { QueryResult, QueryResultRow } from "../types/result.js";
+import { connectionTimezone } from "./normalize-config.js";
 import { SESSION_STATE, sessionStateReader } from "./session-state.js";
 
 /** Values of all the sets of an `executeMany()`, without failing on a malformed argument. */
@@ -149,7 +150,6 @@ export function withLogging(factory: ConnectionFactory, logger: unknown): Connec
     });
 
     const wrapped: ConnectionLike = {
-      ...(inner.timezone !== undefined && { timezone: inner.timezone }),
       connect: () => timed("connect", {}, () => inner.connect()),
       query: <T extends QueryResultRow = QueryResultRow>(
         sql: string,
@@ -291,6 +291,8 @@ export function withLogging(factory: ConnectionFactory, logger: unknown): Connec
         destroy();
       };
     }
+    // A transaction reads the zone the connection decodes in through the wrapper.
+    Object.defineProperty(wrapped, "timezone", { get: () => connectionTimezone(inner) });
     // The pool reads the session's state through the wrapper.
     const readState = sessionStateReader(inner);
     if (readState) {

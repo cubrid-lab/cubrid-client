@@ -229,6 +229,32 @@ out does not compile; a value typed `{ rowMode?: "object" | "array" }` selects t
 object signature, so its rows are typed as objects; and through a union with a
 user-implementable interface only object mode is offered.
 
+### Timezone property (#292)
+
+`readonly timezone: "local" | "utc"`
+([#292](https://github.com/cubrid-lab/cubrid-client/issues/292)) is an additive
+MINOR change. It reports the `timezone` option in effect, `"local"` when unset, so
+code built on the client can interpret the `Date` values it returns. It adds the
+exported interface `TimezoneAware` and the property on `CubridClient`,
+`CubridPool`, `CubridTransaction` and `NativeCubridAdapter`. `CubridTransaction`
+gains an optional second constructor argument, the zone reported when its
+connection has none; the one-argument form is unchanged. Nothing about how dates
+are decoded changes.
+
+- `TransactionClient`, `ConnectionLike` and the other capability interfaces are
+  unchanged, so classes and test doubles implementing them keep compiling,
+  including a connection whose own `timezone` is a string such as `"Asia/Seoul"`
+  or a private member. The zone of a connection is read duck-typed and only a
+  value of `"local"` or `"utc"` counts; any other value is ignored.
+- `PoolConnection` and `TransactionScope` extend `TimezoneAware`. They describe
+  values the library provides, and their documentation reserves the right to add
+  members in a minor release; a hand-written mock typed as one of them now needs a
+  `timezone`.
+- The `tx` type of `CubridClient.transaction()` and `CubridPool.transaction()`
+  gains `& TimezoneAware`. That only widens what the callback receives, so a
+  callback written against `TransactionClient` or the earlier intersection is
+  still accepted.
+
 For the complete 1.x line, Node.js 18 and 20 are retained even though they are upstream EOL. [ADR 0006](adr/0006-node-18-support-through-1x.md) records the explicit Node 18 release commitment and independent Node 18 **packed-package** test requirement. A higher Node minimum is reserved for a possible, separately reviewed 2.0 MAJOR, not a 1.x development-tooling update.
 
 ## Node.js, TypeScript and distribution

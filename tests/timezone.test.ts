@@ -463,9 +463,12 @@ test("#281: the package exports zoned()", async () => {
 
 // #292: the effective timezone is public on every object that returns dates.
 
-/** A connection that answers without a server and may declare its own zone. */
+/**
+ * A connection that answers without a server and may have a `timezone`, which
+ * `ConnectionLike` does not declare, so it may mean anything.
+ */
 class ZoneConnection implements ConnectionLike {
-  constructor(readonly timezone?: "local" | "utc") {}
+  constructor(readonly timezone?: string) {}
   async connect(): Promise<void> {}
   async query<T extends QueryResultRow = QueryResultRow>(): Promise<T[]> {
     return [];
@@ -563,6 +566,25 @@ test("#292: a transaction reports the zone its connection decodes in, not a copy
   await reverse.close();
 });
 
+test("#292: a connection's timezone other than local or utc is ignored for the configured one", async () => {
+  for (const timezone of ["Asia/Seoul", "UTC", ""]) {
+    const factory = () => new ZoneConnection(timezone);
+    const client = createClient({ ...BASE, timezone: "utc", connectionFactory: factory });
+    assert.deepEqual(await observedZones(client), ["utc", "utc", "utc"]);
+    await client.close();
+
+    const pool = createPool({ ...BASE, timezone: "utc", connectionFactory: factory });
+    assert.deepEqual(await observedZones(pool), ["utc", "utc", "utc", "utc"]);
+    await pool.close();
+
+    const logged = createPool({ ...BASE, timezone: "utc", logger: {}, connectionFactory: factory });
+    assert.deepEqual(await observedZones(logged), ["utc", "utc", "utc", "utc"]);
+    await logged.close();
+  }
+  const getter = Object.defineProperty(new ZoneConnection(), "timezone", { get: () => 9 });
+  assert.equal(new CubridTransaction(getter, "utc").timezone, "utc");
+});
+
 test("#292: the logger's wrapper passes on the zone of the connection it wraps", async () => {
   const logger = { debug() {}, info() {}, error() {} };
   for (const declared of ["local", "utc"] as const) {
@@ -575,7 +597,32 @@ test("#292: the logger's wrapper passes on the zone of the connection it wraps",
     const zones = await observedZones(client);
     assert.deepEqual(zones.slice(1), [declared, declared]);
     await client.close();
+
+    const pool = createPool({
+      ...BASE,
+      timezone: declared === "utc" ? "local" : "utc",
+      logger,
+      connectionFactory: () => new ZoneConnection(declared),
+    });
+    assert.deepEqual((await observedZones(pool)).slice(1), [declared, declared, declared]);
+    await pool.close();
   }
+});
+
+test("#292: the logger's wrapper reads the zone when asked, not once", async () => {
+  let zone = "local";
+  const connection = Object.defineProperty(new ZoneConnection(), "timezone", { get: () => zone });
+  const client = createClient({
+    ...BASE,
+    logger: {},
+    connectionFactory: () => connection,
+  });
+  await client.transaction(async (tx) => {
+    assert.equal(tx.timezone, "local");
+    zone = "utc";
+    assert.equal(tx.timezone, "utc");
+  });
+  await client.close();
 });
 
 test("#292: a CubridTransaction built by hand reports its connection's zone, else local", () => {

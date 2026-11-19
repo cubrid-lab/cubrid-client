@@ -556,13 +556,6 @@ export interface TransactionScope
 }
 
 export interface ConnectionLike {
-  /**
-   * The zone this connection decodes DATE, TIME, TIMESTAMP and DATETIME values
-   * in. Optional so 1.x connection factories keep compiling: when it is absent,
-   * a transaction or pool connection on it reports the configured
-   * {@link ClientOptions.timezone} as its `timezone`.
-   */
-  readonly timezone?: "local" | "utc" | undefined;
   connect(): Promise<void>;
   query<T extends QueryResultRow = QueryResultRow>(
     sql: string,

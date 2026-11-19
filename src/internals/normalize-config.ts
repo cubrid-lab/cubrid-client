@@ -119,6 +119,25 @@ export function assertValidTimezone(timezone: unknown): void {
   }
 }
 
+/**
+ * The zone a connection decodes dates in, read duck-typed because
+ * `ConnectionLike` declares none: `NativeCubridAdapter` has a `timezone` getter,
+ * and a custom connection may have a property of that name meaning anything. Only
+ * `"local"` and `"utc"` count; otherwise `configured`.
+ */
+export function connectionTimezone(
+  connection: object,
+  configured: "local" | "utc",
+): "local" | "utc";
+export function connectionTimezone(connection: object): "local" | "utc" | undefined;
+export function connectionTimezone(
+  connection: object,
+  configured?: "local" | "utc",
+): "local" | "utc" | undefined {
+  const zone = (connection as { timezone?: unknown }).timezone;
+  return zone === "utc" || zone === "local" ? zone : configured;
+}
+
 /** Disabling the limit is not offered: that is what would let a nested statement hang. */
 export function assertValidStreamOptions(options: StreamOptions | undefined): void {
   assertValidFetchSize(options?.fetchSize);

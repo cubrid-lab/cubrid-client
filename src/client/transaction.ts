@@ -9,6 +9,7 @@ import {
   assertValidQueryOptions,
   checkedResult,
   checkedRows,
+  connectionTimezone,
 } from "../internals/normalize-config.js";
 import { unknownOutcomeProbe } from "../internals/session-state.js";
 import type {
@@ -40,8 +41,9 @@ export class CubridTransaction
     TimezoneAware
 {
   /**
-   * @param configuredTimezone reported by {@link timezone} when `connection` does not
-   * declare its own, as a custom `connectionFactory` connection may not.
+   * @param configuredTimezone reported by {@link timezone} when `connection` has no
+   * `timezone` of `"local"` or `"utc"`, as a custom `connectionFactory` connection
+   * may not.
    */
   constructor(
     private readonly connection: ConnectionLike,
@@ -50,11 +52,12 @@ export class CubridTransaction
 
   /**
    * The zone this transaction's DATE, TIME, TIMESTAMP and DATETIME values are
-   * decoded in: its connection's, which is the client's `timezone` option, or
-   * `"local"` when that was not set. See `ClientOptions.timezone`.
+   * decoded in: the `timezone` of its connection when that is `"local"` or
+   * `"utc"`, as on `NativeCubridAdapter`, otherwise `configuredTimezone`. See
+   * `TimezoneAware`.
    */
   get timezone(): "local" | "utc" {
-    return this.connection.timezone ?? this.configuredTimezone;
+    return connectionTimezone(this.connection, this.configuredTimezone);
   }
 
   query<T extends readonly unknown[] = unknown[]>(

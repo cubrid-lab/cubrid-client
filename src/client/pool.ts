@@ -11,6 +11,7 @@ import {
   assertValidTransactionOptions,
   checkedResult,
   checkedRows,
+  connectionTimezone,
   normalizeConfig,
   pickTransactionOptions,
 } from "../internals/normalize-config.js";
@@ -569,9 +570,10 @@ export class CubridPool
   }
 
   /**
-   * The zone DATE, TIME, TIMESTAMP and DATETIME values are decoded in: the
-   * `timezone` option, or `"local"` when it was not set. Every connection the
-   * pool opens gets this setting. See `ClientOptions.timezone`.
+   * The configured zone for DATE, TIME, TIMESTAMP and DATETIME values: the
+   * `timezone` option, or `"local"` when it was not set. Connections of the
+   * built-in factory decode in it; a custom `connectionFactory` connection may
+   * not, so a pool connection or transaction reports its own. See `TimezoneAware`.
    */
   get timezone(): "local" | "utc" {
     return this.config.timezone ?? "local";
@@ -746,7 +748,7 @@ export class CubridPool
         yield* streamRows<R>(async () => lease.connection, sql, params, streamOptions);
       },
       // The leased connection's own zone, as for a transaction.
-      () => lease.connection.timezone ?? this.timezone,
+      () => connectionTimezone(lease.connection, this.timezone),
     );
 
     try {

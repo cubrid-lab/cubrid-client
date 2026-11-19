@@ -619,13 +619,6 @@ interface TransactionScope extends ResultTransactionClient, ExecutableTransactio
     queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<QueryResult<T>>;
 }
 interface ConnectionLike {
-    /**
-     * The zone this connection decodes DATE, TIME, TIMESTAMP and DATETIME values
-     * in. Optional so 1.x connection factories keep compiling: when it is absent,
-     * a transaction or pool connection on it reports the configured
-     * {@link ClientOptions.timezone} as its `timezone`.
-     */
-    readonly timezone?: "local" | "utc" | undefined;
     connect(): Promise<void>;
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
     /**
@@ -1215,9 +1208,10 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
     private readonly destroyedSignal;
     constructor(config: ClientConfig, connectionFactory: ConnectionFactory);
     /**
-     * The zone DATE, TIME, TIMESTAMP and DATETIME values are decoded in: the
-     * `timezone` option, or `"local"` when it was not set. Every connection the
-     * client opens gets this setting. See `ClientOptions.timezone`.
+     * The configured zone for DATE, TIME, TIMESTAMP and DATETIME values: the
+     * `timezone` option, or `"local"` when it was not set. Connections of the
+     * built-in factory decode in it; a custom `connectionFactory` connection may
+     * not, so a transaction reports its own. See `TimezoneAware`.
      */
     get timezone(): "local" | "utc";
     /**
@@ -1525,9 +1519,10 @@ declare class CubridPool implements Queryable, ResultQueryable, Executable, Prep
     /** Same as {@link createPool}. */
     constructor(options: PoolOptions);
     /**
-     * The zone DATE, TIME, TIMESTAMP and DATETIME values are decoded in: the
-     * `timezone` option, or `"local"` when it was not set. Every connection the
-     * pool opens gets this setting. See `ClientOptions.timezone`.
+     * The configured zone for DATE, TIME, TIMESTAMP and DATETIME values: the
+     * `timezone` option, or `"local"` when it was not set. Connections of the
+     * built-in factory decode in it; a custom `connectionFactory` connection may
+     * not, so a pool connection or transaction reports its own. See `TimezoneAware`.
      */
     get timezone(): "local" | "utc";
     /**
@@ -1669,14 +1664,16 @@ declare class CubridTransaction implements ArrayRowQueryable, ResultTransactionC
     private readonly connection;
     private readonly configuredTimezone;
     /**
-     * @param configuredTimezone reported by {@link timezone} when `connection` does not
-     * declare its own, as a custom `connectionFactory` connection may not.
+     * @param configuredTimezone reported by {@link timezone} when `connection` has no
+     * `timezone` of `"local"` or `"utc"`, as a custom `connectionFactory` connection
+     * may not.
      */
     constructor(connection: ConnectionLike, configuredTimezone?: "local" | "utc");
     /**
      * The zone this transaction's DATE, TIME, TIMESTAMP and DATETIME values are
-     * decoded in: its connection's, which is the client's `timezone` option, or
-     * `"local"` when that was not set. See `ClientOptions.timezone`.
+     * decoded in: the `timezone` of its connection when that is `"local"` or
+     * `"utc"`, as on `NativeCubridAdapter`, otherwise `configuredTimezone`. See
+     * `TimezoneAware`.
      */
     get timezone(): "local" | "utc";
     query<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayRowOptions): Promise<T[]>;

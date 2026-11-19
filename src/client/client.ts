@@ -158,9 +158,10 @@ export class CubridClient
   }
 
   /**
-   * The zone DATE, TIME, TIMESTAMP and DATETIME values are decoded in: the
-   * `timezone` option, or `"local"` when it was not set. Every connection the
-   * client opens gets this setting. See `ClientOptions.timezone`.
+   * The configured zone for DATE, TIME, TIMESTAMP and DATETIME values: the
+   * `timezone` option, or `"local"` when it was not set. Connections of the
+   * built-in factory decode in it; a custom `connectionFactory` connection may
+   * not, so a transaction reports its own. See `TimezoneAware`.
    */
   get timezone(): "local" | "utc" {
     return this.source.timezone;

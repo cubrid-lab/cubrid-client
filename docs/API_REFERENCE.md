@@ -126,7 +126,7 @@ class CubridClient implements Queryable, Executable
 readonly timezone: "local" | "utc"
 ```
 
-The zone DATE, TIME, TIMESTAMP and DATETIME values are decoded in: the [`timezone`](#clientoptions) option, or `"local"` when it was not set. Every connection the client opens is given this setting. Code built on the client, such as an ORM, reads it to interpret the returned `Date` objects. The `tx` of [`transaction()`](#transactiontcallback-options) and the handle of [`beginTransactionScope()`](#begintransactionscopeoptions) have it too, and report the zone of their own connection; see [`TimezoneAware`](#timezoneaware).
+The configured zone for DATE, TIME, TIMESTAMP and DATETIME values: the [`timezone`](#clientoptions) option, or `"local"` when it was not set. Connections of the built-in factory decode in it; a custom `connectionFactory` connection may not. Code built on the client, such as an ORM, reads it to interpret the returned `Date` objects. The `tx` of [`transaction()`](#transactiontcallback-options) and the handle of [`beginTransactionScope()`](#begintransactionscopeoptions) have it too, and report the zone of their own connection; see [`TimezoneAware`](#timezoneaware).
 
 ```ts
 const db = createClient({ host: "localhost", database: "demodb", user: "dba", timezone: "utc" });
@@ -974,8 +974,8 @@ The `Prepared` methods take `blob()` and `clob()` values, as on the client, and
 The deprecated `beginTransaction()`, `commit()` and `rollback()` of the client do
 not exist on the pool.
 
-`pool.timezone` is the [`timezone`](#clientoptions) option, or `"local"` when it
-was not set, as [`CubridClient.timezone`](#timezone). The `PoolConnection` of
+`pool.timezone` is the configured [`timezone`](#clientoptions) option, or
+`"local"` when it was not set, as [`CubridClient.timezone`](#timezone). The `PoolConnection` of
 `connection()`, the `tx` of `transaction()` and the handle of
 `beginTransactionScope()` report the zone of the connection they lease; see
 [`TimezoneAware`](#timezoneaware).
@@ -1118,7 +1118,7 @@ class CubridTransaction
 }
 ```
 
-`timezone` is the connection's [`timezone`](#connectionlike) when it declares one, otherwise `configuredTimezone` (default `"local"`). The `tx` that `transaction()` passes in is given the client's or pool's setting as `configuredTimezone`.
+`timezone` is the connection's own `timezone` property when that is `"local"` or `"utc"`, as on `NativeCubridAdapter`, otherwise `configuredTimezone` (default `"local"`); see [`TimezoneAware`](#timezoneaware). The `tx` that `transaction()` passes in is given the client's or pool's setting as `configuredTimezone`.
 
 ### Methods
 
@@ -1699,7 +1699,6 @@ Interface that any connection adapter must implement. This is the contract betwe
 
 ```ts
 interface ConnectionLike {
-  readonly timezone?: "local" | "utc";
   connect(): Promise<void>;
   query<T extends QueryResultRow = QueryResultRow>(
     sql: string,
@@ -1731,7 +1730,7 @@ interface ConnectionLike {
 }
 ```
 
-`timezone` is optional: the zone the connection decodes DATE, TIME, TIMESTAMP and DATETIME values in. `NativeCubridAdapter` reports the `timezone` of the config it was given, or `"local"`. A transaction or `PoolConnection` reports it as its own [`timezone`](#timezoneaware), and the client's or pool's setting when it is absent.
+`ConnectionLike` has no `timezone` member. A connection that has a `timezone` property of `"local"` or `"utc"`, as `NativeCubridAdapter` does, is taken to decode dates in that zone, and a transaction or `PoolConnection` on it reports that as its own [`timezone`](#timezoneaware); any other value is ignored.
 
 `destroy` is optional. It must tear the connection down at once, without waiting for the request in flight, make every pending and later call reject, and leave `close()` resolving; it is synchronous and idempotent. `CubridClient.destroy()` calls it, and on a connection without it calls `close()` without waiting. `NativeCubridAdapter` implements it.
 
@@ -2016,9 +2015,9 @@ interface TimezoneAware {
 | Object | `timezone` |
 |--------|------------|
 | `CubridClient`, `CubridPool` | The [`timezone`](#clientoptions) option, or `"local"` when it was not set |
-| The `tx` of `transaction()`, a [`TransactionScope`](#transactionscope), a [`PoolConnection`](#pooloptions-poolstats-and-poolconnection) | The zone of the connection it runs on: [`ConnectionLike.timezone`](#connectionlike), which `NativeCubridAdapter` sets from the option, or the client's or pool's value when a custom connection does not declare one |
+| The `tx` of `transaction()`, a [`TransactionScope`](#transactionscope), a [`PoolConnection`](#pooloptions-poolstats-and-poolconnection) | The zone of the connection it runs on: that connection's `timezone` property when it is `"local"` or `"utc"`, otherwise the client's or pool's value |
 
-The two differ only when a custom `connectionFactory` builds a connection with another zone than the one configured; the transaction then reports what its connection actually decodes in. The value never changes over an object's life.
+`NativeCubridAdapter` has a read-only `timezone`, the zone it decodes in, set from the config it was given. [`ConnectionLike`](#connectionlike) declares no `timezone`, so a custom connection's property of that name is read only when it is `"local"` or `"utc"`; any other value, such as `"Asia/Seoul"`, is ignored. The logging wrapper reads the wrapped connection's property each time. The values differ only when a custom `connectionFactory` builds a connection with another zone than the one configured; the transaction then reports what its connection actually decodes in.
 
 ### QueryParam
 
