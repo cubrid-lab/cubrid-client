@@ -233,7 +233,8 @@ user-implementable interface only object mode is offered.
 
 `readonly timezone: "local" | "utc"`
 ([#292](https://github.com/cubrid-lab/cubrid-client/issues/292)) is an additive
-MINOR change. It reports the `timezone` option in effect, `"local"` when unset, so
+MINOR change. It reports the `timezone` option in effect, `"local"` when unset (for
+a transaction, scope or pool connection, the zone its connection decodes in), so
 code built on the client can interpret the `Date` values it returns. It adds the
 exported interface `TimezoneAware` and the property on `CubridClient`,
 `CubridPool`, `CubridTransaction` and `NativeCubridAdapter`. `CubridTransaction`

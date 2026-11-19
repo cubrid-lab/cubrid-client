@@ -123,7 +123,7 @@ export function assertValidTimezone(timezone: unknown): void {
  * The zone a connection decodes dates in, read duck-typed because
  * `ConnectionLike` declares none: `NativeCubridAdapter` has a `timezone` getter,
  * and a custom connection may have a property of that name meaning anything. Only
- * `"local"` and `"utc"` count; otherwise `configured`.
+ * `"local"` and `"utc"` count; otherwise, or if reading it throws, `configured`.
  */
 export function connectionTimezone(
   connection: object,
@@ -134,7 +134,13 @@ export function connectionTimezone(
   connection: object,
   configured?: "local" | "utc",
 ): "local" | "utc" | undefined {
-  const zone = (connection as { timezone?: unknown }).timezone;
+  let zone: unknown;
+  try {
+    zone = (connection as { timezone?: unknown }).timezone;
+  } catch {
+    // A custom connection's own getter failing says nothing about decoding.
+    return configured;
+  }
   return zone === "utc" || zone === "local" ? zone : configured;
 }
 

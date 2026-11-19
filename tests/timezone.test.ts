@@ -14,7 +14,7 @@ import { CubridClient } from "../src/client/client.js";
 import { createClient } from "../src/client/create-client.js";
 import { CubridPool, createPool } from "../src/client/pool.js";
 import { CubridTransaction } from "../src/client/transaction.js";
-import { normalizeConfig } from "../src/internals/normalize-config.js";
+import { connectionTimezone, normalizeConfig } from "../src/internals/normalize-config.js";
 import { PacketReader } from "../src/protocol/packet-reader.js";
 import { encodePreparedParams, formatValue, interpolateParams } from "../src/protocol/protocol.js";
 import type { ClientConfig, ClientOptions, ConnectionLike } from "../src/types/client.js";
@@ -642,4 +642,14 @@ test("#292: timezone is read-only", () => {
     (client as { timezone: string }).timezone = "local";
   }, TypeError);
   assert.equal(client.timezone, "utc");
+});
+
+test("a connection whose timezone getter throws reports the configured zone (#292)", () => {
+  const throwing = {
+    get timezone(): string {
+      throw new Error("boom");
+    },
+  };
+  assert.equal(connectionTimezone(throwing, "utc"), "utc");
+  assert.equal(connectionTimezone(throwing), undefined);
 });
