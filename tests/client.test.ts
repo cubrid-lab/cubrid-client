@@ -1837,6 +1837,7 @@ test("mapError keeps classified codes without a subclass as a plain QueryError",
     [-494, "semantic"],
     [-4, "interrupted"],
     [-111, "connection-lost"],
+    [-224, "connection-lost"],
     [-171, "authentication"],
     [-165, "authentication"],
   ] as const) {

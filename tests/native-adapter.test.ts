@@ -11,6 +11,7 @@ import { ConnectionError } from "../src/errors/connection-error.js";
 import { ConstraintError, DeadlockError, QueryError } from "../src/errors/query-error.js";
 import { ReadTimeoutError } from "../src/errors/read-timeout-error.js";
 import { TransactionError } from "../src/errors/transaction-error.js";
+import { SESSION_STATE, type SessionState } from "../src/internals/session-state.js";
 import { CASFunctionCode, EndTranType } from "../src/protocol/constants.js";
 import { writePrepareAndExecute } from "../src/protocol/protocol.js";
 import type {
@@ -2741,6 +2742,50 @@ test("only the server's -72 inside a transaction blocks what follows", async () 
   fakeCAS.queueResponse(buildServerErrorResponse(-72));
   await assert.rejects(adapter.query("INSERT INTO t VALUES (6)"), DeadlockError);
   await assertLaterStatementIsNotSent(adapter, fakeCAS);
+});
+
+// A live 11.4 CAS answered every request after `cubrid server restart`, the
+// ROLLBACK included, with -224 until the transaction ended (#306).
+test("a database server restart mid-transaction rejects transaction() as connection-lost", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS();
+  const client = new CubridClient(DEFAULT_CONFIG, () => adapter);
+  fakeCAS.queueResponse(buildDMLResponse(20, 1));
+  fakeCAS.queueResponse(buildSimpleResponse(0));
+  fakeCAS.queueResponse(buildServerErrorResponse(-224));
+  fakeCAS.queueResponse(buildServerErrorResponse(-224));
+
+  await assert.rejects(
+    client.transaction(async (tx) => {
+      await tx.query("INSERT INTO t VALUES ('a')");
+      await tx.query("INSERT INTO t VALUES ('b')");
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof TransactionError);
+      assert.equal(error.code, -224);
+      assert.equal(error.origin, "server");
+      assert.equal(error.kind, "connection-lost");
+      // Every request has its reply, so nothing is in doubt.
+      assert.equal(error.outcomeUnknown, false);
+      return true;
+    },
+  );
+
+  assert.deepEqual(endTranTypes(fakeCAS), [EndTranType.ROLLBACK]);
+});
+
+test("after -224 the rollback fails too, so a pool does not reuse the connection", async () => {
+  const { adapter, fakeCAS } = await beginWithOneInsert();
+  fakeCAS.queueResponse(buildServerErrorResponse(-224));
+  await assert.rejects(adapter.query("INSERT INTO t VALUES ('b')"), (error: unknown) => {
+    assert.ok(error instanceof QueryError);
+    assert.equal(error.kind, "connection-lost");
+    return true;
+  });
+  fakeCAS.queueResponse(buildServerErrorResponse(-224));
+  await assert.rejects(adapter.rollback(), TransactionError);
+
+  const state = (adapter as unknown as { [SESSION_STATE](): SessionState })[SESSION_STATE]();
+  assert.equal(state.inTransaction, true);
 });
 
 // ---------------------------------------------------------------------------

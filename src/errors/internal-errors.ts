@@ -18,6 +18,9 @@ const SERVER_ERROR_KINDS: ReadonlyMap<number, CubridErrorKind> = new Map([
   [-74, "lock-timeout"], // ER_LK_OBJECT_TIMEOUT_CLASS_MSG: waiting on a table lock.
   [-75, "lock-timeout"], // ER_LK_OBJECT_TIMEOUT_CLASSOF_MSG: waiting on a row lock.
   [-111, "connection-lost"], // ER_TM_SERVER_DOWN_UNILATERALLY_ABORTED: cub_server died.
+  // ER_OBJ_NO_CONNECT: the CAS lost cub_server to a restart, and the transaction
+  // with it. Reported by a live 11.4 server after `cubrid server restart` (#306).
+  [-224, "connection-lost"],
   [-165, "authentication"], // ER_AU_INVALID_USER
   [-171, "authentication"], // ER_AU_INVALID_PASSWORD
   [-493, "syntax"], // ER_PT_SYNTAX, also used for an unknown table.

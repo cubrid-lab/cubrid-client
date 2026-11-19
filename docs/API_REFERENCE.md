@@ -920,7 +920,10 @@ These methods have the signatures, options and errors of the
   rejects with a [`ConnectionError`](#connectionerror) of `kind` `pool-timeout`,
   `pool-full` or `pool-closed`, or with the failure to open the connection opened
   for that caller; `beginTransactionScope()` wraps it in a `TransactionError` that
-  keeps the `kind`, as it does every failure to begin.
+  keeps the `kind`, as it does every failure to begin. An idle connection whose
+  CAS has gone is reopened by the statement itself, so a failure to reopen it
+  rejects as that statement, for example with a `QueryError`, with the same
+  `kind`; see [Error details](#error-details).
 - A query awaited inside a `stream()` loop runs on another connection, or waits
   for one, instead of being refused with `stream-busy`. With `max: 1` it waits
   until `acquireTimeoutMs`.
@@ -1387,6 +1390,7 @@ try {
 | `interrupted` | `-4` | The server stopped the statement, for example with `cubrid killtran` |
 | `authentication` | `-165`, `-171` | Unknown user, wrong password |
 | `connection-lost` | `-111` | `cub_server` died, taking the transaction with it |
+| `connection-lost` | `-224` | The database server restarted while a transaction was open, taking the transaction with it (observed on 11.4). The CAS answers every later request of that transaction, `COMMIT` and `ROLLBACK` included, with `-224`, so nothing of it is committed. Outside a transaction the CAS reconnects on its own and the next statement succeeds |
 
 Failures detected by the client have a `kind` but no `code` or `origin`:
 
@@ -1398,6 +1402,10 @@ Failures detected by the client have a `kind` but no `code` or `origin`:
 | `pool-timeout` | A [`CubridPool`](#cubridpool) caller waited `acquireTimeoutMs` for a connection. Nothing was sent |
 | `pool-full` | A pool already had `maxWaitingClients` callers waiting. Nothing was sent |
 | `pool-closed` | The pool was closed before a connection could be lent. Nothing was sent |
+
+The two `connection-lost` server codes come with a reply, so `outcomeUnknown` is `false`: the server rolled the transaction back, that statement included, and nothing of it is committed. Retry the whole transaction once the server is back. After `-224` the `ROLLBACK` fails with `-224` too, so a [`CubridPool`](#cubridpool) closes that connection instead of lending it again.
+
+**Test `kind`, not the class, to tell why something failed.** The class says which call failed, and the same cause can reach different calls. When a [`CubridPool`](#cubridpool) cannot reach the broker, a `query()` that runs on an idle connection reconnects inside the statement and rejects with a `QueryError`, while one that needs a new connection rejects with a `ConnectionError` because opening it failed. Both have `kind: "connection-lost"`. In 1.x the class of each call's rejection is kept as it is, so that existing `instanceof` checks keep working.
 
 After any `deadlock`, roll back and retry the transaction from its start.
 
