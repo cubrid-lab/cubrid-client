@@ -39,6 +39,7 @@ import type {
   ResultTransactionClient,
   Streamable,
   StreamOptions,
+  TimezoneAware,
   TransactionCallback,
   TransactionOptions,
   TransactionScope,
@@ -238,7 +239,12 @@ class PoolStatements implements PoolConnection {
   constructor(
     private readonly run: Runner,
     private readonly openStream: StreamOpener,
+    private readonly zone: () => "local" | "utc",
   ) {}
+
+  get timezone(): "local" | "utc" {
+    return this.zone();
+  }
 
   /**
    * A method that renders SQL literals refuses blob() and clob() before it
@@ -506,7 +512,14 @@ function leasedConnection(lease: Lease): ConnectionLike {
  * Otherwise it is closed. See `docs/API_REFERENCE.md` and ADR 0008.
  */
 export class CubridPool
-  implements Queryable, ResultQueryable, Executable, PreparedQueryable, BatchExecutable, Streamable
+  implements
+    Queryable,
+    ResultQueryable,
+    Executable,
+    PreparedQueryable,
+    BatchExecutable,
+    Streamable,
+    TimezoneAware
 {
   private closed = false;
   /** Everything close() waits for but callbacks; started by the first close(). */
@@ -550,8 +563,18 @@ export class CubridPool
     this.statements = new PoolStatements(
       (options, failureMessage, run) => this.runStatement(options, failureMessage, run),
       (sql, params, options) => this.streamOnLease(sql, params, options),
+      () => this.timezone,
     );
     this.fillMin();
+  }
+
+  /**
+   * The zone DATE, TIME, TIMESTAMP and DATETIME values are decoded in: the
+   * `timezone` option, or `"local"` when it was not set. Every connection the
+   * pool opens gets this setting. See `ClientOptions.timezone`.
+   */
+  get timezone(): "local" | "utc" {
+    return this.config.timezone ?? "local";
   }
 
   /**
@@ -722,6 +745,8 @@ export class CubridPool
         }
         yield* streamRows<R>(async () => lease.connection, sql, params, streamOptions);
       },
+      // The leased connection's own zone, as for a transaction.
+      () => lease.connection.timezone ?? this.timezone,
     );
 
     try {
@@ -742,7 +767,8 @@ export class CubridPool
         ResultTransactionClient &
         ExecutableTransactionClient &
         PreparedTransactionClient &
-        BatchTransactionClient
+        BatchTransactionClient &
+        TimezoneAware
     >,
     options?: TransactionOptions,
   ): Promise<T> {
@@ -948,6 +974,7 @@ export class CubridPool
 
   private sourceFor(kind: "transaction" | "scope", slot: LeaseSlot = {}): ConnectionSource {
     return {
+      timezone: this.timezone,
       open: async () => {
         slot.lease = await this.acquire(kind);
         return slot.lease.connection;

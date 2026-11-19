@@ -10,6 +10,7 @@ import type {
   ResultQueryable,
   Streamable,
   StreamOptions,
+  TimezoneAware,
 } from "./client.js";
 import type { PreparedQueryParam } from "./lob.js";
 import type { QueryParams } from "./query.js";
@@ -95,7 +96,8 @@ export interface PoolConnection
     Executable,
     PreparedQueryable,
     BatchExecutable,
-    Streamable {
+    Streamable,
+    TimezoneAware {
   query<T extends readonly unknown[] = unknown[]>(
     sql: string,
     params: QueryParams | undefined,

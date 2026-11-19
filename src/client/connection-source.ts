@@ -12,6 +12,7 @@ import type {
   ExecutableTransactionClient,
   PreparedTransactionClient,
   ResultTransactionClient,
+  TimezoneAware,
   TransactionCallback,
   TransactionOptions,
   TransactionScope,
@@ -33,6 +34,8 @@ export type ConnectionVerdict = "reuse" | "in-transaction" | "error";
  * closes it, the pool leases one and releases or destroys it.
  */
 export interface ConnectionSource {
+  /** The configured timezone, reported by a transaction whose connection does not declare one. */
+  readonly timezone: "local" | "utc";
   open(): Promise<ConnectionLike>;
   /** Applies the configured, then the per-call, transaction settings. */
   applyOptions(connection: ConnectionLike, options: TransactionOptions | undefined): Promise<void>;
@@ -62,6 +65,7 @@ export async function applyTransactionOptions(
 /** The client's source: a new connection per transaction, closed at its end. */
 export function factorySource(config: ClientConfig, factory: ConnectionFactory): ConnectionSource {
   return {
+    timezone: config.timezone ?? "local",
     open: async () => factory(config),
     applyOptions: (connection, options) =>
       applyTransactionOptions(connection, {
@@ -76,7 +80,8 @@ export type TransactionHandle = ArrayRowQueryable &
   ResultTransactionClient &
   ExecutableTransactionClient &
   PreparedTransactionClient &
-  BatchTransactionClient;
+  BatchTransactionClient &
+  TimezoneAware;
 
 /**
  * The body of `transaction()`: begin, run the callback, commit or roll back,
@@ -97,7 +102,7 @@ export async function runTransaction<T>(
   try {
     await source.applyOptions(connection, options);
     await connection.beginTransaction();
-    transaction = new CallbackTransaction(connection);
+    transaction = new CallbackTransaction(connection, source.timezone);
     const result = await callback(transaction);
     await transaction.finish();
     return result;

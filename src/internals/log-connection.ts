@@ -149,6 +149,7 @@ export function withLogging(factory: ConnectionFactory, logger: unknown): Connec
     });
 
     const wrapped: ConnectionLike = {
+      ...(inner.timezone !== undefined && { timezone: inner.timezone }),
       connect: () => timed("connect", {}, () => inner.connect()),
       query: <T extends QueryResultRow = QueryResultRow>(
         sql: string,

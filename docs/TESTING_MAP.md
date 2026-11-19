@@ -181,7 +181,7 @@ are the section comments in each file.
 | outcomeUnknown | `outcome-unknown.test.ts` | `Integration: outcomeUnknown on uncertain outcomes (#254)` |
 | rowMode | `row-mode.test.ts` (options and typings); `protocol.test.ts`: row shape (#255); `native-adapter.test.ts`: rowMode "array" | `Integration: rowMode "array" keeps every column (#255)` |
 | Charset | `protocol-oracles.test.ts`: text charsets (#238); `native-adapter.test.ts`: the charset option (#238) | `text charsets (#238)` (needs `CUBRID_TEST_UTF8_DATABASE`) |
-| Dates, times and zones | `timezone.test.ts`; `protocol-oracles.test.ts`: timezone-aware values and JSON (#111) | `zero dates`, `years 1 to 99`, `timezone-aware values and JSON`, `Integration: temporal values under TZ=… (#250)`, `Integration: a Date written to a zone-aware column (#273)` |
+| Dates, times and zones | `timezone.test.ts`, including the `timezone` property (#292); `protocol-oracles.test.ts`: timezone-aware values and JSON (#111) | `zero dates`, `years 1 to 99`, `timezone-aware values and JSON`, `Integration: temporal values under TZ=… (#250)`, `Integration: a Date written to a zone-aware column (#273)` |
 | Collections | `protocol-oracles.test.ts`: collections (#82) | `collection columns` |
 | Schema introspection | `schema.test.ts` | `schema introspection` |
 | Logging | `logger.test.ts` | none |

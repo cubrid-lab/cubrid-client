@@ -40,6 +40,7 @@ Complete reference for every public export of `cubrid-client`.
   - [TransactionClient](#transactionclient-interface)
   - [TransactionCallback](#transactioncallback)
   - [ResultTransactionClient](#resulttransactionclient)
+  - [TimezoneAware](#timezoneaware)
   - [QueryParam](#queryparam)
   - [QueryParams](#queryparams)
   - [zoned() and ZonedParam](#zoned-and-zonedparam)
@@ -116,6 +117,22 @@ class CubridClient implements Queryable, Executable
 
 - **Non-transactional queries** reuse a single shared connection (created lazily on first use).
 - **Transactions** allocate a dedicated isolated connection via the `connectionFactory`, ensuring transaction isolation. The isolated connection is closed automatically when the transaction completes.
+
+### Properties
+
+#### `timezone`
+
+```ts
+readonly timezone: "local" | "utc"
+```
+
+The zone DATE, TIME, TIMESTAMP and DATETIME values are decoded in: the [`timezone`](#clientoptions) option, or `"local"` when it was not set. Every connection the client opens is given this setting. Code built on the client, such as an ORM, reads it to interpret the returned `Date` objects. The `tx` of [`transaction()`](#transactiontcallback-options) and the handle of [`beginTransactionScope()`](#begintransactionscopeoptions) have it too, and report the zone of their own connection; see [`TimezoneAware`](#timezoneaware).
+
+```ts
+const db = createClient({ host: "localhost", database: "demodb", user: "dba", timezone: "utc" });
+db.timezone; // "utc"
+await db.transaction(async (tx) => tx.timezone); // "utc"
+```
 
 ### Methods
 
@@ -542,6 +559,8 @@ async transaction<T>(
 ): Promise<T>
 ```
 
+The `tx` is also [`TimezoneAware`](#timezoneaware): `tx.timezone` reports the zone its connection decodes dates in.
+
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `callback` | [`TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient>`](#transactioncallback) | Async function receiving a [`ResultTransactionClient`](#resulttransactionclient) (a [`TransactionClient`](#transactionclient-interface) that also has `queryResult()`) that is also an [`ExecutableTransactionClient`](#executabletransactionclient) (it also has `execute()`). A callback written against `TransactionClient` is still accepted. |
@@ -683,6 +702,7 @@ try {
 - `commit()` first waits for statements of `tx` still running. If a statement of the scope failed and nothing [observed](#observed-and-unobserved-statement-failures) its promise, whenever it failed, or the COMMIT itself is refused, it rolls back instead and rejects with a `TransactionError`; `rollbackError` and `closeError` are set when those also failed (a `ReadTimeoutError` is passed on unchanged, without them). A failure the caller awaited or otherwise observed is the caller's to handle and does not stop the commit. A connection that fails to close after a successful commit does not turn the commit into a failure, unlike `transaction()`, which rejects with the close error.
 - [`close()`](#close) discards every scope that was not ended: it closes the scope's connection, without waiting for its statements still running, and the server rolls back the uncommitted work. Such a statement fails with a connection error, and later calls on `tx` reject with `Transaction was discarded because the client was closed.`
 - A failed BEGIN closes the new connection and rejects with `Failed to begin transaction.`; no handle is returned.
+- `tx.timezone` reports the zone its connection decodes dates in, as on the `transaction()` callback's `tx`; see [`TimezoneAware`](#timezoneaware).
 
 **Throws:** `RangeError` for invalid options, [`TransactionError`](#transactionerror) on failure.
 
@@ -906,7 +926,14 @@ await pool.close();
 
 ```ts
 class CubridPool
-  implements Queryable, ResultQueryable, Executable, PreparedQueryable, BatchExecutable, Streamable
+  implements
+    Queryable,
+    ResultQueryable,
+    Executable,
+    PreparedQueryable,
+    BatchExecutable,
+    Streamable,
+    TimezoneAware
 ```
 
 ### Leases
@@ -946,6 +973,12 @@ The `Prepared` methods take `blob()` and `clob()` values, as on the client, and
 
 The deprecated `beginTransaction()`, `commit()` and `rollback()` of the client do
 not exist on the pool.
+
+`pool.timezone` is the [`timezone`](#clientoptions) option, or `"local"` when it
+was not set, as [`CubridClient.timezone`](#timezone). The `PoolConnection` of
+`connection()`, the `tx` of `transaction()` and the handle of
+`beginTransactionScope()` report the zone of the connection they lease; see
+[`TimezoneAware`](#timezoneaware).
 
 Callers are served in arrival order. A connection released while callers wait goes
 straight to the first of them, so a caller arriving later cannot take it first. A
@@ -1075,8 +1108,17 @@ The exported constructor stays available in 1.x for compatibility. An instance y
 
 ```ts
 class CubridTransaction
-  implements ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient
+  implements
+    ResultTransactionClient,
+    ExecutableTransactionClient,
+    PreparedTransactionClient,
+    TimezoneAware {
+  constructor(connection: ConnectionLike, configuredTimezone?: "local" | "utc");
+  readonly timezone: "local" | "utc";
+}
 ```
+
+`timezone` is the connection's [`timezone`](#connectionlike) when it declares one, otherwise `configuredTimezone` (default `"local"`). The `tx` that `transaction()` passes in is given the client's or pool's setting as `configuredTimezone`.
 
 ### Methods
 
@@ -1657,6 +1699,7 @@ Interface that any connection adapter must implement. This is the contract betwe
 
 ```ts
 interface ConnectionLike {
+  readonly timezone?: "local" | "utc";
   connect(): Promise<void>;
   query<T extends QueryResultRow = QueryResultRow>(
     sql: string,
@@ -1687,6 +1730,8 @@ interface ConnectionLike {
   destroy?(): void;
 }
 ```
+
+`timezone` is optional: the zone the connection decodes DATE, TIME, TIMESTAMP and DATETIME values in. `NativeCubridAdapter` reports the `timezone` of the config it was given, or `"local"`. A transaction or `PoolConnection` reports it as its own [`timezone`](#timezoneaware), and the client's or pool's setting when it is absent.
 
 `destroy` is optional. It must tear the connection down at once, without waiting for the request in flight, make every pending and later call reject, and leave `close()` resolving; it is synchronous and idempotent. `CubridClient.destroy()` calls it, and on a connection without it calls `close()` without waiting. `NativeCubridAdapter` implements it.
 
@@ -1954,8 +1999,26 @@ interface TransactionScope
   extends ResultTransactionClient,
     ExecutableTransactionClient,
     PreparedTransactionClient,
-    BatchTransactionClient {}
+    BatchTransactionClient,
+    TimezoneAware {}
 ```
+
+### TimezoneAware
+
+An object that reports the zone DATE, TIME, TIMESTAMP and DATETIME values are decoded in, so code built on the client can interpret the returned `Date` objects.
+
+```ts
+interface TimezoneAware {
+  readonly timezone: "local" | "utc";
+}
+```
+
+| Object | `timezone` |
+|--------|------------|
+| `CubridClient`, `CubridPool` | The [`timezone`](#clientoptions) option, or `"local"` when it was not set |
+| The `tx` of `transaction()`, a [`TransactionScope`](#transactionscope), a [`PoolConnection`](#pooloptions-poolstats-and-poolconnection) | The zone of the connection it runs on: [`ConnectionLike.timezone`](#connectionlike), which `NativeCubridAdapter` sets from the option, or the client's or pool's value when a custom connection does not declare one |
+
+The two differ only when a custom `connectionFactory` builds a connection with another zone than the one configured; the transaction then reports what its connection actually decodes in. The value never changes over an object's life.
 
 ### QueryParam
 
@@ -2266,7 +2329,8 @@ interface PoolConnection
     Executable,
     PreparedQueryable,
     BatchExecutable,
-    Streamable {
+    Streamable,
+    TimezoneAware {
   // Plus, before each inherited signature, the overload of
   // query, queryResult, queryPrepared, queryResultPrepared and stream
   // that takes rowMode: "array" (see "Array rows").

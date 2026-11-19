@@ -553,6 +553,15 @@ interface ExecuteManyResult {
 interface BatchExecutable {
     executeMany(sql: string, paramSets: readonly QueryParams[], options?: QueryOptions): Promise<ExecuteManyResult>;
 }
+/**
+ * Reports the zone DATE, TIME, TIMESTAMP and DATETIME values are decoded in,
+ * so code built on this client can interpret the returned `Date` objects. The
+ * effective value: `"local"` when {@link ClientOptions.timezone} was not set.
+ */
+interface TimezoneAware {
+    /** See {@link ClientOptions.timezone}. */
+    readonly timezone: "local" | "utc";
+}
 interface TransactionClient extends Queryable {
     commit(): Promise<void>;
     rollback(): Promise<void>;
@@ -599,7 +608,7 @@ interface BatchTransactionClient extends TransactionClient, BatchExecutable {
  * This describes a value the client returns. Members may be added to it in a
  * minor release, so do not implement it in your own classes.
  */
-interface TransactionScope extends ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient, BatchTransactionClient {
+interface TransactionScope extends ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient, BatchTransactionClient, TimezoneAware {
     query<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayRowOptions): Promise<T[]>;
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
     queryResult<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayRowOptions): Promise<ArrayQueryResult<T>>;
@@ -610,6 +619,13 @@ interface TransactionScope extends ResultTransactionClient, ExecutableTransactio
     queryResultPrepared<T extends QueryResultRow = QueryResultRow>(sql: string, params?: readonly PreparedQueryParam[], options?: QueryOptions): Promise<QueryResult<T>>;
 }
 interface ConnectionLike {
+    /**
+     * The zone this connection decodes DATE, TIME, TIMESTAMP and DATETIME values
+     * in. Optional so 1.x connection factories keep compiling: when it is absent,
+     * a transaction or pool connection on it reports the configured
+     * {@link ClientOptions.timezone} as its `timezone`.
+     */
+    readonly timezone?: "local" | "utc" | undefined;
     connect(): Promise<void>;
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
     /**
@@ -759,6 +775,8 @@ declare class NativeCubridAdapter implements DriverAdapter {
     /** See ClientOptions.charset. */
     private readonly charset;
     constructor(config: ClientConfig);
+    /** The zone DATE, TIME, TIMESTAMP and DATETIME values are decoded in: `timezone`, or `"local"`. */
+    get timezone(): "local" | "utc";
     connect(): Promise<void>;
     /**
      * See {@link QueryOptions} for `signal` and a per-statement `readTimeout`, and
@@ -922,6 +940,21 @@ declare class NativeCubridAdapter implements DriverAdapter {
      * ExecuteResult for when `lastInsertId` is set.
      */
     private readExecuteResult;
+    /**
+     * The key of an INSERT whose GET_GENERATED_KEYS reply listed its rows without
+     * naming a key column, which CUBRID 11.x does after a table's OIDs are reused
+     * (see parseGeneratedKeysReply(), #297). The reply still proves the statement
+     * generated a key, so the session's last insert id, read before COMMIT on the
+     * same session, is the first key it generated, when nothing else in it can have
+     * drawn one first: the SQL must be plainInsertTarget() (no routine call, no ON
+     * DUPLICATE KEY UPDATE; 11.x refuses a triggered INSERT with generatedKeys) and
+     * its table must have exactly one AUTO_INCREMENT column, read from the columns
+     * PREPARE reports for `SELECT * FROM` it, each reported as that table's (not,
+     * say, a view's base table). Anything else, a refused PREPARE included (no
+     * SELECT privilege, say), reports no key: never a guess (#247). A server abort
+     * (-72) fails the statement instead, and a damaged reply drops the session.
+     */
+    private readKeylessKey;
     /**
      * Sends one statement and hands its decoded reply to `use` while the handle
      * is open.
@@ -1143,7 +1176,7 @@ interface SchemaIndex {
     columns: SchemaIndexColumn[];
 }
 
-declare class CubridClient implements Queryable, ResultQueryable, Executable, PreparedQueryable, BatchExecutable, Streamable {
+declare class CubridClient implements Queryable, ResultQueryable, Executable, PreparedQueryable, BatchExecutable, Streamable, TimezoneAware {
     private readonly config;
     private readonly connectionFactory;
     private sharedConnectionPromise;
@@ -1181,6 +1214,12 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
     /** Resolves when destroy() runs, which ends the wait of a running close(). */
     private readonly destroyedSignal;
     constructor(config: ClientConfig, connectionFactory: ConnectionFactory);
+    /**
+     * The zone DATE, TIME, TIMESTAMP and DATETIME values are decoded in: the
+     * `timezone` option, or `"local"` when it was not set. Every connection the
+     * client opens gets this setting. See `ClientOptions.timezone`.
+     */
+    get timezone(): "local" | "utc";
     /**
      * Run a statement and return its rows. See {@link QueryOptions} for `signal`
      * and a per-statement `readTimeout`. With `rowMode: "array"` each row is an
@@ -1237,7 +1276,7 @@ declare class CubridClient implements Queryable, ResultQueryable, Executable, Pr
      * `Streamable` or `ConnectionLike` stays callable. Never chosen by a direct call.
      */
     stream<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: StreamOptions): AsyncIterable<T>;
-    transaction<T>(callback: TransactionCallback<T, ArrayRowQueryable & ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient & BatchTransactionClient>, options?: TransactionOptions): Promise<T>;
+    transaction<T>(callback: TransactionCallback<T, ArrayRowQueryable & ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient & BatchTransactionClient & TimezoneAware>, options?: TransactionOptions): Promise<T>;
     /**
      * Start a manual transaction on its own connection and return the handle that
      * owns it. Statements belong to the transaction only when sent through the
@@ -1419,7 +1458,7 @@ interface PoolStats {
  * This describes a value the pool passes in. Members may be added to it in a
  * minor release, so do not implement it in your own classes.
  */
-interface PoolConnection extends Queryable, ResultQueryable, Executable, PreparedQueryable, BatchExecutable, Streamable {
+interface PoolConnection extends Queryable, ResultQueryable, Executable, PreparedQueryable, BatchExecutable, Streamable, TimezoneAware {
     query<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayRowOptions): Promise<T[]>;
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
     queryResult<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayRowOptions): Promise<ArrayQueryResult<T>>;
@@ -1454,7 +1493,7 @@ declare function createPool(options: PoolOptions): CubridPool;
  * with an unknown outcome and no transaction settings other than the pool's.
  * Otherwise it is closed. See `docs/API_REFERENCE.md` and ADR 0008.
  */
-declare class CubridPool implements Queryable, ResultQueryable, Executable, PreparedQueryable, BatchExecutable, Streamable {
+declare class CubridPool implements Queryable, ResultQueryable, Executable, PreparedQueryable, BatchExecutable, Streamable, TimezoneAware {
     private closed;
     /** Everything close() waits for but callbacks; started by the first close(). */
     private draining;
@@ -1485,6 +1524,12 @@ declare class CubridPool implements Queryable, ResultQueryable, Executable, Prep
     private readonly settings;
     /** Same as {@link createPool}. */
     constructor(options: PoolOptions);
+    /**
+     * The zone DATE, TIME, TIMESTAMP and DATETIME values are decoded in: the
+     * `timezone` option, or `"local"` when it was not set. Every connection the
+     * pool opens gets this setting. See `ClientOptions.timezone`.
+     */
+    get timezone(): "local" | "utc";
     /**
      * Run a statement on a leased connection and return its rows. See
      * {@link QueryOptions}, and {@link ArrayRowOptions} for `rowMode: "array"`.
@@ -1525,7 +1570,7 @@ declare class CubridPool implements Queryable, ResultQueryable, Executable, Prep
      * `transaction()` of the client, on a leased connection. The connection goes
      * back to the pool only when the transaction ended cleanly.
      */
-    transaction<T>(callback: TransactionCallback<T, ArrayRowQueryable & ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient & BatchTransactionClient>, options?: TransactionOptions): Promise<T>;
+    transaction<T>(callback: TransactionCallback<T, ArrayRowQueryable & ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient & BatchTransactionClient & TimezoneAware>, options?: TransactionOptions): Promise<T>;
     /**
      * `beginTransactionScope()` of the client, on a leased connection held until
      * `commit()` or `rollback()`. `close()` discards a scope nobody ended.
@@ -1620,9 +1665,20 @@ declare class CubridPool implements Queryable, ResultQueryable, Executable, Prep
     private endpoint;
 }
 
-declare class CubridTransaction implements ArrayRowQueryable, ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient, BatchTransactionClient {
+declare class CubridTransaction implements ArrayRowQueryable, ResultTransactionClient, ExecutableTransactionClient, PreparedTransactionClient, BatchTransactionClient, TimezoneAware {
     private readonly connection;
-    constructor(connection: ConnectionLike);
+    private readonly configuredTimezone;
+    /**
+     * @param configuredTimezone reported by {@link timezone} when `connection` does not
+     * declare its own, as a custom `connectionFactory` connection may not.
+     */
+    constructor(connection: ConnectionLike, configuredTimezone?: "local" | "utc");
+    /**
+     * The zone this transaction's DATE, TIME, TIMESTAMP and DATETIME values are
+     * decoded in: its connection's, which is the client's `timezone` option, or
+     * `"local"` when that was not set. See `ClientOptions.timezone`.
+     */
+    get timezone(): "local" | "utc";
     query<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayRowOptions): Promise<T[]>;
     query<T extends QueryResultRow = QueryResultRow>(sql: string, params?: QueryParams, options?: QueryOptions): Promise<T[]>;
     queryResult<T extends readonly unknown[] = unknown[]>(sql: string, params: QueryParams | undefined, options: ArrayRowOptions): Promise<ArrayQueryResult<T>>;
@@ -1845,8 +1901,8 @@ declare function parseConnectionString(url: string): ConnectionConfig;
  * doubled: `a]b` becomes `` `a]b` ``. Backticks quote the same way whatever
  * `ansi_quotes` and `no_backslash_escapes` are set to.
  *
- * CUBRID 11.4 refuses `[` and `]` in any identifier, so the server rejects such
- * a name there; CUBRID 10.2 accepts it.
+ * CUBRID 11.2 and later refuse `[` and `]` in any identifier, so the server
+ * rejects such a name there; CUBRID 10.2 and 11.0 accept it.
  */
 declare function escapeIdentifier(name: string): string;
 /**
@@ -1859,4 +1915,4 @@ declare function buildWhere(conditions: Record<string, unknown>): {
     params: unknown[];
 };
 
-export { type ArrayQueryResult, type ArrayRowOptions, type ArrayRowQueryable, type ArrayStreamOptions, type BatchExecutable, type BatchTransactionClient, type BlobSource, type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type ClobSource, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridPool, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteManyFailure, type ExecuteManyResult, type ExecuteManySetFailure, type ExecuteOptions, type ExecuteResult, type IsolationLevel, type LobParam, LockTimeoutError, NativeCubridAdapter, type PoolConnection, type PoolConnectionOptions, type PoolOptions, type PoolStats, type PreparedQueryParam, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryOptions, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type StreamOptions, type Streamable, type TransactionCallback, type TransactionClient, TransactionError, type TransactionOptions, type TransactionScope, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, type ZonedParam, blob, buildWhere, clob, createClient, createPool, escapeIdentifier, parseConnectionString, zoned };
+export { type ArrayQueryResult, type ArrayRowOptions, type ArrayRowQueryable, type ArrayStreamOptions, type BatchExecutable, type BatchTransactionClient, type BlobSource, type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type ClobSource, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridPool, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteManyFailure, type ExecuteManyResult, type ExecuteManySetFailure, type ExecuteOptions, type ExecuteResult, type IsolationLevel, type LobParam, LockTimeoutError, NativeCubridAdapter, type PoolConnection, type PoolConnectionOptions, type PoolOptions, type PoolStats, type PreparedQueryParam, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryOptions, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type StreamOptions, type Streamable, type TimezoneAware, type TransactionCallback, type TransactionClient, TransactionError, type TransactionOptions, type TransactionScope, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, type ZonedParam, blob, buildWhere, clob, createClient, createPool, escapeIdentifier, parseConnectionString, zoned };

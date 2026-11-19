@@ -12,10 +12,13 @@ import test from "node:test";
 import { NativeCubridAdapter } from "../src/adapters/native.js";
 import { CubridClient } from "../src/client/client.js";
 import { createClient } from "../src/client/create-client.js";
+import { CubridPool, createPool } from "../src/client/pool.js";
+import { CubridTransaction } from "../src/client/transaction.js";
 import { normalizeConfig } from "../src/internals/normalize-config.js";
 import { PacketReader } from "../src/protocol/packet-reader.js";
 import { encodePreparedParams, formatValue, interpolateParams } from "../src/protocol/protocol.js";
-import type { ClientOptions } from "../src/types/client.js";
+import type { ClientConfig, ClientOptions, ConnectionLike } from "../src/types/client.js";
+import type { QueryResultRow } from "../src/types/result.js";
 import { isZonedParam, zoned } from "../src/types/zoned-param.js";
 import {
   FIXTURE_ZONES,
@@ -456,4 +459,140 @@ test("#281: only a value zoned() made is a zoned parameter, recognized across bu
 test("#281: the package exports zoned()", async () => {
   const entry = await import("../src/index.js");
   assert.equal(entry.zoned, zoned);
+});
+
+// #292: the effective timezone is public on every object that returns dates.
+
+/** A connection that answers without a server and may declare its own zone. */
+class ZoneConnection implements ConnectionLike {
+  constructor(readonly timezone?: "local" | "utc") {}
+  async connect(): Promise<void> {}
+  async query<T extends QueryResultRow = QueryResultRow>(): Promise<T[]> {
+    return [];
+  }
+  async beginTransaction(): Promise<void> {}
+  async commit(): Promise<void> {}
+  async rollback(): Promise<void> {}
+  async close(): Promise<void> {}
+}
+
+/** The built-in adapter, whose zone is what decodes, with no server behind it. */
+class OfflineAdapter extends NativeCubridAdapter {
+  override async connect(): Promise<void> {}
+  override async beginTransaction(): Promise<void> {}
+  override async commit(): Promise<void> {}
+  override async rollback(): Promise<void> {}
+  override async close(): Promise<void> {}
+}
+
+const BASE: ClientOptions = { host: "localhost", database: "demodb", user: "dba" };
+const SETTINGS = [
+  { options: {}, expected: "local" },
+  { options: { timezone: "local" }, expected: "local" },
+  { options: { timezone: "utc" }, expected: "utc" },
+] as const;
+
+/** Every timezone-aware object of a client or pool, in the order they are reached. */
+async function observedZones(db: CubridClient | CubridPool): Promise<string[]> {
+  const zones = [db.timezone];
+  await db.transaction(async (tx) => {
+    zones.push(tx.timezone);
+  });
+  const scope = await db.beginTransactionScope();
+  zones.push(scope.timezone);
+  await scope.rollback();
+  if (db instanceof CubridPool) {
+    await db.connection(async (connection) => {
+      zones.push(connection.timezone);
+    });
+  }
+  return zones;
+}
+
+for (const { options, expected } of SETTINGS) {
+  const label = "timezone" in options ? `timezone: "${options.timezone}"` : "no timezone";
+
+  test(`#292: with ${label}, NativeCubridAdapter reports "${expected}"`, () => {
+    assert.equal(
+      new NativeCubridAdapter(normalizeConfig({ ...BASE, ...options })).timezone,
+      expected,
+    );
+  });
+
+  test(`#292: with ${label}, the client, its transaction and scope report "${expected}"`, async () => {
+    for (const client of [
+      createClient({ ...BASE, ...options, connectionFactory: () => new ZoneConnection() }),
+      new CubridClient(normalizeConfig({ ...BASE, ...options }), () => new ZoneConnection()),
+      createClient({
+        ...BASE,
+        ...options,
+        connectionFactory: (config) => new OfflineAdapter(config),
+      }),
+    ]) {
+      assert.deepEqual(await observedZones(client), [expected, expected, expected]);
+      await client.close();
+    }
+  });
+
+  test(`#292: with ${label}, the pool, its connection, transaction and scope report "${expected}"`, async () => {
+    for (const connectionFactory of [
+      () => new ZoneConnection(),
+      (config: ClientConfig) => new OfflineAdapter(config),
+    ]) {
+      const pool = createPool({ ...BASE, ...options, connectionFactory });
+      assert.deepEqual(await observedZones(pool), [expected, expected, expected, expected]);
+      await pool.close();
+    }
+  });
+}
+
+test("#292: a transaction reports the zone its connection decodes in, not a copy of the option", async () => {
+  // A factory may build its connection with another zone than the one configured.
+  const local = (config: ClientConfig) => new OfflineAdapter({ ...config, timezone: "local" });
+  const client = createClient({ ...BASE, timezone: "utc", connectionFactory: local });
+  assert.deepEqual(await observedZones(client), ["utc", "local", "local"]);
+  await client.close();
+
+  const pool = createPool({ ...BASE, timezone: "utc", connectionFactory: local });
+  assert.deepEqual(await observedZones(pool), ["utc", "local", "local", "local"]);
+  await pool.close();
+
+  const utc = () => new ZoneConnection("utc");
+  const reverse = createClient({ ...BASE, connectionFactory: utc });
+  assert.deepEqual(await observedZones(reverse), ["local", "utc", "utc"]);
+  await reverse.close();
+});
+
+test("#292: the logger's wrapper passes on the zone of the connection it wraps", async () => {
+  const logger = { debug() {}, info() {}, error() {} };
+  for (const declared of ["local", "utc"] as const) {
+    const client = createClient({
+      ...BASE,
+      timezone: declared === "utc" ? "local" : "utc",
+      logger,
+      connectionFactory: () => new ZoneConnection(declared),
+    });
+    const zones = await observedZones(client);
+    assert.deepEqual(zones.slice(1), [declared, declared]);
+    await client.close();
+  }
+});
+
+test("#292: a CubridTransaction built by hand reports its connection's zone, else local", () => {
+  assert.equal(new CubridTransaction(new ZoneConnection()).timezone, "local");
+  assert.equal(new CubridTransaction(new ZoneConnection(), "utc").timezone, "utc");
+  assert.equal(new CubridTransaction(new ZoneConnection("utc")).timezone, "utc");
+  assert.equal(new CubridTransaction(new ZoneConnection("local"), "utc").timezone, "local");
+});
+
+test("#292: timezone is read-only", () => {
+  const client = createClient({
+    ...BASE,
+    timezone: "utc",
+    connectionFactory: () => new ZoneConnection(),
+  });
+  assert.throws(() => {
+    (client as { timezone: string }).timezone = "local";
+  }, TypeError);
+  assert.equal(client.timezone, "utc");
 });

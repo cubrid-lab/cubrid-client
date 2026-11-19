@@ -23,6 +23,7 @@ import type {
   PreparedTransactionClient,
   QueryOptions,
   ResultTransactionClient,
+  TimezoneAware,
 } from "../types/client.js";
 import { LobParamError, type PreparedQueryParam, refuseLobParams } from "../types/lob.js";
 import type { QueryParams } from "../types/query.js";
@@ -35,9 +36,26 @@ export class CubridTransaction
     ResultTransactionClient,
     ExecutableTransactionClient,
     PreparedTransactionClient,
-    BatchTransactionClient
+    BatchTransactionClient,
+    TimezoneAware
 {
-  constructor(private readonly connection: ConnectionLike) {}
+  /**
+   * @param configuredTimezone reported by {@link timezone} when `connection` does not
+   * declare its own, as a custom `connectionFactory` connection may not.
+   */
+  constructor(
+    private readonly connection: ConnectionLike,
+    private readonly configuredTimezone: "local" | "utc" = "local",
+  ) {}
+
+  /**
+   * The zone this transaction's DATE, TIME, TIMESTAMP and DATETIME values are
+   * decoded in: its connection's, which is the client's `timezone` option, or
+   * `"local"` when that was not set. See `ClientOptions.timezone`.
+   */
+  get timezone(): "local" | "utc" {
+    return this.connection.timezone ?? this.configuredTimezone;
+  }
 
   query<T extends readonly unknown[] = unknown[]>(
     sql: string,
@@ -593,7 +611,7 @@ export class ScopedTransaction extends CallbackTransaction {
     private readonly source: ConnectionSource,
     private readonly onEnded: () => void,
   ) {
-    super(ownConnection);
+    super(ownConnection, source.timezone);
     this.outcomeUnknown = unknownOutcomeProbe(ownConnection);
   }
 
