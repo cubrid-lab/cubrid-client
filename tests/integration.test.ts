@@ -4845,6 +4845,53 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       }
     });
 
+    test("a pool reports every key of concurrent INSERTs into tables another session recreated (#297)", async () => {
+      // On 11.x the CAS of a pooled session can still hold a row object of a table
+      // another session dropped; a new table's row that reuses its OID then comes
+      // back from GET_GENERATED_KEYS without its key, 6 to 8 times in 60 here.
+      const ROUNDS = Number(process.env.CUBRID_CONCURRENCY_ROUNDS ?? 5);
+      const INSERTS = 60;
+      const ddl = createClient(TEST_CONFIG);
+      const pool = createPool({ ...TEST_CONFIG, max: 4 });
+      try {
+        for (let round = 0; round < ROUNDS; round++) {
+          for (const table of [A, B]) {
+            await ddl.query(`DROP TABLE IF EXISTS ${table}`);
+            await ddl.query(`CREATE TABLE ${table} (id INT AUTO_INCREMENT PRIMARY KEY, v INT)`);
+          }
+          const tableOf = (i: number) => (i % 2 === 0 ? A : B);
+          const results = await Promise.all(
+            Array.from({ length: INSERTS }, (_, i) =>
+              i % 3 === 0
+                ? pool.execute(`INSERT INTO ${tableOf(i)} (v) VALUES (${i})`, [], KEYS)
+                : pool.executePrepared(`INSERT INTO ${tableOf(i)} (v) VALUES (?)`, [i], KEYS),
+            ),
+          );
+          const ids = new Map<string, number>();
+          for (const table of [A, B]) {
+            const rows = (await ddl.query(`SELECT id, v FROM ${table}`)) as Array<{
+              id: number;
+              v: number;
+            }>;
+            for (const { id, v } of rows) {
+              ids.set(`${table}:${v}`, id);
+            }
+          }
+          results.forEach((result, i) => {
+            assert.equal(result.affectedRows, 1);
+            assert.strictEqual(
+              result.lastInsertId,
+              ids.get(`${tableOf(i)}:${i}`),
+              `round ${round}, INSERT ${i}`,
+            );
+          });
+        }
+      } finally {
+        await pool.close();
+        await ddl.close();
+      }
+    });
+
     test("pool.execute passes generatedKeys on", async () => {
       const pool = createPool({ ...TEST_CONFIG, max: 1 });
       try {

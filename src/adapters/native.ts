@@ -8,7 +8,7 @@
 import { TextDecoder } from "node:util";
 import type { ExecuteManySetFailure } from "../errors/error-details.js";
 import {
-  type CasReplyError,
+  CasReplyError,
   ConnectionLostError,
   ExecuteManyError,
   isServerTransactionAbort,
@@ -70,7 +70,7 @@ import {
   parseExecute,
   parseExecuteArray,
   parseFetch,
-  parseGetGeneratedKeys,
+  parseGeneratedKeysReply,
   parseGetLastInsertId,
   parseLobNew,
   parseLobRead,
@@ -78,6 +78,7 @@ import {
   parsePrepare,
   parsePrepareAndExecute,
   parseSimpleResponse,
+  plainInsertTarget,
   type RowShape,
   readQueryHandle,
   setCell,
@@ -1384,7 +1385,11 @@ export class NativeCubridAdapter implements DriverAdapter {
       if (oneInsert) {
         const { header, payload } = writeGetGeneratedKeys(result.queryHandle, cas.casInfo);
         const reply = await this.exchangeOnSession(cas, generation, header, payload);
-        setInsertId(executed, parseGetGeneratedKeys(reply));
+        const { key, keylessRows } = parseGeneratedKeysReply(reply);
+        setInsertId(
+          executed,
+          key ?? (keylessRows > 0 ? await this.readKeylessKey(cas, sql, generation) : undefined),
+        );
       }
       return executed;
     }
@@ -1414,6 +1419,48 @@ export class NativeCubridAdapter implements DriverAdapter {
       setInsertId(executed, text);
     }
     return executed;
+  }
+
+  /**
+   * The key of an INSERT whose GET_GENERATED_KEYS reply listed its rows without
+   * naming a key column, which CUBRID 11.x does after a table's OIDs are reused
+   * (see parseGeneratedKeysReply(), #297). The reply still proves the statement
+   * generated a key, so the session's last insert id, read before COMMIT on the
+   * same session, is the first key it generated, when nothing else in it can have
+   * drawn one first: the SQL must be plainInsertTarget() (no routine call, no ON
+   * DUPLICATE KEY UPDATE; 11.x refuses a triggered INSERT with generatedKeys) and
+   * its table must have exactly one AUTO_INCREMENT column, read from the columns
+   * PREPARE reports for `SELECT * FROM` it. Anything else, a failed PREPARE
+   * included (no SELECT privilege, say), reports no key: never a guess (#247).
+   */
+  private async readKeylessKey(
+    cas: CASConnection,
+    sql: string,
+    generation: number,
+  ): Promise<string | undefined> {
+    const table = plainInsertTarget(sql);
+    if (table === undefined) {
+      return undefined;
+    }
+    const { header, payload } = writePrepare(`SELECT * FROM ${table}`, cas.casInfo, this.charset);
+    const reply = await this.exchangeOnSession(cas, generation, header, payload);
+    const handle = readQueryHandle(reply);
+    let keyColumns: number;
+    try {
+      keyColumns = parsePrepare(reply, this.charset).columns.filter(
+        (column) => column.isAutoIncrement,
+      ).length;
+    } catch (error) {
+      if (error instanceof CasReplyError) {
+        return undefined;
+      }
+      throw error;
+    } finally {
+      if (handle !== null) {
+        await this.closeQueryHandle(cas, handle, generation);
+      }
+    }
+    return keyColumns === 1 ? this.fetchLastInsertId(cas, generation) : undefined;
   }
 
   /**
