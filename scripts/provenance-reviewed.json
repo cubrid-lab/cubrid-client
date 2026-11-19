@@ -1,0 +1,93 @@
+{
+  "description": "Similarity hits of scripts/check-provenance.mjs that were read by hand (#295, docs/PROVENANCE.md). A hit is accepted when file, field and sha256 match and it is not longer than `tokens`; `where`, `lines` and `upstream` are hints only.",
+  "entries": [
+    {
+      "file": "src/adapters/native.ts",
+      "field": "norm",
+      "tokens": 88,
+      "sha256": "d996ffcd171ec98a8c797cff5173fd9f538863d45ac3a1ad4e2da93141e25309",
+      "where": "import list from ../internals and ../protocol",
+      "lines": "51-100",
+      "upstream": "CUBRID/cubrid src/broker/cas.c:80-124, lexed",
+      "category": "trivial",
+      "reason": "Same shape only: an ES import list ({ a, b, ... }) against a list of identifiers in C. No code is shared."
+    },
+    {
+      "file": "src/protocol/packet-reader.ts",
+      "field": "norm",
+      "tokens": 68,
+      "sha256": "f299c2dc1bb7e4ed3110123abb7a05c32d6511f50318fa81793382c3c1db1657",
+      "where": "PacketReader.parseDatetime()",
+      "lines": "170-177",
+      "upstream": "node-cubrid@11.0.0 src/packets/PacketReader.js:180-188 (_parseDateTime)",
+      "category": "protocol",
+      "reason": "Seven consecutive int16 reads in the wire order of a CAS DATETIME (year, month, day, hour, minute, second, millisecond) with the JavaScript month made zero-based. The layout is the protocol's; the Date is built differently (toDate() with the session timezone, not setUTCFullYear/setUTCHours)."
+    },
+    {
+      "file": "src/protocol/packet-reader.ts",
+      "field": "norm",
+      "tokens": 59,
+      "sha256": "0aaecdee99af48990cb861501420457dc86b64a9311c830627d6dceafcefdcc2",
+      "where": "PacketReader.parseTimestamp()",
+      "lines": "182-188",
+      "upstream": "node-cubrid@11.0.0 src/packets/PacketReader.js:180-187 (_parseDateTime)",
+      "category": "protocol",
+      "reason": "Six int16 reads of a CAS TIMESTAMP in wire order; same reasoning as parseDatetime()."
+    },
+    {
+      "file": "src/protocol/constants.ts",
+      "field": "norm",
+      "tokens": 78,
+      "sha256": "d839a6b47a8eb623d55a2e6bb975c2ec42c95ffacc6a11e8f8b3aedb336a4b80",
+      "where": "enum CASFunctionCode",
+      "lines": "68-87",
+      "upstream": "CUBRID/cubrid-cci src/cci/broker_cas_protocol.h:156-176 (enum t_cas_func_code), lexed",
+      "category": "protocol",
+      "reason": "Same shape only (NAME = number, ...): any enum of numbered names matches. The values are the CAS function codes; the names drop the CAS_FC_ prefix and only the codes the driver sends are listed."
+    },
+    {
+      "file": "src/protocol/constants.ts",
+      "field": "norm",
+      "tokens": 126,
+      "sha256": "b6cfd65e9a011c5ec86a86ed89aa890c582e81377071e09a255ff6f9f861c889",
+      "where": "enum CUBRIDDataType",
+      "lines": "136-167",
+      "upstream": "CUBRID/cubrid-cci src/cci/broker_cas_protocol.h:156-188 (enum t_cas_func_code), lexed",
+      "category": "protocol",
+      "reason": "Same shape only, matched against an unrelated enum (function codes): a list of numbered names. The values are the CCI_U_TYPE wire type codes."
+    },
+    {
+      "file": "src/protocol/constants.ts",
+      "field": "norm",
+      "tokens": 114,
+      "sha256": "b506e3c03a884d99a031f0543d0e519a054e8918f821513597e5b7812ac29631",
+      "where": "enum StatementType",
+      "lines": "179-207",
+      "upstream": "CUBRID/cubrid-cci src/cci/broker_cas_protocol.h:156-185 (enum t_cas_func_code), lexed",
+      "category": "protocol",
+      "reason": "Same shape only, matched against an unrelated enum (function codes). The values are the T_CCI_CUBRID_STMT statement codes."
+    },
+    {
+      "file": "src/protocol/protocol.ts",
+      "field": "norm",
+      "tokens": 58,
+      "sha256": "91414af932964539c35335665cbb1c3a0df83fce8350c6630e2cae417cd9a446",
+      "where": "DATETIME bind value (writeBindValue and the zoned/array bind writers)",
+      "lines": "1483-1488, 1693-1698",
+      "upstream": "CUBRID/cubrid-jdbc src/jdbc/cubrid/jdbc/jci/UOutputBuffer.java:206-211 (addTimestamp), lexed",
+      "category": "protocol",
+      "reason": "A run of writeShort(value.getX()) calls in the wire order of a DATETIME bind value. The order and widths are the protocol's; the date accessors differ (JavaScript Date, not java.time)."
+    },
+    {
+      "file": "src/protocol/protocol.ts",
+      "field": "norm",
+      "tokens": 63,
+      "sha256": "d7e8c759043b7c0a52cb1495a226d373eafdfdd2cb790ac03242fbac040b0e6a",
+      "where": "DATETIMETZ bind value",
+      "lines": "1717-1723",
+      "upstream": "CUBRID/cubrid-jdbc src/jdbc/cubrid/jdbc/jci/UOutputBuffer.java:206-212 (addTimestamp), lexed",
+      "category": "protocol",
+      "reason": "Seven writeShort(value.getUTCX()) calls in DATETIME wire order before the zone name; same reasoning."
+    }
+  ]
+}
