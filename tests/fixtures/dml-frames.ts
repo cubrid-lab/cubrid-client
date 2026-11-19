@@ -127,6 +127,37 @@ export const GENERATED_KEYS_FRAMES = {
   afterUpdate: "fffffffe000000004e6f206572726f72206d65737361676520617661696c61626c652e00",
   /** Asked after CLOSE_REQ_HANDLE: response code -1, CAS error -1006 (CAS_ER_SRV_HANDLE). */
   closedHandle: "fffffffffffffc1200",
+  /**
+   * #297, from 11.4.7.1995: a one-row INSERT into a newly created table, after
+   * another session dropped a table, under a pool of 4. One row (index 1) with
+   * zero columns, so no key, and a nonzero OID: the CAS read the row's class as
+   * a dropped one. The same INSERTs otherwise got `insertOneRow`'s layout.
+   */
+  keylessRow: "0000000015000000010100000000000000010000000100001101000c0000",
+} as const;
+
+/**
+ * #297: PREPARE replies for `SELECT * FROM <table>`, which the generatedKeys
+ * fallback sends to count the table's AUTO_INCREMENT columns, captured as above
+ * from 11.4.7.1995. Column info as in parseColumnMetadata(): the byte after each
+ * column's default value is is_auto_increment.
+ */
+export const KEY_COLUMN_FRAMES = {
+  /** `k_ai (id INT AUTO_INCREMENT PRIMARY KEY, v INT)`: `id` is the one key column. */
+  oneKey:
+    "00000001ffffffff15000000000000000002800800000000000a000000036964000000000100000000096462" +
+    "612e6b5f61690001000000054e554c4c0001010100000000800800000000000a000000027600000000010000" +
+    "0000096462612e6b5f61690000000000054e554c4c0000000000000000",
+  /** `k_two (a INT AUTO_INCREMENT, b INT AUTO_INCREMENT(100, 1), v INT)`. */
+  twoKeys:
+    "00000001ffffffff15000000000000000003800800000000000a00000002610000000001000000000a646261" +
+    "2e6b5f74776f0000000000054e554c4c0001000000000000800800000000000a000000026200000000010000" +
+    "00000a6462612e6b5f74776f0000000000054e554c4c0001000000000000800800000000000a000000027600" +
+    "00000001000000000a6462612e6b5f74776f0000000000054e554c4c0000000000000000",
+  /** A table that does not exist: error -493, "Unknown class". */
+  unknownTable:
+    "fffffffefffffe1353796e7461783a20556e6b6e6f776e20636c61737320226462612e6b5f6d697373696e67" +
+    "222e2073656c656374202a2066726f6d205b6462612e6b5f6d697373696e675d00",
 } as const;
 
 /**

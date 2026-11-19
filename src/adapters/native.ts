@@ -8,7 +8,7 @@
 import { TextDecoder } from "node:util";
 import type { ExecuteManySetFailure } from "../errors/error-details.js";
 import {
-  type CasReplyError,
+  CasReplyError,
   ConnectionLostError,
   ExecuteManyError,
   isServerTransactionAbort,
@@ -62,6 +62,7 @@ import {
   interpolateParams,
   isPlainInsert,
   isSingleInsert,
+  isTableNamed,
   LobLocator,
   MalformedReplyError,
   mayHoldLob,
@@ -70,7 +71,7 @@ import {
   parseExecute,
   parseExecuteArray,
   parseFetch,
-  parseGetGeneratedKeys,
+  parseGeneratedKeysReply,
   parseGetLastInsertId,
   parseLobNew,
   parseLobRead,
@@ -78,6 +79,7 @@ import {
   parsePrepare,
   parsePrepareAndExecute,
   parseSimpleResponse,
+  plainInsertTarget,
   type RowShape,
   readQueryHandle,
   setCell,
@@ -1384,7 +1386,11 @@ export class NativeCubridAdapter implements DriverAdapter {
       if (oneInsert) {
         const { header, payload } = writeGetGeneratedKeys(result.queryHandle, cas.casInfo);
         const reply = await this.exchangeOnSession(cas, generation, header, payload);
-        setInsertId(executed, parseGetGeneratedKeys(reply));
+        const { key, keylessRows } = parseGeneratedKeysReply(reply);
+        setInsertId(
+          executed,
+          key ?? (keylessRows > 0 ? await this.readKeylessKey(cas, sql, generation) : undefined),
+        );
       }
       return executed;
     }
@@ -1414,6 +1420,63 @@ export class NativeCubridAdapter implements DriverAdapter {
       setInsertId(executed, text);
     }
     return executed;
+  }
+
+  /**
+   * The key of an INSERT whose GET_GENERATED_KEYS reply listed its rows without
+   * naming a key column, which CUBRID 11.x does after a table's OIDs are reused
+   * (see parseGeneratedKeysReply(), #297). The reply still proves the statement
+   * generated a key, so the session's last insert id, read before COMMIT on the
+   * same session, is the first key it generated, when nothing else in it can have
+   * drawn one first: the SQL must be plainInsertTarget() (no routine call, no ON
+   * DUPLICATE KEY UPDATE; 11.x refuses a triggered INSERT with generatedKeys) and
+   * its table must have exactly one AUTO_INCREMENT column, read from the columns
+   * PREPARE reports for `SELECT * FROM` it, each reported as that table's (not,
+   * say, a view's base table). Anything else, a refused PREPARE included (no
+   * SELECT privilege, say), reports no key: never a guess (#247). A server abort
+   * (-72) fails the statement instead, and a damaged reply drops the session.
+   */
+  private async readKeylessKey(
+    cas: CASConnection,
+    sql: string,
+    generation: number,
+  ): Promise<string | undefined> {
+    const table = plainInsertTarget(sql);
+    if (table === undefined) {
+      return undefined;
+    }
+    const { header, payload } = writePrepare(`SELECT * FROM ${table}`, cas.casInfo, this.charset);
+    const reply = await this.exchangeOnSession(cas, generation, header, payload);
+    const handle = readQueryHandle(reply);
+    let columns: readonly ColumnMeta[];
+    try {
+      columns = parsePrepare(reply, this.charset).columns;
+    } catch (error) {
+      // A damaged reply may not have ended where its frame said, so nothing more
+      // is sent on this session: the statement's withQueryHandle() drops it.
+      if (error instanceof MalformedReplyError) {
+        throw error;
+      }
+      if (handle !== null) {
+        await this.closeQueryHandle(cas, handle, generation);
+      }
+      // A server abort (-72) rolled the statement back with its transaction, so
+      // it fails like any statement would; only a refused PREPARE means no key.
+      if (error instanceof CasReplyError && !isServerTransactionAbort(error)) {
+        return undefined;
+      }
+      throw error;
+    }
+    if (handle !== null) {
+      await this.closeQueryHandle(cas, handle, generation);
+    }
+    // A view over a table with two AUTO_INCREMENT columns can show only one, so
+    // every column must come from the target table itself.
+    const ownColumns = columns.every((column) =>
+      isTableNamed(table, column.tableName, this.config.user),
+    );
+    const keyColumns = columns.filter((column) => column.isAutoIncrement).length;
+    return ownColumns && keyColumns === 1 ? this.fetchLastInsertId(cas, generation) : undefined;
   }
 
   /**

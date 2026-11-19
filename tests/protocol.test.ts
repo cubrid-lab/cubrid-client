@@ -31,9 +31,11 @@ import {
   interpolateParams,
   isPlainInsert,
   isSingleInsert,
+  isTableNamed,
   MalformedReplyError,
   parseClientInfoExchange,
   parseFetch,
+  parseGeneratedKeysReply,
   parseGetDbVersion,
   parseGetGeneratedKeys,
   parseGetLastInsertId,
@@ -41,6 +43,7 @@ import {
   parsePrepare,
   parsePrepareAndExecute,
   parseSimpleResponse,
+  plainInsertTarget,
   readQueryHandle,
   writeClientInfoExchange,
   writeCloseReqHandle,
@@ -2537,6 +2540,91 @@ test("isPlainInsert accepts only one INSERT whose text cannot call a routine", (
     "INSERT INTO t (v) VALUES ('a\\'); SELECT f(1); --')",
   ]) {
     assert.equal(isPlainInsert(sql), false, sql);
+  }
+});
+
+test("parseGeneratedKeysReply tells rows listed without a key column from no rows (#297)", () => {
+  const read = (hex: string) => parseGeneratedKeysReply(Buffer.from(hex, "hex"));
+
+  // The reply the server sends when its CAS reads a reused OID's dropped class.
+  assert.deepEqual(read(GENERATED_KEYS_FRAMES.keylessRow), { key: undefined, keylessRows: 1 });
+  assert.equal(
+    parseGetGeneratedKeys(Buffer.from(GENERATED_KEYS_FRAMES.keylessRow, "hex")),
+    undefined,
+  );
+
+  assert.deepEqual(read(GENERATED_KEYS_FRAMES.insertOneRow), { key: "1", keylessRows: 0 });
+  assert.deepEqual(read(GENERATED_KEYS_FRAMES.insertThreeRows), { key: "2", keylessRows: 0 });
+  // Nothing generated, or a supplied key: no row at all.
+  assert.deepEqual(read(GENERATED_KEYS_FRAMES.noAutoIncrement), { key: undefined, keylessRows: 0 });
+  assert.deepEqual(read(GENERATED_KEYS_FRAMES.explicitKey), { key: undefined, keylessRows: 0 });
+  // Two key columns are named, so this is not the keyless reply.
+  assert.deepEqual(read(GENERATED_KEYS_FRAMES.twoColumns), { key: undefined, keylessRows: 0 });
+  // A body that does not decode says nothing reliable.
+  const cut = GENERATED_KEYS_FRAMES.keylessRow.slice(0, -2);
+  assert.deepEqual(read(cut), { key: undefined, keylessRows: 0 });
+  assert.throws(() => read(GENERATED_KEYS_FRAMES.closedHandle), CasReplyError);
+});
+
+test("plainInsertTarget names the table of a plain INSERT as written, or nothing", () => {
+  const cases: Array<[string, string | undefined]> = [
+    ["INSERT INTO t (v) VALUES (?)", "t"],
+    ["insert into T values (1), (2)", "T"],
+    ["  INSERT INTO dba.t(a) VALUES(1)", "dba.t"],
+    ["INSERT INTO dba . t (a) VALUES (1)", "dba . t"],
+    [`INSERT INTO "my t" ("a") VALUES ('f(x)')`, `"my t"`],
+    ["INSERT INTO `t` (v) VALUES (1)", "`t`"],
+    ["INSERT INTO [t] (v) VALUES (1)", "[t]"],
+    ["INSERT t (v) VALUES (1)", "t"],
+    ["INSERT INTO into_t (v) VALUES (1)", "into_t"],
+    ["REPLACE INTO t (id, v) VALUES (1, 2)", "t"],
+    ["INSERT INTO t SET a = 1", "t"],
+    ["INSERT INTO t DEFAULT VALUES", "t"],
+    // ON DUPLICATE KEY UPDATE draws a value even when it updates a row instead.
+    ["INSERT INTO t (v) VALUES (1) ON DUPLICATE KEY UPDATE v = v + 1", undefined],
+    ["insert into t (v) values (1) on  duplicate key update v = 2", undefined],
+    // Not isPlainInsert().
+    ["INSERT INTO t (v) VALUES (f())", undefined],
+    ["INSERT INTO t (v) SELECT v FROM s", undefined],
+    ["INSERT INTO t (v) VALUES (1); INSERT INTO u (v) VALUES (2)", undefined],
+    ["UPDATE t SET v = 1", undefined],
+    // A comment or hint before the name, or a quote inside it: not read.
+    ["INSERT /*+ NO_STATS */ INTO t (v) VALUES (1)", undefined],
+    ["/* c */ INSERT INTO t (v) VALUES (1)", undefined],
+    ["INSERT INTO t/* c */(v) VALUES (1)", undefined],
+    [`INSERT INTO "a""b" (v) VALUES (1)`, undefined],
+  ];
+  for (const [sql, expected] of cases) {
+    assert.equal(plainInsertTarget(sql), expected, sql);
+  }
+});
+
+test("isTableNamed matches PREPARE's class name to an INSERT target (#297)", () => {
+  const cases: Array<[string, string, boolean]> = [
+    ["k_ai", "dba.k_ai", true],
+    ["k_ai", "k_ai", true],
+    ["K_AI", "dba.k_ai", true],
+    ["dba.k_ai", "dba.k_ai", true],
+    ["DBA . k_ai", "dba.k_ai", true],
+    [`"K_AI"`, "dba.k_ai", true],
+    ["`k_ai`", "dba.k_ai", true],
+    ["[dba].[k_ai]", "dba.k_ai", true],
+    [`"my t"`, "dba.my t", true],
+    ["dba.k_ai", "k_ai", true],
+    // A view's columns reported as its base table's, another owner, an empty name.
+    ["v_ai", "dba.k_ai", false],
+    ["u1.k_ai", "dba.k_ai", false],
+    ["k_ai", "dba.xk_ai", false],
+    ["k_ai", "", false],
+    // Another owner's table of the same name, a dotted quoted name, three parts.
+    ["v", "bob.v", false],
+    ["t", "a.b.t", false],
+    [`"a.b"`, "a.b", false],
+    ["[a.b]", "a.b", false],
+    ["a.b.t", "a.b.t", false],
+  ];
+  for (const [target, className, expected] of cases) {
+    assert.equal(isTableNamed(target, className, "DBA"), expected, `${target} / ${className}`);
   }
 });
 

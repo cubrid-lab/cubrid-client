@@ -1014,6 +1014,30 @@ export function writeGetGeneratedKeys(
  * throws; a body that does not decode is undefined, see below.
  */
 export function parseGetGeneratedKeys(data: Buffer): string | undefined {
+  return parseGeneratedKeysReply(data).key;
+}
+
+/**
+ * What a GET_GENERATED_KEYS reply holds: the key parseGetGeneratedKeys() reports,
+ * and `keylessRows`, the rows it lists without naming any key column.
+ *
+ * The server lists a row only for an INSERT that generated its AUTO_INCREMENT
+ * value (`is_autoincrement_set` in `qexec_execute_insert` and
+ * `do_insert_template`), and names the row's key columns from the class its CAS
+ * process holds for the row's OID. On CUBRID 11.x that class can be a dropped
+ * table's: when another session drops a table (a DROP by the CAS's own session
+ * does not leave this), the CAS can keep an object of it, and when a new table's
+ * row reuses that OID, `ux_get_generated_keys_server_insert` reads the dropped
+ * class, finds no AUTO_INCREMENT column and sends the row with zero columns and
+ * the row's real OID (a live row of a REUSE_OID table is sent with a zero OID).
+ * JDBC's getGeneratedKeys() gets the same reply. So
+ * `keylessRows > 0` says the statement generated a key the reply cannot name
+ * (#297). It is 0 otherwise, including for a body that does not decode.
+ */
+export function parseGeneratedKeysReply(data: Buffer): {
+  key: string | undefined;
+  keylessRows: number;
+} {
   assertReplySize(data);
   const reader = new PacketReader(data);
   const code = reader.parseInt();
@@ -1038,13 +1062,16 @@ export function parseGetGeneratedKeys(data: Buffer): string | undefined {
     return readGeneratedKeys(reader);
   } catch (error) {
     if (error instanceof MalformedReplyError || error instanceof RangeError) {
-      return undefined;
+      return { key: undefined, keylessRows: 0 };
     }
     throw error;
   }
 }
 
-function readGeneratedKeys(reader: PacketReader): string | undefined {
+function readGeneratedKeys(reader: PacketReader): {
+  key: string | undefined;
+  keylessRows: number;
+} {
   return decodeReply(() => {
     reader.parseByte(); // statement type
     const totalRows = reader.parseInt();
@@ -1085,7 +1112,10 @@ function readGeneratedKeys(reader: PacketReader): string | undefined {
     }
 
     // Two AUTO_INCREMENT columns leave no one value to report.
-    return firstRow.length === 1 ? firstRow[0] : undefined;
+    return {
+      key: firstRow.length === 1 ? firstRow[0] : undefined,
+      keylessRows: columnCount === 0 ? rowCount : 0,
+    };
   });
 }
 
@@ -1831,6 +1861,47 @@ export function isPlainInsert(sql: string): boolean {
 }
 
 /**
+ * The table a plain INSERT or REPLACE writes, exactly as `sql` names it, or
+ * undefined. Only for isPlainInsert() SQL without ON DUPLICATE KEY UPDATE (whose
+ * update of an existing row still draws an AUTO_INCREMENT value), and only when
+ * the name stands right after `INSERT INTO`: a comment or hint before it, or a
+ * quote inside a quoted name, gives undefined. See readKeylessKey() in the
+ * native adapter (#297).
+ */
+export function plainInsertTarget(sql: string): string | undefined {
+  if (
+    !isPlainInsert(sql) ||
+    ALL_LEX_RULES.some((rules) => /\bon\s+duplicate\b/i.test(codeOnly(sql, rules).code))
+  ) {
+    return undefined;
+  }
+  return INSERT_TARGET.exec(sql)?.[1];
+}
+
+/**
+ * Whether `className`, the table PREPARE reports a column of (`owner.table` from
+ * CUBRID 11.2, `table` before), is the table `target` names as plainInsertTarget()
+ * returns it. Quotes are dropped and case is ignored, as the server does. A
+ * target without an owner names a table of `user`, the login user, so another
+ * owner's table of the same name never matches; a class name without an owner
+ * (before 11.2) matches on the table name alone. A quoted part that contains a
+ * dot never matches. readKeylessKey() uses it so a view whose columns come from
+ * another table is never taken for that table (#297).
+ */
+export function isTableNamed(target: string, className: string, user: string): boolean {
+  const parts = Array.from(target.matchAll(TARGET_NAME_PART), ([part]) =>
+    (/^["`[]/.test(part) ? part.slice(1, -1) : part).toLowerCase(),
+  );
+  if (parts.length === 0 || parts.length > 2 || parts.some((part) => part.includes("."))) {
+    return false;
+  }
+  const name = parts.at(-1) as string;
+  const owner = parts.length === 2 ? parts[0] : user.toLowerCase();
+  const actual = className.toLowerCase();
+  return actual === name || actual === `${owner}.${name}`;
+}
+
+/**
  * Whether `sql` is one statement that starts with INSERT or REPLACE under every
  * lexing: the only statements EXECUTE_RETURN_GENERATED_KEYS is sent with, since
  * on 11.x the flag can make an INSERT the server runs on the client side fail.
@@ -1849,6 +1920,13 @@ const INSERT_HEAD = new RegExp(
   "iu",
 );
 const CALL = new RegExp(String.raw`(${SQL_NAME})\s*\(`, "gu");
+/** A name as written: plain, or quoted without the quote character inside. */
+const TARGET_NAME = String.raw`(?:[\p{L}_][\p{L}\p{N}_$#]*|"[^"]+"|\x60[^\x60]+\x60|\[[^\]]+\])`;
+const TARGET_NAME_PART = new RegExp(TARGET_NAME, "gu");
+const INSERT_TARGET = new RegExp(
+  String.raw`^\s*(?:insert|replace)\s+(?:into\s+)?(?!into\b)(${TARGET_NAME}(?:\s*\.\s*${TARGET_NAME})?)(?=[\s(]|$)`,
+  "iu",
+);
 
 /**
  * `sql` with comments blanked, string literals as `0` and quoted identifiers as
