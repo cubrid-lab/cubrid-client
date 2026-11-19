@@ -47,7 +47,7 @@ import type {
   TransactionOptions,
   TransactionScope,
 } from "../types/client.js";
-import { type PreparedQueryParam, refuseLobParams } from "../types/lob.js";
+import { type PreparedQueryParam, refuseLobParams, refuseStreamLobParams } from "../types/lob.js";
 import type {
   PoolConnection,
   PoolConnectionOptions,
@@ -403,7 +403,7 @@ class PoolStatements implements PoolConnection {
     options?: StreamOptions,
   ): AsyncGenerator<unknown, void, undefined> {
     assertValidStreamOptions(options);
-    refuseLobParams(params);
+    refuseStreamLobParams(params);
     return this.openStream(sql, params, options);
   }
 }

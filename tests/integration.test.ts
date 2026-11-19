@@ -9028,6 +9028,89 @@ describe("Integration: stream() in a transaction, and with typed binds (#307)", 
     });
   });
 
+  /** DDL from another session, which an unended read transaction would block. */
+  async function assertTableUnlocked(column: string): Promise<void> {
+    const other = createClient(TEST_CONFIG);
+    try {
+      await other.transaction(async (tx) => {
+        await tx.query("SET TRANSACTION LOCK TIMEOUT 3");
+        await tx.query(`ALTER TABLE ${TABLE} ADD COLUMN ${column} INT`);
+      });
+    } finally {
+      await other.close();
+    }
+  }
+
+  test('binding: "prepared": early break, a server error, an abort, a transaction and a pool lease', async () => {
+    await withTable(async (client) => {
+      const sql = `SELECT id, pad FROM ${TABLE} WHERE id > ? ORDER BY id`;
+
+      // Early break in autocommit: one END_TRAN ends the read, nothing is thrown.
+      for await (const row of client.stream(sql, [0], { binding: "prepared" })) {
+        assert.ok(row);
+        break;
+      }
+      await assertTableUnlocked("p1");
+
+      // A server error. CUBRID 11.4 evaluates this SELECT at EXECUTE, so the error
+      // rejects the first read; a failing FETCH is covered offline.
+      await assert.rejects(async () => {
+        for await (const row of client.stream(
+          `SELECT id, 10 / (id - 500) AS n FROM ${TABLE} WHERE id > ?`,
+          [0],
+          {
+            binding: "prepared",
+          },
+        )) {
+          assert.ok(row);
+        }
+      }, QueryError);
+      assert.equal(await count(client), ROWS);
+      await assertTableUnlocked("p2");
+
+      // An abort while the consumer is away releases the cursor; the session stays usable.
+      const controller = new AbortController();
+      const reason = new Error("stop");
+      const aborted = client.stream(sql, [0], { binding: "prepared", signal: controller.signal });
+      await aborted.next();
+      controller.abort(reason);
+      await assert.rejects(
+        () => aborted.next(),
+        (error) => error === reason,
+      );
+      assert.equal(await count(client), ROWS);
+      await assertTableUnlocked("p3");
+
+      // Inside transaction(): the stream reads the transaction's own uncommitted work.
+      const seen = await client.transaction(async (tx) => {
+        await tx.execute(`DELETE FROM ${TABLE} WHERE id = ?`, [1]);
+        let first: unknown;
+        for await (const row of tx.stream<{ id: number }>(sql, [0], { binding: "prepared" })) {
+          first = row.id;
+          break;
+        }
+        return first;
+      });
+      assert.equal(seen, 2);
+      assert.equal(await count(client), ROWS - 1);
+
+      // A pool lease: the stream holds it, and the session is reused once it closes.
+      const pool = createPool({ ...TEST_CONFIG, max: 1 });
+      try {
+        for await (const row of pool.stream(sql, [0], { binding: "prepared" })) {
+          assert.ok(row);
+          break;
+        }
+        const [after] = await pool.query(`SELECT COUNT(*) AS n FROM ${TABLE}`);
+        assert.equal(Number(after?.n), ROWS - 1);
+        assert.equal(pool.stats().total, 1);
+      } finally {
+        await pool.close();
+      }
+      await assertTableUnlocked("p4");
+    });
+  });
+
   test('binding: "prepared" binds NULL as queryPrepared() does, where a literal NULL differs inside OR', async () => {
     await withTable(async (client) => {
       await client.execute(`UPDATE ${TABLE} SET v = NULL WHERE id = 2`);

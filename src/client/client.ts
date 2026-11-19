@@ -40,7 +40,7 @@ import type {
   TransactionOptions,
   TransactionScope,
 } from "../types/client.js";
-import { type PreparedQueryParam, refuseLobParams } from "../types/lob.js";
+import { type PreparedQueryParam, refuseLobParams, refuseStreamLobParams } from "../types/lob.js";
 import type { QueryParams } from "../types/query.js";
 import type { ArrayQueryResult, QueryResult, QueryResultRow } from "../types/result.js";
 import type {
@@ -384,7 +384,7 @@ export class CubridClient
     options?: StreamOptions,
   ): AsyncGenerator<unknown, void, undefined> {
     assertValidStreamOptions(options);
-    refuseLobParams(params);
+    refuseStreamLobParams(params);
     return streamRows(() => this.getSharedConnection(), sql, params, options);
   }
 

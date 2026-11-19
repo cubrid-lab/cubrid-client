@@ -30,7 +30,12 @@ import type {
   StreamTransactionClient,
   TimezoneAware,
 } from "../types/client.js";
-import { LobParamError, type PreparedQueryParam, refuseLobParams } from "../types/lob.js";
+import {
+  LobParamError,
+  type PreparedQueryParam,
+  refuseLobParams,
+  refuseStreamLobParams,
+} from "../types/lob.js";
 import type { QueryParams } from "../types/query.js";
 import type { ArrayQueryResult, QueryResult, QueryResultRow } from "../types/result.js";
 import type { ConnectionSource, ConnectionVerdict } from "./connection-source.js";
@@ -228,7 +233,7 @@ export class CubridTransaction
     options?: StreamOptions,
   ): AsyncGenerator<unknown, void, undefined> {
     assertValidStreamOptions(options);
-    refuseLobParams(params);
+    refuseStreamLobParams(params);
     return streamRows(
       async () => this.connection,
       sql,
@@ -502,7 +507,7 @@ export class CallbackTransaction extends CubridTransaction {
     options?: StreamOptions,
   ): AsyncGenerator<unknown, void, undefined> {
     assertValidStreamOptions(options);
-    refuseLobParams(params);
+    refuseStreamLobParams(params);
     return this.trackStream(sql, params, options);
   }
 

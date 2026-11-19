@@ -120,6 +120,7 @@ import {
   lobChunks,
   type PreparedQueryParam,
   refuseLobParams,
+  refuseStreamLobParams,
 } from "../types/lob.js";
 import type { QueryParams } from "../types/query.js";
 import type { ArrayQueryResult, ColumnInfo, QueryResult, QueryResultRow } from "../types/result.js";
@@ -416,7 +417,7 @@ export class NativeCubridAdapter implements DriverAdapter {
     // Read once here, so the blob()/clob() refusal stays synchronous and checks
     // the same values that are sent.
     const values = params === undefined ? undefined : Array.from(params);
-    refuseLobParams(values);
+    refuseStreamLobParams(values);
     return this.streamRows(sql, values, options, options?.binding === "prepared");
   }
 
@@ -430,7 +431,11 @@ export class NativeCubridAdapter implements DriverAdapter {
     params: QueryParams | undefined,
     options: StreamOptions | undefined,
   ): AsyncGenerator<unknown, void, undefined> {
-    return this.stream(sql, params, { ...options, binding: "prepared" });
+    // Not through stream(), which a subclass may override and so run literals.
+    assertValidStreamOptions(options);
+    const values = params === undefined ? undefined : Array.from(params);
+    refuseStreamLobParams(values);
+    return this.streamRows(sql, values, options, true);
   }
 
   private async *streamRows(
@@ -764,8 +769,11 @@ export class NativeCubridAdapter implements DriverAdapter {
     issued: IssuedOn,
     shape: RowShape,
   ): Promise<void> {
-    /** A prepared autocommit stream the consumer left early: only its deferred END_TRAN follows. */
-    let leftEarly: CASConnection | undefined;
+    /**
+     * A prepared autocommit SELECT whose rows were all delivered or that its
+     * consumer left early: only its deferred END_TRAN follows.
+     */
+    let windowsDone: CASConnection | undefined;
     try {
       await this.runStatement(
         sql,
@@ -777,8 +785,8 @@ export class NativeCubridAdapter implements DriverAdapter {
           if (result.statementType === StatementType.SELECT) {
             // A prepared statement's autocommit transaction is ended by runOnSession().
             await this.streamWindows(cursor, cas, result, fetchSize, shape, binds === undefined);
-            if (binds && this.autoCommit && cursor.isStopped) {
-              leftEarly = cas;
+            if (binds && this.autoCommit) {
+              windowsDone = cas;
             }
           }
         },
@@ -788,12 +796,13 @@ export class NativeCubridAdapter implements DriverAdapter {
         shape,
       );
     } catch (error) {
-      // As endReadTransaction() does for a literal stream: the consumer stopped and
-      // the statement only read, so a failed END_TRAN is not thrown out of its
+      // As endReadTransaction() does for a literal stream: the rows are delivered
+      // or no longer wanted and the statement only read, so a failed END_TRAN is
+      // not thrown at the consumer, whether it reads the last window or leaves with
       // `break`. Nothing more goes on that session, so nothing inherits it.
-      if (leftEarly) {
-        if (leftEarly.isConnected) {
-          await leftEarly.discardSession(false);
+      if (windowsDone) {
+        if (windowsDone.isConnected) {
+          await windowsDone.discardSession(false);
         }
         return;
       }

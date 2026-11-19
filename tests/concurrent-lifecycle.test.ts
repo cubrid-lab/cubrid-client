@@ -2423,3 +2423,40 @@ test("transaction stream: a pool transaction and scope stream on their lease, wh
     await cas.stop();
   }
 });
+
+test("transaction stream: a -72 on a FETCH that the callback catches still fails the transaction, which only rolls back", {
+  timeout: 10000,
+}, async () => {
+  await withClient(async (client, cas) => {
+    const deadlock = errorReply(-72, "deadlock victim");
+    deadlock.writeInt32BE(-2, 0);
+    cas.fetchError = deadlock;
+    cas.failFetchOf = "s";
+
+    let caught: unknown;
+    await assert.rejects(
+      client.transaction(async (tx) => {
+        await tx.query("INSERT INTO items VALUES (1)");
+        try {
+          for await (const row of tx.stream(STREAM_SELECT)) {
+            assert.ok(row);
+          }
+        } catch (error) {
+          caught = error;
+        }
+        await tx.query("INSERT INTO items VALUES (2)");
+      }),
+      TransactionError,
+    );
+
+    assert.ok(caught instanceof TransactionError);
+    assert.equal(caught.code, -72);
+    // The server rolled the transaction back, so nothing after it was sent and
+    // nothing was committed: the only END_TRAN is the ROLLBACK.
+    assert.deepEqual(endTrans(cas), [EndTranType.ROLLBACK]);
+    assert.equal(
+      cas.of(CASFunctionCode.PREPARE_AND_EXECUTE).filter(({ sql }) => sql?.includes("(2)")).length,
+      0,
+    );
+  });
+});

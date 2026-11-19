@@ -264,53 +264,68 @@ test("prepared stream: a custom connection cannot bind on the server, so it is r
   await client.close();
 });
 
-test("prepared stream: a pool lease streams through the connection's prepared stream and tracks it", async () => {
-  const connection = new RowsConnection([[1]]);
-  const received: unknown[] = [];
-  // As the built-in adapter has it: a method of the class, not an own property.
-  Object.setPrototypeOf(
-    connection,
-    Object.create(RowsConnection.prototype, {
-      [PREPARED_STREAM]: {
-        value: async function* (_sql: string, params: unknown, options: unknown) {
-          received.push([params, options]);
-          yield [7];
+for (const logged of [false, true]) {
+  test(`prepared stream: a pool lease streams through the connection's prepared stream and tracks it${logged ? ", with a logger" : ""}`, async () => {
+    const connection = new RowsConnection([[1]]);
+    const received: unknown[] = [];
+    // As the built-in adapter has it: a method of the class, not an own property.
+    Object.setPrototypeOf(
+      connection,
+      Object.create(RowsConnection.prototype, {
+        [PREPARED_STREAM]: {
+          value: async function* (_sql: string, params: unknown, options: unknown) {
+            received.push([params, options]);
+            yield [7];
+            yield [8];
+          },
         },
-      },
-    }),
-  );
-  // With a logger, the pool's lease proxy wraps the logging wrapper's prepared stream.
-  const pool = createPool({
-    host: "localhost",
-    database: "demodb",
-    user: "dba",
-    max: 1,
-    logger: { debug() {}, info() {}, error() {} },
-    connectionFactory: () => connection,
-  });
+      }),
+    );
+    // With a logger, the lease proxy wraps the logging wrapper's own prepared stream.
+    const pool = createPool({
+      host: "localhost",
+      database: "demodb",
+      user: "dba",
+      max: 1,
+      ...(logged && { logger: { debug() {}, info() {}, error() {} } }),
+      connectionFactory: () => connection,
+    });
 
-  assert.deepEqual(
-    await collect(pool.stream("SELECT ?", [7], { binding: "prepared", rowMode: "array" })),
-    [[7]],
-  );
-  let kept: PoolConnection | undefined;
-  await pool.connection(async (leased) => {
-    kept = leased;
-    assert.deepEqual(await collect(leased.stream("SELECT ?", [7], { binding: "prepared" })), [[7]]);
+    assert.deepEqual(
+      await collect(pool.stream("SELECT ?", [7], { binding: "prepared", rowMode: "array" })),
+      [[7], [8]],
+    );
+    let kept: PoolConnection | undefined;
+    await pool.connection(async (leased) => {
+      kept = leased;
+      assert.deepEqual(await collect(leased.stream("SELECT ?", [7], { binding: "prepared" })), [
+        [7],
+        [8],
+      ]);
+    });
+    assert.deepEqual(received, [
+      [[7], { rowMode: "array" }],
+      [[7], {}],
+    ]);
+    // A finished prepared stream left the session reusable.
+    assert.equal(pool.stats().total, 1);
+    // A reference kept past its lease is refused like any other call.
+    assert.ok(kept);
+    await assert.rejects(
+      collect(kept.stream("SELECT ?", [7], { binding: "prepared" })),
+      /was released when its callback settled/,
+    );
+
+    // The lease counts a prepared stream left open as running, so its connection is
+    // not handed to the next caller.
+    await pool.connection(async (leased) => {
+      const open = leased.stream("SELECT ?", [7], { binding: "prepared" })[Symbol.asyncIterator]();
+      await open.next();
+    });
+    assert.equal(pool.stats().total, 0);
+    await pool.close();
   });
-  assert.deepEqual(received, [
-    [[7], { rowMode: "array" }],
-    [[7], {}],
-  ]);
-  // A reference kept past its lease is refused like any other call.
-  assert.ok(kept);
-  await assert.rejects(
-    collect(kept.stream("SELECT ?", [7], { binding: "prepared" })),
-    /was released when its callback settled/,
-  );
-  assert.equal(pool.stats().total, 1);
-  await pool.close();
-});
+}
 
 // ---------------------------------------------------------------------------
 // Compile-time checks. Never run: `npm run typecheck` compiles them.

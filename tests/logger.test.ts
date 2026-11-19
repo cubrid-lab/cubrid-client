@@ -438,6 +438,27 @@ test("a prepared stream is logged as a stream, and the connection never sees bin
   assert.equal(JSON.stringify(entries).includes(PARAM), false);
 });
 
+test("the logging wrapper forwards both the connection's timezone and its prepared stream", async () => {
+  const { logger } = recorder();
+  const connection = Object.assign(streamingConnection(), { timezone: "utc" as const });
+  Object.defineProperty(connection, PREPARED_STREAM, {
+    value: async function* () {
+      yield { v: ROW_VALUE };
+    },
+  });
+  const db = client(logger, connection);
+
+  await db.transaction(async (tx) => {
+    assert.equal(tx.timezone, "utc");
+    const rows: unknown[] = [];
+    for await (const row of tx.stream("SELECT ?", [PARAM], { binding: "prepared" })) {
+      rows.push(row);
+    }
+    assert.deepEqual(rows, [{ v: ROW_VALUE }]);
+  });
+  await db.close();
+});
+
 test("a prepared stream is refused on a connection that cannot bind, before any log entry", async () => {
   const { logger, entries } = recorder();
 

@@ -1,11 +1,19 @@
 # ADR 0011: Choose binding with one option and move the driver SPI to its own entry point in 2.0
 
-- **Status:** Proposed (2.0 planning; no 1.x change in this record)
+- **Status:** Proposed (2.0 planning). One 1.x change is implemented ahead of acceptance; see the note below
 - **Date:** 2026-11-12
 - **Decision scope:** how a statement chooses between SQL literals and server-side typed binds, how prepared streaming is offered, which entry point exports the driver service provider interface (`ConnectionLike` and the types around it), and the deprecation and SemVer plan that gets 1.x users there
 - **Issue:** [#249](https://github.com/cubrid-lab/cubrid-client/issues/249)
 - **Design:** [v2 API design](../design/v2-api.md) (inventory, value behavior matrix, migration matrix) and the compile-tested type mock in [`tests/v2-api-mock/`](../../tests/v2-api-mock/)
 - **Prerequisites:** [ADR 0001](0001-release-governance.md) (SemVer), [API stability](../API_STABILITY.md) ([#98](https://github.com/cubrid-lab/cubrid-client/issues/98), [#132](https://github.com/cubrid-lab/cubrid-client/issues/132)), [ADR 0008](0008-pool-reuse-invariant.md) (pool reuse), [ADR 0010](0010-utc-temporal-default-in-2-0.md) (the other 2.0 default change)
+
+> **Note (2026-11-20):** #307 implements decision 4 for `stream()` alone in 1.x,
+> pending acceptance of this record: `StreamOptions.binding`, default
+> `"literal"`, with `"prepared"` sending PREPARE and EXECUTE through the guard
+> described in the design, an internal capability symbol on the built-in adapter,
+> and the option removed before any connection call. No other statement method
+> gains `binding`, and the record's status is unchanged: accepting it remains the
+> maintainers' decision.
 
 ## Context
 
@@ -153,8 +161,12 @@ Verified facts this decision relies on:
 - [ ] Prepared streaming is verified on a live CUBRID server (cursor lifecycle,
       early stop, errors, abort, transactions, pool lease) before the 1.x MINOR
       ships it. #307 adds `StreamOptions.binding` for `stream()` alone, ahead of
-      the rest of the bridge, with live tests on 11.4 (`Integration: stream() in a
-      transaction, and with typed binds (#307)`); 10.2 to 11.2 are not yet run.
+      the rest of the bridge. Live tests on 11.4 only (`Integration: stream() in
+      a transaction, and with typed binds (#307)`) cover a stream that completes,
+      an early break, a server error (11.4 raises it at EXECUTE for the SELECTs
+      tried, so a failing FETCH is covered only offline), an abort, a stream inside
+      `transaction()` and on a pool lease. 10.2, 11.0 and 11.2 are not yet run,
+      so this item stays open.
 - [ ] The packed package resolves `cubrid-client/driver` for ESM, CJS, and
       TypeScript with `moduleResolution` `node16`, `bundler` and `node10`, and
       `instanceof` holds across entry points.

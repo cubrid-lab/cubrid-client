@@ -563,7 +563,7 @@ for await (const row of db.stream("SELECT id FROM orders WHERE NOT (coupon = ? O
 
 - `blob()` and `clob()` are refused with a `TypeError` before anything is sent, under both bindings: a SELECT has no use for an uploaded LOB.
 - Errors are those of `queryPrepared()`: bad SQL fails at PREPARE, a wrong value count or a refused value before EXECUTE, all on the first read.
-- In autocommit mode a prepared stream ends its own transaction once, after its last row or when it closes early: COMMIT, or ROLLBACK when a read failed. A failed COMMIT after a `break` is not thrown out of the `break`; the session is discarded instead, as for a literal stream. Inside a transaction it sends no END_TRAN of its own.
+- In autocommit mode a prepared stream ends its own transaction once, after its last reply or when it closes early: COMMIT, or ROLLBACK when a read failed. A failed COMMIT once the rows were delivered, or after a `break`, is not thrown at the consumer, whether it is still reading the last reply or leaving with `break`; the session is discarded instead, as a literal stream does when its read transaction fails to end. The SELECT only read, so no change is lost that the SQL did not make itself; a SELECT that calls a function which writes should use `queryPrepared()`, whose failed COMMIT rejects. Inside a transaction it sends no END_TRAN of its own.
 - Only the built-in connection binds on the server. A custom `connectionFactory` connection fails the first read with a [`QueryError`](#queryerror) whose cause says it cannot bind, and it never receives `binding` or a literal fallback.
 - Typed binds cost one more request than a literal stream (PREPARE and EXECUTE instead of one PREPARE_AND_EXECUTE), and in autocommit mode the END_TRAN above, nothing per row.
 
@@ -580,13 +580,15 @@ await db.transaction(async (tx) => {
 }); // Commits once the loop has ended.
 ```
 
+> **Pitfall: an iterator driven by hand rolls back the whole transaction.** Code that calls `next()` itself, instead of `for await`, and stops without reading to `done: true` or calling `return()` leaves the stream open. The commit, including the one `transaction()` makes when the callback returns, is then refused and **every statement of the transaction is rolled back**, not only the stream. Call `await rows.return()` (for example in a `finally`) before committing.
+
 The rules:
 
 - **Other statements of the transaction wait for the stream**, as on a shared connection: the stream holds the connection's turn until its last reply or until it closes. A statement awaited inside the loop is refused with `kind: "stream-busy"` after `consumerTimeout`, as a [`TransactionError`](#transactionerror), and nothing of it is sent, so the transaction is unaffected. Like any statement failure it makes `transaction()` roll back when the callback lets it propagate, and an [unobserved](#observed-and-unobserved-statement-failures) one refuses the commit. Waiting is safe inside a transaction because the statement behind the stream is part of the same transaction either way; run per-row statements after the loop, or collect the rows first.
 - **`commit()` while a stream is open is refused.** The stream is aborted first, which closes its cursor and ends its turn even if its consumer is not reading, then the transaction is rolled back and `commit()` rejects with a `TransactionError` (`outcomeUnknown: false`) saying a stream was still open. A scope reports it as the `cause` of `Failed to commit.`. The stream's next read rejects with the same error. Rows still unread mean the work that reads them is not finished, so the client does not commit part of it.
 - **`rollback()` closes an open stream first**, then rolls back. The stream's next read rejects with a `TransactionError` saying the transaction was rolled back.
 - **A `transaction()` callback that returns while one of its streams is still open** (for example one it left reading in the background) is the commit above: the transaction rolls back and `transaction()` rejects with a `TransactionError` whose `cause` is that refusal. A stream that was created but never read is not open: it sent nothing, does not stop the commit, and its first read after the transaction ended is refused, sending nothing.
-- **"Open"** means from the first read until the rows run out, the loop breaks or throws, `return()` is called, or the read fails. Code that drives the iterator by hand must call `return()` before committing.
+- **"Open"** means from the first read until a read reports the end (`done: true`), the loop breaks or throws, `return()` is called, or a read fails. Having read the last row is not enough: the stream ends on the read after it, which `for await` makes for you.
 - **`break`, `return()` and a throw** close the cursor and release the turn; the transaction stays open, and its next statement and `commit()` proceed. **`signal`** does the same while the consumer is away, and the next read rejects with `signal.reason`.
 - [`close()`](#close) of the client or pool discards a scope with an open stream like any other scope: its connection closes and the stream's next read rejects.
 
@@ -598,7 +600,16 @@ Executes a callback within an isolated transactional connection. Commits on succ
 
 ```ts
 async transaction<T>(
-  callback: TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient>,
+  callback: TransactionCallback<
+    T,
+    ArrayRowQueryable &
+      ResultTransactionClient &
+      ExecutableTransactionClient &
+      PreparedTransactionClient &
+      BatchTransactionClient &
+      StreamTransactionClient &
+      TimezoneAware
+  >,
   options?: TransactionOptions,
 ): Promise<T>
 ```
@@ -607,7 +618,7 @@ The callback's `tx` also has `executeMany()`, the `rowMode: "array"` overloads a
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `callback` | [`TransactionCallback<T, ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient>`](#transactioncallback) | Async function receiving a [`ResultTransactionClient`](#resulttransactionclient) (a [`TransactionClient`](#transactionclient-interface) that also has `queryResult()`) that is also an [`ExecutableTransactionClient`](#executabletransactionclient) (it also has `execute()`). A callback written against `TransactionClient` is still accepted. |
+| `callback` | [`TransactionCallback<T, ArrayRowQueryable & ResultTransactionClient & ExecutableTransactionClient & PreparedTransactionClient & BatchTransactionClient & StreamTransactionClient & TimezoneAware>`](#transactioncallback) | Async function receiving the transaction's `tx`: a [`TransactionClient`](#transactionclient-interface) that also has `queryResult()` ([`ResultTransactionClient`](#resulttransactionclient)), `execute()` ([`ExecutableTransactionClient`](#executabletransactionclient)), the prepared methods ([`PreparedTransactionClient`](#preparedtransactionclient)), `executeMany()` ([`BatchTransactionClient`](#batchtransactionclient)), `stream()` ([`StreamTransactionClient`](#streamtransactionclient)), the array-row overloads ([`ArrayRowQueryable`](#arrayrowqueryable)) and `timezone` ([`TimezoneAware`](#timezoneaware)). A callback written against `TransactionClient` is still accepted. |
 | `options` | [`TransactionOptions`](#transactionoptions) | Optional `isolationLevel` and `lockTimeout` for this transaction only. Each one replaces the client's value, and the shared connection is not affected. They are applied before the transaction begins, so they cover all of it. See [Isolation Level and Lock Timeout](CONNECTION.md#isolation-level-and-lock-timeout) |
 
 **Returns:** `Promise<T>` — The return value of the callback.
@@ -1037,7 +1048,7 @@ never rolled back for reuse, when:
 |-------------------------|------|
 | `in-transaction` | A transaction is still open on the session, the server ended one the caller did not acknowledge, a rollback failed, or a scope was discarded by `close()` |
 | `error` | The session is closed, `transaction()` or `beginTransactionScope()` failed before its transaction began, or a custom `ConnectionLike` (which cannot report its state) had a call fail during the lease |
-| `busy` | A statement or stream of the lease is still running, for example one the `connection()` callback did not await |
+| `busy` | A statement or stream of the lease is still running, for example one the `connection()` callback did not await. This includes a stream of a `transaction()` or scope that its commit or rollback [aborted](#streaming-inside-a-transaction) while its consumer was not reading: the lease counts it until the consumer reads again or calls `return()`, so the connection is closed instead of reused, and the next lease opens a new one |
 | `failed-exchange` | A request of the lease has an unknown outcome: a read timeout or an abort while it was on the wire |
 | `options` | The `transaction()` or `beginTransactionScope()` options differ from the pool's own `isolationLevel` or `lockTimeout`. They cannot be undone, so set them on the pool instead |
 | `lifetime` | The connection is older than `maxLifetimeMs` |
@@ -2050,6 +2061,13 @@ interface StreamTransactionClient extends TransactionClient, Streamable {
     params?: QueryParams,
     options?: StreamOptions,
   ): AsyncGenerator<T, void, undefined>;
+  // The signature of Streamable.stream, so a union with Streamable or
+  // ConnectionLike stays callable. Never chosen by a direct call.
+  stream<T extends QueryResultRow = QueryResultRow>(
+    sql: string,
+    params?: QueryParams,
+    options?: StreamOptions,
+  ): AsyncIterable<T>;
 }
 ```
 
