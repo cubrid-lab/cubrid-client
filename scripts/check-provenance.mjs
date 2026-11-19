@@ -157,7 +157,7 @@ function checkPack() {
  * `// node_modules/...` and any other file outside src/ under its own path.
  */
 export function bundledModules(code) {
-  return [...code.matchAll(/^\/\/ (\S+\.(?:[cm]?[jt]sx?))$/gm)].map((m) => m[1]);
+  return [...code.matchAll(/^\/\/ (.+\.[A-Za-z0-9]+)$/gm)].map((m) => m[1]);
 }
 
 const TS_ONLY_KEYWORDS = new Set([

@@ -29,7 +29,7 @@ and an oracle never shares a builder with the code it checks
 
 | Command | Files | Where it runs | Result on `25c770d` |
 | --- | --- | --- | --- |
-| `npm test` | the offline `.ts` files (20 on `25c770d`; 21 with `frame-reader.test.ts`, #253), then `verify-npm-version.test.mjs` | `ci.yml` (Node 18–26), `release-validation.yml` | 1416 pass, 0 fail, 0 skipped; then 6 pass |
+| `npm test` | the offline `.ts` files (20 on `25c770d`; 21 with `frame-reader.test.ts`, #253), then `verify-npm-version.test.mjs` and `provenance-scan.test.mjs` | `ci.yml` (Node 18–26), `release-validation.yml` | 1416 pass, 0 fail, 0 skipped; then the `.mjs` tests pass |
 | `npm run test:coverage` | the same 20 files under `c8`, then `verify-npm-version.test.mjs` and `provenance-scan.test.mjs` without coverage | `ci.yml` | same 1416 tests |
 | `npm run test:integration`, no broker | `integration.test.ts` | `ci.yml` `ci` job, step "Integration file, offline cases only": checks the file loads on Node 18–26; it is not live evidence | 1 pass (`connect fails with wrong port`); the 18 top-level suites are skipped |
 | `CUBRID_LIVE_REQUIRED=1 CUBRID_TEST_PORT=1 npm run test:integration` | `integration.test.ts` | `ci.yml` negative check | fails with "Live CUBRID integration was required but the broker was unreachable" |
