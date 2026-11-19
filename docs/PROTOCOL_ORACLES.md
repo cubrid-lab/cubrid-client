@@ -70,7 +70,10 @@ transaction at once. A new session, including one on the same CAS after the prev
 client closed or was cut off, starts from the server defaults (4 and `-1` on a stock
 server). The reply to the database server restart case was `-111` and then `-224`
 inside a transaction, after which the CAS closed its socket, so no session lost its
-settings without the client opening a new one.
+settings without the client opening a new one. A later run on 11.4 (#306) saw a
+different reply: the CAS answered every request of the open transaction, `ROLLBACK`
+included, with `-224` and kept the socket, and outside a transaction it reconnected
+to the database server on its own. Either way the transaction is gone.
 
 An autocommit SELECT closed before its last row therefore stays in a transaction:
 it keeps its table lock and its CAS, and a second session's `ALTER TABLE` waits,

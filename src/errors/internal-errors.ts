@@ -20,6 +20,9 @@ const SERVER_ERROR_KINDS: ReadonlyMap<number, CubridErrorKind> = new Map([
   [-111, "connection-lost"], // ER_TM_SERVER_DOWN_UNILATERALLY_ABORTED: cub_server died.
   [-165, "authentication"], // ER_AU_INVALID_USER
   [-171, "authentication"], // ER_AU_INVALID_PASSWORD
+  // ER_OBJ_NO_CONNECT: the CAS lost cub_server to a restart, and the transaction
+  // with it. Reported by a live 11.4 server after `cubrid server restart` (#306).
+  [-224, "connection-lost"],
   [-493, "syntax"], // ER_PT_SYNTAX, also used for an unknown table.
   [-494, "semantic"], // ER_PT_SEMANTIC
   [-631, "not-null-violation"], // ER_NULL_CONSTRAINT_VIOLATION
