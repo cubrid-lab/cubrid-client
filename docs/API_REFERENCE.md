@@ -309,7 +309,7 @@ A listed row proves the statement generated a key, so `execute()` then reports t
 
 - the SQL is one `INSERT` or `REPLACE` that calls no function and has no `SELECT` (as for the default) and no `ON DUPLICATE KEY UPDATE`;
 - the table is named right after `INSERT INTO`, with no comment or hint before it;
-- a `PREPARE` of `SELECT * FROM` that table reports exactly one `AUTO_INCREMENT` column, and every column as that table's own: a view whose columns the server reports as another table's reports no key. What the server reports for the columns of a view has not been checked live.
+- a `PREPARE` of `SELECT * FROM` that table reports exactly one `AUTO_INCREMENT` column, and every column as that table's own: a view whose columns the server reports as another table's reports no key. A table name without an owner is taken as the login user's, so another owner's table of the same name does not match. What the server reports for the columns of a view has not been checked live.
 
 Cost: a `PREPARE`, its `CLOSE_REQ_HANDLE` and a `GET_LAST_INSERT_ID`, only after such a reply; no other statement pays anything.
 

@@ -2616,9 +2616,15 @@ test("isTableNamed matches PREPARE's class name to an INSERT target (#297)", () 
     ["u1.k_ai", "dba.k_ai", false],
     ["k_ai", "dba.xk_ai", false],
     ["k_ai", "", false],
+    // Another owner's table of the same name, a dotted quoted name, three parts.
+    ["v", "bob.v", false],
+    ["t", "a.b.t", false],
+    [`"a.b"`, "a.b", false],
+    ["[a.b]", "a.b", false],
+    ["a.b.t", "a.b.t", false],
   ];
   for (const [target, className, expected] of cases) {
-    assert.equal(isTableNamed(target, className), expected, `${target} / ${className}`);
+    assert.equal(isTableNamed(target, className, "DBA"), expected, `${target} / ${className}`);
   }
 });
 

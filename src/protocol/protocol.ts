@@ -1881,22 +1881,24 @@ export function plainInsertTarget(sql: string): string | undefined {
 /**
  * Whether `className`, the table PREPARE reports a column of (`owner.table` from
  * CUBRID 11.2, `table` before), is the table `target` names as plainInsertTarget()
- * returns it. Quotes are dropped and case is ignored, as the server does; an
- * owner is compared only when both name one. readKeylessKey() uses it so a view
- * whose columns come from another table is never taken for that table (#297).
+ * returns it. Quotes are dropped and case is ignored, as the server does. A
+ * target without an owner names a table of `user`, the login user, so another
+ * owner's table of the same name never matches; a class name without an owner
+ * (before 11.2) matches on the table name alone. A quoted part that contains a
+ * dot never matches. readKeylessKey() uses it so a view whose columns come from
+ * another table is never taken for that table (#297).
  */
-export function isTableNamed(target: string, className: string): boolean {
+export function isTableNamed(target: string, className: string, user: string): boolean {
   const parts = Array.from(target.matchAll(TARGET_NAME_PART), ([part]) =>
     (/^["`[]/.test(part) ? part.slice(1, -1) : part).toLowerCase(),
   );
-  const name = parts.at(-1);
-  const owner = parts.length === 2 ? parts[0] : undefined;
+  if (parts.length === 0 || parts.length > 2 || parts.some((part) => part.includes("."))) {
+    return false;
+  }
+  const name = parts.at(-1) as string;
+  const owner = parts.length === 2 ? parts[0] : user.toLowerCase();
   const actual = className.toLowerCase();
-  return (
-    name !== undefined &&
-    (actual === name ||
-      (owner === undefined ? actual.endsWith(`.${name}`) : actual === `${owner}.${name}`))
-  );
+  return actual === name || actual === `${owner}.${name}`;
 }
 
 /**

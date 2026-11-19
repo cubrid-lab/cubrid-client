@@ -1472,7 +1472,9 @@ export class NativeCubridAdapter implements DriverAdapter {
     }
     // A view over a table with two AUTO_INCREMENT columns can show only one, so
     // every column must come from the target table itself.
-    const ownColumns = columns.every((column) => isTableNamed(table, column.tableName));
+    const ownColumns = columns.every((column) =>
+      isTableNamed(table, column.tableName, this.config.user),
+    );
     const keyColumns = columns.filter((column) => column.isAutoIncrement).length;
     return ownColumns && keyColumns === 1 ? this.fetchLastInsertId(cas, generation) : undefined;
   }
