@@ -193,6 +193,18 @@ fields in. The [`timezone`](API_REFERENCE.md#clientoptions) client option picks 
 | `"local"` (default) | The fields in the Node.js process zone. The same stored value is a **different instant** under `TZ=UTC`, `TZ=Asia/Seoul` or `TZ=America/Los_Angeles` | `getFullYear()`, `getHours()`, ... |
 | `"utc"` | The fields as UTC, the zone `Date` parameters are sent in: a `Date` written and read back is the same instant on every host | `getUTCFullYear()`, `getUTCHours()`, ... |
 
+The setting in effect is public as a read-only `timezone` property, `"local"`
+when the option was not set, so code built on the client can interpret the
+`Date` objects it returns: on `CubridClient` and `CubridPool`, on the `tx` of
+`transaction()`, on a `beginTransactionScope()` handle and on the
+`PoolConnection` of `pool.connection()`. The last three report the zone of the
+connection they run on; see [`TimezoneAware`](API_REFERENCE.md#timezoneaware).
+
+```ts
+const db = createClient({ host: "localhost", database: "demodb", user: "dba", timezone: "utc" });
+db.timezone; // "utc"
+```
+
 - DATE is midnight of that day; TIME is that time on 1970-01-01.
 - DATETIME keeps milliseconds; TIMESTAMP and TIME have none.
 - Years 1 to 99 stay as written in both modes.

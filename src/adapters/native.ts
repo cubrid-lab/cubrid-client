@@ -319,6 +319,11 @@ export class NativeCubridAdapter implements DriverAdapter {
     this.charset = config.charset ?? "utf-8";
   }
 
+  /** The zone DATE, TIME, TIMESTAMP and DATETIME values are decoded in: `timezone`, or `"local"`. */
+  get timezone(): "local" | "utc" {
+    return this.utcDates ? "utc" : "local";
+  }
+
   async connect(): Promise<void> {
     const cas = this.getOrCreateCAS();
 

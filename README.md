@@ -103,6 +103,10 @@ await db.close();
 > const db = createClient({ host: "localhost", database: "demodb", user: "dba", timezone: "utc" });
 > ```
 >
+> `db.timezone` reports the setting in effect (`"local"` when unset), and so does
+> `timezone` on a pool, a pool connection and a transaction, for libraries that
+> interpret the returned `Date` objects.
+>
 > The 1.x default does not change. `"utc"` is proposed as the 2.0 default; see
 > [date and time values](docs/TYPES.md#date-and-time-values) and
 > [ADR 0010](docs/adr/0010-utc-temporal-default-in-2-0.md).

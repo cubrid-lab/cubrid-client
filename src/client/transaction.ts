@@ -9,6 +9,7 @@ import {
   assertValidQueryOptions,
   checkedResult,
   checkedRows,
+  connectionTimezone,
 } from "../internals/normalize-config.js";
 import { unknownOutcomeProbe } from "../internals/session-state.js";
 import type {
@@ -23,6 +24,7 @@ import type {
   PreparedTransactionClient,
   QueryOptions,
   ResultTransactionClient,
+  TimezoneAware,
 } from "../types/client.js";
 import { LobParamError, type PreparedQueryParam, refuseLobParams } from "../types/lob.js";
 import type { QueryParams } from "../types/query.js";
@@ -35,9 +37,28 @@ export class CubridTransaction
     ResultTransactionClient,
     ExecutableTransactionClient,
     PreparedTransactionClient,
-    BatchTransactionClient
+    BatchTransactionClient,
+    TimezoneAware
 {
-  constructor(private readonly connection: ConnectionLike) {}
+  /**
+   * @param configuredTimezone reported by {@link timezone} when `connection` has no
+   * `timezone` of `"local"` or `"utc"`, as a custom `connectionFactory` connection
+   * may not.
+   */
+  constructor(
+    private readonly connection: ConnectionLike,
+    private readonly configuredTimezone: "local" | "utc" = "local",
+  ) {}
+
+  /**
+   * The zone this transaction's DATE, TIME, TIMESTAMP and DATETIME values are
+   * decoded in: the `timezone` of its connection when that is `"local"` or
+   * `"utc"`, as on `NativeCubridAdapter`, otherwise `configuredTimezone`. See
+   * `TimezoneAware`.
+   */
+  get timezone(): "local" | "utc" {
+    return connectionTimezone(this.connection, this.configuredTimezone);
+  }
 
   query<T extends readonly unknown[] = unknown[]>(
     sql: string,
@@ -593,7 +614,7 @@ export class ScopedTransaction extends CallbackTransaction {
     private readonly source: ConnectionSource,
     private readonly onEnded: () => void,
   ) {
-    super(ownConnection);
+    super(ownConnection, source.timezone);
     this.outcomeUnknown = unknownOutcomeProbe(ownConnection);
   }
 

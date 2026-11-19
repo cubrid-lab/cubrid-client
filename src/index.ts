@@ -47,6 +47,7 @@ export type {
   ResultTransactionClient,
   Streamable,
   StreamOptions,
+  TimezoneAware,
   TransactionCallback,
   TransactionClient,
   TransactionOptions,

@@ -447,6 +447,16 @@ export interface BatchExecutable {
   ): Promise<ExecuteManyResult>;
 }
 
+/**
+ * Reports the zone DATE, TIME, TIMESTAMP and DATETIME values are decoded in,
+ * so code built on this client can interpret the returned `Date` objects. The
+ * effective value: `"local"` when {@link ClientOptions.timezone} was not set.
+ */
+export interface TimezoneAware {
+  /** See {@link ClientOptions.timezone}. */
+  readonly timezone: "local" | "utc";
+}
+
 export interface TransactionClient extends Queryable {
   commit(): Promise<void>;
   rollback(): Promise<void>;
@@ -501,7 +511,8 @@ export interface TransactionScope
   extends ResultTransactionClient,
     ExecutableTransactionClient,
     PreparedTransactionClient,
-    BatchTransactionClient {
+    BatchTransactionClient,
+    TimezoneAware {
   query<T extends readonly unknown[] = unknown[]>(
     sql: string,
     params: QueryParams | undefined,

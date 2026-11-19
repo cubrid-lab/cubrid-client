@@ -36,6 +36,7 @@ import type {
   ResultTransactionClient,
   Streamable,
   StreamOptions,
+  TimezoneAware,
   TransactionCallback,
   TransactionOptions,
   TransactionScope,
@@ -61,7 +62,14 @@ import * as schema from "./schema.js";
 import type { ScopedTransaction } from "./transaction.js";
 
 export class CubridClient
-  implements Queryable, ResultQueryable, Executable, PreparedQueryable, BatchExecutable, Streamable
+  implements
+    Queryable,
+    ResultQueryable,
+    Executable,
+    PreparedQueryable,
+    BatchExecutable,
+    Streamable,
+    TimezoneAware
 {
   private sharedConnectionPromise: Promise<ConnectionLike> | undefined;
   /** The shared connection as soon as the factory returns it, before it is ready. */
@@ -147,6 +155,16 @@ export class CubridClient
         return connection;
       },
     };
+  }
+
+  /**
+   * The configured zone for DATE, TIME, TIMESTAMP and DATETIME values: the
+   * `timezone` option, or `"local"` when it was not set. Connections of the
+   * built-in factory decode in it; a custom `connectionFactory` connection may
+   * not, so a transaction reports its own. See `TimezoneAware`.
+   */
+  get timezone(): "local" | "utc" {
+    return this.source.timezone;
   }
 
   /**
@@ -376,7 +394,8 @@ export class CubridClient
         ResultTransactionClient &
         ExecutableTransactionClient &
         PreparedTransactionClient &
-        BatchTransactionClient
+        BatchTransactionClient &
+        TimezoneAware
     >,
     options?: TransactionOptions,
   ): Promise<T> {
