@@ -3261,6 +3261,71 @@ test("generatedKeys asks nothing more for a keyless row of SQL that is not a pla
   }
 });
 
+test("generatedKeys reports no keyless key when PREPARE reports another table's columns, as for a view (#297)", async () => {
+  // A view over a table with two key columns could show only one of them.
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  queueKeyless(fakeCAS, KEY_COLUMN_FRAMES.oneKey); // columns of dba.k_ai
+
+  const result = await adapter.execute("INSERT INTO v_ai (v) VALUES (1)", undefined, KEYS);
+
+  assert.deepEqual(result, { affectedRows: 1 });
+  assert.equal(sentCodes(fakeCAS).includes(GET_LAST_INSERT_ID), false);
+  assert.deepEqual(endTranTypes(fakeCAS), [COMMIT]);
+});
+
+/** Queues the INSERT and its keyless reply; the server aborts at the fallback's PREPARE. */
+function queueKeylessAbort(fakeCAS: FakeCASConnection): void {
+  fakeCAS.queueResponse(hex(DML_FRAMES.insertOneRow.hex));
+  fakeCAS.queueResponse(hex(GENERATED_KEYS_FRAMES.keylessRow));
+  fakeCAS.queueResponse(buildServerErrorResponse(-72));
+}
+
+test("-72 answering the keyless fallback's PREPARE rejects an autocommit execute() (#297)", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  queueKeylessAbort(fakeCAS);
+
+  await assert.rejects(
+    adapter.execute("INSERT INTO k_ai (v) VALUES (1)", undefined, KEYS),
+    DeadlockError,
+  );
+
+  assert.equal(sentCodes(fakeCAS).includes(GET_LAST_INSERT_ID), false);
+  assert.equal(endTranTypes(fakeCAS).includes(COMMIT), false);
+});
+
+test("-72 answering the keyless fallback's PREPARE ends the transaction like any statement's (#297)", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  await adapter.beginTransaction();
+  queueKeylessAbort(fakeCAS);
+
+  await assert.rejects(
+    adapter.execute("INSERT INTO k_ai (v) VALUES (1)", undefined, KEYS),
+    DeadlockError,
+  );
+
+  await assertLaterStatementIsNotSent(adapter, fakeCAS);
+});
+
+test("a malformed reply to the keyless fallback's PREPARE drops the session (#297)", async () => {
+  const { adapter, fakeCAS } = createAdapterWithFakeCAS(DEFAULT_CONFIG, { _protoVersion: 7 });
+  fakeCAS.queueResponse(hex(DML_FRAMES.insertOneRow.hex));
+  fakeCAS.queueResponse(hex(GENERATED_KEYS_FRAMES.keylessRow));
+  fakeCAS.queueResponse(hex(KEY_COLUMN_FRAMES.oneKey.slice(0, 80)));
+
+  await assert.rejects(
+    adapter.execute("INSERT INTO k_ai (v) VALUES (1)", undefined, KEYS),
+    QueryError,
+  );
+
+  // Nothing follows the damaged reply: no CLOSE_REQ_HANDLE, no END_TRAN.
+  assertSessionDiscarded(fakeCAS);
+  assert.deepEqual(sentCodes(fakeCAS), [
+    PREPARE_AND_EXECUTE,
+    GET_GENERATED_KEYS,
+    CASFunctionCode.PREPARE,
+  ]);
+});
+
 test("without generatedKeys the execute flag stays EXECUTE_QUERY_ALL", async () => {
   const { adapter, fakeCAS } = createPreparedAdapter();
   fakeCAS.queueResponse(preparedReply(PREPARED_GENERATED_KEYS_FRAMES.prepare));

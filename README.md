@@ -260,9 +260,10 @@ await db.execute("INSERT INTO b (v) VALUES (?)", [1], { generatedKeys: true });
 
 On CUBRID 11.0 to 11.4 that option makes an `INSERT` into a table with an
 `INSERT` trigger fail. When the server's reply lists the inserted row without
-its key, which 11.x does for some `INSERT`s into a table created after another
-session dropped one, a plain `INSERT` into a table with one `AUTO_INCREMENT`
-column still reports its key, read from the session; other statements then come
+its key, which live tests on 11.x saw for some `INSERT`s into a table created
+after another session dropped one, a plain `INSERT` into a table (not a view)
+with one `AUTO_INCREMENT` column still reports its key, read from the session at
+the cost of three extra requests on that reply only; other statements then come
 back without it, never with a wrong one. See
 [Generated ids](docs/API_REFERENCE.md#generated-ids) for every case and its cost.
 

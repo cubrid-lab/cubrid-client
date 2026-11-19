@@ -31,6 +31,7 @@ import {
   interpolateParams,
   isPlainInsert,
   isSingleInsert,
+  isTableNamed,
   MalformedReplyError,
   parseClientInfoExchange,
   parseFetch,
@@ -2595,6 +2596,29 @@ test("plainInsertTarget names the table of a plain INSERT as written, or nothing
   ];
   for (const [sql, expected] of cases) {
     assert.equal(plainInsertTarget(sql), expected, sql);
+  }
+});
+
+test("isTableNamed matches PREPARE's class name to an INSERT target (#297)", () => {
+  const cases: Array<[string, string, boolean]> = [
+    ["k_ai", "dba.k_ai", true],
+    ["k_ai", "k_ai", true],
+    ["K_AI", "dba.k_ai", true],
+    ["dba.k_ai", "dba.k_ai", true],
+    ["DBA . k_ai", "dba.k_ai", true],
+    [`"K_AI"`, "dba.k_ai", true],
+    ["`k_ai`", "dba.k_ai", true],
+    ["[dba].[k_ai]", "dba.k_ai", true],
+    [`"my t"`, "dba.my t", true],
+    ["dba.k_ai", "k_ai", true],
+    // A view's columns reported as its base table's, another owner, an empty name.
+    ["v_ai", "dba.k_ai", false],
+    ["u1.k_ai", "dba.k_ai", false],
+    ["k_ai", "dba.xk_ai", false],
+    ["k_ai", "", false],
+  ];
+  for (const [target, className, expected] of cases) {
+    assert.equal(isTableNamed(target, className), expected, `${target} / ${className}`);
   }
 });
 

@@ -1879,6 +1879,27 @@ export function plainInsertTarget(sql: string): string | undefined {
 }
 
 /**
+ * Whether `className`, the table PREPARE reports a column of (`owner.table` from
+ * CUBRID 11.2, `table` before), is the table `target` names as plainInsertTarget()
+ * returns it. Quotes are dropped and case is ignored, as the server does; an
+ * owner is compared only when both name one. readKeylessKey() uses it so a view
+ * whose columns come from another table is never taken for that table (#297).
+ */
+export function isTableNamed(target: string, className: string): boolean {
+  const parts = Array.from(target.matchAll(TARGET_NAME_PART), ([part]) =>
+    (/^["`[]/.test(part) ? part.slice(1, -1) : part).toLowerCase(),
+  );
+  const name = parts.at(-1);
+  const owner = parts.length === 2 ? parts[0] : undefined;
+  const actual = className.toLowerCase();
+  return (
+    name !== undefined &&
+    (actual === name ||
+      (owner === undefined ? actual.endsWith(`.${name}`) : actual === `${owner}.${name}`))
+  );
+}
+
+/**
  * Whether `sql` is one statement that starts with INSERT or REPLACE under every
  * lexing: the only statements EXECUTE_RETURN_GENERATED_KEYS is sent with, since
  * on 11.x the flag can make an INSERT the server runs on the client side fail.
@@ -1899,6 +1920,7 @@ const INSERT_HEAD = new RegExp(
 const CALL = new RegExp(String.raw`(${SQL_NAME})\s*\(`, "gu");
 /** A name as written: plain, or quoted without the quote character inside. */
 const TARGET_NAME = String.raw`(?:[\p{L}_][\p{L}\p{N}_$#]*|"[^"]+"|\x60[^\x60]+\x60|\[[^\]]+\])`;
+const TARGET_NAME_PART = new RegExp(TARGET_NAME, "gu");
 const INSERT_TARGET = new RegExp(
   String.raw`^\s*(?:insert|replace)\s+(?:into\s+)?(?!into\b)(${TARGET_NAME}(?:\s*\.\s*${TARGET_NAME})?)(?=[\s(]|$)`,
   "iu",

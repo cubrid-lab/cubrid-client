@@ -62,6 +62,7 @@ import {
   interpolateParams,
   isPlainInsert,
   isSingleInsert,
+  isTableNamed,
   LobLocator,
   MalformedReplyError,
   mayHoldLob,
@@ -1430,8 +1431,10 @@ export class NativeCubridAdapter implements DriverAdapter {
    * drawn one first: the SQL must be plainInsertTarget() (no routine call, no ON
    * DUPLICATE KEY UPDATE; 11.x refuses a triggered INSERT with generatedKeys) and
    * its table must have exactly one AUTO_INCREMENT column, read from the columns
-   * PREPARE reports for `SELECT * FROM` it. Anything else, a failed PREPARE
-   * included (no SELECT privilege, say), reports no key: never a guess (#247).
+   * PREPARE reports for `SELECT * FROM` it, each reported as that table's (not,
+   * say, a view's base table). Anything else, a refused PREPARE included (no
+   * SELECT privilege, say), reports no key: never a guess (#247). A server abort
+   * (-72) fails the statement instead, and a damaged reply drops the session.
    */
   private async readKeylessKey(
     cas: CASConnection,
@@ -1445,22 +1448,33 @@ export class NativeCubridAdapter implements DriverAdapter {
     const { header, payload } = writePrepare(`SELECT * FROM ${table}`, cas.casInfo, this.charset);
     const reply = await this.exchangeOnSession(cas, generation, header, payload);
     const handle = readQueryHandle(reply);
-    let keyColumns: number;
+    let columns: readonly ColumnMeta[];
     try {
-      keyColumns = parsePrepare(reply, this.charset).columns.filter(
-        (column) => column.isAutoIncrement,
-      ).length;
+      columns = parsePrepare(reply, this.charset).columns;
     } catch (error) {
-      if (error instanceof CasReplyError) {
-        return undefined;
+      // A damaged reply may not have ended where its frame said, so nothing more
+      // is sent on this session: the statement's withQueryHandle() drops it.
+      if (error instanceof MalformedReplyError) {
+        throw error;
       }
-      throw error;
-    } finally {
       if (handle !== null) {
         await this.closeQueryHandle(cas, handle, generation);
       }
+      // A server abort (-72) rolled the statement back with its transaction, so
+      // it fails like any statement would; only a refused PREPARE means no key.
+      if (error instanceof CasReplyError && !isServerTransactionAbort(error)) {
+        return undefined;
+      }
+      throw error;
     }
-    return keyColumns === 1 ? this.fetchLastInsertId(cas, generation) : undefined;
+    if (handle !== null) {
+      await this.closeQueryHandle(cas, handle, generation);
+    }
+    // A view over a table with two AUTO_INCREMENT columns can show only one, so
+    // every column must come from the target table itself.
+    const ownColumns = columns.every((column) => isTableNamed(table, column.tableName));
+    const keyColumns = columns.filter((column) => column.isAutoIncrement).length;
+    return ownColumns && keyColumns === 1 ? this.fetchLastInsertId(cas, generation) : undefined;
   }
 
   /**

@@ -119,11 +119,13 @@ a stored function and a trigger that calls a procedure
 sent the same GET_GENERATED_KEYS frames apart from the row OIDs, which only 10.2
 fills in. From 11.0 the server refuses `generatedKeys` for an INSERT into a table
 with an INSERT trigger; 10.2 runs it. From 11.0 the GET_GENERATED_KEYS reply can list the inserted
-row without its key, mostly for the first INSERTs into a table created after another session
-dropped one, and more often through a pool; for a plain INSERT into a table with one
-AUTO_INCREMENT column the client then reports the session's value for the statement, and the
-key is otherwise absent, never wrong ([#297](https://github.com/cubrid-lab/cubrid-client/issues/297);
-asserted on 11.4 by 300 concurrent INSERTs through a pool of 4 into recreated tables).
+row without its key, seen mostly for the first INSERTs into a table created after another session
+dropped one, and more often through a pool (the cause, a CAS holding a dropped table's class for a
+reused OID, was observed on 11.4.7, not confirmed); for a plain INSERT into a table (not a view)
+with one AUTO_INCREMENT column the client then reports the session's value for the statement, and
+the key is otherwise absent, never wrong ([#297](https://github.com/cubrid-lab/cubrid-client/issues/297);
+asserted on 11.4.7 by 300 concurrent INSERTs through a pool of 4 into recreated tables, a run that
+reports itself inconclusive when the server sends no such reply).
 
 BLOB and CLOB writes (`blob()` and `clob()` on the prepared methods, LOB_NEW and
 LOB_WRITE) are asserted against local `cubrid/cubrid` 10.2, 11.0, 11.2 and 11.4

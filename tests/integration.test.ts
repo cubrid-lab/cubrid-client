@@ -4845,12 +4845,22 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       }
     });
 
-    test("a pool reports every key of concurrent INSERTs into tables another session recreated (#297)", async () => {
+    test("a pool reports every key of concurrent INSERTs into tables another session recreated (#297)", async (t) => {
       // On 11.x the CAS of a pooled session can still hold a row object of a table
       // another session dropped; a new table's row that reuses its OID then comes
       // back from GET_GENERATED_KEYS without its key, 6 to 8 times in 60 here.
       const ROUNDS = Number(process.env.CUBRID_CONCURRENCY_ROUNDS ?? 5);
       const INSERTS = 60;
+      // Counts the keyless replies, each of which runs the fallback once.
+      const native = NativeCubridAdapter.prototype as unknown as {
+        readKeylessKey: (...args: unknown[]) => Promise<string | undefined>;
+      };
+      const readKeylessKey = native.readKeylessKey;
+      let keyless = 0;
+      native.readKeylessKey = function (this: unknown, ...args: unknown[]) {
+        keyless += 1;
+        return readKeylessKey.apply(this, args);
+      };
       const ddl = createClient(TEST_CONFIG);
       const pool = createPool({ ...TEST_CONFIG, max: 4 });
       try {
@@ -4886,7 +4896,15 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
             );
           });
         }
+        // A server without the bug never sends the keyless reply: the keys above
+        // are then right, but the fallback went untested.
+        t.diagnostic(
+          keyless === 0
+            ? "inconclusive: the server sent no keyless GET_GENERATED_KEYS reply"
+            : `${keyless} keyless replies, every key reported`,
+        );
       } finally {
+        native.readKeylessKey = readKeylessKey;
         await pool.close();
         await ddl.close();
       }
