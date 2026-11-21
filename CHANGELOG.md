@@ -5,6 +5,20 @@ This file is the **commit-level history**; the curated GitHub Release text for e
 version lives in `docs/releases/vX.Y.Z.md`. Release notes must describe verified
 user-visible behavior and known limitations, not just completed implementation.
 
+## [1.5.0](https://github.com/cubrid-lab/cubrid-client/compare/v1.4.0...v1.5.0) (2026-11-21)
+
+
+### Features
+
+* expose the effective timezone as a read-only property ([#314](https://github.com/cubrid-lab/cubrid-client/issues/314)) ([5564bf2](https://github.com/cubrid-lab/cubrid-client/commit/5564bf27dd51f83f87c2e3586e130d4e81fa6ae7))
+* stream() on transaction clients and typed binds for stream() ([#315](https://github.com/cubrid-lab/cubrid-client/issues/315)) ([e779e5d](https://github.com/cubrid-lab/cubrid-client/commit/e779e5df6c94a221220f8fc5dc0ec380756c280b))
+
+
+### Bug Fixes
+
+* classify -224 after a server restart as connection-lost ([#311](https://github.com/cubrid-lab/cubrid-client/issues/311)) ([4472667](https://github.com/cubrid-lab/cubrid-client/commit/447266770e20a2562226402421bd1a2e86e6e432))
+* recover generatedKeys when the server lists the row without its key column ([#313](https://github.com/cubrid-lab/cubrid-client/issues/313)) ([316e84c](https://github.com/cubrid-lab/cubrid-client/commit/316e84cdfdbab1cf5f0291d96407e27acdb5ae09))
+
 ## [1.4.0](https://github.com/cubrid-lab/cubrid-client/compare/v1.3.0...v1.4.0) (2026-11-12)
 
 
