@@ -1,0 +1,36 @@
+name: Improvement Idea
+description: Share a confusing step, missed test, usability problem, or improvement idea without a ready-made fix.
+labels: ["status: needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A short real-world observation is enough. No implementation plan,
+        complete reproduction, or acceptance criteria is required to file an idea.
+        Keep your title descriptive (use docs:, test:, feat: when appropriate).
+        Maintainers check duplication, evidence, scope and priority during triage.
+        Never post credentials, private logs or sensitive data. Use the
+        project's security disclosure route for vulnerabilities.
+        Filing an idea does not authorize work or bypass existing reviews.
+  - type: textarea
+    id: observation
+    attributes:
+      label: What did you notice?
+      description: Describe a confusing, missing, broken or inconvenient step.
+      placeholder: "When I tried ..., I noticed ..."
+    validations:
+      required: true
+  - type: textarea
+    id: location
+    attributes:
+      label: Where did you notice it? (optional)
+      description: File, page, example, operation or version if known.
+    validations:
+      required: false
+  - type: textarea
+    id: outcome
+    attributes:
+      label: What would help? (optional)
+      description: Your preferred outcome or possible improvement if known.
+    validations:
+      required: false
