@@ -11,6 +11,6 @@ Each `vX.Y.Z.md` describes the **code in the immutable version tag**, not featur
 | v1.2.0 | Existing published Release | [v1.2.0.md](v1.2.0.md) |
 | v1.3.0 | Existing published Release | [v1.3.0.md](v1.3.0.md) |
 | v1.4.0 | Existing published Release | [v1.4.0.md](v1.4.0.md) |
-| v1.5.0 | Not yet tagged; source for the next Release | [v1.5.0.md](v1.5.0.md) |
+| v1.5.0 | Existing published Release | [v1.5.0.md](v1.5.0.md) |
 
 A source change does not update the public body. Each existing GitHub Release description is updated separately, body only, with a backup, a concurrency check and a fresh readback; this never changes tags, creates a missing GitHub Release, or republishes npm packages. The one-time synchronization workflow was removed by [#235](https://github.com/cubrid-lab/cubrid-client/pull/235) (issue [#226](https://github.com/cubrid-lab/cubrid-client/issues/226)). The [release notes audit](../RELEASE_NOTES_AUDIT.md) records the version-by-version check of the published bodies and which ones await a body-only sync.
