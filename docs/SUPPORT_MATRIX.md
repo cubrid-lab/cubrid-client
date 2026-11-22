@@ -10,7 +10,7 @@ broker qualify as live CI coverage.
 | --- | --- | --- | --- |
 | 18 | `engines.node >=18` | Included | Not established |
 | 20 | Included by >=18 | Included | Not established |
-| 22 | Included by >=18 | Included, plus declaration API check | Not established |
+| 22 | Included by >=18 | Included, plus declaration API check and packed declaration check | Not established |
 | 24 | Included by >=18 | Included | Not established |
 | 26 | Included by >=18 | Included | Not established |
 | Other newer versions | Included by >=18 | Not claimed as matrix coverage | Not established |

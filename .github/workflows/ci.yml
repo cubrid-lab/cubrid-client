@@ -160,6 +160,13 @@ jobs:
         if: matrix.node-version == 22
         run: npm run api:check
 
+      # Offline: packs the build and compiles consumers against the published
+      # declarations with skipLibCheck false: without @types/node or the DOM
+      # lib, with the DOM lib, and with @types/node (#309).
+      - name: Packed declarations compile without Node types
+        if: matrix.node-version == 22
+        run: npm run types:packed
+
       # Offline: packs the build and checks what npm would publish (#295,
       # docs/PROVENANCE.md). The upstream similarity scan is manual.
       - name: Provenance and package contents check

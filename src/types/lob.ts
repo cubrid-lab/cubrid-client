@@ -1,11 +1,14 @@
-import type { Readable } from "node:stream";
 import { TextDecoder } from "node:util";
 
 import { NOT_LATIN1, type TextCharset } from "../protocol/charset.js";
+import type { CubridBytes } from "./platform.js";
 import type { QueryParam } from "./query.js";
 
-/** Content for {@link blob}: bytes, or a stream of byte chunks read once. */
-export type BlobSource = Buffer | Uint8Array | AsyncIterable<Buffer | Uint8Array> | Readable;
+/**
+ * Content for {@link blob}: bytes, or a stream of byte chunks read once. A Node
+ * `Readable` is accepted as an AsyncIterable.
+ */
+export type BlobSource = CubridBytes | Uint8Array | AsyncIterable<CubridBytes | Uint8Array>;
 
 /**
  * Content for {@link clob}: text, UTF-8 bytes, or a stream of either read once.
@@ -13,7 +16,7 @@ export type BlobSource = Buffer | Uint8Array | AsyncIterable<Buffer | Uint8Array
  * `ClientOptions.charset` "iso-8859-1" the bytes are ISO-8859-1 instead, sent as
  * they are, and text must not hold a character above U+00FF.
  */
-export type ClobSource = string | Buffer | AsyncIterable<string | Buffer | Uint8Array> | Readable;
+export type ClobSource = string | CubridBytes | AsyncIterable<string | CubridBytes | Uint8Array>;
 
 /**
  * A BLOB or CLOB parameter, made by {@link blob} or {@link clob}. The prepared

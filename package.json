@@ -49,6 +49,7 @@
     "lint:ci": "biome ci .",
     "api:check": "node scripts/api-check.mjs",
     "api:update": "npm run build && node scripts/api-check.mjs --update",
+    "types:packed": "node scripts/check-packed-types.mjs",
     "provenance:check": "node scripts/check-provenance.mjs pack",
     "check": "npm run typecheck && npm run test:coverage"
   },

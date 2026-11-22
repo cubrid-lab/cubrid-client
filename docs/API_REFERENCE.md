@@ -47,6 +47,7 @@ Complete reference for every public export of `cubrid-client`.
   - [zoned() and ZonedParam](#zoned-and-zonedparam)
   - [blob() and clob()](#blob-and-clob)
   - [LobParam, BlobSource and ClobSource](#lobparam-blobsource-and-clobsource)
+  - [CubridBytes and CubridAbortSignal](#cubridbytes-and-cubridabortsignal)
   - [PreparedQueryParam](#preparedqueryparam)
   - [QueryResultRow](#queryresultrow)
   - [QueryResult](#queryresult)
@@ -1877,7 +1878,7 @@ Options of [`stream()`](#streamtsql-params-options).
 ```ts
 interface StreamOptions {
   fetchSize?: number;
-  signal?: AbortSignal;
+  signal?: CubridAbortSignal; // AbortSignal
   consumerTimeout?: number;
   binding?: "literal" | "prepared";
 }
@@ -1896,7 +1897,7 @@ The optional last argument of `query()`, `queryResult()`, `execute()`, `queryPre
 
 ```ts
 interface QueryOptions {
-  signal?: AbortSignal;
+  signal?: CubridAbortSignal; // AbortSignal
   readTimeout?: number;
 }
 ```
@@ -2123,7 +2124,7 @@ type QueryParam =
   | boolean
   | bigint
   | Date
-  | Buffer
+  | CubridBytes // Buffer with @types/node
   | ZonedParam
   | null;
 ```
@@ -2237,8 +2238,8 @@ await db.executePrepared("INSERT INTO docs (id, body, notes) VALUES (?, ?, ?)", 
 ### LobParam, BlobSource and ClobSource
 
 ```ts
-type BlobSource = Buffer | Uint8Array | AsyncIterable<Buffer | Uint8Array> | Readable;
-type ClobSource = string | Buffer | AsyncIterable<string | Buffer | Uint8Array> | Readable;
+type BlobSource = CubridBytes | Uint8Array | AsyncIterable<CubridBytes | Uint8Array>;
+type ClobSource = string | CubridBytes | AsyncIterable<string | CubridBytes | Uint8Array>;
 
 interface LobParam {
   readonly kind: "blob" | "clob";
@@ -2247,6 +2248,27 @@ interface LobParam {
 ```
 
 A `LobParam` is frozen. Only `blob()` and `clob()` make one: an object of the same shape built by hand is not recognized.
+
+A Node `Readable` is accepted as an `AsyncIterable`. To tell one apart in `LobParam.source`, use `instanceof Readable`.
+
+### CubridBytes and CubridAbortSignal
+
+The environment types of the public declarations, so they compile without `@types/node` or the DOM lib ([#309](https://github.com/cubrid-lab/cubrid-client/issues/309)).
+
+```ts
+// Buffer when the program has @types/node, otherwise Uint8Array.
+type CubridBytes = typeof globalThis extends { Buffer: { isBuffer(value: unknown): value is infer B } }
+  ? B
+  : Uint8Array;
+
+// The global AbortSignal with @types/node or the DOM lib, otherwise a structural
+// type with aborted, reason, throwIfAborted() and add/removeEventListener("abort").
+type CubridAbortSignal = typeof globalThis extends { AbortSignal: { prototype: infer S } }
+  ? S
+  : AbortSignalShape;
+```
+
+With `@types/node` they are exactly `Buffer` and `AbortSignal`. At run time the client returns bytes as `Buffer` and requires a real `AbortSignal` for every `signal` option, whatever the types say. See [Declarations without Node types](API_STABILITY.md#declarations-without-node-types-309).
 
 ### PreparedQueryParam
 
@@ -2429,7 +2451,7 @@ interface PoolConnection
 }
 
 interface PoolConnectionOptions {
-  signal?: AbortSignal;
+  signal?: CubridAbortSignal; // AbortSignal
 }
 ```
 

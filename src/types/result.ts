@@ -1,3 +1,4 @@
+import type { CubridBytes } from "./platform.js";
 import type { ZonedDateTime } from "./zoned-date-time.js";
 
 export type QueryResultRow = Record<string, unknown>;
@@ -9,7 +10,7 @@ export type CollectionElement =
   | bigint
   | Date
   | ZonedDateTime
-  | Buffer
+  | CubridBytes
   | null
   | CollectionElement[];
 

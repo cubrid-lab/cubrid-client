@@ -56,6 +56,7 @@ export type {
 } from "./types/client.js";
 export type { BlobSource, ClobSource, LobParam, PreparedQueryParam } from "./types/lob.js";
 export { blob, clob } from "./types/lob.js";
+export type { CubridAbortSignal, CubridBytes } from "./types/platform.js";
 export type {
   PoolConnection,
   PoolConnectionOptions,
