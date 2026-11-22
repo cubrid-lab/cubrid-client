@@ -1,5 +1,22 @@
 # Reviewed npm release process
 
+## Publisher naming and configuration migration
+
+The package publisher is `.github/workflows/publish.yml`. Its
+`publish-production` job uses the `production` GitHub Environment.
+Release PR preparation uses `release-please.yml`, tests use `ci.yml`,
+and documentation deployment uses `docs.yml` when present.
+An optional test-index publisher uses job `publish-test` and environment
+`test`; candidate artifact checks require no test-index publication.
+
+Before merging the naming migration, configure `production` with the
+existing publisher environment's deployment ref restrictions, protection
+rules and applicable settings. Update the registry Trusted Publisher to
+authorize this repository, `publish.yml` and `production`, and verify
+the saved identity. Keep the previous configuration available until the
+replacement is verified. After cutover, verify the normal release and
+recovery route before retiring the obsolete configuration.
+
 This TypeScript/npm library uses Release Please's **node** release type, not a
 Python release strategy. The GitHub Release and npm publish steps are separate.
 
@@ -88,7 +105,7 @@ retained and no Release is created for it.
    severity dependency audit and the complete four-version live database,
    TLS and packed npm consumer validation on the **exact main commit**.
    Any failure blocks tag creation and npm publication.
-5. After every gate succeeds, the protected `npm-publish` environment
+5. After every gate succeeds, the protected `production` environment
    creates the exact version tag from the validated main commit using
    `gh release create` and publishes npm. **Release Please remains the
    version/changelog PR generator**, while the publication job independently
@@ -97,7 +114,7 @@ retained and no Release is created for it.
    Use **npm Trusted Publishing (OIDC)** rather than a long-lived
    `NPM_TOKEN`: an npm package maintainer must first register the publisher
    for organization `cubrid-lab`, repository `cubrid-client`, workflow
-   filename `publish.yml`, and environment `npm-publish`, with direct
+   filename `publish.yml`, and environment `production`, with direct
    `npm publish` permission (not just staging). The publish job uses Node
    22, an npm 11 CLI supporting OIDC and existing `id-token: write`
    GitHub permissions. The published package's GitHub source must match
@@ -164,7 +181,7 @@ An **npm package maintainer** must configure the Trusted Publisher under
 npmjs.com → package `cubrid-client` → Settings → Trusted Publishing.
 Set the provider to GitHub Actions, organization/user `cubrid-lab`,
 repository `cubrid-client`, workflow `publish.yml`, environment
-`npm-publish`, and enable direct `npm publish`. The package owner must
+`production`, and enable direct `npm publish`. The package owner must
 perform this one-time external-account operation. See the
 [official npm setup](https://docs.npmjs.com/trusted-publishers/).
 
