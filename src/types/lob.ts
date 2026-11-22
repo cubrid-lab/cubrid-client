@@ -1,5 +1,6 @@
 import { TextDecoder } from "node:util";
 
+import { asBuffer, isBytes } from "../internals/bytes.js";
 import { NOT_LATIN1, type TextCharset } from "../protocol/charset.js";
 import type { CubridBytes } from "./platform.js";
 import type { QueryParam } from "./query.js";
@@ -68,7 +69,7 @@ export function blob(source: BlobSource): LobParam {
  * {@link ClobSource}.
  */
 export function clob(source: ClobSource): LobParam {
-  if (typeof source !== "string" && !Buffer.isBuffer(source) && !isAsyncIterable(source)) {
+  if (typeof source !== "string" && !isBytes(source) && !isAsyncIterable(source)) {
     throw new TypeError("clob() takes a string, a Buffer, an AsyncIterable or a Readable");
   }
   return makeLobParam("clob", source);
@@ -229,7 +230,7 @@ async function* clobPieces(source: BlobSource | ClobSource): AsyncGenerator<Buff
   let carry = "";
 
   const pieces: Iterable<unknown> | AsyncIterable<unknown> =
-    typeof source === "string" || Buffer.isBuffer(source) ? [source] : source;
+    typeof source === "string" || isBytes(source) ? [source] : source;
   for await (const piece of pieces) {
     if (typeof piece === "string") {
       // Bytes before this text must have ended on a whole character.
@@ -268,7 +269,7 @@ async function* clobPieces(source: BlobSource | ClobSource): AsyncGenerator<Buff
 /** clobPieces() for charset "iso-8859-1": one byte per character, so nothing spans pieces. */
 async function* latin1ClobPieces(source: BlobSource | ClobSource): AsyncGenerator<Buffer> {
   const pieces: Iterable<unknown> | AsyncIterable<unknown> =
-    typeof source === "string" || Buffer.isBuffer(source) ? [source] : source;
+    typeof source === "string" || isBytes(source) ? [source] : source;
   for await (const piece of pieces) {
     if (typeof piece === "string") {
       for (let at = 0; at < piece.length; at += TEXT_SLICE) {
@@ -324,12 +325,6 @@ const LONE_SURROGATE_REFUSED = "clob() text holds a lone surrogate, which has no
 
 function isHighSurrogate(code: number): boolean {
   return code >= 0xd800 && code <= 0xdbff;
-}
-
-function asBuffer(bytes: Uint8Array): Buffer {
-  return Buffer.isBuffer(bytes)
-    ? bytes
-    : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 }
 
 function describe(value: unknown): string {

@@ -1409,7 +1409,8 @@ test("formatValue refuses values that are not a QueryParam instead of stringifyi
     [Symbol("s"), "symbol"],
     [new Map(), "object"],
     [Object.create(null), "object"],
-    [new Uint8Array([1]), "object"],
+    // A plain Uint8Array is bytes since #309; other typed arrays are not.
+    [new Uint16Array([1]), "object"],
   ];
   for (const [value, type] of cases) {
     for (const mode of [true, false]) {
@@ -1426,7 +1427,18 @@ test("formatValue refuses values that are not a QueryParam instead of stringifyi
 });
 
 test("assertLiteralParams accepts every QueryParam and refuses what formatValue refuses", () => {
-  assertLiteralParams([null, undefined, true, 1, -1, 1n, "it's", new Date(0), Buffer.from([1])]);
+  assertLiteralParams([
+    null,
+    undefined,
+    true,
+    1,
+    -1,
+    1n,
+    "it's",
+    new Date(0),
+    Buffer.from([1]),
+    new Uint8Array([1]),
+  ]);
   for (const value of [Number.NaN, new Date(Number.NaN), {}, [1], "a\0b"]) {
     assert.throws(() => assertLiteralParams(["ok", value]));
   }

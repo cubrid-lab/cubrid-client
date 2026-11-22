@@ -6843,3 +6843,40 @@ test("stream prepared: the client's prepared stream does not go through an overr
   ]);
   await client.close();
 });
+
+test("executeMany sends plain Uint8Array values exactly like equal Buffers (#309)", async () => {
+  const bytes = Buffer.from([0x00, 0x5c, 0x27, 0xff]);
+  const backing = new Uint8Array([7, ...bytes, 7]);
+  const sent: string[] = [];
+  for (const value of [bytes, new Uint8Array(bytes), backing.subarray(1, 1 + bytes.length)]) {
+    const { adapter, fakeCAS } = createPreparedAdapter();
+    queueBatch(fakeCAS, EXECUTE_ARRAY_FRAMES.prepareInsert, EXECUTE_ARRAY_FRAMES.insertThree);
+    await adapter.executeMany(INSERT_EM, [
+      [1, value as Buffer],
+      [2, value as Buffer],
+      [3, value as Buffer],
+    ]);
+    sent.push(fakeCAS.sentPayloads[1]!.toString("hex"));
+  }
+  assert.equal(sent[1], sent[0]);
+  assert.equal(sent[2], sent[0]);
+});
+
+test("ssl.ca given as a plain Uint8Array reaches TLS as a Buffer over the same bytes (#309)", () => {
+  const pem = Buffer.from("-----BEGIN CERTIFICATE-----\n");
+  const backing = new Uint8Array([0, ...pem, 0]);
+  for (const ca of [new Uint8Array(pem), backing.subarray(1, 1 + pem.length)]) {
+    const adapter = new NativeCubridAdapter({ ...DEFAULT_CONFIG, ssl: { ca: ca as Buffer } });
+    const resolved = (
+      adapter as unknown as { resolveSslConfig(): { ca?: unknown } }
+    ).resolveSslConfig();
+    assert.ok(Buffer.isBuffer(resolved.ca));
+    assert.deepEqual(resolved.ca, pem);
+  }
+  const text = "pem";
+  const adapter = new NativeCubridAdapter({ ...DEFAULT_CONFIG, ssl: { ca: text } });
+  assert.equal(
+    (adapter as unknown as { resolveSslConfig(): { ca?: unknown } }).resolveSslConfig().ca,
+    text,
+  );
+});

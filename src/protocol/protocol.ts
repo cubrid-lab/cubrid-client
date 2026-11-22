@@ -11,6 +11,7 @@
 
 import { TextDecoder } from "node:util";
 import { CasReplyError } from "../errors/internal-errors.js";
+import { asBuffer, isBytes } from "../internals/bytes.js";
 import {
   CLOB_NOT_LATIN1,
   isLobParam,
@@ -1489,10 +1490,10 @@ function encodeOneParam(w: PacketWriter, value: unknown): void {
     return;
   }
 
-  if (Buffer.isBuffer(value)) {
+  if (isBytes(value)) {
     w.writeInt(1 + value.length);
     w.writeByte(CUBRIDDataType.VARBIT);
-    w.writeBytes(value);
+    w.writeBytes(asBuffer(value));
     return;
   }
 
@@ -1617,13 +1618,13 @@ function writePreparedParam(w: PacketWriter, value: unknown, charset: TextCharse
     return;
   }
 
-  if (Buffer.isBuffer(value)) {
+  if (isBytes(value)) {
     // X'' is valid SQL, but the CAS reads a zero-length bind as SQL NULL.
     if (value.length === 0) {
       throw new Error("an empty Buffer cannot be sent as a prepared parameter: it would be NULL");
     }
     w.addByte(CUBRIDDataType.VARBIT);
-    w.addBytes(value);
+    w.addBytes(asBuffer(value));
     return;
   }
 
@@ -2119,8 +2120,8 @@ export function formatValue(value: unknown, noBackslashEscapes: boolean): string
     return formatZoned(value.time);
   }
 
-  if (Buffer.isBuffer(value)) {
-    return `X'${value.toString("hex")}'`;
+  if (isBytes(value)) {
+    return `X'${asBuffer(value).toString("hex")}'`;
   }
 
   throw unsupportedParam(value);

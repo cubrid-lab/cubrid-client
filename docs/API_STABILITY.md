@@ -310,24 +310,36 @@ MINOR change:
   `instanceof Readable` instead, which still works.
 - Without `@types/node`, a `signal` of the structural shape type-checks, but at
   run time a `signal` option must still be a real `AbortSignal`, as before; any
-  other object is refused with a `TypeError`. Likewise a byte value in
-  `QueryParam` and a `clob()` byte source type-check as a plain `Uint8Array`
-  without Node's types, but at run time they must be a `Buffer`, as before: a
-  plain `Uint8Array` parameter or `clob()` source is refused (`blob()` accepts
-  one, as it always did). The client always returns
-  BLOB, BIT and collection bytes as `Buffer`; without Node's types they are only
-  typed `Uint8Array`, which `Buffer` extends.
-- **Projects without `@types/node` that set `skipLibCheck: true`.** Before, the
-  unresolved `Buffer` and `AbortSignal` silently behaved as `any`, so for example
-  any value passed as a `QueryParam`, and `signal.reason` read as any type. They
-  are now real types, so such code can get new compile errors (for example
-  `db.query(sql, values as unknown[])`). This configuration never type-checked
-  the declarations, and the runtime accepts exactly what the new types describe
-  (plus the `Buffer` caveat above), so this is classified as a MINOR correction
-  of the declarations rather than a narrowed contract. Release notes must call
-  it out. The fix is to type the values, or to add `@types/node`.
-- The declarations still need `lib` `es2022` or later (`ErrorOptions`, for
-  example).
+  other object is refused with a `TypeError`.
+- **Runtime widening: a plain `Uint8Array` is bytes.** So that the types and the
+  runtime agree, a `Uint8Array` that is not a `Buffer` is now accepted wherever a
+  `Buffer` is: a parameter of `query()`, `execute()`, `stream()`, the
+  `*Prepared` methods and `executeMany()`; a `clob()` source (`blob()` and stream
+  chunks already took one); and `ssl.ca`. It is wrapped as a `Buffer` over the
+  same memory, without copying, and sends exactly the bytes an equal `Buffer`
+  sends: `X'...'` on the literal path, VARBIT on the prepared path, and an
+  empty one is refused on the prepared path like an empty `Buffer`. Before, such
+  a value was refused. `Buffer` handling is unchanged, and other typed arrays
+  and `DataView` are still refused. This is a backward-compatible MINOR
+  widening. With `@types/node` the types still say `Buffer`, as before. The
+  client always returns BLOB, BIT and collection bytes as `Buffer`; without
+  Node's types they are typed `Uint8Array`, which `Buffer` extends.
+- **SemVer decision: new compile errors for projects without `@types/node` that
+  set `skipLibCheck: true`.** In those projects the unresolved `Buffer` and
+  `AbortSignal` in the old declarations resolved to `any`. So `QueryParam` and
+  every `signal` option were effectively `any`. Now they are real types, and such
+  code can get new compile errors. For example `db.query(sql, rows as unknown[])`
+  no longer compiles, and neither does `const s: string = options.signal.reason`.
+  The maintainer decided, on
+  [#325](https://github.com/cubrid-lab/cubrid-client/pull/325), to class this as a
+  **1.x MINOR declaration-bug correction**, not a MAJOR narrowing. The reasons:
+  - That configuration never type-checked the declarations.
+  - The runtime accepts what the new types describe.
+  - Projects with `@types/node`, or with `skipLibCheck: false`, are unaffected.
+
+  The 1.6.0 release notes carry it as an upgrade note. To fix such code, type the
+  values (for example `rows as QueryParam[]`) or add `@types/node`.
+- The declarations need `lib` `es2022` or later (`ErrorOptions`, for example).
 - `npm run types:packed` (CI, Node 22) packs the build and compiles three
   consumers with `skipLibCheck: false`: no Node or DOM types, the DOM lib only, and
   `@types/node`, where it also checks that `CubridBytes` and `CubridAbortSignal`

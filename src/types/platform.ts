@@ -7,8 +7,9 @@
 /**
  * Bytes: Node's `Buffer` when the program has Node's types (`@types/node`),
  * otherwise `Uint8Array`, which `Buffer` extends. At run time the client always
- * returns a `Buffer`, and a byte parameter or `clob()` source must be a `Buffer`.
- * A global `Buffer` typed `any` falls back to `Uint8Array` too.
+ * returns a `Buffer`, and accepts a plain `Uint8Array` wherever it accepts a
+ * `Buffer` (sent without copying, as the same bytes). A global `Buffer` typed
+ * `any` falls back to `Uint8Array` too.
  */
 export type CubridBytes = typeof globalThis extends {
   Buffer: { isBuffer(value: unknown): value is infer B };

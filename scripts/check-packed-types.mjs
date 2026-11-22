@@ -64,8 +64,10 @@ const CONSUMERS = {
     lib: ["es2022"],
     types: [],
     source: `${COMMON}${EQUAL}
-// Without Node's types the bytes type is Uint8Array. At run time a byte
-// parameter or clob() source must still be a Buffer (docs/API_STABILITY.md).
+// Without Node's types the bytes type is Uint8Array, and the runtime accepts a
+// plain Uint8Array wherever it accepts a Buffer (docs/API_STABILITY.md).
+void db.query("SELECT ?", [bytes]);
+clob(bytes);
 const bytesIsUint8Array: Equal<CubridBytes, Uint8Array> = true;
 void bytesIsUint8Array;
 declare const signal: CubridAbortSignal;

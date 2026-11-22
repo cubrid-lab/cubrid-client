@@ -2137,7 +2137,7 @@ type QueryParam =
 | `bigint` | `BIGINT` | `9007199254740993n` |
 | `Date` | `DATETIME` / `TIMESTAMP` | `new Date()` |
 | [`ZonedParam`](#zoned-and-zonedparam) | `DATETIMETZ` at `+00:00`, for zone-aware columns | `zoned(new Date())` |
-| `Buffer` | `BIT VARYING` (also stored into a `BLOB` column) | `Buffer.from("data")` |
+| `Buffer` | `BIT VARYING` (also stored into a `BLOB` column). A plain `Uint8Array` is sent the same way (#309) | `Buffer.from("data")` |
 | `null` | `NULL` | `null` |
 
 Note: `BIGINT` columns in query results are returned as JavaScript `bigint` values (not `number`), so the full signed 64-bit range is preserved.
@@ -2269,7 +2269,7 @@ type CubridAbortSignal = typeof globalThis extends { AbortSignal: { prototype: i
   : AbortSignalShape;
 ```
 
-With `@types/node` they are exactly `Buffer` and `AbortSignal`. At run time the client returns bytes as `Buffer`, requires a `Buffer` for a byte parameter and a `clob()` byte source, and requires a real `AbortSignal` for every `signal` option, whatever the types say. See [Declarations without Node types](API_STABILITY.md#declarations-without-node-types-309).
+With `@types/node` they are exactly `Buffer` and `AbortSignal`. At run time the client returns bytes as `Buffer`, accepts a plain `Uint8Array` wherever it accepts a `Buffer` (parameters, `executeMany()` rows, `blob()`, `clob()` and `ssl.ca`; sent as the same bytes, without copying), and requires a real `AbortSignal` for every `signal` option, whatever the types say. See [Declarations without Node types](API_STABILITY.md#declarations-without-node-types-309).
 
 ### PreparedQueryParam
 
