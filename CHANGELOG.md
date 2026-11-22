@@ -5,6 +5,18 @@ This file is the **commit-level history**; the curated GitHub Release text for e
 version lives in `docs/releases/vX.Y.Z.md`. Release notes must describe verified
 user-visible behavior and known limitations, not just completed implementation.
 
+## [1.6.0](https://github.com/cubrid-lab/cubrid-client/compare/v1.5.0...v1.6.0) (2026-11-22)
+
+
+### Bug Fixes
+
+* compile published declarations without @types/node ([#325](https://github.com/cubrid-lab/cubrid-client/issues/325)) ([b808400](https://github.com/cubrid-lab/cubrid-client/commit/b808400cad856bb438f06220d1596a72764ab64b))
+
+
+### Documentation
+
+* add curated v1.6.0 release notes ([#327](https://github.com/cubrid-lab/cubrid-client/issues/327)) ([51163f2](https://github.com/cubrid-lab/cubrid-client/commit/51163f2bfac4c1e7c2fa7dcda5c8e98cb19fc86b))
+
 ## [1.5.0](https://github.com/cubrid-lab/cubrid-client/compare/v1.4.0...v1.5.0) (2026-11-22)
 
 
