@@ -22,6 +22,7 @@ if (existsSync(jar) && sha256(readFileSync(jar)) === pin.sha256) {
 }
 const MAX_ATTEMPTS = 6;
 const MAX_DELAY_MS = 60_000;
+const REQUEST_TIMEOUT_MS = 60_000;
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 const isTransient = (status) => status === 408 || status === 429 || status >= 500;
 
@@ -40,14 +41,18 @@ async function download(url) {
   for (let attempt = 1; ; attempt++) {
     let response;
     try {
-      response = await fetch(url);
+      // The timeout covers the body too, so a stalled transfer is retried.
+      response = await fetch(url, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+      if (response.ok) return Buffer.from(await response.arrayBuffer());
     } catch (error) {
       if (attempt >= MAX_ATTEMPTS) throw new Error(`GET ${url} failed: ${error}`);
-      process.stderr.write(`GET ${url} failed (${error}); retry ${attempt}/${MAX_ATTEMPTS - 1}\n`);
-      await sleep(retryDelay(attempt));
+      const delay = retryDelay(attempt);
+      process.stderr.write(
+        `GET ${url} failed (${error}); retry ${attempt}/${MAX_ATTEMPTS - 1} in ${Math.round(delay / 1000)}s\n`,
+      );
+      await sleep(delay);
       continue;
     }
-    if (response.ok) return Buffer.from(await response.arrayBuffer());
     if (!isTransient(response.status) || attempt >= MAX_ATTEMPTS) {
       throw new Error(`GET ${url} failed: HTTP ${response.status}`);
     }

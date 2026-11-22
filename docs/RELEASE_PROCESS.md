@@ -132,13 +132,16 @@ retained and no Release is created for it.
    revalidating the npm cache and allowing up to 10 minutes for registry
    propagation ([#329](https://github.com/cubrid-lab/cubrid-client/issues/329)).
 7. If validation fails **before a tag was created**, for example on a
-   transient registry or Maven Central error, fix the cause and re-run all
-   jobs of the release merge's own `Publish verified npm release` run.
-   This works after `main` has moved on. Do not merge other changes as a
-   way to trigger publication: those pushes are not release candidates.
-   A `workflow_dispatch` run with `confirmation=PUBLISH` and no
-   `recovery_tag` validates the current `main` head and warns that it is
-   not the release merge; use it only when re-running is impossible.
+   transient registry or Maven Central error, re-run the release merge's
+   own `Publish verified npm release` run with **Re-run all jobs**. This
+   works after `main` has moved on, but GitHub allows re-runs for only
+   30 days, and a re-run uses that commit's workflow files. If the
+   pipeline itself needs a fix, merge the fix, then use **Actions →
+   Publish verified npm release → Run workflow** from `main` with
+   `confirmation=PUBLISH` and no `recovery_tag`. A manual run uses the
+   workflow code on `main` but still validates and tags the reviewed
+   release merge. Other pushes to `main` are not release candidates; one
+   that arrives while a release is unpublished ends with a warning.
 8. If npm publication fails **after a tag was created**, investigate the
    cause and use **Actions → Publish verified npm release → Run workflow**,
    `confirmation=PUBLISH`, `recovery_tag=vX.Y.Z`. The workflow validates
