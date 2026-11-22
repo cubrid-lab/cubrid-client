@@ -100,7 +100,11 @@ retained and no Release is created for it.
    the version, package lockfile and manifest match, the curated note exists,
    a matching Release Please PR was merged, and no version tag or npm
    artifact already exists. It is idempotent: an existing GitHub Release
-   is not generated twice.
+   is not generated twice. An automatic run publishes **only from that
+   Release Please PR's merge commit**. A later push to `main`, such as a
+   workflow change merged while the release is pending, is not a candidate
+   and cannot move the release onto a different commit
+   ([#330](https://github.com/cubrid-lab/cubrid-client/issues/330)).
 4. The same automatic job repeats Node 18/20/22/24/26 preflight checks, high
    severity dependency audit and the complete four-version live database,
    TLS and packed npm consumer validation on the **exact main commit**.
@@ -124,13 +128,23 @@ retained and no Release is created for it.
    versions, API declarations, tests, package and audited dependencies,
    publishes the emoji-free curated Release notes under the title
    `cubrid-client vX.Y.Z`, then publishes the package. Finally it verifies
-   that the exact version appears both in GitHub Releases and npm.
-7. If npm publication fails **after a tag was created**, investigate the
+   that the exact version appears both in GitHub Releases and npm,
+   revalidating the npm cache and allowing up to 10 minutes for registry
+   propagation ([#329](https://github.com/cubrid-lab/cubrid-client/issues/329)).
+7. If validation fails **before a tag was created**, for example on a
+   transient registry or Maven Central error, fix the cause and re-run all
+   jobs of the release merge's own `Publish verified npm release` run.
+   This works after `main` has moved on. Do not merge other changes as a
+   way to trigger publication: those pushes are not release candidates.
+   A `workflow_dispatch` run with `confirmation=PUBLISH` and no
+   `recovery_tag` validates the current `main` head and warns that it is
+   not the release merge; use it only when re-running is impossible.
+8. If npm publication fails **after a tag was created**, investigate the
    cause and use **Actions → Publish verified npm release → Run workflow**,
    `confirmation=PUBLISH`, `recovery_tag=vX.Y.Z`. The workflow validates
    that immutable tag instead of creating another release or changing tag
    history. This manual path is for recovery, not the standard release.
-8. Release Please does **not** propose the following version until the
+9. Release Please does **not** propose the following version until the
    current `package.json` version has both a GitHub Release and the **exact
    corresponding public npm version**. Missing or unavailable registry data
    fails closed; check the existing immutable tag and use explicit publication
