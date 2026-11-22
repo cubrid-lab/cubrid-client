@@ -1,13 +1,14 @@
 /**
  * Bytes: Node's `Buffer` when the program has Node's types (`@types/node`),
  * otherwise `Uint8Array`, which `Buffer` extends. At run time the client always
- * returns a `Buffer`.
+ * returns a `Buffer`, and a byte parameter or `clob()` source must be a `Buffer`.
+ * A global `Buffer` typed `any` falls back to `Uint8Array` too.
  */
 type CubridBytes = typeof globalThis extends {
     Buffer: {
         isBuffer(value: unknown): value is infer B;
     };
-} ? B : Uint8Array;
+} ? unknown extends B ? Uint8Array : B : Uint8Array;
 /**
  * The members of an abort signal that the client uses. Only the fallback of
  * {@link CubridAbortSignal} when neither Node's types nor the DOM lib are present.
@@ -31,7 +32,7 @@ type CubridAbortSignal = typeof globalThis extends {
     AbortSignal: {
         prototype: infer S;
     };
-} ? S : AbortSignalShape;
+} ? unknown extends S ? AbortSignalShape : S : AbortSignalShape;
 
 /**
  * A `Date` parameter sent with its zone, made by {@link zoned}: a DATETIMETZ of

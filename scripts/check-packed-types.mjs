@@ -64,7 +64,8 @@ const CONSUMERS = {
     lib: ["es2022"],
     types: [],
     source: `${COMMON}${EQUAL}
-// Without Node's types the bytes type is Uint8Array.
+// Without Node's types the bytes type is Uint8Array. At run time a byte
+// parameter or clob() source must still be a Buffer (docs/API_STABILITY.md).
 const bytesIsUint8Array: Equal<CubridBytes, Uint8Array> = true;
 void bytesIsUint8Array;
 declare const signal: CubridAbortSignal;
@@ -81,7 +82,8 @@ void wrong;
     types: [],
     source: `${COMMON}${EQUAL}
 const signalIsDom: Equal<CubridAbortSignal, AbortSignal> = true;
-void signalIsDom;
+const bytesIsUint8Array: Equal<CubridBytes, Uint8Array> = true;
+void [signalIsDom, bytesIsUint8Array];
 const options: QueryOptions = { signal: new AbortController().signal };
 void options;
 `,
@@ -188,7 +190,9 @@ try {
             types,
             typeRoots: types.length > 0 ? [NODE_TYPES] : [],
           },
-          // Both declaration files are checked: ESM and CommonJS consumers get one each.
+          // Both published declaration files are checked under skipLibCheck: false.
+          // package.json resolves both import and require to index.d.ts; api:check
+          // keeps index.d.cts identical to it.
           files: [
             "index.ts",
             "node_modules/cubrid-client/dist/index.d.ts",

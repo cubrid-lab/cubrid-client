@@ -291,16 +291,17 @@ MINOR change:
 | Public type | Before | Now, with `@types/node` | Now, without `@types/node` |
 | --- | --- | --- | --- |
 | `CubridBytes` (new export) | — | `Buffer` | `Uint8Array` |
-| `CubridAbortSignal` (new export) | — | the global `AbortSignal` (also with the DOM lib) | a structural type: `aborted`, `reason`, `throwIfAborted()`, `addEventListener("abort")`, `removeEventListener("abort")` |
+| `CubridAbortSignal` (new export) | — | the global `AbortSignal` | the DOM `AbortSignal` with the DOM lib; otherwise a structural type: `aborted`, `reason`, `throwIfAborted()`, `addEventListener("abort")`, `removeEventListener("abort")` |
 | `QueryParam`, `CollectionElement`, `ClientSSLOptions.ca` | `Buffer` | `CubridBytes`, which is exactly `Buffer` | `Uint8Array` |
 | `BlobSource`, `ClobSource` | `Buffer`, `AsyncIterable` of chunks, or `Readable` | `CubridBytes` (`Buffer`), `Uint8Array`, `AsyncIterable` of chunks | the same with `Uint8Array` |
 | `signal` of `QueryOptions`, `StreamOptions`, `PoolConnectionOptions` | `AbortSignal` | `CubridAbortSignal`, which is exactly `AbortSignal` | the structural type |
 
 - Both new types are conditional on `typeof globalThis`: they resolve to the
-  real global type when the program has it. With `@types/node`, every value the
-  client hands back keeps its exact type: a `Buffer` in a collection is typed
-  `Buffer`, and the `signal` a custom `ConnectionLike` receives is a full
-  `AbortSignal`.
+  real global type when the program has it (a global typed `any` counts as
+  absent). With `@types/node` they are exactly `Buffer` and `AbortSignal`: a
+  `Buffer` in a collection is typed `Buffer`, and the `signal` a custom
+  `ConnectionLike` receives is a full `AbortSignal`. The one value whose type
+  narrows is `LobParam.source`, below.
 - A real `AbortSignal`, `Buffer` and `Readable` are accepted everywhere they were.
   `Readable` is no longer named in `BlobSource` and `ClobSource`: it is accepted as
   an `AsyncIterable`, which it implements with chunks typed `any`. The one
@@ -309,9 +310,24 @@ MINOR change:
   `instanceof Readable` instead, which still works.
 - Without `@types/node`, a `signal` of the structural shape type-checks, but at
   run time a `signal` option must still be a real `AbortSignal`, as before; any
-  other object is refused with a `TypeError`. The client always returns BLOB,
-  BIT and collection bytes as `Buffer`; without Node's types they are only typed
-  `Uint8Array`, which `Buffer` extends.
+  other object is refused with a `TypeError`. Likewise a byte value in
+  `QueryParam` and a `clob()` byte source type-check as a plain `Uint8Array`
+  without Node's types, but at run time they must be a `Buffer`, as before: a
+  plain `Uint8Array` parameter or `clob()` source is refused (`blob()` accepts
+  one, as it always did). The client always returns
+  BLOB, BIT and collection bytes as `Buffer`; without Node's types they are only
+  typed `Uint8Array`, which `Buffer` extends.
+- **Projects without `@types/node` that set `skipLibCheck: true`.** Before, the
+  unresolved `Buffer` and `AbortSignal` silently behaved as `any`, so for example
+  any value passed as a `QueryParam`, and `signal.reason` read as any type. They
+  are now real types, so such code can get new compile errors (for example
+  `db.query(sql, values as unknown[])`). This configuration never type-checked
+  the declarations, and the runtime accepts exactly what the new types describe
+  (plus the `Buffer` caveat above), so this is classified as a MINOR correction
+  of the declarations rather than a narrowed contract. Release notes must call
+  it out. The fix is to type the values, or to add `@types/node`.
+- The declarations still need `lib` `es2022` or later (`ErrorOptions`, for
+  example).
 - `npm run types:packed` (CI, Node 22) packs the build and compiles three
   consumers with `skipLibCheck: false`: no Node or DOM types, the DOM lib only, and
   `@types/node`, where it also checks that `CubridBytes` and `CubridAbortSignal`

@@ -7,12 +7,15 @@
 /**
  * Bytes: Node's `Buffer` when the program has Node's types (`@types/node`),
  * otherwise `Uint8Array`, which `Buffer` extends. At run time the client always
- * returns a `Buffer`.
+ * returns a `Buffer`, and a byte parameter or `clob()` source must be a `Buffer`.
+ * A global `Buffer` typed `any` falls back to `Uint8Array` too.
  */
 export type CubridBytes = typeof globalThis extends {
   Buffer: { isBuffer(value: unknown): value is infer B };
 }
-  ? B
+  ? unknown extends B
+    ? Uint8Array
+    : B
   : Uint8Array;
 
 /**
@@ -36,5 +39,7 @@ interface AbortSignalShape {
 export type CubridAbortSignal = typeof globalThis extends {
   AbortSignal: { prototype: infer S };
 }
-  ? S
+  ? unknown extends S
+    ? AbortSignalShape
+    : S
   : AbortSignalShape;

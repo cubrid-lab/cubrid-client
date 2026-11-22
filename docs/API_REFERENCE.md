@@ -2263,12 +2263,13 @@ type CubridBytes = typeof globalThis extends { Buffer: { isBuffer(value: unknown
 
 // The global AbortSignal with @types/node or the DOM lib, otherwise a structural
 // type with aborted, reason, throwIfAborted() and add/removeEventListener("abort").
+// AbortSignalShape is internal to the declarations and not exported.
 type CubridAbortSignal = typeof globalThis extends { AbortSignal: { prototype: infer S } }
   ? S
   : AbortSignalShape;
 ```
 
-With `@types/node` they are exactly `Buffer` and `AbortSignal`. At run time the client returns bytes as `Buffer` and requires a real `AbortSignal` for every `signal` option, whatever the types say. See [Declarations without Node types](API_STABILITY.md#declarations-without-node-types-309).
+With `@types/node` they are exactly `Buffer` and `AbortSignal`. At run time the client returns bytes as `Buffer`, requires a `Buffer` for a byte parameter and a `clob()` byte source, and requires a real `AbortSignal` for every `signal` option, whatever the types say. See [Declarations without Node types](API_STABILITY.md#declarations-without-node-types-309).
 
 ### PreparedQueryParam
 
