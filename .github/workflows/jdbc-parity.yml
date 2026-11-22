@@ -64,12 +64,35 @@ jobs:
           distribution: temurin
           java-version: "17"
       - run: npm ci
+      # The verified JAR is cached so most runs never contact Maven Central,
+      # which rate-limits CI runners with HTTP 429 (#328). It is saved right
+      # after the download, so a later failure in this job still caches it.
+      - name: Restore the cached CUBRID JDBC driver
+        id: jar-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/cubrid-jdbc
+          key: cubrid-jdbc-${{ runner.os }}-${{ hashFiles('tests/jdbc-parity/jdbc-driver.json') }}
       - name: Download the pinned CUBRID JDBC driver and check its SHA-256
         id: jar
         shell: bash
         run: |
           set -euo pipefail
-          echo "path=$(node tests/jdbc-parity/fetch-jdbc.mjs "$RUNNER_TEMP/cubrid-jdbc")" >> "$GITHUB_OUTPUT"
+          # Assign first: a failure inside $(...) passed to echo would be ignored.
+          jar=$(node tests/jdbc-parity/fetch-jdbc.mjs "$RUNNER_TEMP/cubrid-jdbc")
+          if [[ -z "$jar" || ! -f "$jar" ]]; then
+            echo "::error::JDBC driver download did not produce a JAR"
+            exit 1
+          fi
+          echo "path=$jar" >> "$GITHUB_OUTPUT"
+      - name: Save the verified CUBRID JDBC driver
+        if: steps.jar-cache.outputs.cache-hit != 'true'
+        # Parallel matrix jobs race to save the same key; losing is harmless.
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/cubrid-jdbc
+          key: ${{ steps.jar-cache.outputs.cache-primary-key }}
       - name: Start disposable CUBRID broker and database
         shell: bash
         run: |

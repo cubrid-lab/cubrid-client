@@ -2,7 +2,7 @@ name: Publish verified npm release
 
 # A reviewed version/CHANGELOG merge on main automatically runs all pre-tag
 # checks and publishes the package. Workflow changes also trigger this job,
-# allowing the initial v1.2.0 release to bootstrap without a manual dispatch.
+# but the candidate job publishes only from the Release Please merge commit.
 # GITHUB_TOKEN tag events do not trigger other workflows, so tagged verification
 # and npm publication remain in this same workflow.
 on:
@@ -28,11 +28,6 @@ on:
 permissions:
   contents: read
 
-# No parallel tag/npm publication for the same repository/version line.
-concurrency:
-  group: reviewed-npm-release-${{ github.repository }}
-  cancel-in-progress: false
-
 jobs:
   candidate:
     name: Detect a reviewed, unpublished release candidate
@@ -40,10 +35,15 @@ jobs:
     outputs:
       should_publish: ${{ steps.decide.outputs.should_publish }}
       tag: ${{ steps.decide.outputs.tag }}
+      # Commit or tag every later job validates and publishes: the release
+      # merge for a new release, or the existing tag for a recovery.
+      ref: ${{ steps.decide.outputs.ref }}
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.recovery_tag || github.sha }}
+          # Full history, so a manual run can confirm the release merge exists.
+          fetch-depth: 0
           persist-credentials: false
       - name: Verify merged release version and idempotency
         id: decide
@@ -54,6 +54,7 @@ jobs:
           MANUAL_CONFIRMATION: ${{ inputs.confirmation }}
           RECOVERY_TAG: ${{ inputs.recovery_tag }}
           TRIGGER_SHA: ${{ github.sha }}
+          TRIGGER_REF: ${{ github.ref }}
         shell: bash
         run: |
           set -euo pipefail
@@ -83,15 +84,41 @@ jobs:
               exit 1
             fi
             gh release view "$tag" --repo "$GH_REPO" >/dev/null
+            echo "ref=$RECOVERY_TAG" >> "$GITHUB_OUTPUT"
             echo "should_publish=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          release_exists=false
           if gh release view "$tag" --repo "$GH_REPO" >/dev/null 2>&1; then
             if node scripts/verify-npm-version.mjs "$version"; then
               echo "::notice::$tag already exists in GitHub and npm; no duplicate publication."
               echo "should_publish=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
+            release_exists=true
+          fi
+          # Only a merged Release Please PR with the expected release title
+          # can authorize automated creation of a new immutable tag.
+          release_merge=$(gh pr list --repo "$GH_REPO" --state merged --base main --limit 100 \
+              --json title,headRefName,mergeCommit \
+              --jq '.[] | select(.headRefName | startswith("release-please--")) | [.title, .mergeCommit.oid] | @tsv' \
+            | awk -F '\t' -v title="chore(main): release $version" '$1 == title && !found {print $2; found = 1}')
+          if [[ -z "$release_merge" ]]; then
+            echo "::error::No merged, reviewed Release Please PR for $tag"
+            exit 1
+          fi
+          # Tag only the reviewed release merge itself (#330). A later push,
+          # such as a workflow change merged while a release is pending, must
+          # not publish that release from a different commit. Re-running the
+          # release merge's own run remains possible after main has moved.
+          # This runs before the checks below, so such a push never fails
+          # while the release merge's own run is still publishing.
+          if [[ "$EVENT_NAME" == push && "$TRIGGER_SHA" != "$release_merge" ]]; then
+            echo "::warning::$tag is not yet on npm, and $TRIGGER_SHA is not its release merge $release_merge, so this run does not publish it. If that commit's publish run has failed, re-run all of its jobs, or dispatch this workflow from main."
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$release_exists" == true ]]; then
             echo "::error::$tag exists on GitHub but npm publication is not verified. Use explicit recovery_tag for this immutable version; never advance by creating another tag."
             exit 1
           fi
@@ -118,23 +145,18 @@ jobs:
             echo "::error::npm package $version exists but its GitHub Release is missing."
             exit 1
           fi
-          if [[ "$EVENT_NAME" == push ]]; then
-            latest=$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq '.object.sha')
-            if [[ "$latest" != "$TRIGGER_SHA" ]]; then
-              echo "::notice::Obsolete main commit; a later push will check the latest release candidate."
-              echo "should_publish=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          fi
-          # Only a merged Release Please PR with the expected release title
-          # can authorize automated creation of a new immutable tag.
-          if ! gh pr list --repo "$GH_REPO" --state merged --base main --limit 100 \
-              --json title,headRefName \
-              --jq '.[] | select(.headRefName | startswith("release-please--")) | .title' \
-              | grep -Fxq "chore(main): release $version"; then
-            echo "::error::No merged, reviewed Release Please PR for $tag"
+          # A manual run validates and tags the release merge as well, using
+          # the workflow YAML on main. Scripts and tests still come from the
+          # release merge, because they are checked out at that commit.
+          if [[ "$EVENT_NAME" == workflow_dispatch && "$TRIGGER_REF" != refs/heads/main ]]; then
+            echo "::error::Dispatch a new release from main, not $TRIGGER_REF"
             exit 1
           fi
+          if ! git merge-base --is-ancestor "$release_merge" HEAD; then
+            echo "::error::Release merge $release_merge is not in the history of $TRIGGER_SHA"
+            exit 1
+          fi
+          echo "ref=$release_merge" >> "$GITHUB_OUTPUT"
           echo "should_publish=true" >> "$GITHUB_OUTPUT"
           echo "Verified reviewed release candidate $tag" >> "$GITHUB_STEP_SUMMARY"
 
@@ -149,7 +171,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           # Recovery must validate the immutable artifact, not unrelated main.
-          ref: ${{ inputs.recovery_tag || github.sha }}
+          ref: ${{ needs.candidate.outputs.ref }}
           persist-credentials: false
       - name: Setup Node.js ${{ matrix.node-version }}
         uses: actions/setup-node@v7
@@ -179,13 +201,19 @@ jobs:
     needs: [candidate, preflight]
     uses: ./.github/workflows/release-validation.yml
     with:
-      checkout_ref: ${{ inputs.recovery_tag || github.sha }}
+      checkout_ref: ${{ needs.candidate.outputs.ref }}
 
   publish-production:
     if: needs.candidate.outputs.should_publish == 'true'
     needs: [candidate, preflight, release-validation]
     runs-on: ubuntu-latest
     environment: production
+    # No parallel tag/npm publication. Only this job is serialized: a
+    # workflow-level group would let a later push cancel a queued release
+    # merge run, since GitHub keeps one pending run per group.
+    concurrency:
+      group: reviewed-npm-release-${{ github.repository }}
+      cancel-in-progress: false
     permissions:
       contents: write
       # Clear the pending state of the merged Release Please PR after npm
@@ -199,7 +227,7 @@ jobs:
       # edited after creation, leaving a fully verified candidate untagged.
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.recovery_tag || github.sha }}
+          ref: ${{ needs.candidate.outputs.ref }}
           persist-credentials: false
       - name: Create immutable version tag and reviewed GitHub Release
         if: ${{ inputs.recovery_tag == '' }}
@@ -207,7 +235,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           EXPECTED_TAG: ${{ needs.candidate.outputs.tag }}
-          CANDIDATE_SHA: ${{ github.sha }}
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.ref }}
         shell: bash
         run: |
           set -euo pipefail
@@ -323,8 +351,11 @@ jobs:
           set -euo pipefail
           version=${RELEASE_TAG#v}
           gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null
-          for (( attempt=1; attempt<=18; attempt++ )); do
-            published=$(npm view "cubrid-client@$version" version 2>/dev/null || true)
+          # --prefer-online: the pre-publish "npm view" cached the package
+          # document (max-age 300) without this version (#329). Allow up to
+          # 10 minutes for registry propagation.
+          for (( attempt=1; attempt<=60; attempt++ )); do
+            published=$(npm view "cubrid-client@$version" version --prefer-online 2>/dev/null || true)
             if [[ "$published" == "$version" ]]; then
               echo "Verified GitHub Release $RELEASE_TAG and npm cubrid-client@$version" >> "$GITHUB_STEP_SUMMARY"
               exit 0
