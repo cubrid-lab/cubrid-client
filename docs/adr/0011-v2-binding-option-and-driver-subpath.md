@@ -158,15 +158,17 @@ Verified facts this decision relies on:
       `api/index.d.ts`.
 - [ ] Every item of the evidence gate is recorded with exact server versions
       before the 2.0 default is chosen.
-- [ ] Prepared streaming is verified on a live CUBRID server (cursor lifecycle,
+- [x] Prepared streaming is verified on a live CUBRID server (cursor lifecycle,
       early stop, errors, abort, transactions, pool lease) before the 1.x MINOR
       ships it. #307 adds `StreamOptions.binding` for `stream()` alone, ahead of
-      the rest of the bridge. Live tests on 11.4 only (`Integration: stream() in
-      a transaction, and with typed binds (#307)`) cover a stream that completes,
+      the rest of the bridge. The live tests `Integration: stream() in a
+      transaction, and with typed binds (#307)` cover a stream that completes,
       an early break, a server error (11.4 raises it at EXECUTE for the SELECTs
       tried, so a failing FETCH is covered only offline), an abort, a stream inside
-      `transaction()` and on a pool lease. 10.2, 11.0 and 11.2 are not yet run,
-      so this item stays open.
+      `transaction()` and on a pool lease. They passed on CUBRID 10.2, 11.0, 11.2
+      and 11.4 in the main push CI of `beceb54` (run 44893617353: 322 passed,
+      0 skipped on each version). This box records the test result only; the
+      record stays Proposed until a maintainer accepts it.
 - [ ] The packed package resolves `cubrid-client/driver` for ESM, CJS, and
       TypeScript with `moduleResolution` `node16`, `bundler` and `node10`, and
       `instanceof` holds across entry points.
