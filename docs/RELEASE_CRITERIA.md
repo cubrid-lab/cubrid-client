@@ -51,7 +51,7 @@ A maintainer merges the Release Please PR only after:
 - seeing **All reviewed release checks passed** succeed on the PR head;
 - checking that the curated `docs/releases/vX.Y.Z.md` discloses open limitations.
 
-The protected `npm-publish` environment can also require a reviewer before
+The protected `production` environment can also require a reviewer before
 publication. Merging the Release Please PR is the recorded approval.
 
 ## Limited-scope hotfix

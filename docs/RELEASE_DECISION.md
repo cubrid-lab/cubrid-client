@@ -90,7 +90,7 @@ from an earlier commit.
 - [ ] Maintainer explicitly chooses **limited-scope remediation** rather
       than `production-ready` and accepts the limitations in the release
       announcement, with a recorded approval URL.
-- [ ] The npm-publish environment is authorized for npm trusted (OIDC)
+- [ ] The production environment is authorized for npm trusted (OIDC)
       publishing as configured in `.github/workflows/publish.yml`; a manual
       `PUBLISH` run uses the exact merged main candidate.
 - [ ] Only after a successful npm publication is confirmed, decide whether to

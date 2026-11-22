@@ -181,11 +181,11 @@ jobs:
     with:
       checkout_ref: ${{ inputs.recovery_tag || github.sha }}
 
-  publish:
+  publish-production:
     if: needs.candidate.outputs.should_publish == 'true'
     needs: [candidate, preflight, release-validation]
     runs-on: ubuntu-latest
-    environment: npm-publish
+    environment: production
     permissions:
       contents: write
       # Clear the pending state of the merged Release Please PR after npm
@@ -310,7 +310,7 @@ jobs:
         # Do not set NODE_AUTH_TOKEN: the old registry token is rejected.
         # npm exchanges GitHub's short-lived OIDC identity for publish auth.
         # Requires npm package owner to configure Trusted Publisher:
-        # cubrid-lab / cubrid-client / publish.yml / npm-publish,
+        # cubrid-lab / cubrid-client / publish.yml / production,
         # with the direct npm publish operation explicitly allowed.
         run: npm publish --access public
       - name: Verify npm and GitHub release consistency after publication
