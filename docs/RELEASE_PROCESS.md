@@ -135,13 +135,17 @@ retained and no Release is created for it.
    transient registry or Maven Central error, re-run the release merge's
    own `Publish verified npm release` run with **Re-run all jobs**. This
    works after `main` has moved on, but GitHub allows re-runs for only
-   30 days, and a re-run uses that commit's workflow files. If the
-   pipeline itself needs a fix, merge the fix, then use **Actions →
-   Publish verified npm release → Run workflow** from `main` with
+   30 days, and a re-run uses that commit's workflow files. If a workflow
+   YAML file needs a fix, merge the fix, then use **Actions → Publish
+   verified npm release → Run workflow** from `main` with
    `confirmation=PUBLISH` and no `recovery_tag`. A manual run uses the
-   workflow code on `main` but still validates and tags the reviewed
-   release merge. Other pushes to `main` are not release candidates; one
-   that arrives while a release is unpublished ends with a warning.
+   workflow YAML on `main` but still validates and tags the reviewed
+   release merge, so scripts and tests (`scripts/`, `tests/`) still come
+   from the release merge, and a fix there does not reach it. A manual run
+   reads the version from `main`, so it cannot publish an older release
+   once a newer Release PR has merged. Other pushes to `main` are not
+   release candidates; one that arrives while a release is unpublished
+   ends with a warning.
 8. If npm publication fails **after a tag was created**, investigate the
    cause and use **Actions → Publish verified npm release → Run workflow**,
    `confirmation=PUBLISH`, `recovery_tag=vX.Y.Z`. The workflow validates

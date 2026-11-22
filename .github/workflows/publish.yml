@@ -88,12 +88,37 @@ jobs:
             echo "should_publish=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          release_exists=false
           if gh release view "$tag" --repo "$GH_REPO" >/dev/null 2>&1; then
             if node scripts/verify-npm-version.mjs "$version"; then
               echo "::notice::$tag already exists in GitHub and npm; no duplicate publication."
               echo "should_publish=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
+            release_exists=true
+          fi
+          # Only a merged Release Please PR with the expected release title
+          # can authorize automated creation of a new immutable tag.
+          release_merge=$(gh pr list --repo "$GH_REPO" --state merged --base main --limit 100 \
+              --json title,headRefName,mergeCommit \
+              --jq '.[] | select(.headRefName | startswith("release-please--")) | [.title, .mergeCommit.oid] | @tsv' \
+            | awk -F '\t' -v title="chore(main): release $version" '$1 == title && !found {print $2; found = 1}')
+          if [[ -z "$release_merge" ]]; then
+            echo "::error::No merged, reviewed Release Please PR for $tag"
+            exit 1
+          fi
+          # Tag only the reviewed release merge itself (#330). A later push,
+          # such as a workflow change merged while a release is pending, must
+          # not publish that release from a different commit. Re-running the
+          # release merge's own run remains possible after main has moved.
+          # This runs before the checks below, so such a push never fails
+          # while the release merge's own run is still publishing.
+          if [[ "$EVENT_NAME" == push && "$TRIGGER_SHA" != "$release_merge" ]]; then
+            echo "::warning::$tag is not yet on npm, and $TRIGGER_SHA is not its release merge $release_merge, so this run does not publish it. If that commit's publish run has failed, re-run all of its jobs, or dispatch this workflow from main."
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$release_exists" == true ]]; then
             echo "::error::$tag exists on GitHub but npm publication is not verified. Use explicit recovery_tag for this immutable version; never advance by creating another tag."
             exit 1
           fi
@@ -120,28 +145,9 @@ jobs:
             echo "::error::npm package $version exists but its GitHub Release is missing."
             exit 1
           fi
-          # Only a merged Release Please PR with the expected release title
-          # can authorize automated creation of a new immutable tag.
-          release_merge=$(gh pr list --repo "$GH_REPO" --state merged --base main --limit 100 \
-              --json title,headRefName,mergeCommit \
-              --jq '.[] | select(.headRefName | startswith("release-please--")) | [.title, .mergeCommit.oid] | @tsv' \
-            | awk -F '\t' -v title="chore(main): release $version" '$1 == title && !found {print $2; found = 1}')
-          if [[ -z "$release_merge" ]]; then
-            echo "::error::No merged, reviewed Release Please PR for $tag"
-            exit 1
-          fi
-          # Tag only the reviewed release merge itself (#330). A later push,
-          # such as a workflow change merged while a release is pending, must
-          # not publish that release from a different commit. Re-running the
-          # release merge's own run remains possible after main has moved.
-          if [[ "$EVENT_NAME" == push && "$TRIGGER_SHA" != "$release_merge" ]]; then
-            echo "::warning::$tag is merged but unpublished, and $TRIGGER_SHA is not its release merge $release_merge. Re-run all jobs of that commit's publish run, or dispatch this workflow from main, to publish it."
-            echo "should_publish=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           # A manual run validates and tags the release merge as well, using
-          # the workflow code on main, so a fix to the pipeline itself can
-          # still publish the reviewed commit.
+          # the workflow YAML on main. Scripts and tests still come from the
+          # release merge, because they are checked out at that commit.
           if [[ "$EVENT_NAME" == workflow_dispatch && "$TRIGGER_REF" != refs/heads/main ]]; then
             echo "::error::Dispatch a new release from main, not $TRIGGER_REF"
             exit 1
