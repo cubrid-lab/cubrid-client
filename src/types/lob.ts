@@ -62,7 +62,7 @@ export function blob(source: BlobSource): LobParam {
 
 /**
  * A CLOB parameter for the prepared methods, stored as UTF-8. A string is
- * encoded, a Buffer must already be UTF-8, and an AsyncIterable or Readable may
+ * encoded, a Buffer or Uint8Array must already be UTF-8, and an AsyncIterable or Readable may
  * yield either and is read once. Content that is not valid UTF-8 or text with a
  * lone surrogate fails the statement with a TypeError, and nothing is stored.
  * With `ClientOptions.charset` "iso-8859-1" it is stored as ISO-8859-1: see
@@ -70,7 +70,9 @@ export function blob(source: BlobSource): LobParam {
  */
 export function clob(source: ClobSource): LobParam {
   if (typeof source !== "string" && !isBytes(source) && !isAsyncIterable(source)) {
-    throw new TypeError("clob() takes a string, a Buffer, an AsyncIterable or a Readable");
+    throw new TypeError(
+      "clob() takes a string, a Buffer, a Uint8Array, an AsyncIterable or a Readable",
+    );
   }
   return makeLobParam("clob", source);
 }

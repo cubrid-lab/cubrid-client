@@ -6880,3 +6880,40 @@ test("ssl.ca given as a plain Uint8Array reaches TLS as a Buffer over the same b
     text,
   );
 });
+
+test("every statement method sends a plain Uint8Array exactly like an equal Buffer (#309)", async () => {
+  const bytes = Buffer.from([0x00, 0x5c, 0x27, 0xff]);
+  const backing = new Uint8Array([7, 7, ...bytes, 7]);
+  const sql = "UPDATE t SET b = ? WHERE id = ?";
+  const drain = async (rows: AsyncIterable<unknown>): Promise<void> => {
+    for await (const _row of rows) {
+      // only the request matters
+    }
+  };
+  const calls: Array<[string, boolean, (a: NativeCubridAdapter, v: Buffer) => Promise<unknown>]> = [
+    ["query", false, (a, v) => a.query(sql, [v, 1])],
+    ["execute", false, (a, v) => a.execute(sql, [v, 1])],
+    ["stream", false, (a, v) => drain(a.stream(sql, [v, 1]))],
+    ["queryPrepared", true, (a, v) => a.queryPrepared(sql, [v, 1])],
+    ["executePrepared", true, (a, v) => a.executePrepared(sql, [v, 1])],
+    ["stream prepared", true, (a, v) => drain(a.stream(sql, [v, 1], { binding: "prepared" }))],
+  ];
+  for (const [name, prepared, call] of calls) {
+    const sent: string[] = [];
+    for (const value of [bytes, new Uint8Array(bytes), backing.subarray(2, 2 + bytes.length)]) {
+      const { adapter, fakeCAS } = createPreparedAdapter();
+      // The request carrying the values is recorded, then refused: only its bytes are compared.
+      if (prepared) {
+        fakeCAS.queueResponse(Buffer.from(EXECUTE_ARRAY_FRAMES.prepareInsert, "hex"));
+      }
+      fakeCAS.queueExchangeFailure(new Error("stop after the request"));
+      await call(adapter, value as Buffer).catch(() => undefined);
+      const request = fakeCAS.sentPayloads[prepared ? 1 : 0];
+      assert.ok(request, name);
+      sent.push(request.toString("hex"));
+    }
+    assert.ok(sent[0]?.includes("005c27ff") || sent[0]?.includes("30303563323766"), name);
+    assert.equal(sent[1], sent[0], name);
+    assert.equal(sent[2], sent[0], name);
+  }
+});

@@ -1491,9 +1491,10 @@ function encodeOneParam(w: PacketWriter, value: unknown): void {
   }
 
   if (isBytes(value)) {
-    w.writeInt(1 + value.length);
+    const bytes = asBuffer(value);
+    w.writeInt(1 + bytes.length);
     w.writeByte(CUBRIDDataType.VARBIT);
-    w.writeBytes(asBuffer(value));
+    w.writeBytes(bytes);
     return;
   }
 
@@ -1619,12 +1620,15 @@ function writePreparedParam(w: PacketWriter, value: unknown, charset: TextCharse
   }
 
   if (isBytes(value)) {
+    const bytes = asBuffer(value);
     // X'' is valid SQL, but the CAS reads a zero-length bind as SQL NULL.
-    if (value.length === 0) {
-      throw new Error("an empty Buffer cannot be sent as a prepared parameter: it would be NULL");
+    if (bytes.length === 0) {
+      throw new Error(
+        "an empty Buffer or Uint8Array cannot be sent as a prepared parameter: it would be NULL",
+      );
     }
     w.addByte(CUBRIDDataType.VARBIT);
-    w.addBytes(asBuffer(value));
+    w.addBytes(bytes);
     return;
   }
 

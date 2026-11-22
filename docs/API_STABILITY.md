@@ -334,10 +334,12 @@ MINOR change:
   [#325](https://github.com/cubrid-lab/cubrid-client/pull/325), to class this as a
   **1.x MINOR declaration-bug correction**, not a MAJOR narrowing. The reasons:
   - That configuration never type-checked the declarations.
-  - The runtime accepts what the new types describe.
+  - The runtime accepts what the new types describe, except that a `signal`
+    must still be a real `AbortSignal`.
   - Projects with `@types/node`, or with `skipLibCheck: false`, are unaffected.
 
-  The 1.6.0 release notes carry it as an upgrade note. To fix such code, type the
+  The release notes of the release that ships it (planned: 1.6.0) must carry
+  it as an upgrade note. To fix such code, type the
   values (for example `rows as QueryParam[]`) or add `@types/node`.
 - The declarations need `lib` `es2022` or later (`ErrorOptions`, for example).
 - `npm run types:packed` (CI, Node 22) packs the build and compiles three
