@@ -1327,7 +1327,8 @@ test("values that cannot be sent safely are refused without echoing them", () =>
     [new Date("0000-06-01T00:00:00Z"), /0001 to 9999/],
     [new Date("+010000-01-01T00:00:00Z"), /0001 to 9999/],
     [{ secret: 1 }, /unsupported prepared parameter type/],
-    [new Uint8Array([1]), /unsupported prepared parameter type/],
+    // A plain Uint8Array is bytes since #309; other typed arrays are not.
+    [new Uint16Array([1]), /unsupported prepared parameter type/],
   ] as const) {
     assert.throws(
       () => encodePreparedParams([value]),
@@ -1896,4 +1897,68 @@ test("iso-8859-1 clob() content: text as Latin-1, bytes as they are, nothing abo
       // drain
     }
   }, /not valid UTF-8/);
+});
+
+// ---------------------------------------------------------------------------
+// Plain Uint8Array byte values (#309): the same bytes as an equal Buffer
+// ---------------------------------------------------------------------------
+
+const BYTES_309 = Buffer.from([0x00, 0x5c, 0x27, 0xff]);
+
+/** A Uint8Array copy of BYTES_309, and a subarray of it at a non-zero byteOffset. */
+function plainByteViews(): Uint8Array[] {
+  const backing = new Uint8Array([9, 9, ...BYTES_309, 9]);
+  return [new Uint8Array(BYTES_309), backing.subarray(2, 2 + BYTES_309.length)];
+}
+
+test("a plain Uint8Array parameter is sent exactly like an equal Buffer on every path (#309)", () => {
+  for (const view of plainByteViews()) {
+    assert.equal(Buffer.isBuffer(view), false);
+    for (const noBackslashEscapes of [false, true]) {
+      assert.equal(formatValue(view, noBackslashEscapes), "X'005c27ff'");
+      assert.equal(
+        interpolateParams("SELECT ?", [view], noBackslashEscapes),
+        interpolateParams("SELECT ?", [BYTES_309], noBackslashEscapes),
+      );
+    }
+    assert.deepEqual(encodeBindParams([view]), encodeBindParams([BYTES_309]));
+    assert.equal(bindHex(view), bindHex(BYTES_309));
+  }
+});
+
+test("an empty plain Uint8Array is refused as a prepared parameter, like an empty Buffer (#309)", () => {
+  assert.throws(() => encodePreparedParams([new Uint8Array(0)]), /empty Buffer/);
+  assert.equal(formatValue(new Uint8Array(0), false), "X''");
+});
+
+test("other typed arrays and DataView are still refused as parameters (#309)", () => {
+  for (const value of [
+    new Uint16Array([1]),
+    new Uint8ClampedArray([1]),
+    new DataView(new ArrayBuffer(1)),
+  ]) {
+    assert.throws(() => formatValue(value, false));
+    assert.throws(() => encodeBindParams([value]));
+    assert.throws(() => encodePreparedParams([value]));
+  }
+});
+
+test("clob() and blob() take a plain Uint8Array and a subarray, sent like an equal Buffer (#309)", async () => {
+  const collect = async (chunks: AsyncIterable<Buffer>): Promise<string> => {
+    const parts: Buffer[] = [];
+    for await (const chunk of chunks) parts.push(Buffer.from(chunk));
+    return Buffer.concat(parts).toString("hex");
+  };
+  const text = Buffer.from("héllo wörld", "utf-8");
+  const backing = new Uint8Array([0x41, ...text, 0x42]);
+  for (const view of [new Uint8Array(text), backing.subarray(1, 1 + text.length)]) {
+    assert.equal(Buffer.isBuffer(view), false);
+    for (const charset of ["utf-8", "iso-8859-1"] as const) {
+      assert.equal(
+        await collect(lobChunks(clob(view as Buffer), 4, charset)),
+        await collect(lobChunks(clob(text), 4, charset)),
+      );
+    }
+    assert.equal(await collect(lobChunks(blob(view), 4)), await collect(lobChunks(blob(text), 4)));
+  }
 });

@@ -1,4 +1,39 @@
-import { Readable } from 'node:stream';
+/**
+ * Bytes: Node's `Buffer` when the program has Node's types (`@types/node`),
+ * otherwise `Uint8Array`, which `Buffer` extends. At run time the client always
+ * returns a `Buffer`, and accepts a plain `Uint8Array` wherever it accepts a
+ * `Buffer` (sent without copying, as the same bytes). A global `Buffer` typed
+ * `any` falls back to `Uint8Array` too.
+ */
+type CubridBytes = typeof globalThis extends {
+    Buffer: {
+        isBuffer(value: unknown): value is infer B;
+    };
+} ? unknown extends B ? Uint8Array : B : Uint8Array;
+/**
+ * The members of an abort signal that the client uses. Only the fallback of
+ * {@link CubridAbortSignal} when neither Node's types nor the DOM lib are present.
+ */
+interface AbortSignalShape {
+    readonly aborted: boolean;
+    readonly reason: unknown;
+    throwIfAborted(): void;
+    addEventListener(type: "abort", listener: () => void, options?: {
+        once?: boolean;
+    }): void;
+    removeEventListener(type: "abort", listener: () => void): void;
+}
+/**
+ * An abort signal: the global `AbortSignal` when the program has Node's types or
+ * the DOM lib, otherwise a structural type with the members the client uses. At
+ * run time a `signal` option must still be a real `AbortSignal`; any other object
+ * is refused with a `TypeError`.
+ */
+type CubridAbortSignal = typeof globalThis extends {
+    AbortSignal: {
+        prototype: infer S;
+    };
+} ? unknown extends S ? AbortSignalShape : S : AbortSignalShape;
 
 /**
  * A `Date` parameter sent with its zone, made by {@link zoned}: a DATETIMETZ of
@@ -23,18 +58,21 @@ interface ZonedParam {
  */
 declare function zoned(date: Date): ZonedParam;
 
-type QueryParam = string | number | boolean | bigint | Date | Buffer | ZonedParam | null;
+type QueryParam = string | number | boolean | bigint | Date | CubridBytes | ZonedParam | null;
 type QueryParams = readonly QueryParam[];
 
-/** Content for {@link blob}: bytes, or a stream of byte chunks read once. */
-type BlobSource = Buffer | Uint8Array | AsyncIterable<Buffer | Uint8Array> | Readable;
+/**
+ * Content for {@link blob}: bytes, or a stream of byte chunks read once. A Node
+ * `Readable` is accepted as an AsyncIterable.
+ */
+type BlobSource = CubridBytes | Uint8Array | AsyncIterable<CubridBytes | Uint8Array>;
 /**
  * Content for {@link clob}: text, UTF-8 bytes, or a stream of either read once.
  * Bytes must be valid UTF-8 and text must not hold a lone surrogate. With
  * `ClientOptions.charset` "iso-8859-1" the bytes are ISO-8859-1 instead, sent as
  * they are, and text must not hold a character above U+00FF.
  */
-type ClobSource = string | Buffer | AsyncIterable<string | Buffer | Uint8Array> | Readable;
+type ClobSource = string | CubridBytes | AsyncIterable<string | CubridBytes | Uint8Array>;
 /**
  * A BLOB or CLOB parameter, made by {@link blob} or {@link clob}. The prepared
  * methods upload its content with LOB_NEW and LOB_WRITE before the statement
@@ -113,7 +151,7 @@ declare class ZonedDateTime {
 
 type QueryResultRow = Record<string, unknown>;
 /** One decoded SET, MULTISET or SEQUENCE element. */
-type CollectionElement = string | number | bigint | Date | ZonedDateTime | Buffer | null | CollectionElement[];
+type CollectionElement = string | number | bigint | Date | ZonedDateTime | CubridBytes | null | CollectionElement[];
 /**
  * A decoded SET, MULTISET or SEQUENCE column value, in the order the server sent
  * it. SET values arrive without duplicates and MULTISET values keep them; both
@@ -186,7 +224,7 @@ interface ClientSSLOptions {
     /** Verify the server certificate chain. Default: true (secure by default). */
     rejectUnauthorized?: boolean;
     /** PEM CA certificate(s) used to verify the server certificate. */
-    ca?: string | Buffer;
+    ca?: string | CubridBytes;
     /** Server name for SNI and certificate hostname verification. */
     servername?: string;
 }
@@ -410,7 +448,7 @@ interface QueryOptions {
      * answer another statement, it rejects with `signal.reason`, and it is never
      * retried. Inside a transaction that loses the transaction.
      */
-    signal?: AbortSignal;
+    signal?: CubridAbortSignal;
     /**
      * {@link ClientOptions.readTimeout} for this statement only, including its
      * FETCH, LOB and END_TRAN requests: the same inactivity limit and
@@ -474,7 +512,7 @@ interface StreamOptions {
      * A reply already awaited is not interrupted: the stream stops when it arrives,
      * so `readTimeout` limits how long that takes. The session stays usable.
      */
-    signal?: AbortSignal;
+    signal?: CubridAbortSignal;
     /**
      * Milliseconds a statement issued on this connection waits while the consumer
      * asks for no row, before it rejects with `kind: "stream-busy"`. Such a statement
@@ -1509,7 +1547,7 @@ interface PoolConnection extends Queryable, ResultQueryable, Executable, Prepare
 /** Options of `CubridPool.connection()`. */
 interface PoolConnectionOptions {
     /** Cancels the wait for a connection. It does not apply to the callback's statements. */
-    signal?: AbortSignal;
+    signal?: CubridAbortSignal;
 }
 
 /**
@@ -1967,4 +2005,4 @@ declare function buildWhere(conditions: Record<string, unknown>): {
     params: unknown[];
 };
 
-export { type ArrayQueryResult, type ArrayRowOptions, type ArrayRowQueryable, type ArrayStreamOptions, type BatchExecutable, type BatchTransactionClient, type BlobSource, type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type ClobSource, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridPool, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteManyFailure, type ExecuteManyResult, type ExecuteManySetFailure, type ExecuteOptions, type ExecuteResult, type IsolationLevel, type LobParam, LockTimeoutError, NativeCubridAdapter, type PoolConnection, type PoolConnectionOptions, type PoolOptions, type PoolStats, type PreparedQueryParam, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryOptions, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type StreamOptions, type StreamTransactionClient, type Streamable, type TimezoneAware, type TransactionCallback, type TransactionClient, TransactionError, type TransactionOptions, type TransactionScope, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, type ZonedParam, blob, buildWhere, clob, createClient, createPool, escapeIdentifier, parseConnectionString, zoned };
+export { type ArrayQueryResult, type ArrayRowOptions, type ArrayRowQueryable, type ArrayStreamOptions, type BatchExecutable, type BatchTransactionClient, type BlobSource, type ClientConfig, type ClientLogFields, type ClientLogLevel, type ClientLogger, type ClientOptions, type ClobSource, type CollectionElement, type CollectionValue, type ColumnInfo, type ConnectionConfig, ConnectionError, type ConnectionFactory, type ConnectionLike, ConstraintError, type CubridAbortSignal, type CubridBytes, CubridClient, type CubridErrorDetails, type CubridErrorKind, type CubridErrorOptions, CubridPool, CubridTransaction, DeadlockError, type Executable, type ExecutableTransactionClient, type ExecuteManyFailure, type ExecuteManyResult, type ExecuteManySetFailure, type ExecuteOptions, type ExecuteResult, type IsolationLevel, type LobParam, LockTimeoutError, NativeCubridAdapter, type PoolConnection, type PoolConnectionOptions, type PoolOptions, type PoolStats, type PreparedQueryParam, type PreparedQueryable, type PreparedTransactionClient, QueryError, type QueryOptions, type QueryParam, type QueryParams, type QueryResult, type QueryResultRow, type Queryable, ReadTimeoutError, type ResultQueryable, type ResultTransactionClient, type SchemaColumn, type SchemaIndex, type SchemaIndexColumn, type SchemaOptions, type SchemaPrimaryKey, type SchemaTable, SqlSyntaxError, type StreamOptions, type StreamTransactionClient, type Streamable, type TimezoneAware, type TransactionCallback, type TransactionClient, TransactionError, type TransactionOptions, type TransactionScope, ZonedDateTime, type ZonedDateTimeFields, type ZonedDateTimeType, type ZonedParam, blob, buildWhere, clob, createClient, createPool, escapeIdentifier, parseConnectionString, zoned };

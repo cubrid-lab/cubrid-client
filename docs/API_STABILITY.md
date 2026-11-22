@@ -277,6 +277,77 @@ are decoded changes.
   callback written against `TransactionClient` or the earlier intersection is
   still accepted.
 
+### Declarations without Node types (#309)
+
+The published `dist/index.d.ts` and `dist/index.d.cts` no longer name `Buffer`,
+`AbortSignal` or `node:stream`
+([#309](https://github.com/cubrid-lab/cubrid-client/issues/309)), so a TypeScript
+consumer with `lib: ["es2022"]`, no DOM lib, no `@types/node` and
+`skipLibCheck: false` compiles them. **Decision:** option 1 of #309, minimal
+structural types, rather than documenting `@types/node` as a required peer.
+`@types/node` stays optional. The runtime is unchanged. This is a compatible
+MINOR change:
+
+| Public type | Before | Now, with `@types/node` | Now, without `@types/node` |
+| --- | --- | --- | --- |
+| `CubridBytes` (new export) | — | `Buffer` | `Uint8Array` |
+| `CubridAbortSignal` (new export) | — | the global `AbortSignal` | the DOM `AbortSignal` with the DOM lib; otherwise a structural type: `aborted`, `reason`, `throwIfAborted()`, `addEventListener("abort")`, `removeEventListener("abort")` |
+| `QueryParam`, `CollectionElement`, `ClientSSLOptions.ca` | `Buffer` | `CubridBytes`, which is exactly `Buffer` | `Uint8Array` |
+| `BlobSource`, `ClobSource` | `Buffer`, `AsyncIterable` of chunks, or `Readable` | `CubridBytes` (`Buffer`), `Uint8Array`, `AsyncIterable` of chunks | the same with `Uint8Array` |
+| `signal` of `QueryOptions`, `StreamOptions`, `PoolConnectionOptions` | `AbortSignal` | `CubridAbortSignal`, which is exactly `AbortSignal` | the structural type |
+
+- Both new types are conditional on `typeof globalThis`: they resolve to the
+  real global type when the program has it (a global typed `any` counts as
+  absent). With `@types/node` they are exactly `Buffer` and `AbortSignal`: a
+  `Buffer` in a collection is typed `Buffer`, and the `signal` a custom
+  `ConnectionLike` receives is a full `AbortSignal`. The one value whose type
+  narrows is `LobParam.source`, below.
+- A real `AbortSignal`, `Buffer` and `Readable` are accepted everywhere they were.
+  `Readable` is no longer named in `BlobSource` and `ClobSource`: it is accepted as
+  an `AsyncIterable`, which it implements with chunks typed `any`. The one
+  difference is for code that reads `LobParam.source` and narrows it without
+  `instanceof Readable`, for example with `"pipe" in source`; narrow with
+  `instanceof Readable` instead, which still works.
+- Without `@types/node`, a `signal` of the structural shape type-checks, but at
+  run time a `signal` option must still be a real `AbortSignal`, as before; any
+  other object is refused with a `TypeError`.
+- **Runtime widening: a plain `Uint8Array` is bytes.** So that the types and the
+  runtime agree, a `Uint8Array` that is not a `Buffer` is now accepted wherever a
+  `Buffer` is: a parameter of `query()`, `execute()`, `stream()`, the
+  `*Prepared` methods and `executeMany()`; a `clob()` source (`blob()` and stream
+  chunks already took one); and `ssl.ca`. It is wrapped as a `Buffer` over the
+  same memory, without copying, and sends exactly the bytes an equal `Buffer`
+  sends: `X'...'` on the literal path, VARBIT on the prepared path, and an
+  empty one is refused on the prepared path like an empty `Buffer`. Before, such
+  a value was refused. `Buffer` handling is unchanged, and other typed arrays
+  and `DataView` are still refused. This is a backward-compatible MINOR
+  widening. With `@types/node` the types still say `Buffer`, as before. The
+  client always returns BLOB, BIT and collection bytes as `Buffer`; without
+  Node's types they are typed `Uint8Array`, which `Buffer` extends.
+- **SemVer decision: new compile errors for projects without `@types/node` that
+  set `skipLibCheck: true`.** In those projects the unresolved `Buffer` and
+  `AbortSignal` in the old declarations resolved to `any`. So `QueryParam` and
+  every `signal` option were effectively `any`. Now they are real types, and such
+  code can get new compile errors. For example `db.query(sql, rows as unknown[])`
+  no longer compiles, and neither does `const s: string = options.signal.reason`.
+  The maintainer decided, on
+  [#325](https://github.com/cubrid-lab/cubrid-client/pull/325), to class this as a
+  **1.x MINOR declaration-bug correction**, not a MAJOR narrowing. The reasons:
+  - That configuration never type-checked the declarations.
+  - The runtime accepts what the new types describe, except that a `signal`
+    must still be a real `AbortSignal`.
+  - Projects with `@types/node`, or with `skipLibCheck: false`, are unaffected.
+
+  The release notes of the release that ships it (planned: 1.6.0) must carry
+  it as an upgrade note. To fix such code, type the
+  values (for example `rows as QueryParam[]`) or add `@types/node`.
+- The declarations need `lib` `es2022` or later (`ErrorOptions`, for example).
+- `npm run types:packed` (CI, Node 22) packs the build and compiles three
+  consumers with `skipLibCheck: false`: no Node or DOM types, the DOM lib only, and
+  `@types/node`, where it also checks that `CubridBytes` and `CubridAbortSignal`
+  are exactly `Buffer` and `AbortSignal`. A change that names a Node or DOM type in
+  the public declarations again fails it.
+
 For the complete 1.x line, Node.js 18 and 20 are retained even though they are upstream EOL. [ADR 0006](adr/0006-node-18-support-through-1x.md) records the explicit Node 18 release commitment and independent Node 18 **packed-package** test requirement. A higher Node minimum is reserved for a possible, separately reviewed 2.0 MAJOR, not a 1.x development-tooling update.
 
 ## Node.js, TypeScript and distribution
@@ -307,7 +378,9 @@ For the complete 1.x line, Node.js 18 and 20 are retained even though they are u
 - **TypeScript compatibility:** `typescript` in `devDependencies`
   identifies a development tool, not a tested minimum for consumers. Do not
   advertise an explicit compiler minimum until a consumer declaration test
-  demonstrates it. Review declaration syntax/type changes for compatibility;
+  demonstrates it. The declarations must compile without `@types/node` or the
+  DOM lib; `npm run types:packed` checks it (see
+  [Declarations without Node types](#declarations-without-node-types-309)). Review declaration syntax/type changes for compatibility;
   announce any intentionally raised tested compiler floor.
 
 ## Release review

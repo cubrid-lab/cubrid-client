@@ -5344,6 +5344,31 @@ describe("Integration: NativeCubridAdapter against Docker CUBRID", { skip: !avai
       }
     });
 
+    test("a plain Uint8Array stores the same bits as an equal Buffer on both paths (#309)", async () => {
+      const client = createClient(TEST_CONFIG);
+      const insert = `INSERT INTO ${TYPES} (k, c_bit, c_vbit) VALUES (?, ?, ?)`;
+      const buffer = Buffer.from([0xab, 0xcd]);
+      // Typed Buffer here because this project has @types/node; at run time it is not one.
+      const view = new Uint8Array([0, 0xab, 0xcd, 0]).subarray(1, 3) as Buffer;
+      try {
+        await client.query(`DELETE FROM ${TYPES}`);
+        await client.query(insert, [1, buffer, buffer]);
+        await client.query(insert, [2, view, view]);
+        await client.queryPrepared(insert, [3, view, view]);
+        await client.executeMany(insert, [[4, view, view]]);
+        const rows = await client.query<Record<string, unknown>>(
+          `SELECT c_bit, c_vbit FROM ${TYPES} ORDER BY k`,
+        );
+
+        assert.equal(rows.length, 4);
+        for (const row of rows.slice(1)) {
+          assert.deepEqual(row, rows[0]);
+        }
+      } finally {
+        await client.close();
+      }
+    });
+
     test("text cannot be bound to NCHAR on either path", async () => {
       const client = createClient(TEST_CONFIG);
       const insert = `INSERT INTO ${TYPES} (k, c_nchar) VALUES (?, ?)`;

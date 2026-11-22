@@ -377,6 +377,10 @@ const rows = await db.query("SELECT id, name FROM users");
 // rows is Record<string, unknown>[]
 ```
 
+### Type errors in cubrid-client's declarations without `@types/node`
+
+Since [#309](https://github.com/cubrid-lab/cubrid-client/issues/309) the published declarations compile without `@types/node` or the DOM lib, also with `skipLibCheck: false`. An error such as `Cannot find name 'Buffer'`, `Cannot find name 'AbortSignal'` or `Cannot find module 'node:stream'` inside `node_modules/cubrid-client/dist` means an older release: upgrade, or add `@types/node`. Without `@types/node`, bytes are typed `Uint8Array` and `signal` options a structural `CubridAbortSignal`; at run time the client returns `Buffer`, accepts a plain `Uint8Array` wherever it accepts a `Buffer`, and requires a real `AbortSignal`. Code that relied on those names silently being `any` under `skipLibCheck: true` may now get type errors, such as `rows as unknown[]` passed as parameters; type the values (`rows as QueryParam[]`) or add `@types/node`. See [the SemVer decision](API_STABILITY.md#declarations-without-node-types-309). See [CubridBytes and CubridAbortSignal](API_REFERENCE.md#cubridbytes-and-cubridabortsignal).
+
 ### Type errors with query parameters
 
 Parameters must match the `QueryParam` type. Common mistakes:

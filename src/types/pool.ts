@@ -13,6 +13,7 @@ import type {
   TimezoneAware,
 } from "./client.js";
 import type { PreparedQueryParam } from "./lob.js";
+import type { CubridAbortSignal } from "./platform.js";
 import type { QueryParams } from "./query.js";
 import type { ArrayQueryResult, QueryResult, QueryResultRow } from "./result.js";
 
@@ -153,5 +154,5 @@ export interface PoolConnection
 /** Options of `CubridPool.connection()`. */
 export interface PoolConnectionOptions {
   /** Cancels the wait for a connection. It does not apply to the callback's statements. */
-  signal?: AbortSignal;
+  signal?: CubridAbortSignal;
 }

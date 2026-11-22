@@ -39,6 +39,7 @@ and an oracle never shares a builder with the code it checks
 | `npm run test:jdbc-parity` | `tests/jdbc-parity/` | `jdbc-parity.yml` | not run here (needs Java and the pinned JAR) |
 | `npm run test:all` | every `tests/*.test.ts` | no workflow | fails offline by design: 1417 pass, 1 fail (`legacy-parity.test.ts`), 3 skipped (TLS) |
 | `node --test tests/api-public-surface.test.mjs`, `npm run api:check` | public API parser and `api/index.d.ts` | `ci.yml` (Node 22) | 3 pass; "Public API matches api/index.d.ts." |
+| `npm run types:packed` | the packed `dist/index.d.ts` and `dist/index.d.cts` compiled by consumers with `skipLibCheck: false`: no Node or DOM types, the DOM lib, and `@types/node` (#309) | `ci.yml` (Node 22) | 3 consumers compile |
 | `node --test tests/provenance-scan.test.mjs` (also in `npm test` and `npm run test:coverage`, outside `c8`), `npm run provenance:check` | controls of the provenance similarity scan; the packed tarball's contents ([PROVENANCE.md](PROVENANCE.md)) | `ci.yml` (Node 18–26 for the test; Node 22 for the pack check) | 6 pass; "provenance check passed" |
 
 ## Required live CUBRID 11.4 lane (#264)

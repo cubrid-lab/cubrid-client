@@ -15,6 +15,7 @@ import {
   StreamBusyError,
 } from "../errors/internal-errors.js";
 import { TransactionError } from "../errors/transaction-error.js";
+import { asBuffer, isBytes } from "../internals/bytes.js";
 import { type ErrorKind, isAbortReason, mapError, withOutcome } from "../internals/map-error.js";
 import {
   assertValidExecuteOptions,
@@ -194,7 +195,7 @@ function needsBackslashMode(params: QueryParams): boolean {
       typeof value === "number" ||
       typeof value === "bigint" ||
       value instanceof Date ||
-      Buffer.isBuffer(value) ||
+      isBytes(value) ||
       isZonedParam(value)
     ) {
       return false;
@@ -2068,7 +2069,7 @@ export class NativeCubridAdapter implements DriverAdapter {
       ...(ssl.rejectUnauthorized !== undefined && {
         rejectUnauthorized: ssl.rejectUnauthorized,
       }),
-      ...(ssl.ca !== undefined && { ca: ssl.ca }),
+      ...(ssl.ca !== undefined && { ca: isBytes(ssl.ca) ? asBuffer(ssl.ca) : ssl.ca }),
       ...(ssl.servername !== undefined && { servername: ssl.servername }),
     };
   }

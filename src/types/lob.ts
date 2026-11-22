@@ -1,11 +1,15 @@
-import type { Readable } from "node:stream";
 import { TextDecoder } from "node:util";
 
+import { asBuffer, isBytes } from "../internals/bytes.js";
 import { NOT_LATIN1, type TextCharset } from "../protocol/charset.js";
+import type { CubridBytes } from "./platform.js";
 import type { QueryParam } from "./query.js";
 
-/** Content for {@link blob}: bytes, or a stream of byte chunks read once. */
-export type BlobSource = Buffer | Uint8Array | AsyncIterable<Buffer | Uint8Array> | Readable;
+/**
+ * Content for {@link blob}: bytes, or a stream of byte chunks read once. A Node
+ * `Readable` is accepted as an AsyncIterable.
+ */
+export type BlobSource = CubridBytes | Uint8Array | AsyncIterable<CubridBytes | Uint8Array>;
 
 /**
  * Content for {@link clob}: text, UTF-8 bytes, or a stream of either read once.
@@ -13,7 +17,7 @@ export type BlobSource = Buffer | Uint8Array | AsyncIterable<Buffer | Uint8Array
  * `ClientOptions.charset` "iso-8859-1" the bytes are ISO-8859-1 instead, sent as
  * they are, and text must not hold a character above U+00FF.
  */
-export type ClobSource = string | Buffer | AsyncIterable<string | Buffer | Uint8Array> | Readable;
+export type ClobSource = string | CubridBytes | AsyncIterable<string | CubridBytes | Uint8Array>;
 
 /**
  * A BLOB or CLOB parameter, made by {@link blob} or {@link clob}. The prepared
@@ -58,15 +62,17 @@ export function blob(source: BlobSource): LobParam {
 
 /**
  * A CLOB parameter for the prepared methods, stored as UTF-8. A string is
- * encoded, a Buffer must already be UTF-8, and an AsyncIterable or Readable may
+ * encoded, a Buffer or Uint8Array must already be UTF-8, and an AsyncIterable or Readable may
  * yield either and is read once. Content that is not valid UTF-8 or text with a
  * lone surrogate fails the statement with a TypeError, and nothing is stored.
  * With `ClientOptions.charset` "iso-8859-1" it is stored as ISO-8859-1: see
  * {@link ClobSource}.
  */
 export function clob(source: ClobSource): LobParam {
-  if (typeof source !== "string" && !Buffer.isBuffer(source) && !isAsyncIterable(source)) {
-    throw new TypeError("clob() takes a string, a Buffer, an AsyncIterable or a Readable");
+  if (typeof source !== "string" && !isBytes(source) && !isAsyncIterable(source)) {
+    throw new TypeError(
+      "clob() takes a string, a Buffer, a Uint8Array, an AsyncIterable or a Readable",
+    );
   }
   return makeLobParam("clob", source);
 }
@@ -226,7 +232,7 @@ async function* clobPieces(source: BlobSource | ClobSource): AsyncGenerator<Buff
   let carry = "";
 
   const pieces: Iterable<unknown> | AsyncIterable<unknown> =
-    typeof source === "string" || Buffer.isBuffer(source) ? [source] : source;
+    typeof source === "string" || isBytes(source) ? [source] : source;
   for await (const piece of pieces) {
     if (typeof piece === "string") {
       // Bytes before this text must have ended on a whole character.
@@ -265,7 +271,7 @@ async function* clobPieces(source: BlobSource | ClobSource): AsyncGenerator<Buff
 /** clobPieces() for charset "iso-8859-1": one byte per character, so nothing spans pieces. */
 async function* latin1ClobPieces(source: BlobSource | ClobSource): AsyncGenerator<Buffer> {
   const pieces: Iterable<unknown> | AsyncIterable<unknown> =
-    typeof source === "string" || Buffer.isBuffer(source) ? [source] : source;
+    typeof source === "string" || isBytes(source) ? [source] : source;
   for await (const piece of pieces) {
     if (typeof piece === "string") {
       for (let at = 0; at < piece.length; at += TEXT_SLICE) {
@@ -321,12 +327,6 @@ const LONE_SURROGATE_REFUSED = "clob() text holds a lone surrogate, which has no
 
 function isHighSurrogate(code: number): boolean {
   return code >= 0xd800 && code <= 0xdbff;
-}
-
-function asBuffer(bytes: Uint8Array): Buffer {
-  return Buffer.isBuffer(bytes)
-    ? bytes
-    : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 }
 
 function describe(value: unknown): string {

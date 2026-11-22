@@ -1,4 +1,5 @@
 import type { PreparedQueryParam } from "./lob.js";
+import type { CubridAbortSignal, CubridBytes } from "./platform.js";
 import type { QueryParams } from "./query.js";
 import type { ArrayQueryResult, QueryResult, QueryResultRow } from "./result.js";
 
@@ -14,7 +15,7 @@ export interface ClientSSLOptions {
   /** Verify the server certificate chain. Default: true (secure by default). */
   rejectUnauthorized?: boolean;
   /** PEM CA certificate(s) used to verify the server certificate. */
-  ca?: string | Buffer;
+  ca?: string | CubridBytes;
   /** Server name for SNI and certificate hostname verification. */
   servername?: string;
 }
@@ -246,7 +247,7 @@ export interface QueryOptions {
    * answer another statement, it rejects with `signal.reason`, and it is never
    * retried. Inside a transaction that loses the transaction.
    */
-  signal?: AbortSignal;
+  signal?: CubridAbortSignal;
   /**
    * {@link ClientOptions.readTimeout} for this statement only, including its
    * FETCH, LOB and END_TRAN requests: the same inactivity limit and
@@ -324,7 +325,7 @@ export interface StreamOptions {
    * A reply already awaited is not interrupted: the stream stops when it arrives,
    * so `readTimeout` limits how long that takes. The session stays usable.
    */
-  signal?: AbortSignal;
+  signal?: CubridAbortSignal;
   /**
    * Milliseconds a statement issued on this connection waits while the consumer
    * asks for no row, before it rejects with `kind: "stream-busy"`. Such a statement

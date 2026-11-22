@@ -47,6 +47,7 @@ Complete reference for every public export of `cubrid-client`.
   - [zoned() and ZonedParam](#zoned-and-zonedparam)
   - [blob() and clob()](#blob-and-clob)
   - [LobParam, BlobSource and ClobSource](#lobparam-blobsource-and-clobsource)
+  - [CubridBytes and CubridAbortSignal](#cubridbytes-and-cubridabortsignal)
   - [PreparedQueryParam](#preparedqueryparam)
   - [QueryResultRow](#queryresultrow)
   - [QueryResult](#queryresult)
@@ -1877,7 +1878,7 @@ Options of [`stream()`](#streamtsql-params-options).
 ```ts
 interface StreamOptions {
   fetchSize?: number;
-  signal?: AbortSignal;
+  signal?: CubridAbortSignal; // AbortSignal
   consumerTimeout?: number;
   binding?: "literal" | "prepared";
 }
@@ -1896,7 +1897,7 @@ The optional last argument of `query()`, `queryResult()`, `execute()`, `queryPre
 
 ```ts
 interface QueryOptions {
-  signal?: AbortSignal;
+  signal?: CubridAbortSignal; // AbortSignal
   readTimeout?: number;
 }
 ```
@@ -2123,7 +2124,7 @@ type QueryParam =
   | boolean
   | bigint
   | Date
-  | Buffer
+  | CubridBytes // Buffer with @types/node
   | ZonedParam
   | null;
 ```
@@ -2136,7 +2137,7 @@ type QueryParam =
 | `bigint` | `BIGINT` | `9007199254740993n` |
 | `Date` | `DATETIME` / `TIMESTAMP` | `new Date()` |
 | [`ZonedParam`](#zoned-and-zonedparam) | `DATETIMETZ` at `+00:00`, for zone-aware columns | `zoned(new Date())` |
-| `Buffer` | `BIT VARYING` (also stored into a `BLOB` column) | `Buffer.from("data")` |
+| `Buffer` | `BIT VARYING` (also stored into a `BLOB` column). A plain `Uint8Array` is sent the same way (#309) | `Buffer.from("data")` |
 | `null` | `NULL` | `null` |
 
 Note: `BIGINT` columns in query results are returned as JavaScript `bigint` values (not `number`), so the full signed 64-bit range is preserved.
@@ -2237,8 +2238,8 @@ await db.executePrepared("INSERT INTO docs (id, body, notes) VALUES (?, ?, ?)", 
 ### LobParam, BlobSource and ClobSource
 
 ```ts
-type BlobSource = Buffer | Uint8Array | AsyncIterable<Buffer | Uint8Array> | Readable;
-type ClobSource = string | Buffer | AsyncIterable<string | Buffer | Uint8Array> | Readable;
+type BlobSource = CubridBytes | Uint8Array | AsyncIterable<CubridBytes | Uint8Array>;
+type ClobSource = string | CubridBytes | AsyncIterable<string | CubridBytes | Uint8Array>;
 
 interface LobParam {
   readonly kind: "blob" | "clob";
@@ -2247,6 +2248,28 @@ interface LobParam {
 ```
 
 A `LobParam` is frozen. Only `blob()` and `clob()` make one: an object of the same shape built by hand is not recognized.
+
+A Node `Readable` is accepted as an `AsyncIterable`. To tell one apart in `LobParam.source`, use `instanceof Readable`.
+
+### CubridBytes and CubridAbortSignal
+
+The environment types of the public declarations, so they compile without `@types/node` or the DOM lib ([#309](https://github.com/cubrid-lab/cubrid-client/issues/309)).
+
+```ts
+// Buffer when the program has @types/node, otherwise Uint8Array.
+type CubridBytes = typeof globalThis extends { Buffer: { isBuffer(value: unknown): value is infer B } }
+  ? B
+  : Uint8Array;
+
+// The global AbortSignal with @types/node or the DOM lib, otherwise a structural
+// type with aborted, reason, throwIfAborted() and add/removeEventListener("abort").
+// AbortSignalShape is internal to the declarations and not exported.
+type CubridAbortSignal = typeof globalThis extends { AbortSignal: { prototype: infer S } }
+  ? S
+  : AbortSignalShape;
+```
+
+With `@types/node` they are exactly `Buffer` and `AbortSignal`. At run time the client returns bytes as `Buffer`, accepts a plain `Uint8Array` wherever it accepts a `Buffer` (parameters, `executeMany()` rows, `blob()`, `clob()` and `ssl.ca`; sent as the same bytes, without copying), and requires a real `AbortSignal` for every `signal` option, whatever the types say. See [Declarations without Node types](API_STABILITY.md#declarations-without-node-types-309).
 
 ### PreparedQueryParam
 
@@ -2429,7 +2452,7 @@ interface PoolConnection
 }
 
 interface PoolConnectionOptions {
-  signal?: AbortSignal;
+  signal?: CubridAbortSignal; // AbortSignal
 }
 ```
 

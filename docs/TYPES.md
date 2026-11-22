@@ -480,7 +480,7 @@ await db.executePrepared("INSERT INTO docs (id, body, notes) VALUES (?, ?, ?)", 
 | Source | `blob()` | `clob()` |
 | --- | --- | --- |
 | `Buffer` | The bytes | UTF-8 bytes, checked (with `charset: "iso-8859-1"`: the bytes) |
-| `Uint8Array` | The bytes | Refused |
+| `Uint8Array` | The bytes | As a `Buffer` (since #309) |
 | `string` | Refused | Encoded as UTF-8 (with `charset: "iso-8859-1"`: as ISO-8859-1) |
 | `AsyncIterable` or `Readable` | Chunks of `Buffer` or `Uint8Array` | Chunks of `string`, `Buffer` or `Uint8Array`, mixed as you like |
 | Empty | An empty BLOB, not NULL | An empty CLOB, not NULL |
@@ -618,7 +618,7 @@ Other parameters render the same in both modes and are sent without that probe.
 | `boolean` | `1` or `0` |
 | `Date` | `DATETIME'YYYY-MM-DD HH:MM:SS.mmm'` using **UTC components**; it has no timezone offset embedded, so a zone-aware column attaches the session zone (see [a `Date` in a zone-aware column](#a-date-in-a-zone-aware-column)). An invalid `Date` is refused |
 | `zoned(date)` | `DATETIMETZ'YYYY-MM-DD HH:MM:SS.mmm +00:00'` of the UTC fields: the instant, which a zone-aware column keeps (see [`zoned()`](#sending-the-instant-zoned)) |
-| `Buffer` | Hexadecimal binary literal `X'...'`. For BLOB or CLOB content use [`blob()` or `clob()`](#writing-blob-and-clob) with a prepared method |
+| `Buffer` or `Uint8Array` | Hexadecimal binary literal `X'...'`; a plain `Uint8Array` since #309. For BLOB or CLOB content use [`blob()` or `clob()`](#writing-blob-and-clob) with a prepared method |
 | `null`, `undefined` | SQL `NULL` |
 | `blob()`, `clob()` | Refused with a `TypeError`: use a prepared method |
 | Anything else | Refused: an object, array, function or symbol is never converted with `String()` |
@@ -674,7 +674,7 @@ literals without it; `blob()` and `clob()` stay refused there.
 | `string` | CHAR | UTF-8, or ISO-8859-1 with `charset: "iso-8859-1"`; NUL and Ctrl-Z are refused, as on the literal path |
 | `Date` | DATETIME | **UTC components**, as on the literal path, with no zone: a zone-aware column attaches the session zone (see [a `Date` in a zone-aware column](#a-date-in-a-zone-aware-column)). Years outside 0001 to 9999 and an invalid `Date` are refused |
 | `zoned(date)` | DATETIMETZ | The UTC fields, then the zone text `+00:00` without a NUL. See [`zoned()`](#sending-the-instant-zoned) |
-| `Buffer` | VARBIT | An empty `Buffer` is refused: the broker reads it as SQL NULL |
+| `Buffer` or `Uint8Array` | VARBIT | A plain `Uint8Array` since #309. An empty one is refused: the broker reads it as SQL NULL |
 | `blob()`, `clob()` | BLOB, CLOB handle | Uploaded first. See [writing BLOB and CLOB](#writing-blob-and-clob) |
 | Anything else | Refused | As on the literal path |
 

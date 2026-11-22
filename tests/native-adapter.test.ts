@@ -6843,3 +6843,77 @@ test("stream prepared: the client's prepared stream does not go through an overr
   ]);
   await client.close();
 });
+
+test("executeMany sends plain Uint8Array values exactly like equal Buffers (#309)", async () => {
+  const bytes = Buffer.from([0x00, 0x5c, 0x27, 0xff]);
+  const backing = new Uint8Array([7, ...bytes, 7]);
+  const sent: string[] = [];
+  for (const value of [bytes, new Uint8Array(bytes), backing.subarray(1, 1 + bytes.length)]) {
+    const { adapter, fakeCAS } = createPreparedAdapter();
+    queueBatch(fakeCAS, EXECUTE_ARRAY_FRAMES.prepareInsert, EXECUTE_ARRAY_FRAMES.insertThree);
+    await adapter.executeMany(INSERT_EM, [
+      [1, value as Buffer],
+      [2, value as Buffer],
+      [3, value as Buffer],
+    ]);
+    sent.push(fakeCAS.sentPayloads[1]!.toString("hex"));
+  }
+  assert.equal(sent[1], sent[0]);
+  assert.equal(sent[2], sent[0]);
+});
+
+test("ssl.ca given as a plain Uint8Array reaches TLS as a Buffer over the same bytes (#309)", () => {
+  const pem = Buffer.from("-----BEGIN CERTIFICATE-----\n");
+  const backing = new Uint8Array([0, ...pem, 0]);
+  for (const ca of [new Uint8Array(pem), backing.subarray(1, 1 + pem.length)]) {
+    const adapter = new NativeCubridAdapter({ ...DEFAULT_CONFIG, ssl: { ca: ca as Buffer } });
+    const resolved = (
+      adapter as unknown as { resolveSslConfig(): { ca?: unknown } }
+    ).resolveSslConfig();
+    assert.ok(Buffer.isBuffer(resolved.ca));
+    assert.deepEqual(resolved.ca, pem);
+  }
+  const text = "pem";
+  const adapter = new NativeCubridAdapter({ ...DEFAULT_CONFIG, ssl: { ca: text } });
+  assert.equal(
+    (adapter as unknown as { resolveSslConfig(): { ca?: unknown } }).resolveSslConfig().ca,
+    text,
+  );
+});
+
+test("every statement method sends a plain Uint8Array exactly like an equal Buffer (#309)", async () => {
+  const bytes = Buffer.from([0x00, 0x5c, 0x27, 0xff]);
+  const backing = new Uint8Array([7, 7, ...bytes, 7]);
+  const sql = "UPDATE t SET b = ? WHERE id = ?";
+  const drain = async (rows: AsyncIterable<unknown>): Promise<void> => {
+    for await (const _row of rows) {
+      // only the request matters
+    }
+  };
+  const calls: Array<[string, boolean, (a: NativeCubridAdapter, v: Buffer) => Promise<unknown>]> = [
+    ["query", false, (a, v) => a.query(sql, [v, 1])],
+    ["execute", false, (a, v) => a.execute(sql, [v, 1])],
+    ["stream", false, (a, v) => drain(a.stream(sql, [v, 1]))],
+    ["queryPrepared", true, (a, v) => a.queryPrepared(sql, [v, 1])],
+    ["executePrepared", true, (a, v) => a.executePrepared(sql, [v, 1])],
+    ["stream prepared", true, (a, v) => drain(a.stream(sql, [v, 1], { binding: "prepared" }))],
+  ];
+  for (const [name, prepared, call] of calls) {
+    const sent: string[] = [];
+    for (const value of [bytes, new Uint8Array(bytes), backing.subarray(2, 2 + bytes.length)]) {
+      const { adapter, fakeCAS } = createPreparedAdapter();
+      // The request carrying the values is recorded, then refused: only its bytes are compared.
+      if (prepared) {
+        fakeCAS.queueResponse(Buffer.from(EXECUTE_ARRAY_FRAMES.prepareInsert, "hex"));
+      }
+      fakeCAS.queueExchangeFailure(new Error("stop after the request"));
+      await call(adapter, value as Buffer).catch(() => undefined);
+      const request = fakeCAS.sentPayloads[prepared ? 1 : 0];
+      assert.ok(request, name);
+      sent.push(request.toString("hex"));
+    }
+    assert.ok(sent[0]?.includes("005c27ff") || sent[0]?.includes("30303563323766"), name);
+    assert.equal(sent[1], sent[0], name);
+    assert.equal(sent[2], sent[0], name);
+  }
+});
