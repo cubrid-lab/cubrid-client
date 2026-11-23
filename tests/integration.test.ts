@@ -7760,11 +7760,13 @@ describe("Integration: a SELECT-only user (#318)", { skip: !available }, () => {
     { id: 2, label: "beta" },
     { id: 3, label: "gamma" },
   ];
-  // CUBRID 11.4.6 refuses a statement the user lacks the privilege for with
-  // ER_PT_SEMANTIC (-494), "<STATEMENT> is not authorized on <table>". An
-  // unknown column has the same code, so the server's message is checked too.
+  // CUBRID 10.2, 11.0, 11.2 and 11.4 refuse a statement the user lacks the
+  // privilege for with ER_PT_SEMANTIC (-494), "<STATEMENT> is not authorized on
+  // <table>". An unknown column has the same code, so the message is checked too.
   const NOT_AUTHORIZED = -494;
 
+  /** The administrator that owns the table; 11.2 and later qualify it with this owner. */
+  const OWNER = TEST_CONFIG.user;
   let createdTable = false;
   let createdUser = false;
   /** The table as the SELECT-only user names it: 11.2 and later resolve a bare name in its own schema. */
@@ -7812,12 +7814,20 @@ describe("Integration: a SELECT-only user (#318)", { skip: !available }, () => {
       for (const row of ROWS) {
         await admin.query(`INSERT INTO ${TABLE} VALUES (?, ?)`, [row.id, row.label]);
       }
-      await admin.query(`CREATE USER ${USER} PASSWORD '${PASSWORD}'`);
+      try {
+        await admin.query(`CREATE USER ${USER} PASSWORD '${PASSWORD}'`);
+      } catch (error) {
+        // The server echoes the statement, password included, in its message.
+        // Rethrow the text redacted and without the cause chain that holds it.
+        throw new Error(
+          `CREATE USER ${USER} failed: ${causeMessages(error).replaceAll(PASSWORD, "<redacted>")}`,
+        );
+      }
       createdUser = true;
       await admin.query(`GRANT SELECT ON ${TABLE} TO ${USER}`);
       const [major, minor] = (await admin.getServerVersion()).split(".").map(Number);
       if (major! > 11 || (major === 11 && minor! >= 2)) {
-        qualified = `dba.${TABLE}`;
+        qualified = `${OWNER.toLowerCase()}.${TABLE}`;
       }
     } finally {
       await admin.close();
@@ -7826,20 +7836,29 @@ describe("Integration: a SELECT-only user (#318)", { skip: !available }, () => {
   });
 
   after(async () => {
-    await reader?.close();
-    const admin = createClient(TEST_CONFIG);
-    try {
-      if (createdUser) {
-        await admin.query(`DROP USER ${USER}`);
-      }
-    } finally {
+    // Attempt every step; report the first failure, or all of them, never only the last.
+    const errors: unknown[] = [];
+    const attempt = async (step: () => Promise<unknown>) => {
       try {
-        if (createdTable) {
-          await admin.query(`DROP TABLE ${TABLE}`);
-        }
-      } finally {
-        await admin.close();
+        await step();
+      } catch (error) {
+        errors.push(error);
       }
+    };
+    await attempt(async () => reader?.close());
+    const admin = createClient(TEST_CONFIG);
+    if (createdUser) {
+      await attempt(() => admin.query(`DROP USER ${USER}`));
+    }
+    if (createdTable) {
+      await attempt(() => admin.query(`DROP TABLE ${TABLE}`));
+    }
+    await attempt(() => admin.close());
+    if (errors.length === 1) {
+      throw errors[0];
+    }
+    if (errors.length > 1) {
+      throw new AggregateError(errors, `cleanup of ${USER} and ${TABLE} failed`);
     }
   });
 
@@ -7877,7 +7896,10 @@ describe("Integration: a SELECT-only user (#318)", { skip: !available }, () => {
           const messages = causeMessages(error);
           assert.match(
             messages,
-            new RegExp(`${statement} is not authorized on (dba\\.)?${TABLE}`, "i"),
+            new RegExp(
+              `${statement} is not authorized on (${OWNER.toLowerCase()}\\.)?${TABLE}`,
+              "i",
+            ),
           );
           assert.equal(messages.includes(PASSWORD), false);
           return true;
