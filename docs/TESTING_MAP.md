@@ -40,7 +40,7 @@ and an oracle never shares a builder with the code it checks
 | `npm run test:all` | every `tests/*.test.ts` | no workflow | fails offline by design: 1417 pass, 1 fail (`legacy-parity.test.ts`), 3 skipped (TLS) |
 | `node --test tests/api-public-surface.test.mjs`, `npm run api:check` | public API parser and `api/index.d.ts` | `ci.yml` (Node 22) | 3 pass; "Public API matches api/index.d.ts." |
 | `npm run typecheck` (also in `npm run check`) | `tests/consumer-fixtures/`: the 1.x API used by the known downstream consumers at pinned revisions ([inventory](CONSUMER_INVENTORY.md), #300), with `tests/v2-api-mock/` and the other test files | `ci.yml` | no errors; a consumer-used signature changed in `src/` fails it |
-| `npm run types:packed` | the packed `dist/index.d.ts` and `dist/index.d.cts` compiled by consumers with `skipLibCheck: false`: no Node or DOM types, the DOM lib, and `@types/node` (#309) | `ci.yml` (Node 22) | 3 consumers compile |
+| `npm run types:packed` | the packed `dist/index.d.ts` and `dist/index.d.cts` compiled by consumers with `skipLibCheck: false`: no Node or DOM types, the DOM lib, and `@types/node` (#309); `tests/consumer-fixtures/` through ESM (`index.d.ts`) and CJS (`index.d.cts`) resolution (#300) | `ci.yml` (Node 22) | 5 consumers compile |
 | `node --test tests/provenance-scan.test.mjs` (also in `npm test` and `npm run test:coverage`, outside `c8`), `npm run provenance:check` | controls of the provenance similarity scan; the packed tarball's contents ([PROVENANCE.md](PROVENANCE.md)) | `ci.yml` (Node 18–26 for the test; Node 22 for the pack check) | 6 pass; "provenance check passed" |
 
 ## Required live CUBRID 11.4 lane (#264)

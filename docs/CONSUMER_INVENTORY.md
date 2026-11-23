@@ -61,7 +61,7 @@ classes). Neither imports an SPI type, `NativeCubridAdapter`, `CubridTransaction
 | `transaction(callback)`, `transaction(callback, { isolationLevel })`; the callback's `tx` used as the same structural interface | `db.transaction()`, relational reads in one snapshot (`repeatable read`) | [src/session.ts:540-570](https://github.com/cubrid-lab/drizzle-cubrid/blob/0035410ba87b5fbe0eb3d7f35df003fae1fd68d0/src/session.ts#L540-L570), [src/native/session.ts:562-591](https://github.com/cubrid-lab/drizzle-cubrid/blob/0035410ba87b5fbe0eb3d7f35df003fae1fd68d0/src/native/session.ts#L562-L591), [:619-636](https://github.com/cubrid-lab/drizzle-cubrid/blob/0035410ba87b5fbe0eb3d7f35df003fae1fd68d0/src/native/session.ts#L619-L636) |
 | Deprecated `beginTransaction()`, `commit()`, `rollback()` on the client | Legacy fallback when the value has no `transaction()` | [src/session.ts:601-632](https://github.com/cubrid-lab/drizzle-cubrid/blob/0035410ba87b5fbe0eb3d7f35df003fae1fd68d0/src/session.ts#L601-L632) |
 | `TransactionError` (`instanceof`), `new ConstraintError/SqlSyntaxError/DeadlockError/LockTimeoutError/QueryError(message, options)`; `kind`, `cause`, `rollbackError` | Gives a relational read's statement error the class it has outside a transaction | [src/native/session.ts:3-10](https://github.com/cubrid-lab/drizzle-cubrid/blob/0035410ba87b5fbe0eb3d7f35df003fae1fd68d0/src/native/session.ts#L3-L10), [:52-77](https://github.com/cubrid-lab/drizzle-cubrid/blob/0035410ba87b5fbe0eb3d7f35df003fae1fd68d0/src/native/session.ts#L52-L77), [:592-599](https://github.com/cubrid-lab/drizzle-cubrid/blob/0035410ba87b5fbe0eb3d7f35df003fae1fd68d0/src/native/session.ts#L592-L599) |
-| `timezone` (public, `TimezoneAware`); private `config.timezone`, `connection.utcDates` and `constructor.name` as fallbacks | Refuses temporal columns unless the client decodes in UTC | [src/timezone.ts:18-62](https://github.com/cubrid-lab/drizzle-cubrid/blob/0035410ba87b5fbe0eb3d7f35df003fae1fd68d0/src/timezone.ts#L18-L62), [src/native/timezone.ts:21-41](https://github.com/cubrid-lab/drizzle-cubrid/blob/0035410ba87b5fbe0eb3d7f35df003fae1fd68d0/src/native/timezone.ts#L21-L41) |
+| `timezone` (public, `TimezoneAware`); private `config.timezone`, `connection.utcDates` and `constructor.name` as fallbacks | Refuses temporal columns unless the client decodes in UTC | [src/timezone.ts:18-62](https://github.com/cubrid-lab/drizzle-cubrid/blob/0035410ba87b5fbe0eb3d7f35df003fae1fd68d0/src/timezone.ts#L18-L62), [src/native/timezone.ts:21-60](https://github.com/cubrid-lab/drizzle-cubrid/blob/0035410ba87b5fbe0eb3d7f35df003fae1fd68d0/src/native/timezone.ts#L21-L60) |
 
 ### cubrid-benchmark (`typescript/`)
 
@@ -86,11 +86,17 @@ Base URL: `https://github.com/xhdndi81/cubrid-mcp/blob/876117d3ec9bb2edc3e581f9f
 ## Compile fixtures
 
 [`tests/consumer-fixtures/`](../tests/consumer-fixtures/) has one file per
-consumer. Each states the consumer's 1.x usage in TypeScript against the
-source types (`src/index.ts`), so `npm run typecheck` (in `ci.yml`, and in
-`npm run check`) fails when a 1.x change breaks it. `npm run api:check` keeps the
-built declarations equal to `api/index.d.ts`, and `npm run types:packed` compiles
-the packed declarations, so the fixtures cover the published types too.
+consumer. Each states the consumer's 1.x usage in TypeScript and is compiled
+twice in CI (`ci.yml`):
+
+- by `npm run typecheck` (also in `npm run check`), against the source types
+  (`src/index.ts`);
+- by `npm run types:packed`, against the **packed** package: the fixtures are
+  copied into temporary consumers with `node_modules/cubrid-client` unpacked
+  from `npm pack`, their import rewritten to `"cubrid-client"`, and compiled with
+  `skipLibCheck: false` once through the package's `exports` (ESM,
+  `dist/index.d.ts`) and once with `"cubrid-client"` mapped to
+  `dist/index.d.cts` (CJS declarations). Network-free.
 
 - drizzle-cubrid reaches the driver only through structural interfaces whose
   members are optional and detected at run time, so a client that lost a method
@@ -111,6 +117,11 @@ Checked on 2026-11-23 by breaking one consumer-used signature at a time in
 | `CubridClient.beginTransaction()` renamed | `drizzle-cubrid.ts`: legacy surface and the direct call |
 | `ArrayRowOptions.rowMode` changed from `"array"` | `drizzle-cubrid.ts`: every surface check |
 | `ClientOptions.port` typed `string` | `cubrid-benchmark.ts`: 2; `cubrid-mcp.ts`: 2 |
+
+The packed check was proved the same way: with `generatedKeys` renamed only in
+the built `dist/index.d.cts`, `types:packed` failed the `fixtures-cjs` consumer and
+passed `fixtures-esm`; renamed only in `dist/index.d.ts`, it failed
+`fixtures-esm` and passed `fixtures-cjs`.
 
 ## Runtime behavior the fixtures cannot check
 

@@ -4,7 +4,8 @@
 // fcecf40566d52b1eed47af8101a543e7bf372112 (2026-11-22). typescript/package.json
 // accepts `cubrid-client ^1.1.0`; its lockfile installs 1.1.0. It is a private
 // package (benchmarks), not published to npm. docs/CONSUMER_INVENTORY.md lists
-// every call with a file:line link. `npm run typecheck` compiles this file;
+// every call with a file:line link. `npm run typecheck` (source types) and
+// `npm run types:packed` (packed ESM and CJS declarations) compile this file;
 // nothing here runs.
 
 import { type CubridClient, createClient } from "../../src/index.js";

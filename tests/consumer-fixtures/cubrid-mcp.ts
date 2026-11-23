@@ -5,7 +5,8 @@
 // `cubrid-client ^1.1.0`; its lockfile installs 1.1.0. It is plain JavaScript and
 // types against nothing, so this file states, in TypeScript, the calls it makes.
 // docs/CONSUMER_INVENTORY.md lists them with file:line links. `npm run typecheck`
-// compiles this file; nothing here runs.
+// (source types) and `npm run types:packed` (packed ESM and CJS declarations)
+// compile this file; nothing here runs.
 
 import { createClient } from "../../src/index.js";
 

@@ -12,7 +12,8 @@
 // optional and detected at run time, so a plain assignability check would still
 // pass after a method disappeared. Each surface is therefore checked against
 // `Required<...>` of the interface, and every call drizzle-cubrid makes through
-// it is also made directly on the 1.x types. `npm run typecheck` compiles this
+// it is also made directly on the 1.x types. `npm run typecheck` (source types)
+// and `npm run types:packed` (packed ESM and CJS declarations) compile this
 // file; nothing here runs. A 1.x change that breaks drizzle-cubrid fails here.
 
 import type {
@@ -208,7 +209,7 @@ async function statementCalls(db: CubridClient | CubridPool | ClientTx | PoolTx)
     break;
   }
   // src/timezone.ts:43 and src/native/timezone.ts:44 read a public string `timezone` first.
-  const zone: "local" | "utc" = db.timezone;
+  const zone: string = db.timezone;
   void [rows, arrayRows, preparedRows, preparedArrayRows, literal, literalKeys, prepared];
   void [preparedKeys, zone];
 }
