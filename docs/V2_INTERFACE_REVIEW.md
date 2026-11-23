@@ -39,6 +39,8 @@ Status: review checklist, **not** an accepted API change. This document compleme
 
 Mark each gate **passed**, **failed**, or **not tested**, with a commit SHA and CI/run link. Do not claim that this checklist or the v2 mock establishes production readiness. Issue #300 tracks the independent consumer and runtime evidence.
 
+- **Consumer compatibility, 1.x half (2026-11-23):** the known consumers (drizzle-cubrid, cubrid-benchmark, cubrid-mcp) and the search limits are recorded at pinned revisions in [CONSUMER_INVENTORY.md](CONSUMER_INVENTORY.md), and `tests/consumer-fixtures/` compiles their 1.x usage in `npm run typecheck`. The v2 half (the same fixtures against the proposal) is **not tested** until ADR 0011 is decided.
+
 ## Drizzle integration: defer breaking interface changes to 2.0
 
 Review snapshot: 2026-11-17, `cubrid-lab/drizzle-cubrid` main. The adapter declares `cubrid-client >=1.4.0 <2.0.0`; the default entry point still extends Drizzle's MySQL classes, while `drizzle-cubrid/native` is an experimental CUBRID-specific preview. Its documented live integration target is CUBRID 11.4. This is **not** a claim of full compatibility across every ORM feature or CUBRID version.

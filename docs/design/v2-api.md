@@ -178,6 +178,11 @@ that a client and a pool still satisfy that structural interface under the 2.0
 mock. Other repositories that mention the name (cubrid-rs and sqlalchemy-cubrid
 documents) are not npm consumers.
 
+> **Superseded inventory (2026-11-23, #300).** This section is the 2026-11-12
+> baseline. The current inventory, which also searched npm and found the
+> external consumer `cubrid-mcp`, and the pinned 1.x compile fixtures are in
+> [CONSUMER_INVENTORY.md](../CONSUMER_INVENTORY.md).
+
 ## The binding option
 
 ```ts
