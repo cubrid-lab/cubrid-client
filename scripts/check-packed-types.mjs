@@ -14,10 +14,14 @@
 //            Readable are accepted, and the types the client hands back are
 //            still exactly Buffer and AbortSignal.
 //
+// The downstream consumer fixtures (tests/consumer-fixtures/, #300) are also
+// compiled against the packed package, once resolving "cubrid-client" through
+// package.json (ESM, dist/index.d.ts) and once mapped to dist/index.d.cts (CJS).
+//
 // Network-free: the tarball has no dependencies and @types/node comes from this
 // repository's node_modules. Exits 1 if any consumer fails to compile.
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -156,6 +160,26 @@ void caIsBuffer;
   },
 };
 
+// Each fixture imports the source types; in a consumer it imports the package.
+const FIXTURE_DIR = join(REPO, "tests", "consumer-fixtures");
+const FIXTURES = Object.fromEntries(
+  readdirSync(FIXTURE_DIR)
+    .filter((file) => file.endsWith(".ts"))
+    .map((file) => [
+      file,
+      readFileSync(join(FIXTURE_DIR, file), "utf8").replaceAll(
+        '"../../src/index.js"',
+        '"cubrid-client"',
+      ),
+    ]),
+);
+for (const [esm, paths] of [
+  ["fixtures-esm", undefined],
+  ["fixtures-cjs", { "cubrid-client": ["./node_modules/cubrid-client/dist/index.d.cts"] }],
+]) {
+  CONSUMERS[esm] = { lib: ["es2022"], types: ["node"], files: FIXTURES, paths };
+}
+
 function pack(dest) {
   const [packed] = JSON.parse(
     execFileSync("npm", ["pack", "--ignore-scripts", "--json", "--pack-destination", dest], {
@@ -171,11 +195,12 @@ const tmp = mkdtempSync(join(tmpdir(), "packed-types-"));
 let failed = false;
 try {
   const pkg = pack(tmp);
-  for (const [name, { lib, types, source }] of Object.entries(CONSUMERS)) {
+  for (const [name, { lib, types, source, files, paths }] of Object.entries(CONSUMERS)) {
     const dir = join(tmp, name);
     mkdirSync(join(dir, "node_modules"), { recursive: true });
     execFileSync("cp", ["-R", pkg, join(dir, "node_modules", "cubrid-client")]);
-    writeFileSync(join(dir, "index.ts"), source);
+    const sources = files ?? { "index.ts": source };
+    for (const [file, text] of Object.entries(sources)) writeFileSync(join(dir, file), text);
     writeFileSync(
       join(dir, "tsconfig.json"),
       JSON.stringify(
@@ -191,12 +216,13 @@ try {
             skipLibCheck: false,
             types,
             typeRoots: types.length > 0 ? [NODE_TYPES] : [],
+            ...(paths ? { paths } : {}),
           },
           // Both published declaration files are checked under skipLibCheck: false.
           // package.json resolves both import and require to index.d.ts; api:check
           // keeps index.d.cts identical to it.
           files: [
-            "index.ts",
+            ...Object.keys(sources),
             "node_modules/cubrid-client/dist/index.d.ts",
             "node_modules/cubrid-client/dist/index.d.cts",
           ],
