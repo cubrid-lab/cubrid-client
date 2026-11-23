@@ -10,6 +10,7 @@
  */
 
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
 import { createServer, connect as netConnect, type Server, type Socket } from "node:net";
 import { Readable } from "node:stream";
 import test, { after, before, describe } from "node:test";
@@ -7745,6 +7746,169 @@ describe("Integration: OpenDatabase credential byte limits", { skip: !available 
       assert.throws(() => new NativeCubridAdapter(config), RangeError);
     }
   });
+});
+
+describe("Integration: a SELECT-only user (#318)", { skip: !available }, () => {
+  // Names unique to this run: cleanup drops only what this run created.
+  const SUFFIX = randomBytes(4).toString("hex");
+  const TABLE = `cc318_t_${SUFFIX}`;
+  const USER = `cc318_u_${SUFFIX}`;
+  // Random and never printed: a failing assertion shows no credential.
+  const PASSWORD = randomBytes(12).toString("hex");
+  const ROWS = [
+    { id: 1, label: "alpha" },
+    { id: 2, label: "beta" },
+    { id: 3, label: "gamma" },
+  ];
+  // CUBRID 10.2, 11.0, 11.2 and 11.4 refuse a statement the user lacks the
+  // privilege for with ER_PT_SEMANTIC (-494), "<STATEMENT> is not authorized on
+  // <table>". An unknown column has the same code, so the message is checked too.
+  const NOT_AUTHORIZED = -494;
+
+  /** The administrator that owns the table; 11.2 and later qualify it with this owner. */
+  const OWNER = TEST_CONFIG.user;
+  let createdTable = false;
+  let createdUser = false;
+  /** The table as the SELECT-only user names it: 11.2 and later resolve a bare name in its own schema. */
+  let qualified = TABLE;
+  let reader: ReturnType<typeof createClient>;
+
+  async function storedRows(): Promise<unknown[]> {
+    const observer = createClient(TEST_CONFIG);
+    try {
+      return await observer.query(`SELECT id, label FROM ${TABLE} ORDER BY id`);
+    } finally {
+      await observer.close();
+    }
+  }
+
+  /** The messages of `error` and of each error in its cause chain. */
+  function causeMessages(error: unknown): string {
+    const messages: string[] = [];
+    for (let cause = error; cause instanceof Error; cause = cause.cause) {
+      messages.push(cause.message);
+    }
+    return messages.join("\n");
+  }
+
+  async function assertReaderStillReads(): Promise<void> {
+    assert.deepEqual(await reader.query(`SELECT id, label FROM ${qualified} WHERE id = ?`, [2]), [
+      { id: 2, label: "beta" },
+    ]);
+  }
+
+  before(async () => {
+    const admin = createClient(TEST_CONFIG);
+    try {
+      const users = await admin.query("SELECT name FROM db_user WHERE name = ?", [
+        USER.toUpperCase(),
+      ]);
+      const tables = await admin.query("SELECT class_name FROM db_class WHERE class_name = ?", [
+        TABLE,
+      ]);
+      if (users.length > 0 || tables.length > 0) {
+        throw new Error(`refusing to reuse an existing ${USER} or ${TABLE}`);
+      }
+      await admin.query(`CREATE TABLE ${TABLE} (id INT PRIMARY KEY, label VARCHAR(20) NOT NULL)`);
+      createdTable = true;
+      for (const row of ROWS) {
+        await admin.query(`INSERT INTO ${TABLE} VALUES (?, ?)`, [row.id, row.label]);
+      }
+      try {
+        await admin.query(`CREATE USER ${USER} PASSWORD '${PASSWORD}'`);
+      } catch (error) {
+        // The server echoes the statement, password included, in its message.
+        // Rethrow the text redacted and without the cause chain that holds it.
+        throw new Error(
+          `CREATE USER ${USER} failed: ${causeMessages(error).replaceAll(PASSWORD, "<redacted>")}`,
+        );
+      }
+      createdUser = true;
+      await admin.query(`GRANT SELECT ON ${TABLE} TO ${USER}`);
+      const [major, minor] = (await admin.getServerVersion()).split(".").map(Number);
+      if (major! > 11 || (major === 11 && minor! >= 2)) {
+        qualified = `${OWNER.toLowerCase()}.${TABLE}`;
+      }
+    } finally {
+      await admin.close();
+    }
+    reader = createClient({ ...TEST_CONFIG, user: USER, password: PASSWORD });
+  });
+
+  after(async () => {
+    // Attempt every step; report the first failure, or all of them, never only the last.
+    const errors: unknown[] = [];
+    const attempt = async (step: () => Promise<unknown>) => {
+      try {
+        await step();
+      } catch (error) {
+        errors.push(error);
+      }
+    };
+    await attempt(async () => reader?.close());
+    const admin = createClient(TEST_CONFIG);
+    if (createdUser) {
+      await attempt(() => admin.query(`DROP USER ${USER}`));
+    }
+    if (createdTable) {
+      await attempt(() => admin.query(`DROP TABLE ${TABLE}`));
+    }
+    await attempt(() => admin.close());
+    if (errors.length === 1) {
+      throw errors[0];
+    }
+    if (errors.length > 1) {
+      throw new AggregateError(errors, `cleanup of ${USER} and ${TABLE} failed`);
+    }
+  });
+
+  test("the user logs in as itself and reads with a bound parameter", async () => {
+    assert.deepEqual(await reader.query("SELECT CURRENT_USER AS u"), [{ u: USER.toUpperCase() }]);
+    assert.deepEqual(
+      await reader.query(`SELECT id, label FROM ${qualified} WHERE id >= ? ORDER BY id`, [2]),
+      [
+        { id: 2, label: "beta" },
+        { id: 3, label: "gamma" },
+      ],
+    );
+    assert.deepEqual(
+      await reader.queryPrepared(`SELECT label FROM ${qualified} WHERE id = ?`, [1]),
+      [{ label: "alpha" }],
+    );
+  });
+
+  for (const [statement, sql, params] of [
+    ["INSERT", (t: string) => `INSERT INTO ${t} VALUES (?, ?)`, [4, "delta"]],
+    ["UPDATE", (t: string) => `UPDATE ${t} SET label = ? WHERE id = ?`, ["changed", 1]],
+    ["DELETE", (t: string) => `DELETE FROM ${t} WHERE id = ?`, [3]],
+  ] as const) {
+    test(`the server refuses ${statement} with an authorization error; the session keeps reading`, async () => {
+      for (const run of [
+        () => reader.execute(sql(qualified), [...params]),
+        () => reader.executePrepared(sql(qualified), [...params]),
+      ]) {
+        await assert.rejects(run(), (error: unknown) => {
+          assert.equal((error as Error).constructor, QueryError);
+          const queryError = error as QueryError;
+          assert.equal(queryError.code, NOT_AUTHORIZED);
+          assert.equal(queryError.kind, "semantic");
+          assert.equal(queryError.origin, "server");
+          const messages = causeMessages(error);
+          assert.match(
+            messages,
+            new RegExp(
+              `${statement} is not authorized on (${OWNER.toLowerCase()}\\.)?${TABLE}`,
+              "i",
+            ),
+          );
+          assert.equal(messages.includes(PASSWORD), false);
+          return true;
+        });
+        await assertReaderStillReads();
+      }
+      assert.deepEqual(await storedRows(), ROWS);
+    });
+  }
 });
 
 describe("Integration: destroy() (#245)", { skip: !available }, () => {
